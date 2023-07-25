@@ -1,0 +1,625 @@
+<html>
+<head>
+<title>NativeAnimatedHelper.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+NativeAnimatedHelper.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow strict-local 
+ * @format 
+ */</span>
+
+<span class="s1">import type {EventSubscription} from </span><span class="s2">'../vendor/emitter/EventEmitter'</span><span class="s1">;</span>
+<span class="s1">import type {EventConfig} from </span><span class="s2">'./AnimatedEvent'</span><span class="s1">;</span>
+<span class="s1">import type {AnimationConfig, EndCallback} from </span><span class="s2">'./animations/Animation'</span><span class="s1">;</span>
+<span class="s1">import type {</span>
+  <span class="s1">AnimatedNodeConfig,</span>
+  <span class="s1">AnimatingNodeConfig,</span>
+  <span class="s1">EventMapping,</span>
+<span class="s1">} from </span><span class="s2">'./NativeAnimatedModule'</span><span class="s1">;</span>
+<span class="s1">import type {InterpolationConfigType} from </span><span class="s2">'./nodes/AnimatedInterpolation'</span><span class="s1">;</span>
+
+<span class="s1">import NativeEventEmitter from </span><span class="s2">'../EventEmitter/NativeEventEmitter'</span><span class="s1">;</span>
+<span class="s1">import RCTDeviceEventEmitter from </span><span class="s2">'../EventEmitter/RCTDeviceEventEmitter'</span><span class="s1">;</span>
+<span class="s1">import ReactNativeFeatureFlags from </span><span class="s2">'../ReactNative/ReactNativeFeatureFlags'</span><span class="s1">;</span>
+<span class="s1">import Platform from </span><span class="s2">'../Utilities/Platform'</span><span class="s1">;</span>
+<span class="s1">import NativeAnimatedNonTurboModule from </span><span class="s2">'./NativeAnimatedModule'</span><span class="s1">;</span>
+<span class="s1">import NativeAnimatedTurboModule from </span><span class="s2">'./NativeAnimatedTurboModule'</span><span class="s1">;</span>
+<span class="s1">import invariant from </span><span class="s2">'invariant'</span><span class="s1">;</span>
+
+<span class="s0">// TODO T69437152 @petetheheat - Delete this fork when Fabric ships to 100%.</span>
+<span class="s1">const NativeAnimatedModule =</span>
+  <span class="s1">Platform.OS === </span><span class="s2">'ios' </span><span class="s1">&amp;&amp; global.RN$Bridgeless === </span><span class="s3">true</span>
+    <span class="s1">? NativeAnimatedTurboModule</span>
+    <span class="s1">: NativeAnimatedNonTurboModule;</span>
+
+<span class="s1">let __nativeAnimatedNodeTagCount = </span><span class="s4">1</span><span class="s1">; </span><span class="s0">/* used for animated nodes */</span>
+<span class="s1">let __nativeAnimationIdCount = </span><span class="s4">1</span><span class="s1">; </span><span class="s0">/* used for started animations */</span>
+
+<span class="s1">let nativeEventEmitter;</span>
+
+<span class="s1">let waitingForQueuedOperations = </span><span class="s3">new </span><span class="s1">Set&lt;string&gt;();</span>
+<span class="s1">let queueOperations = </span><span class="s3">false</span><span class="s1">;</span>
+<span class="s1">let queue: Array&lt;() =&gt; </span><span class="s3">void</span><span class="s1">&gt; = [];</span>
+<span class="s0">// $FlowFixMe</span>
+<span class="s1">let singleOpQueue: Array&lt;any&gt; = [];</span>
+
+<span class="s1">const useSingleOpBatching =</span>
+  <span class="s1">Platform.OS === </span><span class="s2">'android' </span><span class="s1">&amp;&amp;</span>
+  <span class="s1">!!NativeAnimatedModule?.queueAndExecuteBatchedOperations &amp;&amp;</span>
+  <span class="s1">ReactNativeFeatureFlags.animatedShouldUseSingleOp();</span>
+<span class="s1">let flushQueueTimeout = </span><span class="s3">null</span><span class="s1">;</span>
+
+<span class="s1">const eventListenerGetValueCallbacks: {</span>
+  <span class="s1">[$FlowFixMe | number]: ((value: number) =&gt; </span><span class="s3">void</span><span class="s1">) | </span><span class="s3">void</span><span class="s1">,</span>
+<span class="s1">} = {};</span>
+<span class="s1">const eventListenerAnimationFinishedCallbacks: {</span>
+  <span class="s1">[$FlowFixMe | number]: EndCallback | </span><span class="s3">void</span><span class="s1">,</span>
+<span class="s1">} = {};</span>
+<span class="s1">let globalEventEmitterGetValueListener: ?EventSubscription = </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">let globalEventEmitterAnimationFinishedListener: ?EventSubscription = </span><span class="s3">null</span><span class="s1">;</span>
+
+<span class="s1">const nativeOps: ?</span><span class="s3">typeof </span><span class="s1">NativeAnimatedModule = useSingleOpBatching</span>
+  <span class="s1">? ((</span><span class="s3">function </span><span class="s1">() {</span>
+      <span class="s1">const apis = [</span>
+        <span class="s2">'createAnimatedNode'</span><span class="s1">, </span><span class="s0">// 1</span>
+        <span class="s2">'updateAnimatedNodeConfig'</span><span class="s1">, </span><span class="s0">// 2</span>
+        <span class="s2">'getValue'</span><span class="s1">, </span><span class="s0">// 3</span>
+        <span class="s2">'startListeningToAnimatedNodeValue'</span><span class="s1">, </span><span class="s0">// 4</span>
+        <span class="s2">'stopListeningToAnimatedNodeValue'</span><span class="s1">, </span><span class="s0">// 5</span>
+        <span class="s2">'connectAnimatedNodes'</span><span class="s1">, </span><span class="s0">// 6</span>
+        <span class="s2">'disconnectAnimatedNodes'</span><span class="s1">, </span><span class="s0">// 7</span>
+        <span class="s2">'startAnimatingNode'</span><span class="s1">, </span><span class="s0">// 8</span>
+        <span class="s2">'stopAnimation'</span><span class="s1">, </span><span class="s0">// 9</span>
+        <span class="s2">'setAnimatedNodeValue'</span><span class="s1">, </span><span class="s0">// 10</span>
+        <span class="s2">'setAnimatedNodeOffset'</span><span class="s1">, </span><span class="s0">// 11</span>
+        <span class="s2">'flattenAnimatedNodeOffset'</span><span class="s1">, </span><span class="s0">// 12</span>
+        <span class="s2">'extractAnimatedNodeOffset'</span><span class="s1">, </span><span class="s0">// 13</span>
+        <span class="s2">'connectAnimatedNodeToView'</span><span class="s1">, </span><span class="s0">// 14</span>
+        <span class="s2">'disconnectAnimatedNodeFromView'</span><span class="s1">, </span><span class="s0">// 15</span>
+        <span class="s2">'restoreDefaultValues'</span><span class="s1">, </span><span class="s0">// 16</span>
+        <span class="s2">'dropAnimatedNode'</span><span class="s1">, </span><span class="s0">// 17</span>
+        <span class="s2">'addAnimatedEventToView'</span><span class="s1">, </span><span class="s0">// 18</span>
+        <span class="s2">'removeAnimatedEventFromView'</span><span class="s1">, </span><span class="s0">// 19</span>
+        <span class="s2">'addListener'</span><span class="s1">, </span><span class="s0">// 20</span>
+        <span class="s2">'removeListener'</span><span class="s1">, </span><span class="s0">// 21</span>
+      <span class="s1">];</span>
+      <span class="s3">return </span><span class="s1">apis.reduce&lt;{[string]: number}&gt;((acc, functionName, i) =&gt; {</span>
+        <span class="s0">// These indices need to be kept in sync with the indices in native (see NativeAnimatedModule in Java, or the equivalent for any other native platform).</span>
+        <span class="s0">// $FlowFixMe[prop-missing]</span>
+        <span class="s1">acc[functionName] = i + </span><span class="s4">1</span><span class="s1">;</span>
+        <span class="s3">return </span><span class="s1">acc;</span>
+      <span class="s1">}, {});</span>
+    <span class="s1">})(): $FlowFixMe)</span>
+  <span class="s1">: NativeAnimatedModule;</span>
+
+<span class="s0">/** 
+ * Wrappers around NativeAnimatedModule to provide flow and autocomplete support for 
+ * the native module methods, and automatic queue management on Android 
+ */</span>
+<span class="s1">const API = {</span>
+  <span class="s1">getValue: </span><span class="s3">function </span><span class="s1">(</span>
+    <span class="s1">tag: number,</span>
+    <span class="s1">saveValueCallback: (value: number) =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(useSingleOpBatching) {</span>
+      <span class="s3">if </span><span class="s1">(saveValueCallback) {</span>
+        <span class="s1">eventListenerGetValueCallbacks[tag] = saveValueCallback;</span>
+      <span class="s1">}</span>
+      <span class="s0">// $FlowFixMe</span>
+      <span class="s1">API.queueOperation(nativeOps.getValue, tag);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">API.queueOperation(nativeOps.getValue, tag, saveValueCallback);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">setWaitingForIdentifier: </span><span class="s3">function </span><span class="s1">(id: string): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">waitingForQueuedOperations.add(id);</span>
+    <span class="s1">queueOperations = </span><span class="s3">true</span><span class="s1">;</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">ReactNativeFeatureFlags.animatedShouldDebounceQueueFlush() &amp;&amp;</span>
+      <span class="s1">flushQueueTimeout</span>
+    <span class="s1">) {</span>
+      <span class="s1">clearTimeout(flushQueueTimeout);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">unsetWaitingForIdentifier: </span><span class="s3">function </span><span class="s1">(id: string): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">waitingForQueuedOperations.</span><span class="s3">delete</span><span class="s1">(id);</span>
+
+    <span class="s3">if </span><span class="s1">(waitingForQueuedOperations.size === </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">queueOperations = </span><span class="s3">false</span><span class="s1">;</span>
+      <span class="s1">API.disableQueue();</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">disableQueue: </span><span class="s3">function </span><span class="s1">(): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(ReactNativeFeatureFlags.animatedShouldDebounceQueueFlush()) {</span>
+      <span class="s1">const prevTimeout = flushQueueTimeout;</span>
+      <span class="s1">clearImmediate(prevTimeout);</span>
+      <span class="s1">flushQueueTimeout = setImmediate(API.flushQueue);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">API.flushQueue();</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">flushQueue: </span><span class="s3">function </span><span class="s1">(): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s0">// TODO: (T136971132)</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">NativeAnimatedModule || process.env.NODE_ENV === </span><span class="s2">'test'</span><span class="s1">,</span>
+      <span class="s2">'Native animated module is not available'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+    <span class="s1">flushQueueTimeout = </span><span class="s3">null</span><span class="s1">;</span>
+
+    <span class="s0">// Early returns before calling any APIs</span>
+    <span class="s3">if </span><span class="s1">(useSingleOpBatching &amp;&amp; singleOpQueue.length === </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(!useSingleOpBatching &amp;&amp; queue.length === </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(useSingleOpBatching) {</span>
+      <span class="s0">// Set up event listener for callbacks if it's not set up</span>
+      <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">!globalEventEmitterGetValueListener ||</span>
+        <span class="s1">!globalEventEmitterAnimationFinishedListener</span>
+      <span class="s1">) {</span>
+        <span class="s1">setupGlobalEventEmitterListeners();</span>
+      <span class="s1">}</span>
+      <span class="s0">// Single op batching doesn't use callback functions, instead we</span>
+      <span class="s0">// use RCTDeviceEventEmitter. This reduces overhead of sending lots of</span>
+      <span class="s0">// JSI functions across to native code; but also, TM infrastructure currently</span>
+      <span class="s0">// does not support packing a function into native arrays.</span>
+      <span class="s1">NativeAnimatedModule?.queueAndExecuteBatchedOperations?.(singleOpQueue);</span>
+      <span class="s1">singleOpQueue.length = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">Platform.OS === </span><span class="s2">'android' </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">NativeAnimatedModule?.startOperationBatch?.();</span>
+
+      <span class="s3">for </span><span class="s1">(let q = </span><span class="s4">0</span><span class="s1">, l = queue.length; q &lt; l; q++) {</span>
+        <span class="s1">queue[q]();</span>
+      <span class="s1">}</span>
+      <span class="s1">queue.length = </span><span class="s4">0</span><span class="s1">;</span>
+      <span class="s1">Platform.OS === </span><span class="s2">'android' </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">NativeAnimatedModule?.finishOperationBatch?.();</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">queueOperation: &lt;Args: $ReadOnlyArray&lt;mixed&gt;, Fn: (...Args) =&gt; </span><span class="s3">void</span><span class="s1">&gt;(</span>
+    <span class="s1">fn: Fn,</span>
+    <span class="s1">...args: Args</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">=&gt; {</span>
+    <span class="s3">if </span><span class="s1">(useSingleOpBatching) {</span>
+      <span class="s0">// Get the command ID from the queued function, and push that ID and any arguments needed to execute the operation</span>
+      <span class="s0">// $FlowFixMe: surprise, fn is actually a number</span>
+      <span class="s1">singleOpQueue.push(fn, ...args);</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// If queueing is explicitly on, *or* the queue has not yet</span>
+    <span class="s0">// been flushed, use the queue. This is to prevent operations</span>
+    <span class="s0">// from being executed out of order.</span>
+    <span class="s3">if </span><span class="s1">(queueOperations || queue.length !== </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">queue.push(() =&gt; fn(...args));</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">fn(...args);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">createAnimatedNode: </span><span class="s3">function </span><span class="s1">(tag: number, config: AnimatedNodeConfig): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.createAnimatedNode, tag, config);</span>
+  <span class="s1">},</span>
+  <span class="s1">updateAnimatedNodeConfig: </span><span class="s3">function </span><span class="s1">(</span>
+    <span class="s1">tag: number,</span>
+    <span class="s1">config: AnimatedNodeConfig,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(nativeOps.updateAnimatedNodeConfig) {</span>
+      <span class="s1">API.queueOperation(nativeOps.updateAnimatedNodeConfig, tag, config);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">startListeningToAnimatedNodeValue: </span><span class="s3">function </span><span class="s1">(tag: number) {</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.startListeningToAnimatedNodeValue, tag);</span>
+  <span class="s1">},</span>
+  <span class="s1">stopListeningToAnimatedNodeValue: </span><span class="s3">function </span><span class="s1">(tag: number) {</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.stopListeningToAnimatedNodeValue, tag);</span>
+  <span class="s1">},</span>
+  <span class="s1">connectAnimatedNodes: </span><span class="s3">function </span><span class="s1">(parentTag: number, childTag: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.connectAnimatedNodes, parentTag, childTag);</span>
+  <span class="s1">},</span>
+  <span class="s1">disconnectAnimatedNodes: </span><span class="s3">function </span><span class="s1">(</span>
+    <span class="s1">parentTag: number,</span>
+    <span class="s1">childTag: number,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.disconnectAnimatedNodes, parentTag, childTag);</span>
+  <span class="s1">},</span>
+  <span class="s1">startAnimatingNode: </span><span class="s3">function </span><span class="s1">(</span>
+    <span class="s1">animationId: number,</span>
+    <span class="s1">nodeTag: number,</span>
+    <span class="s1">config: AnimatingNodeConfig,</span>
+    <span class="s1">endCallback: EndCallback,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(useSingleOpBatching) {</span>
+      <span class="s3">if </span><span class="s1">(endCallback) {</span>
+        <span class="s1">eventListenerAnimationFinishedCallbacks[animationId] = endCallback;</span>
+      <span class="s1">}</span>
+      <span class="s0">// $FlowFixMe</span>
+      <span class="s1">API.queueOperation(</span>
+        <span class="s0">// $FlowFixMe[incompatible-call]</span>
+        <span class="s1">nativeOps.startAnimatingNode,</span>
+        <span class="s1">animationId,</span>
+        <span class="s1">nodeTag,</span>
+        <span class="s1">config,</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">API.queueOperation(</span>
+        <span class="s1">nativeOps.startAnimatingNode,</span>
+        <span class="s1">animationId,</span>
+        <span class="s1">nodeTag,</span>
+        <span class="s1">config,</span>
+        <span class="s1">endCallback,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">stopAnimation: </span><span class="s3">function </span><span class="s1">(animationId: number) {</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.stopAnimation, animationId);</span>
+  <span class="s1">},</span>
+  <span class="s1">setAnimatedNodeValue: </span><span class="s3">function </span><span class="s1">(nodeTag: number, value: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.setAnimatedNodeValue, nodeTag, value);</span>
+  <span class="s1">},</span>
+  <span class="s1">setAnimatedNodeOffset: </span><span class="s3">function </span><span class="s1">(nodeTag: number, offset: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.setAnimatedNodeOffset, nodeTag, offset);</span>
+  <span class="s1">},</span>
+  <span class="s1">flattenAnimatedNodeOffset: </span><span class="s3">function </span><span class="s1">(nodeTag: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.flattenAnimatedNodeOffset, nodeTag);</span>
+  <span class="s1">},</span>
+  <span class="s1">extractAnimatedNodeOffset: </span><span class="s3">function </span><span class="s1">(nodeTag: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.extractAnimatedNodeOffset, nodeTag);</span>
+  <span class="s1">},</span>
+  <span class="s1">connectAnimatedNodeToView: </span><span class="s3">function </span><span class="s1">(nodeTag: number, viewTag: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.connectAnimatedNodeToView, nodeTag, viewTag);</span>
+  <span class="s1">},</span>
+  <span class="s1">disconnectAnimatedNodeFromView: </span><span class="s3">function </span><span class="s1">(</span>
+    <span class="s1">nodeTag: number,</span>
+    <span class="s1">viewTag: number,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(</span>
+      <span class="s1">nativeOps.disconnectAnimatedNodeFromView,</span>
+      <span class="s1">nodeTag,</span>
+      <span class="s1">viewTag,</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+  <span class="s1">restoreDefaultValues: </span><span class="s3">function </span><span class="s1">(nodeTag: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s0">// Backwards compat with older native runtimes, can be removed later.</span>
+    <span class="s3">if </span><span class="s1">(nativeOps.restoreDefaultValues != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s1">API.queueOperation(nativeOps.restoreDefaultValues, nodeTag);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+  <span class="s1">dropAnimatedNode: </span><span class="s3">function </span><span class="s1">(tag: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(nativeOps.dropAnimatedNode, tag);</span>
+  <span class="s1">},</span>
+  <span class="s1">addAnimatedEventToView: </span><span class="s3">function </span><span class="s1">(</span>
+    <span class="s1">viewTag: number,</span>
+    <span class="s1">eventName: string,</span>
+    <span class="s1">eventMapping: EventMapping,</span>
+  <span class="s1">) {</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(</span>
+      <span class="s1">nativeOps.addAnimatedEventToView,</span>
+      <span class="s1">viewTag,</span>
+      <span class="s1">eventName,</span>
+      <span class="s1">eventMapping,</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+  <span class="s1">removeAnimatedEventFromView(</span>
+    <span class="s1">viewTag: number,</span>
+    <span class="s1">eventName: string,</span>
+    <span class="s1">animatedNodeTag: number,</span>
+  <span class="s1">) {</span>
+    <span class="s1">invariant(nativeOps, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+    <span class="s1">API.queueOperation(</span>
+      <span class="s1">nativeOps.removeAnimatedEventFromView,</span>
+      <span class="s1">viewTag,</span>
+      <span class="s1">eventName,</span>
+      <span class="s1">animatedNodeTag,</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+
+<span class="s3">function </span><span class="s1">setupGlobalEventEmitterListeners() {</span>
+  <span class="s1">globalEventEmitterGetValueListener = RCTDeviceEventEmitter.addListener(</span>
+    <span class="s2">'onNativeAnimatedModuleGetValue'</span><span class="s1">,</span>
+    <span class="s3">function </span><span class="s1">(params) {</span>
+      <span class="s1">const {tag} = params;</span>
+      <span class="s1">const callback = eventListenerGetValueCallbacks[tag];</span>
+      <span class="s3">if </span><span class="s1">(!callback) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">callback(params.value);</span>
+      <span class="s3">delete </span><span class="s1">eventListenerGetValueCallbacks[tag];</span>
+    <span class="s1">},</span>
+  <span class="s1">);</span>
+  <span class="s1">globalEventEmitterAnimationFinishedListener =</span>
+    <span class="s1">RCTDeviceEventEmitter.addListener(</span>
+      <span class="s2">'onNativeAnimatedModuleAnimationFinished'</span><span class="s1">,</span>
+      <span class="s3">function </span><span class="s1">(params) {</span>
+        <span class="s1">const {animationId} = params;</span>
+        <span class="s1">const callback = eventListenerAnimationFinishedCallbacks[animationId];</span>
+        <span class="s3">if </span><span class="s1">(!callback) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">callback(params);</span>
+        <span class="s3">delete </span><span class="s1">eventListenerAnimationFinishedCallbacks[animationId];</span>
+      <span class="s1">},</span>
+    <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Styles allowed by the native animated implementation. 
+ * 
+ * In general native animated implementation should support any numeric or color property that 
+ * doesn't need to be updated through the shadow view hierarchy (all non-layout properties). 
+ */</span>
+<span class="s1">const SUPPORTED_COLOR_STYLES = {</span>
+  <span class="s1">backgroundColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderBottomColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderEndColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderLeftColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderRightColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderStartColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderTopColor: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">color: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">tintColor: </span><span class="s3">true</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">const SUPPORTED_STYLES = {</span>
+  <span class="s1">...SUPPORTED_COLOR_STYLES,</span>
+  <span class="s1">borderBottomEndRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderBottomLeftRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderBottomRightRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderBottomStartRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderEndEndRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderEndStartRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderTopEndRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderTopLeftRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderTopRightRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderTopStartRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderStartEndRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">borderStartStartRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">elevation: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">opacity: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">transform: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">zIndex: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s0">/* ios styles */</span>
+  <span class="s1">shadowOpacity: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">shadowRadius: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s0">/* legacy android transform properties */</span>
+  <span class="s1">scaleX: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">scaleY: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">translateX: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">translateY: </span><span class="s3">true</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">const SUPPORTED_TRANSFORMS = {</span>
+  <span class="s1">translateX: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">translateY: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">scale: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">scaleX: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">scaleY: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">rotate: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">rotateX: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">rotateY: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">rotateZ: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">perspective: </span><span class="s3">true</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">const SUPPORTED_INTERPOLATION_PARAMS = {</span>
+  <span class="s1">inputRange: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">outputRange: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">extrapolate: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">extrapolateRight: </span><span class="s3">true</span><span class="s1">,</span>
+  <span class="s1">extrapolateLeft: </span><span class="s3">true</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s3">function </span><span class="s1">addWhitelistedStyleProp(prop: string): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s0">// $FlowFixMe[prop-missing]</span>
+  <span class="s1">SUPPORTED_STYLES[prop] = </span><span class="s3">true</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">addWhitelistedTransformProp(prop: string): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s0">// $FlowFixMe[prop-missing]</span>
+  <span class="s1">SUPPORTED_TRANSFORMS[prop] = </span><span class="s3">true</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">addWhitelistedInterpolationParam(param: string): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s0">// $FlowFixMe[prop-missing]</span>
+  <span class="s1">SUPPORTED_INTERPOLATION_PARAMS[param] = </span><span class="s3">true</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">isSupportedColorStyleProp(prop: string): boolean {</span>
+  <span class="s3">return </span><span class="s1">SUPPORTED_COLOR_STYLES.hasOwnProperty(prop);</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">isSupportedStyleProp(prop: string): boolean {</span>
+  <span class="s3">return </span><span class="s1">SUPPORTED_STYLES.hasOwnProperty(prop);</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">isSupportedTransformProp(prop: string): boolean {</span>
+  <span class="s3">return </span><span class="s1">SUPPORTED_TRANSFORMS.hasOwnProperty(prop);</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">isSupportedInterpolationParam(param: string): boolean {</span>
+  <span class="s3">return </span><span class="s1">SUPPORTED_INTERPOLATION_PARAMS.hasOwnProperty(param);</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">validateTransform(</span>
+  <span class="s1">configs: Array&lt;</span>
+    <span class="s1">| {</span>
+        <span class="s1">type: </span><span class="s2">'animated'</span><span class="s1">,</span>
+        <span class="s1">property: string,</span>
+        <span class="s1">nodeTag: ?number,</span>
+        <span class="s1">...</span>
+      <span class="s1">}</span>
+    <span class="s1">| {</span>
+        <span class="s1">type: </span><span class="s2">'static'</span><span class="s1">,</span>
+        <span class="s1">property: string,</span>
+        <span class="s1">value: number | string,</span>
+        <span class="s1">...</span>
+      <span class="s1">},</span>
+  <span class="s1">&gt;,</span>
+<span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">configs.forEach(config =&gt; {</span>
+    <span class="s3">if </span><span class="s1">(!isSupportedTransformProp(config.property)) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span>
+        <span class="s1">`Property </span><span class="s2">'${config.property}' </span><span class="s1">is not supported by native animated module`,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">validateStyles(styles: {[key: string]: ?number, ...}): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s3">for </span><span class="s1">(const key </span><span class="s3">in </span><span class="s1">styles) {</span>
+    <span class="s3">if </span><span class="s1">(!isSupportedStyleProp(key)) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span>
+        <span class="s1">`Style property </span><span class="s2">'${key}' </span><span class="s1">is not supported by native animated module`,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">validateInterpolation&lt;OutputT: number | string&gt;(</span>
+  <span class="s1">config: InterpolationConfigType&lt;OutputT&gt;,</span>
+<span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s3">for </span><span class="s1">(const key </span><span class="s3">in </span><span class="s1">config) {</span>
+    <span class="s3">if </span><span class="s1">(!isSupportedInterpolationParam(key)) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span>
+        <span class="s1">`Interpolation property </span><span class="s2">'${key}' </span><span class="s1">is not supported by native animated module`,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">generateNewNodeTag(): number {</span>
+  <span class="s3">return </span><span class="s1">__nativeAnimatedNodeTagCount++;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">generateNewAnimationId(): number {</span>
+  <span class="s3">return </span><span class="s1">__nativeAnimationIdCount++;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">assertNativeAnimatedModule(): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">invariant(NativeAnimatedModule, </span><span class="s2">'Native animated module is not available'</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s1">let _warnedMissingNativeAnimated = </span><span class="s3">false</span><span class="s1">;</span>
+
+<span class="s3">function </span><span class="s1">shouldUseNativeDriver(</span>
+  <span class="s1">config: $ReadOnly&lt;{...AnimationConfig, ...}&gt; | EventConfig,</span>
+<span class="s1">): boolean {</span>
+  <span class="s3">if </span><span class="s1">(config.useNativeDriver == </span><span class="s3">null</span><span class="s1">) {</span>
+    <span class="s1">console.warn(</span>
+      <span class="s2">'Animated: `useNativeDriver` was not specified. This is a required ' </span><span class="s1">+</span>
+        <span class="s2">'option and must be explicitly set to `true` or `false`'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">if </span><span class="s1">(config.useNativeDriver === </span><span class="s3">true </span><span class="s1">&amp;&amp; !NativeAnimatedModule) {</span>
+    <span class="s3">if </span><span class="s1">(process.env.NODE_ENV !== </span><span class="s2">'test'</span><span class="s1">) {</span>
+      <span class="s3">if </span><span class="s1">(!_warnedMissingNativeAnimated) {</span>
+        <span class="s1">console.warn(</span>
+          <span class="s2">'Animated: `useNativeDriver` is not supported because the native ' </span><span class="s1">+</span>
+            <span class="s2">'animated module is missing. Falling back to JS-based animation. To ' </span><span class="s1">+</span>
+            <span class="s2">'resolve this, add `RCTAnimation` module to this app, or remove ' </span><span class="s1">+</span>
+            <span class="s2">'`useNativeDriver`. ' </span><span class="s1">+</span>
+            <span class="s2">'Make sure to run `bundle exec pod install` first. Read more about autolinking: https://github.com/react-native-community/cli/blob/master/docs/autolinking.md'</span><span class="s1">,</span>
+        <span class="s1">);</span>
+        <span class="s1">_warnedMissingNativeAnimated = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">return false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">config.useNativeDriver || </span><span class="s3">false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">transformDataType(value: number | string): number | string {</span>
+  <span class="s0">// Change the string type to number type so we can reuse the same logic in</span>
+  <span class="s0">// iOS and Android platform</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">value !== </span><span class="s2">'string'</span><span class="s1">) {</span>
+    <span class="s3">return </span><span class="s1">value;</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(/deg$/.test(value)) {</span>
+    <span class="s1">const degrees = parseFloat(value) || </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">const radians = (degrees * Math.PI) / </span><span class="s4">180.0</span><span class="s1">;</span>
+    <span class="s3">return </span><span class="s1">radians;</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s3">return </span><span class="s1">value;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">default </span><span class="s1">{</span>
+  <span class="s1">API,</span>
+  <span class="s1">isSupportedColorStyleProp,</span>
+  <span class="s1">isSupportedStyleProp,</span>
+  <span class="s1">isSupportedTransformProp,</span>
+  <span class="s1">isSupportedInterpolationParam,</span>
+  <span class="s1">addWhitelistedStyleProp,</span>
+  <span class="s1">addWhitelistedTransformProp,</span>
+  <span class="s1">addWhitelistedInterpolationParam,</span>
+  <span class="s1">validateStyles,</span>
+  <span class="s1">validateTransform,</span>
+  <span class="s1">validateInterpolation,</span>
+  <span class="s1">generateNewNodeTag,</span>
+  <span class="s1">generateNewAnimationId,</span>
+  <span class="s1">assertNativeAnimatedModule,</span>
+  <span class="s1">shouldUseNativeDriver,</span>
+  <span class="s1">transformDataType,</span>
+  <span class="s0">// $FlowExpectedError[unsafe-getters-setters] - unsafe getter lint suppression</span>
+  <span class="s0">// $FlowExpectedError[missing-type-arg] - unsafe getter lint suppression</span>
+  <span class="s1">get nativeEventEmitter(): NativeEventEmitter {</span>
+    <span class="s3">if </span><span class="s1">(!nativeEventEmitter) {</span>
+      <span class="s0">// $FlowFixMe[underconstrained-implicit-instantiation]</span>
+      <span class="s1">nativeEventEmitter = </span><span class="s3">new </span><span class="s1">NativeEventEmitter(</span>
+        <span class="s0">// T88715063: NativeEventEmitter only used this parameter on iOS. Now it uses it on all platforms, so this code was modified automatically to preserve its behavior</span>
+        <span class="s0">// If you want to use the native module on other platforms, please remove this condition and test its behavior</span>
+        <span class="s1">Platform.OS !== </span><span class="s2">'ios' </span><span class="s1">? </span><span class="s3">null </span><span class="s1">: NativeAnimatedModule,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">nativeEventEmitter;</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

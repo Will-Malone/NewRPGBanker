@@ -1,0 +1,170 @@
+<html>
+<head>
+<title>util.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+util.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {AssetDataFiltered, AssetDataWithoutFiles} from '../Assets';</span>
+<span class="s0">import type {ModuleTransportLike} from '../shared/types.flow';</span>
+<span class="s0">import type {File} from '@babel/types';</span>
+
+<span class="s0">const babylon = require('@babel/parser');</span>
+<span class="s0">const template = require('@babel/template').default;</span>
+<span class="s0">const babelTypes = require('@babel/types');</span>
+
+<span class="s0">type SubTree&lt;T: ModuleTransportLike&gt; = (</span>
+  <span class="s0">moduleTransport: T,</span>
+  <span class="s0">moduleTransportsByPath: Map&lt;string, T&gt;,</span>
+<span class="s0">) =&gt; Iterable&lt;number&gt;;</span>
+
+<span class="s0">const assetPropertyBlockList = new Set(['files', 'fileSystemLocation', 'path']);</span>
+
+<span class="s0">function generateAssetCodeFileAst(</span>
+  <span class="s0">assetRegistryPath: string,</span>
+  <span class="s0">assetDescriptor: AssetDataWithoutFiles,</span>
+<span class="s0">): File {</span>
+  <span class="s0">const properDescriptor = filterObject(</span>
+    <span class="s0">assetDescriptor,</span>
+    <span class="s0">assetPropertyBlockList,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">// {...}</span>
+  <span class="s0">const descriptorAst = babylon.parseExpression(</span>
+    <span class="s0">JSON.stringify(properDescriptor),</span>
+  <span class="s0">);</span>
+  <span class="s0">const t = babelTypes;</span>
+
+  <span class="s0">// require('AssetRegistry').registerAsset({...})</span>
+  <span class="s0">const buildRequire = template.statement(`</span>
+    <span class="s0">module.exports = require(ASSET_REGISTRY_PATH).registerAsset(DESCRIPTOR_AST)</span>
+  <span class="s0">`);</span>
+
+  <span class="s0">return t.file(</span>
+    <span class="s0">t.program([</span>
+      <span class="s0">buildRequire({</span>
+        <span class="s0">ASSET_REGISTRY_PATH: t.stringLiteral(assetRegistryPath),</span>
+        <span class="s0">DESCRIPTOR_AST: descriptorAst,</span>
+      <span class="s0">}),</span>
+    <span class="s0">]),</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function filterObject(</span>
+  <span class="s0">object: AssetDataWithoutFiles,</span>
+  <span class="s0">blockList: Set&lt;string&gt;,</span>
+<span class="s0">): AssetDataFiltered {</span>
+  <span class="s0">const copied = {...object};</span>
+  <span class="s0">for (const key of blockList) {</span>
+    <span class="s0">// $FlowFixMe[prop-missing]</span>
+    <span class="s0">delete copied[key];</span>
+  <span class="s0">}</span>
+  <span class="s0">return copied;</span>
+<span class="s0">}</span>
+
+<span class="s0">function createRamBundleGroups&lt;T: ModuleTransportLike&gt;(</span>
+  <span class="s0">ramGroups: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">groupableModules: $ReadOnlyArray&lt;T&gt;,</span>
+  <span class="s0">subtree: SubTree&lt;T&gt;,</span>
+<span class="s0">): Map&lt;number, Set&lt;number&gt;&gt; {</span>
+  <span class="s0">// build two maps that allow to lookup module data</span>
+  <span class="s0">// by path or (numeric) module id;</span>
+  <span class="s0">const byPath: Map&lt;string, T&gt; = new Map();</span>
+  <span class="s0">const byId: Map&lt;number, string&gt; = new Map();</span>
+  <span class="s0">groupableModules.forEach((m: T) =&gt; {</span>
+    <span class="s0">byPath.set(m.sourcePath, m);</span>
+    <span class="s0">byId.set(m.id, m.sourcePath);</span>
+  <span class="s0">});</span>
+
+  <span class="s0">// build a map of group root IDs to an array of module IDs in the group</span>
+  <span class="s0">const result: Map&lt;number, Set&lt;number&gt;&gt; = new Map(</span>
+    <span class="s0">ramGroups.map((modulePath: string) =&gt; {</span>
+      <span class="s0">const root = byPath.get(modulePath);</span>
+      <span class="s0">if (root == null) {</span>
+        <span class="s0">throw Error(`Group root ${modulePath} is not part of the bundle`);</span>
+      <span class="s0">}</span>
+      <span class="s0">return [</span>
+        <span class="s0">root.id,</span>
+        <span class="s0">// `subtree` yields the IDs of all transitive dependencies of a module</span>
+        <span class="s0">new Set(subtree(root, byPath)),</span>
+      <span class="s0">];</span>
+    <span class="s0">}),</span>
+  <span class="s0">);</span>
+
+  <span class="s0">if (ramGroups.length &gt; 1) {</span>
+    <span class="s0">// build a map of all grouped module IDs to an array of group root IDs</span>
+    <span class="s0">const all = new ArrayMap&lt;number, number&gt;();</span>
+    <span class="s0">for (const [parent, children] of result) {</span>
+      <span class="s0">for (const module of children) {</span>
+        <span class="s0">all.get(module).push(parent);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">// find all module IDs that are part of more than one group</span>
+    <span class="s0">const doubles = filter(all, ([, parents]) =&gt; parents.length &gt; 1);</span>
+    <span class="s0">for (const [moduleId, parents] of doubles) {</span>
+      <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+      <span class="s0">const parentNames = parents.map(byId.get, byId);</span>
+      <span class="s0">const lastName = parentNames.pop();</span>
+      <span class="s0">throw new Error(</span>
+        <span class="s0">`Module ${</span>
+          <span class="s0">byId.get(moduleId) || moduleId</span>
+        <span class="s0">} belongs to groups ${parentNames.join(', ')}, and ${String(</span>
+          <span class="s0">lastName,</span>
+        <span class="s0">)}. Ensure that each module is only part of one group.`,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return result;</span>
+<span class="s0">}</span>
+
+<span class="s0">function* filter&lt;A: number, B: number&gt;(</span>
+  <span class="s0">iterator: ArrayMap&lt;A, B&gt;,</span>
+  <span class="s0">predicate: ([A, Array&lt;B&gt;]) =&gt; boolean,</span>
+<span class="s0">): Generator&lt;[A, Array&lt;B&gt;], void, void&gt; {</span>
+  <span class="s0">for (const value of iterator) {</span>
+    <span class="s0">if (predicate(value)) {</span>
+      <span class="s0">yield value;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">class ArrayMap&lt;K, V&gt; extends Map&lt;K, Array&lt;V&gt;&gt; {</span>
+  <span class="s0">get(key: K): Array&lt;V&gt; {</span>
+    <span class="s0">let array = super.get(key);</span>
+    <span class="s0">if (!array) {</span>
+      <span class="s0">array = [];</span>
+      <span class="s0">this.set(key, array);</span>
+    <span class="s0">}</span>
+    <span class="s0">return array;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">createRamBundleGroups,</span>
+  <span class="s0">generateAssetCodeFileAst,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

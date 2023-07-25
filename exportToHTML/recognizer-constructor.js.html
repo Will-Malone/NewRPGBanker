@@ -1,0 +1,320 @@
+<html>
+<head>
+<title>recognizer-constructor.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #6a8759;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+recognizer-constructor.js</font>
+</center></td></tr></table>
+<pre><span class="s0">import {</span>
+    <span class="s0">STATE_POSSIBLE,</span>
+    <span class="s0">STATE_ENDED,</span>
+    <span class="s0">STATE_FAILED,</span>
+    <span class="s0">STATE_RECOGNIZED,</span>
+    <span class="s0">STATE_CANCELLED,</span>
+    <span class="s0">STATE_BEGAN,</span>
+    <span class="s0">STATE_CHANGED</span>
+<span class="s0">} from </span><span class="s1">'./recognizer-consts'</span><span class="s0">;</span>
+<span class="s0">import assign from </span><span class="s1">'../utils/assign'</span><span class="s0">;</span>
+<span class="s0">import uniqueId from </span><span class="s1">'../utils/unique-id'</span><span class="s0">;</span>
+<span class="s0">import invokeArrayArg from </span><span class="s1">'../utils/invoke-array-arg'</span><span class="s0">;</span>
+<span class="s0">import inArray from </span><span class="s1">'../utils/in-array'</span><span class="s0">;</span>
+<span class="s0">import boolOrFn from </span><span class="s1">'../utils/bool-or-fn'</span><span class="s0">;</span>
+<span class="s0">import getRecognizerByNameIfManager from </span><span class="s1">'./get-recognizer-by-name-if-manager'</span><span class="s0">;</span>
+<span class="s0">import stateStr from </span><span class="s1">'./state-str'</span><span class="s0">;</span>
+
+<span class="s2">/** 
+ * @private 
+ * Recognizer flow explained; * 
+ * All recognizers have the initial state of POSSIBLE when a input session starts. 
+ * The definition of a input session is from the first input until the last input, with all it's movement in it. * 
+ * Example session for mouse-input: mousedown -&gt; mousemove -&gt; mouseup 
+ * 
+ * On each recognizing cycle (see Manager.recognize) the .recognize() method is executed 
+ * which determines with state it should be. 
+ * 
+ * If the recognizer has the state FAILED, CANCELLED or RECOGNIZED (equals ENDED), it is reset to 
+ * POSSIBLE to give it another change on the next cycle. 
+ * 
+ *               Possible 
+ *                  | 
+ *            +-----+---------------+ 
+ *            |                     | 
+ *      +-----+-----+               | 
+ *      |           |               | 
+ *   Failed      Cancelled          | 
+ *                          +-------+------+ 
+ *                          |              | 
+ *                      Recognized       Began 
+ *                                         | 
+ *                                      Changed 
+ *                                         | 
+ *                                  Ended/Recognized 
+ */</span>
+
+<span class="s2">/** 
+ * @private 
+ * Recognizer 
+ * Every recognizer needs to extend from this class. 
+ * @constructor 
+ * @param {Object} options 
+ */</span>
+<span class="s0">export </span><span class="s3">default </span><span class="s0">class Recognizer {</span>
+  <span class="s0">constructor(options = {}) {</span>
+    <span class="s3">this</span><span class="s0">.options = {</span>
+      <span class="s0">enable: </span><span class="s3">true</span><span class="s0">,</span>
+      <span class="s0">...options,</span>
+    <span class="s0">};</span>
+
+    <span class="s3">this</span><span class="s0">.id = uniqueId();</span>
+
+    <span class="s3">this</span><span class="s0">.manager = </span><span class="s3">null</span><span class="s0">;</span>
+
+    <span class="s2">// default is enable true</span>
+    <span class="s3">this</span><span class="s0">.state = STATE_POSSIBLE;</span>
+    <span class="s3">this</span><span class="s0">.simultaneous = {};</span>
+    <span class="s3">this</span><span class="s0">.requireFail = [];</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * set options 
+   * @param {Object} options 
+   * @return {Recognizer} 
+   */</span>
+  <span class="s0">set(options) {</span>
+    <span class="s0">assign(</span><span class="s3">this</span><span class="s0">.options, options);</span>
+
+    <span class="s2">// also update the touchAction, in case something changed about the directions/enabled state</span>
+    <span class="s3">this</span><span class="s0">.manager &amp;&amp; </span><span class="s3">this</span><span class="s0">.manager.touchAction.update();</span>
+    <span class="s3">return this</span><span class="s0">;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * recognize simultaneous with an other recognizer. 
+   * @param {Recognizer} otherRecognizer 
+   * @returns {Recognizer} this 
+   */</span>
+  <span class="s0">recognizeWith(otherRecognizer) {</span>
+    <span class="s3">if </span><span class="s0">(invokeArrayArg(otherRecognizer, </span><span class="s1">'recognizeWith'</span><span class="s0">, </span><span class="s3">this</span><span class="s0">)) {</span>
+      <span class="s3">return this</span><span class="s0">;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">let { simultaneous } = </span><span class="s3">this</span><span class="s0">;</span>
+    <span class="s0">otherRecognizer = getRecognizerByNameIfManager(otherRecognizer, </span><span class="s3">this</span><span class="s0">);</span>
+    <span class="s3">if </span><span class="s0">(!simultaneous[otherRecognizer.id]) {</span>
+      <span class="s0">simultaneous[otherRecognizer.id] = otherRecognizer;</span>
+      <span class="s0">otherRecognizer.recognizeWith(</span><span class="s3">this</span><span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s3">return this</span><span class="s0">;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * drop the simultaneous link. it doesnt remove the link on the other recognizer. 
+   * @param {Recognizer} otherRecognizer 
+   * @returns {Recognizer} this 
+   */</span>
+  <span class="s0">dropRecognizeWith(otherRecognizer) {</span>
+    <span class="s3">if </span><span class="s0">(invokeArrayArg(otherRecognizer, </span><span class="s1">'dropRecognizeWith'</span><span class="s0">, </span><span class="s3">this</span><span class="s0">)) {</span>
+      <span class="s3">return this</span><span class="s0">;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">otherRecognizer = getRecognizerByNameIfManager(otherRecognizer, </span><span class="s3">this</span><span class="s0">);</span>
+    <span class="s3">delete this</span><span class="s0">.simultaneous[otherRecognizer.id];</span>
+    <span class="s3">return this</span><span class="s0">;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * recognizer can only run when an other is failing 
+   * @param {Recognizer} otherRecognizer 
+   * @returns {Recognizer} this 
+   */</span>
+  <span class="s0">requireFailure(otherRecognizer) {</span>
+    <span class="s3">if </span><span class="s0">(invokeArrayArg(otherRecognizer, </span><span class="s1">'requireFailure'</span><span class="s0">, </span><span class="s3">this</span><span class="s0">)) {</span>
+      <span class="s3">return this</span><span class="s0">;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">let { requireFail } = </span><span class="s3">this</span><span class="s0">;</span>
+    <span class="s0">otherRecognizer = getRecognizerByNameIfManager(otherRecognizer, </span><span class="s3">this</span><span class="s0">);</span>
+    <span class="s3">if </span><span class="s0">(inArray(requireFail, otherRecognizer) === -</span><span class="s4">1</span><span class="s0">) {</span>
+      <span class="s0">requireFail.push(otherRecognizer);</span>
+      <span class="s0">otherRecognizer.requireFailure(</span><span class="s3">this</span><span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s3">return this</span><span class="s0">;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * drop the requireFailure link. it does not remove the link on the other recognizer. 
+   * @param {Recognizer} otherRecognizer 
+   * @returns {Recognizer} this 
+   */</span>
+  <span class="s0">dropRequireFailure(otherRecognizer) {</span>
+    <span class="s3">if </span><span class="s0">(invokeArrayArg(otherRecognizer, </span><span class="s1">'dropRequireFailure'</span><span class="s0">, </span><span class="s3">this</span><span class="s0">)) {</span>
+      <span class="s3">return this</span><span class="s0">;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">otherRecognizer = getRecognizerByNameIfManager(otherRecognizer, </span><span class="s3">this</span><span class="s0">);</span>
+    <span class="s0">let index = inArray(</span><span class="s3">this</span><span class="s0">.requireFail, otherRecognizer);</span>
+    <span class="s3">if </span><span class="s0">(index &gt; -</span><span class="s4">1</span><span class="s0">) {</span>
+      <span class="s3">this</span><span class="s0">.requireFail.splice(index, </span><span class="s4">1</span><span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s3">return this</span><span class="s0">;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * has require failures boolean 
+   * @returns {boolean} 
+   */</span>
+  <span class="s0">hasRequireFailures() {</span>
+    <span class="s3">return this</span><span class="s0">.requireFail.length &gt; </span><span class="s4">0</span><span class="s0">;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * if the recognizer can recognize simultaneous with an other recognizer 
+   * @param {Recognizer} otherRecognizer 
+   * @returns {Boolean} 
+   */</span>
+  <span class="s0">canRecognizeWith(otherRecognizer) {</span>
+    <span class="s3">return </span><span class="s0">!!</span><span class="s3">this</span><span class="s0">.simultaneous[otherRecognizer.id];</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * You should use `tryEmit` instead of `emit` directly to check 
+   * that all the needed recognizers has failed before emitting. 
+   * @param {Object} input 
+   */</span>
+  <span class="s0">emit(input) {</span>
+    <span class="s0">let self = </span><span class="s3">this</span><span class="s0">;</span>
+    <span class="s0">let { state } = </span><span class="s3">this</span><span class="s0">;</span>
+
+    <span class="s3">function </span><span class="s0">emit(event) {</span>
+      <span class="s0">self.manager.emit(event, input);</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// 'panstart' and 'panmove'</span>
+    <span class="s3">if </span><span class="s0">(state &lt; STATE_ENDED) {</span>
+      <span class="s0">emit(self.options.event + stateStr(state));</span>
+    <span class="s0">}</span>
+
+    <span class="s0">emit(self.options.event); </span><span class="s2">// simple 'eventName' events</span>
+
+    <span class="s3">if </span><span class="s0">(input.additionalEvent) { </span><span class="s2">// additional event(panleft, panright, pinchin, pinchout...)</span>
+      <span class="s0">emit(input.additionalEvent);</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// panend and pancancel</span>
+    <span class="s3">if </span><span class="s0">(state &gt;= STATE_ENDED) {</span>
+      <span class="s0">emit(self.options.event + stateStr(state));</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * Check that all the require failure recognizers has failed, 
+   * if true, it emits a gesture event, 
+   * otherwise, setup the state to FAILED. 
+   * @param {Object} input 
+   */</span>
+  <span class="s0">tryEmit(input) {</span>
+    <span class="s3">if </span><span class="s0">(</span><span class="s3">this</span><span class="s0">.canEmit()) {</span>
+      <span class="s3">return this</span><span class="s0">.emit(input);</span>
+    <span class="s0">}</span>
+    <span class="s2">// it's failing anyway</span>
+    <span class="s3">this</span><span class="s0">.state = STATE_FAILED;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * can we emit? 
+   * @returns {boolean} 
+   */</span>
+  <span class="s0">canEmit() {</span>
+    <span class="s0">let i = </span><span class="s4">0</span><span class="s0">;</span>
+    <span class="s3">while </span><span class="s0">(i &lt; </span><span class="s3">this</span><span class="s0">.requireFail.length) {</span>
+      <span class="s3">if </span><span class="s0">(!(</span><span class="s3">this</span><span class="s0">.requireFail[i].state &amp; (STATE_FAILED | STATE_POSSIBLE))) {</span>
+        <span class="s3">return false</span><span class="s0">;</span>
+      <span class="s0">}</span>
+      <span class="s0">i++;</span>
+    <span class="s0">}</span>
+    <span class="s3">return true</span><span class="s0">;</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * update the recognizer 
+   * @param {Object} inputData 
+   */</span>
+  <span class="s0">recognize(inputData) {</span>
+    <span class="s2">// make a new copy of the inputData</span>
+    <span class="s2">// so we can change the inputData without messing up the other recognizers</span>
+    <span class="s0">let inputDataClone = assign({}, inputData);</span>
+
+    <span class="s2">// is is enabled and allow recognizing?</span>
+    <span class="s3">if </span><span class="s0">(!boolOrFn(</span><span class="s3">this</span><span class="s0">.options.enable, [</span><span class="s3">this</span><span class="s0">, inputDataClone])) {</span>
+      <span class="s3">this</span><span class="s0">.reset();</span>
+      <span class="s3">this</span><span class="s0">.state = STATE_FAILED;</span>
+      <span class="s3">return</span><span class="s0">;</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// reset when we've reached the end</span>
+    <span class="s3">if </span><span class="s0">(</span><span class="s3">this</span><span class="s0">.state &amp; (STATE_RECOGNIZED | STATE_CANCELLED | STATE_FAILED)) {</span>
+      <span class="s3">this</span><span class="s0">.state = STATE_POSSIBLE;</span>
+    <span class="s0">}</span>
+
+    <span class="s3">this</span><span class="s0">.state = </span><span class="s3">this</span><span class="s0">.process(inputDataClone);</span>
+
+    <span class="s2">// the recognizer has recognized a gesture</span>
+    <span class="s2">// so trigger an event</span>
+    <span class="s3">if </span><span class="s0">(</span><span class="s3">this</span><span class="s0">.state &amp; (STATE_BEGAN | STATE_CHANGED | STATE_ENDED | STATE_CANCELLED)) {</span>
+      <span class="s3">this</span><span class="s0">.tryEmit(inputDataClone);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s2">/** 
+   * @private 
+   * return the state of the recognizer 
+   * the actual recognizing happens in this method 
+   * @virtual 
+   * @param {Object} inputData 
+   * @returns {constant} STATE 
+   */</span>
+
+  <span class="s2">/* jshint ignore:start */</span>
+  <span class="s0">process(inputData) { }</span>
+  <span class="s2">/* jshint ignore:end */</span>
+
+  <span class="s2">/** 
+   * @private 
+   * return the preferred touch-action 
+   * @virtual 
+   * @returns {Array} 
+   */</span>
+  <span class="s0">getTouchAction() { }</span>
+
+  <span class="s2">/** 
+   * @private 
+   * called when the gesture isn't allowed to recognize 
+   * like when another is being recognized or it is disabled 
+   * @virtual 
+   */</span>
+  <span class="s0">reset() { }</span>
+<span class="s0">}</span></pre>
+</body>
+</html>

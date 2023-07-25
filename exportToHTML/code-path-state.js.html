@@ -1,0 +1,1504 @@
+<html>
+<head>
+<title>code-path-state.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+code-path-state.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview A class to manage state of generating a code path. 
+ * @author Toru Nagashima 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const CodePathSegment = require(</span><span class="s2">&quot;./code-path-segment&quot;</span><span class="s1">),</span>
+    <span class="s1">ForkContext = require(</span><span class="s2">&quot;./fork-context&quot;</span><span class="s1">);</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Adds given segments into the `dest` array. 
+ * If the `others` array does not includes the given segments, adds to the `all` 
+ * array as well. 
+ * 
+ * This adds only reachable and used segments. 
+ * @param {CodePathSegment[]} dest A destination array (`returnedSegments` or `thrownSegments`). 
+ * @param {CodePathSegment[]} others Another destination array (`returnedSegments` or `thrownSegments`). 
+ * @param {CodePathSegment[]} all The unified destination array (`finalSegments`). 
+ * @param {CodePathSegment[]} segments Segments to add. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">addToReturnedOrThrown(dest, others, all, segments) {</span>
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; segments.length; ++i) {</span>
+        <span class="s1">const segment = segments[i];</span>
+
+        <span class="s1">dest.push(segment);</span>
+        <span class="s3">if </span><span class="s1">(!others.includes(segment)) {</span>
+            <span class="s1">all.push(segment);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Gets a loop-context for a `continue` statement. 
+ * @param {CodePathState} state A state to get. 
+ * @param {string} label The label of a `continue` statement. 
+ * @returns {LoopContext} A loop-context for a `continue` statement. 
+ */</span>
+<span class="s3">function </span><span class="s1">getContinueContext(state, label) {</span>
+    <span class="s3">if </span><span class="s1">(!label) {</span>
+        <span class="s3">return </span><span class="s1">state.loopContext;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let context = state.loopContext;</span>
+
+    <span class="s3">while </span><span class="s1">(context) {</span>
+        <span class="s3">if </span><span class="s1">(context.label === label) {</span>
+            <span class="s3">return </span><span class="s1">context;</span>
+        <span class="s1">}</span>
+        <span class="s1">context = context.upper;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* c8 ignore next */</span>
+    <span class="s3">return null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Gets a context for a `break` statement. 
+ * @param {CodePathState} state A state to get. 
+ * @param {string} label The label of a `break` statement. 
+ * @returns {LoopContext|SwitchContext} A context for a `break` statement. 
+ */</span>
+<span class="s3">function </span><span class="s1">getBreakContext(state, label) {</span>
+    <span class="s1">let context = state.breakContext;</span>
+
+    <span class="s3">while </span><span class="s1">(context) {</span>
+        <span class="s3">if </span><span class="s1">(label ? context.label === label : context.breakable) {</span>
+            <span class="s3">return </span><span class="s1">context;</span>
+        <span class="s1">}</span>
+        <span class="s1">context = context.upper;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* c8 ignore next */</span>
+    <span class="s3">return null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Gets a context for a `return` statement. 
+ * @param {CodePathState} state A state to get. 
+ * @returns {TryContext|CodePathState} A context for a `return` statement. 
+ */</span>
+<span class="s3">function </span><span class="s1">getReturnContext(state) {</span>
+    <span class="s1">let context = state.tryContext;</span>
+
+    <span class="s3">while </span><span class="s1">(context) {</span>
+        <span class="s3">if </span><span class="s1">(context.hasFinalizer &amp;&amp; context.position !== </span><span class="s2">&quot;finally&quot;</span><span class="s1">) {</span>
+            <span class="s3">return </span><span class="s1">context;</span>
+        <span class="s1">}</span>
+        <span class="s1">context = context.upper;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">state;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Gets a context for a `throw` statement. 
+ * @param {CodePathState} state A state to get. 
+ * @returns {TryContext|CodePathState} A context for a `throw` statement. 
+ */</span>
+<span class="s3">function </span><span class="s1">getThrowContext(state) {</span>
+    <span class="s1">let context = state.tryContext;</span>
+
+    <span class="s3">while </span><span class="s1">(context) {</span>
+        <span class="s3">if </span><span class="s1">(context.position === </span><span class="s2">&quot;try&quot; </span><span class="s1">||</span>
+            <span class="s1">(context.hasFinalizer &amp;&amp; context.position === </span><span class="s2">&quot;catch&quot;</span><span class="s1">)</span>
+        <span class="s1">) {</span>
+            <span class="s3">return </span><span class="s1">context;</span>
+        <span class="s1">}</span>
+        <span class="s1">context = context.upper;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">state;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Removes a given element from a given array. 
+ * @param {any[]} xs An array to remove the specific element. 
+ * @param {any} x An element to be removed. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">remove(xs, x) {</span>
+    <span class="s1">xs.splice(xs.indexOf(x), </span><span class="s4">1</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Disconnect given segments. 
+ * 
+ * This is used in a process for switch statements. 
+ * If there is the &quot;default&quot; chunk before other cases, the order is different 
+ * between node's and running's. 
+ * @param {CodePathSegment[]} prevSegments Forward segments to disconnect. 
+ * @param {CodePathSegment[]} nextSegments Backward segments to disconnect. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">removeConnection(prevSegments, nextSegments) {</span>
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; prevSegments.length; ++i) {</span>
+        <span class="s1">const prevSegment = prevSegments[i];</span>
+        <span class="s1">const nextSegment = nextSegments[i];</span>
+
+        <span class="s1">remove(prevSegment.nextSegments, nextSegment);</span>
+        <span class="s1">remove(prevSegment.allNextSegments, nextSegment);</span>
+        <span class="s1">remove(nextSegment.prevSegments, prevSegment);</span>
+        <span class="s1">remove(nextSegment.allPrevSegments, prevSegment);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Creates looping path. 
+ * @param {CodePathState} state The instance. 
+ * @param {CodePathSegment[]} unflattenedFromSegments Segments which are source. 
+ * @param {CodePathSegment[]} unflattenedToSegments Segments which are destination. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">makeLooped(state, unflattenedFromSegments, unflattenedToSegments) {</span>
+    <span class="s1">const fromSegments = CodePathSegment.flattenUnusedSegments(unflattenedFromSegments);</span>
+    <span class="s1">const toSegments = CodePathSegment.flattenUnusedSegments(unflattenedToSegments);</span>
+
+    <span class="s1">const end = Math.min(fromSegments.length, toSegments.length);</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; end; ++i) {</span>
+        <span class="s1">const fromSegment = fromSegments[i];</span>
+        <span class="s1">const toSegment = toSegments[i];</span>
+
+        <span class="s3">if </span><span class="s1">(toSegment.reachable) {</span>
+            <span class="s1">fromSegment.nextSegments.push(toSegment);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(fromSegment.reachable) {</span>
+            <span class="s1">toSegment.prevSegments.push(fromSegment);</span>
+        <span class="s1">}</span>
+        <span class="s1">fromSegment.allNextSegments.push(toSegment);</span>
+        <span class="s1">toSegment.allPrevSegments.push(fromSegment);</span>
+
+        <span class="s3">if </span><span class="s1">(toSegment.allPrevSegments.length &gt;= </span><span class="s4">2</span><span class="s1">) {</span>
+            <span class="s1">CodePathSegment.markPrevSegmentAsLooped(toSegment, fromSegment);</span>
+        <span class="s1">}</span>
+
+        <span class="s1">state.notifyLooped(fromSegment, toSegment);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Finalizes segments of `test` chunk of a ForStatement. 
+ * 
+ * - Adds `false` paths to paths which are leaving from the loop. 
+ * - Sets `true` paths to paths which go to the body. 
+ * @param {LoopContext} context A loop context to modify. 
+ * @param {ChoiceContext} choiceContext A choice context of this loop. 
+ * @param {CodePathSegment[]} head The current head paths. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">finalizeTestSegmentsOfFor(context, choiceContext, head) {</span>
+    <span class="s3">if </span><span class="s1">(!choiceContext.processed) {</span>
+        <span class="s1">choiceContext.trueForkContext.add(head);</span>
+        <span class="s1">choiceContext.falseForkContext.add(head);</span>
+        <span class="s1">choiceContext.qqForkContext.add(head);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(context.test !== </span><span class="s3">true</span><span class="s1">) {</span>
+        <span class="s1">context.brokenForkContext.addAll(choiceContext.falseForkContext);</span>
+    <span class="s1">}</span>
+    <span class="s1">context.endOfTestSegments = choiceContext.trueForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Public Interface</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * A class which manages state to analyze code paths. 
+ */</span>
+<span class="s1">class CodePathState {</span>
+
+    <span class="s0">/** 
+     * @param {IdGenerator} idGenerator An id generator to generate id for code 
+     *   path segments. 
+     * @param {Function} onLooped A callback function to notify looping. 
+     */</span>
+    <span class="s1">constructor(idGenerator, onLooped) {</span>
+        <span class="s3">this</span><span class="s1">.idGenerator = idGenerator;</span>
+        <span class="s3">this</span><span class="s1">.notifyLooped = onLooped;</span>
+        <span class="s3">this</span><span class="s1">.forkContext = ForkContext.newRoot(idGenerator);</span>
+        <span class="s3">this</span><span class="s1">.choiceContext = </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.switchContext = </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.tryContext = </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.loopContext = </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.breakContext = </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.chainContext = </span><span class="s3">null</span><span class="s1">;</span>
+
+        <span class="s3">this</span><span class="s1">.currentSegments = [];</span>
+        <span class="s3">this</span><span class="s1">.initialSegment = </span><span class="s3">this</span><span class="s1">.forkContext.head[</span><span class="s4">0</span><span class="s1">];</span>
+
+        <span class="s0">// returnedSegments and thrownSegments push elements into finalSegments also.</span>
+        <span class="s1">const final = </span><span class="s3">this</span><span class="s1">.finalSegments = [];</span>
+        <span class="s1">const returned = </span><span class="s3">this</span><span class="s1">.returnedForkContext = [];</span>
+        <span class="s1">const thrown = </span><span class="s3">this</span><span class="s1">.thrownForkContext = [];</span>
+
+        <span class="s1">returned.add = addToReturnedOrThrown.bind(</span><span class="s3">null</span><span class="s1">, returned, thrown, final);</span>
+        <span class="s1">thrown.add = addToReturnedOrThrown.bind(</span><span class="s3">null</span><span class="s1">, thrown, returned, final);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * The head segments. 
+     * @type {CodePathSegment[]} 
+     */</span>
+    <span class="s1">get headSegments() {</span>
+        <span class="s3">return this</span><span class="s1">.forkContext.head;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * The parent forking context. 
+     * This is used for the root of new forks. 
+     * @type {ForkContext} 
+     */</span>
+    <span class="s1">get parentForkContext() {</span>
+        <span class="s1">const current = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">return </span><span class="s1">current &amp;&amp; current.upper;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates and stacks new forking context. 
+     * @param {boolean} forkLeavingPath A flag which shows being in a 
+     *   &quot;finally&quot; block. 
+     * @returns {ForkContext} The created context. 
+     */</span>
+    <span class="s1">pushForkContext(forkLeavingPath) {</span>
+        <span class="s3">this</span><span class="s1">.forkContext = ForkContext.newEmpty(</span>
+            <span class="s3">this</span><span class="s1">.forkContext,</span>
+            <span class="s1">forkLeavingPath</span>
+        <span class="s1">);</span>
+
+        <span class="s3">return this</span><span class="s1">.forkContext;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Pops and merges the last forking context. 
+     * @returns {ForkContext} The last context. 
+     */</span>
+    <span class="s1">popForkContext() {</span>
+        <span class="s1">const lastContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">this</span><span class="s1">.forkContext = lastContext.upper;</span>
+        <span class="s3">this</span><span class="s1">.forkContext.replaceHead(lastContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+
+        <span class="s3">return </span><span class="s1">lastContext;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates a new path. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">forkPath() {</span>
+        <span class="s3">this</span><span class="s1">.forkContext.add(</span><span class="s3">this</span><span class="s1">.parentForkContext.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates a bypass path. 
+     * This is used for such as IfStatement which does not have &quot;else&quot; chunk. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">forkBypassPath() {</span>
+        <span class="s3">this</span><span class="s1">.forkContext.add(</span><span class="s3">this</span><span class="s1">.parentForkContext.head);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">//--------------------------------------------------------------------------</span>
+    <span class="s0">// ConditionalExpression, LogicalExpression, IfStatement</span>
+    <span class="s0">//--------------------------------------------------------------------------</span>
+
+    <span class="s0">/** 
+     * Creates a context for ConditionalExpression, LogicalExpression, AssignmentExpression (logical assignments only), 
+     * IfStatement, WhileStatement, DoWhileStatement, or ForStatement. 
+     * 
+     * LogicalExpressions have cases that it goes different paths between the 
+     * `true` case and the `false` case. 
+     * 
+     * For Example: 
+     * 
+     *     if (a || b) { 
+     *         foo(); 
+     *     } else { 
+     *         bar(); 
+     *     } 
+     * 
+     * In this case, `b` is evaluated always in the code path of the `else` 
+     * block, but it's not so in the code path of the `if` block. 
+     * So there are 3 paths. 
+     * 
+     *     a -&gt; foo(); 
+     *     a -&gt; b -&gt; foo(); 
+     *     a -&gt; b -&gt; bar(); 
+     * @param {string} kind A kind string. 
+     *   If the new context is LogicalExpression's or AssignmentExpression's, this is `&quot;&amp;&amp;&quot;` or `&quot;||&quot;` or `&quot;??&quot;`. 
+     *   If it's IfStatement's or ConditionalExpression's, this is `&quot;test&quot;`. 
+     *   Otherwise, this is `&quot;loop&quot;`. 
+     * @param {boolean} isForkingAsResult A flag that shows that goes different 
+     *   paths between `true` and `false`. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">pushChoiceContext(kind, isForkingAsResult) {</span>
+        <span class="s3">this</span><span class="s1">.choiceContext = {</span>
+            <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.choiceContext,</span>
+            <span class="s1">kind,</span>
+            <span class="s1">isForkingAsResult,</span>
+            <span class="s1">trueForkContext: ForkContext.newEmpty(</span><span class="s3">this</span><span class="s1">.forkContext),</span>
+            <span class="s1">falseForkContext: ForkContext.newEmpty(</span><span class="s3">this</span><span class="s1">.forkContext),</span>
+            <span class="s1">qqForkContext: ForkContext.newEmpty(</span><span class="s3">this</span><span class="s1">.forkContext),</span>
+            <span class="s1">processed: </span><span class="s3">false</span>
+        <span class="s1">};</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Pops the last choice context and finalizes it. 
+     * @throws {Error} (Unreachable.) 
+     * @returns {ChoiceContext} The popped context. 
+     */</span>
+    <span class="s1">popChoiceContext() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+
+        <span class="s3">this</span><span class="s1">.choiceContext = context.upper;</span>
+
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const headSegments = forkContext.head;</span>
+
+        <span class="s3">switch </span><span class="s1">(context.kind) {</span>
+            <span class="s3">case </span><span class="s2">&quot;&amp;&amp;&quot;</span><span class="s1">:</span>
+            <span class="s3">case </span><span class="s2">&quot;||&quot;</span><span class="s1">:</span>
+            <span class="s3">case </span><span class="s2">&quot;??&quot;</span><span class="s1">:</span>
+
+                <span class="s0">/* 
+                 * If any result were not transferred from child contexts, 
+                 * this sets the head segments to both cases. 
+                 * The head segments are the path of the right-hand operand. 
+                 */</span>
+                <span class="s3">if </span><span class="s1">(!context.processed) {</span>
+                    <span class="s1">context.trueForkContext.add(headSegments);</span>
+                    <span class="s1">context.falseForkContext.add(headSegments);</span>
+                    <span class="s1">context.qqForkContext.add(headSegments);</span>
+                <span class="s1">}</span>
+
+                <span class="s0">/* 
+                 * Transfers results to upper context if this context is in 
+                 * test chunk. 
+                 */</span>
+                <span class="s3">if </span><span class="s1">(context.isForkingAsResult) {</span>
+                    <span class="s1">const parentContext = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+
+                    <span class="s1">parentContext.trueForkContext.addAll(context.trueForkContext);</span>
+                    <span class="s1">parentContext.falseForkContext.addAll(context.falseForkContext);</span>
+                    <span class="s1">parentContext.qqForkContext.addAll(context.qqForkContext);</span>
+                    <span class="s1">parentContext.processed = </span><span class="s3">true</span><span class="s1">;</span>
+
+                    <span class="s3">return </span><span class="s1">context;</span>
+                <span class="s1">}</span>
+
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s3">case </span><span class="s2">&quot;test&quot;</span><span class="s1">:</span>
+                <span class="s3">if </span><span class="s1">(!context.processed) {</span>
+
+                    <span class="s0">/* 
+                     * The head segments are the path of the `if` block here. 
+                     * Updates the `true` path with the end of the `if` block. 
+                     */</span>
+                    <span class="s1">context.trueForkContext.clear();</span>
+                    <span class="s1">context.trueForkContext.add(headSegments);</span>
+                <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+
+                    <span class="s0">/* 
+                     * The head segments are the path of the `else` block here. 
+                     * Updates the `false` path with the end of the `else` 
+                     * block. 
+                     */</span>
+                    <span class="s1">context.falseForkContext.clear();</span>
+                    <span class="s1">context.falseForkContext.add(headSegments);</span>
+                <span class="s1">}</span>
+
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s3">case </span><span class="s2">&quot;loop&quot;</span><span class="s1">:</span>
+
+                <span class="s0">/* 
+                 * Loops are addressed in popLoopContext(). 
+                 * This is called from popLoopContext(). 
+                 */</span>
+                <span class="s3">return </span><span class="s1">context;</span>
+
+            <span class="s0">/* c8 ignore next */</span>
+            <span class="s3">default</span><span class="s1">:</span>
+                <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;unreachable&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Merges all paths.</span>
+        <span class="s1">const prevForkContext = context.trueForkContext;</span>
+
+        <span class="s1">prevForkContext.addAll(context.falseForkContext);</span>
+        <span class="s1">forkContext.replaceHead(prevForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+
+        <span class="s3">return </span><span class="s1">context;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment of the right-hand operand of a logical 
+     * expression. 
+     * @throws {Error} (Unreachable.) 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeLogicalRight() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(context.processed) {</span>
+
+            <span class="s0">/* 
+             * This got segments already from the child choice context. 
+             * Creates the next path from own true/false fork context. 
+             */</span>
+            <span class="s1">let prevForkContext;</span>
+
+            <span class="s3">switch </span><span class="s1">(context.kind) {</span>
+                <span class="s3">case </span><span class="s2">&quot;&amp;&amp;&quot;</span><span class="s1">: </span><span class="s0">// if true then go to the right-hand side.</span>
+                    <span class="s1">prevForkContext = context.trueForkContext;</span>
+                    <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">case </span><span class="s2">&quot;||&quot;</span><span class="s1">: </span><span class="s0">// if false then go to the right-hand side.</span>
+                    <span class="s1">prevForkContext = context.falseForkContext;</span>
+                    <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">case </span><span class="s2">&quot;??&quot;</span><span class="s1">: </span><span class="s0">// Both true/false can short-circuit, so needs the third path to go to the right-hand side. That's qqForkContext.</span>
+                    <span class="s1">prevForkContext = context.qqForkContext;</span>
+                    <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">default</span><span class="s1">:</span>
+                    <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;unreachable&quot;</span><span class="s1">);</span>
+            <span class="s1">}</span>
+
+            <span class="s1">forkContext.replaceHead(prevForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+            <span class="s1">prevForkContext.clear();</span>
+            <span class="s1">context.processed = </span><span class="s3">false</span><span class="s1">;</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+
+            <span class="s0">/* 
+             * This did not get segments from the child choice context. 
+             * So addresses the head segments. 
+             * The head segments are the path of the left-hand operand. 
+             */</span>
+            <span class="s3">switch </span><span class="s1">(context.kind) {</span>
+                <span class="s3">case </span><span class="s2">&quot;&amp;&amp;&quot;</span><span class="s1">: </span><span class="s0">// the false path can short-circuit.</span>
+                    <span class="s1">context.falseForkContext.add(forkContext.head);</span>
+                    <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">case </span><span class="s2">&quot;||&quot;</span><span class="s1">: </span><span class="s0">// the true path can short-circuit.</span>
+                    <span class="s1">context.trueForkContext.add(forkContext.head);</span>
+                    <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">case </span><span class="s2">&quot;??&quot;</span><span class="s1">: </span><span class="s0">// both can short-circuit.</span>
+                    <span class="s1">context.trueForkContext.add(forkContext.head);</span>
+                    <span class="s1">context.falseForkContext.add(forkContext.head);</span>
+                    <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">default</span><span class="s1">:</span>
+                    <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;unreachable&quot;</span><span class="s1">);</span>
+            <span class="s1">}</span>
+
+            <span class="s1">forkContext.replaceHead(forkContext.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment of the `if` block. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeIfConsequent() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s0">/* 
+         * If any result were not transferred from child contexts, 
+         * this sets the head segments to both cases. 
+         * The head segments are the path of the test expression. 
+         */</span>
+        <span class="s3">if </span><span class="s1">(!context.processed) {</span>
+            <span class="s1">context.trueForkContext.add(forkContext.head);</span>
+            <span class="s1">context.falseForkContext.add(forkContext.head);</span>
+            <span class="s1">context.qqForkContext.add(forkContext.head);</span>
+        <span class="s1">}</span>
+
+        <span class="s1">context.processed = </span><span class="s3">false</span><span class="s1">;</span>
+
+        <span class="s0">// Creates new path from the `true` case.</span>
+        <span class="s1">forkContext.replaceHead(</span>
+            <span class="s1">context.trueForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment of the `else` block. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeIfAlternate() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s0">/* 
+         * The head segments are the path of the `if` block. 
+         * Updates the `true` path with the end of the `if` block. 
+         */</span>
+        <span class="s1">context.trueForkContext.clear();</span>
+        <span class="s1">context.trueForkContext.add(forkContext.head);</span>
+        <span class="s1">context.processed = </span><span class="s3">true</span><span class="s1">;</span>
+
+        <span class="s0">// Creates new path from the `false` case.</span>
+        <span class="s1">forkContext.replaceHead(</span>
+            <span class="s1">context.falseForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">//--------------------------------------------------------------------------</span>
+    <span class="s0">// ChainExpression</span>
+    <span class="s0">//--------------------------------------------------------------------------</span>
+
+    <span class="s0">/** 
+     * Push a new `ChainExpression` context to the stack. 
+     * This method is called on entering to each `ChainExpression` node. 
+     * This context is used to count forking in the optional chain then merge them on the exiting from the `ChainExpression` node. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">pushChainContext() {</span>
+        <span class="s3">this</span><span class="s1">.chainContext = {</span>
+            <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.chainContext,</span>
+            <span class="s1">countChoiceContexts: </span><span class="s4">0</span>
+        <span class="s1">};</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Pop a `ChainExpression` context from the stack. 
+     * This method is called on exiting from each `ChainExpression` node. 
+     * This merges all forks of the last optional chaining. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">popChainContext() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.chainContext;</span>
+
+        <span class="s3">this</span><span class="s1">.chainContext = context.upper;</span>
+
+        <span class="s0">// pop all choice contexts of this.</span>
+        <span class="s3">for </span><span class="s1">(let i = context.countChoiceContexts; i &gt; </span><span class="s4">0</span><span class="s1">; --i) {</span>
+            <span class="s3">this</span><span class="s1">.popChoiceContext();</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Create a choice context for optional access. 
+     * This method is called on entering to each `(Call|Member)Expression[optional=true]` node. 
+     * This creates a choice context as similar to `LogicalExpression[operator=&quot;??&quot;]` node. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeOptionalNode() {</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.chainContext) {</span>
+            <span class="s3">this</span><span class="s1">.chainContext.countChoiceContexts += </span><span class="s4">1</span><span class="s1">;</span>
+            <span class="s3">this</span><span class="s1">.pushChoiceContext(</span><span class="s2">&quot;??&quot;</span><span class="s1">, </span><span class="s3">false</span><span class="s1">);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Create a fork. 
+     * This method is called on entering to the `arguments|property` property of each `(Call|Member)Expression` node. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeOptionalRight() {</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.chainContext) {</span>
+            <span class="s3">this</span><span class="s1">.makeLogicalRight();</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">//--------------------------------------------------------------------------</span>
+    <span class="s0">// SwitchStatement</span>
+    <span class="s0">//--------------------------------------------------------------------------</span>
+
+    <span class="s0">/** 
+     * Creates a context object of SwitchStatement and stacks it. 
+     * @param {boolean} hasCase `true` if the switch statement has one or more 
+     *   case parts. 
+     * @param {string|null} label The label text. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">pushSwitchContext(hasCase, label) {</span>
+        <span class="s3">this</span><span class="s1">.switchContext = {</span>
+            <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.switchContext,</span>
+            <span class="s1">hasCase,</span>
+            <span class="s1">defaultSegments: </span><span class="s3">null</span><span class="s1">,</span>
+            <span class="s1">defaultBodySegments: </span><span class="s3">null</span><span class="s1">,</span>
+            <span class="s1">foundDefault: </span><span class="s3">false</span><span class="s1">,</span>
+            <span class="s1">lastIsDefault: </span><span class="s3">false</span><span class="s1">,</span>
+            <span class="s1">countForks: </span><span class="s4">0</span>
+        <span class="s1">};</span>
+
+        <span class="s3">this</span><span class="s1">.pushBreakContext(</span><span class="s3">true</span><span class="s1">, label);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Pops the last context of SwitchStatement and finalizes it. 
+     * 
+     * - Disposes all forking stack for `case` and `default`. 
+     * - Creates the next code path segment from `context.brokenForkContext`. 
+     * - If the last `SwitchCase` node is not a `default` part, creates a path 
+     *   to the `default` body. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">popSwitchContext() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.switchContext;</span>
+
+        <span class="s3">this</span><span class="s1">.switchContext = context.upper;</span>
+
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const brokenForkContext = </span><span class="s3">this</span><span class="s1">.popBreakContext().brokenForkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(context.countForks === </span><span class="s4">0</span><span class="s1">) {</span>
+
+            <span class="s0">/* 
+             * When there is only one `default` chunk and there is one or more 
+             * `break` statements, even if forks are nothing, it needs to merge 
+             * those. 
+             */</span>
+            <span class="s3">if </span><span class="s1">(!brokenForkContext.empty) {</span>
+                <span class="s1">brokenForkContext.add(forkContext.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+                <span class="s1">forkContext.replaceHead(brokenForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+            <span class="s1">}</span>
+
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const lastSegments = forkContext.head;</span>
+
+        <span class="s3">this</span><span class="s1">.forkBypassPath();</span>
+        <span class="s1">const lastCaseSegments = forkContext.head;</span>
+
+        <span class="s0">/* 
+         * `brokenForkContext` is used to make the next segment. 
+         * It must add the last segment into `brokenForkContext`. 
+         */</span>
+        <span class="s1">brokenForkContext.add(lastSegments);</span>
+
+        <span class="s0">/* 
+         * A path which is failed in all case test should be connected to path 
+         * of `default` chunk. 
+         */</span>
+        <span class="s3">if </span><span class="s1">(!context.lastIsDefault) {</span>
+            <span class="s3">if </span><span class="s1">(context.defaultBodySegments) {</span>
+
+                <span class="s0">/* 
+                 * Remove a link from `default` label to its chunk. 
+                 * It's false route. 
+                 */</span>
+                <span class="s1">removeConnection(context.defaultSegments, context.defaultBodySegments);</span>
+                <span class="s1">makeLooped(</span><span class="s3">this</span><span class="s1">, lastCaseSegments, context.defaultBodySegments);</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+
+                <span class="s0">/* 
+                 * It handles the last case body as broken if `default` chunk 
+                 * does not exist. 
+                 */</span>
+                <span class="s1">brokenForkContext.add(lastCaseSegments);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Pops the segment context stack until the entry segment.</span>
+        <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; context.countForks; ++i) {</span>
+            <span class="s3">this</span><span class="s1">.forkContext = </span><span class="s3">this</span><span class="s1">.forkContext.upper;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">/* 
+         * Creates a path from all brokenForkContext paths. 
+         * This is a path after switch statement. 
+         */</span>
+        <span class="s3">this</span><span class="s1">.forkContext.replaceHead(brokenForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for a `SwitchCase` node. 
+     * @param {boolean} isEmpty `true` if the body is empty. 
+     * @param {boolean} isDefault `true` if the body is the default case. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeSwitchCaseBody(isEmpty, isDefault) {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.switchContext;</span>
+
+        <span class="s3">if </span><span class="s1">(!context.hasCase) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">/* 
+         * Merge forks. 
+         * The parent fork context has two segments. 
+         * Those are from the current case and the body of the previous case. 
+         */</span>
+        <span class="s1">const parentForkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.pushForkContext();</span>
+
+        <span class="s1">forkContext.add(parentForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+
+        <span class="s0">/* 
+         * Save `default` chunk info. 
+         * If the `default` label is not at the last, we must make a path from 
+         * the last `case` to the `default` chunk. 
+         */</span>
+        <span class="s3">if </span><span class="s1">(isDefault) {</span>
+            <span class="s1">context.defaultSegments = parentForkContext.head;</span>
+            <span class="s3">if </span><span class="s1">(isEmpty) {</span>
+                <span class="s1">context.foundDefault = </span><span class="s3">true</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s1">context.defaultBodySegments = forkContext.head;</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s3">if </span><span class="s1">(!isEmpty &amp;&amp; context.foundDefault) {</span>
+                <span class="s1">context.foundDefault = </span><span class="s3">false</span><span class="s1">;</span>
+                <span class="s1">context.defaultBodySegments = forkContext.head;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s1">context.lastIsDefault = isDefault;</span>
+        <span class="s1">context.countForks += </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">//--------------------------------------------------------------------------</span>
+    <span class="s0">// TryStatement</span>
+    <span class="s0">//--------------------------------------------------------------------------</span>
+
+    <span class="s0">/** 
+     * Creates a context object of TryStatement and stacks it. 
+     * @param {boolean} hasFinalizer `true` if the try statement has a 
+     *   `finally` block. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">pushTryContext(hasFinalizer) {</span>
+        <span class="s3">this</span><span class="s1">.tryContext = {</span>
+            <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.tryContext,</span>
+            <span class="s1">position: </span><span class="s2">&quot;try&quot;</span><span class="s1">,</span>
+            <span class="s1">hasFinalizer,</span>
+
+            <span class="s1">returnedForkContext: hasFinalizer</span>
+                <span class="s1">? ForkContext.newEmpty(</span><span class="s3">this</span><span class="s1">.forkContext)</span>
+                <span class="s1">: </span><span class="s3">null</span><span class="s1">,</span>
+
+            <span class="s1">thrownForkContext: ForkContext.newEmpty(</span><span class="s3">this</span><span class="s1">.forkContext),</span>
+            <span class="s1">lastOfTryIsReachable: </span><span class="s3">false</span><span class="s1">,</span>
+            <span class="s1">lastOfCatchIsReachable: </span><span class="s3">false</span>
+        <span class="s1">};</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Pops the last context of TryStatement and finalizes it. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">popTryContext() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.tryContext;</span>
+
+        <span class="s3">this</span><span class="s1">.tryContext = context.upper;</span>
+
+        <span class="s3">if </span><span class="s1">(context.position === </span><span class="s2">&quot;catch&quot;</span><span class="s1">) {</span>
+
+            <span class="s0">// Merges two paths from the `try` block and `catch` block merely.</span>
+            <span class="s3">this</span><span class="s1">.popForkContext();</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">/* 
+         * The following process is executed only when there is the `finally` 
+         * block. 
+         */</span>
+
+        <span class="s1">const returned = context.returnedForkContext;</span>
+        <span class="s1">const thrown = context.thrownForkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(returned.empty &amp;&amp; thrown.empty) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Separate head to normal paths and leaving paths.</span>
+        <span class="s1">const headSegments = </span><span class="s3">this</span><span class="s1">.forkContext.head;</span>
+
+        <span class="s3">this</span><span class="s1">.forkContext = </span><span class="s3">this</span><span class="s1">.forkContext.upper;</span>
+        <span class="s1">const normalSegments = headSegments.slice(</span><span class="s4">0</span><span class="s1">, headSegments.length / </span><span class="s4">2 </span><span class="s1">| </span><span class="s4">0</span><span class="s1">);</span>
+        <span class="s1">const leavingSegments = headSegments.slice(headSegments.length / </span><span class="s4">2 </span><span class="s1">| </span><span class="s4">0</span><span class="s1">);</span>
+
+        <span class="s0">// Forwards the leaving path to upper contexts.</span>
+        <span class="s3">if </span><span class="s1">(!returned.empty) {</span>
+            <span class="s1">getReturnContext(</span><span class="s3">this</span><span class="s1">).returnedForkContext.add(leavingSegments);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(!thrown.empty) {</span>
+            <span class="s1">getThrowContext(</span><span class="s3">this</span><span class="s1">).thrownForkContext.add(leavingSegments);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Sets the normal path as the next.</span>
+        <span class="s3">this</span><span class="s1">.forkContext.replaceHead(normalSegments);</span>
+
+        <span class="s0">/* 
+         * If both paths of the `try` block and the `catch` block are 
+         * unreachable, the next path becomes unreachable as well. 
+         */</span>
+        <span class="s3">if </span><span class="s1">(!context.lastOfTryIsReachable &amp;&amp; !context.lastOfCatchIsReachable) {</span>
+            <span class="s3">this</span><span class="s1">.forkContext.makeUnreachable();</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for a `catch` block. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeCatchBlock() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.tryContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const thrown = context.thrownForkContext;</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">context.position = </span><span class="s2">&quot;catch&quot;</span><span class="s1">;</span>
+        <span class="s1">context.thrownForkContext = ForkContext.newEmpty(forkContext);</span>
+        <span class="s1">context.lastOfTryIsReachable = forkContext.reachable;</span>
+
+        <span class="s0">// Merge thrown paths.</span>
+        <span class="s1">thrown.add(forkContext.head);</span>
+        <span class="s1">const thrownSegments = thrown.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">// Fork to a bypass and the merged thrown path.</span>
+        <span class="s3">this</span><span class="s1">.pushForkContext();</span>
+        <span class="s3">this</span><span class="s1">.forkBypassPath();</span>
+        <span class="s3">this</span><span class="s1">.forkContext.add(thrownSegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for a `finally` block. 
+     * 
+     * In the `finally` block, parallel paths are created. The parallel paths 
+     * are used as leaving-paths. The leaving-paths are paths from `return` 
+     * statements and `throw` statements in a `try` block or a `catch` block. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeFinallyBlock() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.tryContext;</span>
+        <span class="s1">let forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const returned = context.returnedForkContext;</span>
+        <span class="s1">const thrown = context.thrownForkContext;</span>
+        <span class="s1">const headOfLeavingSegments = forkContext.head;</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s3">if </span><span class="s1">(context.position === </span><span class="s2">&quot;catch&quot;</span><span class="s1">) {</span>
+
+            <span class="s0">// Merges two paths from the `try` block and `catch` block.</span>
+            <span class="s3">this</span><span class="s1">.popForkContext();</span>
+            <span class="s1">forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+            <span class="s1">context.lastOfCatchIsReachable = forkContext.reachable;</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">context.lastOfTryIsReachable = forkContext.reachable;</span>
+        <span class="s1">}</span>
+        <span class="s1">context.position = </span><span class="s2">&quot;finally&quot;</span><span class="s1">;</span>
+
+        <span class="s3">if </span><span class="s1">(returned.empty &amp;&amp; thrown.empty) {</span>
+
+            <span class="s0">// This path does not leave.</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">/* 
+         * Create a parallel segment from merging returned and thrown. 
+         * This segment will leave at the end of this finally block. 
+         */</span>
+        <span class="s1">const segments = forkContext.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; forkContext.count; ++i) {</span>
+            <span class="s1">const prevSegsOfLeavingSegment = [headOfLeavingSegments[i]];</span>
+
+            <span class="s3">for </span><span class="s1">(let j = </span><span class="s4">0</span><span class="s1">; j &lt; returned.segmentsList.length; ++j) {</span>
+                <span class="s1">prevSegsOfLeavingSegment.push(returned.segmentsList[j][i]);</span>
+            <span class="s1">}</span>
+            <span class="s3">for </span><span class="s1">(let j = </span><span class="s4">0</span><span class="s1">; j &lt; thrown.segmentsList.length; ++j) {</span>
+                <span class="s1">prevSegsOfLeavingSegment.push(thrown.segmentsList[j][i]);</span>
+            <span class="s1">}</span>
+
+            <span class="s1">segments.push(</span>
+                <span class="s1">CodePathSegment.newNext(</span>
+                    <span class="s3">this</span><span class="s1">.idGenerator.next(),</span>
+                    <span class="s1">prevSegsOfLeavingSegment</span>
+                <span class="s1">)</span>
+            <span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s3">this</span><span class="s1">.pushForkContext(</span><span class="s3">true</span><span class="s1">);</span>
+        <span class="s3">this</span><span class="s1">.forkContext.add(segments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment from the first throwable node to the `catch` 
+     * block or the `finally` block. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeFirstThrowablePathInTryBlock() {</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(!forkContext.reachable) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const context = getThrowContext(</span><span class="s3">this</span><span class="s1">);</span>
+
+        <span class="s3">if </span><span class="s1">(context === </span><span class="s3">this </span><span class="s1">||</span>
+            <span class="s1">context.position !== </span><span class="s2">&quot;try&quot; </span><span class="s1">||</span>
+            <span class="s1">!context.thrownForkContext.empty</span>
+        <span class="s1">) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">context.thrownForkContext.add(forkContext.head);</span>
+        <span class="s1">forkContext.replaceHead(forkContext.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">//--------------------------------------------------------------------------</span>
+    <span class="s0">// Loop Statements</span>
+    <span class="s0">//--------------------------------------------------------------------------</span>
+
+    <span class="s0">/** 
+     * Creates a context object of a loop statement and stacks it. 
+     * @param {string} type The type of the node which was triggered. One of 
+     *   `WhileStatement`, `DoWhileStatement`, `ForStatement`, `ForInStatement`, 
+     *   and `ForStatement`. 
+     * @param {string|null} label A label of the node which was triggered. 
+     * @throws {Error} (Unreachable - unknown type.) 
+     * @returns {void} 
+     */</span>
+    <span class="s1">pushLoopContext(type, label) {</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const breakContext = </span><span class="s3">this</span><span class="s1">.pushBreakContext(</span><span class="s3">true</span><span class="s1">, label);</span>
+
+        <span class="s3">switch </span><span class="s1">(type) {</span>
+            <span class="s3">case </span><span class="s2">&quot;WhileStatement&quot;</span><span class="s1">:</span>
+                <span class="s3">this</span><span class="s1">.pushChoiceContext(</span><span class="s2">&quot;loop&quot;</span><span class="s1">, </span><span class="s3">false</span><span class="s1">);</span>
+                <span class="s3">this</span><span class="s1">.loopContext = {</span>
+                    <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.loopContext,</span>
+                    <span class="s1">type,</span>
+                    <span class="s1">label,</span>
+                    <span class="s1">test: </span><span class="s3">void </span><span class="s4">0</span><span class="s1">,</span>
+                    <span class="s1">continueDestSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">brokenForkContext: breakContext.brokenForkContext</span>
+                <span class="s1">};</span>
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s3">case </span><span class="s2">&quot;DoWhileStatement&quot;</span><span class="s1">:</span>
+                <span class="s3">this</span><span class="s1">.pushChoiceContext(</span><span class="s2">&quot;loop&quot;</span><span class="s1">, </span><span class="s3">false</span><span class="s1">);</span>
+                <span class="s3">this</span><span class="s1">.loopContext = {</span>
+                    <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.loopContext,</span>
+                    <span class="s1">type,</span>
+                    <span class="s1">label,</span>
+                    <span class="s1">test: </span><span class="s3">void </span><span class="s4">0</span><span class="s1">,</span>
+                    <span class="s1">entrySegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">continueForkContext: ForkContext.newEmpty(forkContext),</span>
+                    <span class="s1">brokenForkContext: breakContext.brokenForkContext</span>
+                <span class="s1">};</span>
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s3">case </span><span class="s2">&quot;ForStatement&quot;</span><span class="s1">:</span>
+                <span class="s3">this</span><span class="s1">.pushChoiceContext(</span><span class="s2">&quot;loop&quot;</span><span class="s1">, </span><span class="s3">false</span><span class="s1">);</span>
+                <span class="s3">this</span><span class="s1">.loopContext = {</span>
+                    <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.loopContext,</span>
+                    <span class="s1">type,</span>
+                    <span class="s1">label,</span>
+                    <span class="s1">test: </span><span class="s3">void </span><span class="s4">0</span><span class="s1">,</span>
+                    <span class="s1">endOfInitSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">testSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">endOfTestSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">updateSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">endOfUpdateSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">continueDestSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">brokenForkContext: breakContext.brokenForkContext</span>
+                <span class="s1">};</span>
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s3">case </span><span class="s2">&quot;ForInStatement&quot;</span><span class="s1">:</span>
+            <span class="s3">case </span><span class="s2">&quot;ForOfStatement&quot;</span><span class="s1">:</span>
+                <span class="s3">this</span><span class="s1">.loopContext = {</span>
+                    <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.loopContext,</span>
+                    <span class="s1">type,</span>
+                    <span class="s1">label,</span>
+                    <span class="s1">prevSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">leftSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">endOfLeftSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">continueDestSegments: </span><span class="s3">null</span><span class="s1">,</span>
+                    <span class="s1">brokenForkContext: breakContext.brokenForkContext</span>
+                <span class="s1">};</span>
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s0">/* c8 ignore next */</span>
+            <span class="s3">default</span><span class="s1">:</span>
+                <span class="s3">throw new </span><span class="s1">Error(`unknown type: </span><span class="s2">&quot;${type}&quot;</span><span class="s1">`);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Pops the last context of a loop statement and finalizes it. 
+     * @throws {Error} (Unreachable - unknown type.) 
+     * @returns {void} 
+     */</span>
+    <span class="s1">popLoopContext() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+
+        <span class="s3">this</span><span class="s1">.loopContext = context.upper;</span>
+
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const brokenForkContext = </span><span class="s3">this</span><span class="s1">.popBreakContext().brokenForkContext;</span>
+
+        <span class="s0">// Creates a looped path.</span>
+        <span class="s3">switch </span><span class="s1">(context.type) {</span>
+            <span class="s3">case </span><span class="s2">&quot;WhileStatement&quot;</span><span class="s1">:</span>
+            <span class="s3">case </span><span class="s2">&quot;ForStatement&quot;</span><span class="s1">:</span>
+                <span class="s3">this</span><span class="s1">.popChoiceContext();</span>
+                <span class="s1">makeLooped(</span>
+                    <span class="s3">this</span><span class="s1">,</span>
+                    <span class="s1">forkContext.head,</span>
+                    <span class="s1">context.continueDestSegments</span>
+                <span class="s1">);</span>
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s3">case </span><span class="s2">&quot;DoWhileStatement&quot;</span><span class="s1">: {</span>
+                <span class="s1">const choiceContext = </span><span class="s3">this</span><span class="s1">.popChoiceContext();</span>
+
+                <span class="s3">if </span><span class="s1">(!choiceContext.processed) {</span>
+                    <span class="s1">choiceContext.trueForkContext.add(forkContext.head);</span>
+                    <span class="s1">choiceContext.falseForkContext.add(forkContext.head);</span>
+                <span class="s1">}</span>
+                <span class="s3">if </span><span class="s1">(context.test !== </span><span class="s3">true</span><span class="s1">) {</span>
+                    <span class="s1">brokenForkContext.addAll(choiceContext.falseForkContext);</span>
+                <span class="s1">}</span>
+
+                <span class="s0">// `true` paths go to looping.</span>
+                <span class="s1">const segmentsList = choiceContext.trueForkContext.segmentsList;</span>
+
+                <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; segmentsList.length; ++i) {</span>
+                    <span class="s1">makeLooped(</span>
+                        <span class="s3">this</span><span class="s1">,</span>
+                        <span class="s1">segmentsList[i],</span>
+                        <span class="s1">context.entrySegments</span>
+                    <span class="s1">);</span>
+                <span class="s1">}</span>
+                <span class="s3">break</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s3">case </span><span class="s2">&quot;ForInStatement&quot;</span><span class="s1">:</span>
+            <span class="s3">case </span><span class="s2">&quot;ForOfStatement&quot;</span><span class="s1">:</span>
+                <span class="s1">brokenForkContext.add(forkContext.head);</span>
+                <span class="s1">makeLooped(</span>
+                    <span class="s3">this</span><span class="s1">,</span>
+                    <span class="s1">forkContext.head,</span>
+                    <span class="s1">context.leftSegments</span>
+                <span class="s1">);</span>
+                <span class="s3">break</span><span class="s1">;</span>
+
+            <span class="s0">/* c8 ignore next */</span>
+            <span class="s3">default</span><span class="s1">:</span>
+                <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;unreachable&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Go next.</span>
+        <span class="s3">if </span><span class="s1">(brokenForkContext.empty) {</span>
+            <span class="s1">forkContext.replaceHead(forkContext.makeUnreachable(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">forkContext.replaceHead(brokenForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the test part of a WhileStatement. 
+     * @param {boolean|undefined} test The test value (only when constant). 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeWhileTest(test) {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const testSegments = forkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">context.test = test;</span>
+        <span class="s1">context.continueDestSegments = testSegments;</span>
+        <span class="s1">forkContext.replaceHead(testSegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the body part of a WhileStatement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeWhileBody() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const choiceContext = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(!choiceContext.processed) {</span>
+            <span class="s1">choiceContext.trueForkContext.add(forkContext.head);</span>
+            <span class="s1">choiceContext.falseForkContext.add(forkContext.head);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s3">if </span><span class="s1">(context.test !== </span><span class="s3">true</span><span class="s1">) {</span>
+            <span class="s1">context.brokenForkContext.addAll(choiceContext.falseForkContext);</span>
+        <span class="s1">}</span>
+        <span class="s1">forkContext.replaceHead(choiceContext.trueForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the body part of a DoWhileStatement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeDoWhileBody() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const bodySegments = forkContext.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">context.entrySegments = bodySegments;</span>
+        <span class="s1">forkContext.replaceHead(bodySegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the test part of a DoWhileStatement. 
+     * @param {boolean|undefined} test The test value (only when constant). 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeDoWhileTest(test) {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s1">context.test = test;</span>
+
+        <span class="s0">// Creates paths of `continue` statements.</span>
+        <span class="s3">if </span><span class="s1">(!context.continueForkContext.empty) {</span>
+            <span class="s1">context.continueForkContext.add(forkContext.head);</span>
+            <span class="s1">const testSegments = context.continueForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+            <span class="s1">forkContext.replaceHead(testSegments);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the test part of a ForStatement. 
+     * @param {boolean|undefined} test The test value (only when constant). 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeForTest(test) {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const endOfInitSegments = forkContext.head;</span>
+        <span class="s1">const testSegments = forkContext.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">context.test = test;</span>
+        <span class="s1">context.endOfInitSegments = endOfInitSegments;</span>
+        <span class="s1">context.continueDestSegments = context.testSegments = testSegments;</span>
+        <span class="s1">forkContext.replaceHead(testSegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the update part of a ForStatement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeForUpdate() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const choiceContext = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s0">// Make the next paths of the test.</span>
+        <span class="s3">if </span><span class="s1">(context.testSegments) {</span>
+            <span class="s1">finalizeTestSegmentsOfFor(</span>
+                <span class="s1">context,</span>
+                <span class="s1">choiceContext,</span>
+                <span class="s1">forkContext.head</span>
+            <span class="s1">);</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">context.endOfInitSegments = forkContext.head;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">const updateSegments = forkContext.makeDisconnected(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s1">context.continueDestSegments = context.updateSegments = updateSegments;</span>
+        <span class="s1">forkContext.replaceHead(updateSegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the body part of a ForStatement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeForBody() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const choiceContext = </span><span class="s3">this</span><span class="s1">.choiceContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s3">if </span><span class="s1">(context.updateSegments) {</span>
+            <span class="s1">context.endOfUpdateSegments = forkContext.head;</span>
+
+            <span class="s0">// `update` -&gt; `test`</span>
+            <span class="s3">if </span><span class="s1">(context.testSegments) {</span>
+                <span class="s1">makeLooped(</span>
+                    <span class="s3">this</span><span class="s1">,</span>
+                    <span class="s1">context.endOfUpdateSegments,</span>
+                    <span class="s1">context.testSegments</span>
+                <span class="s1">);</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(context.testSegments) {</span>
+            <span class="s1">finalizeTestSegmentsOfFor(</span>
+                <span class="s1">context,</span>
+                <span class="s1">choiceContext,</span>
+                <span class="s1">forkContext.head</span>
+            <span class="s1">);</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">context.endOfInitSegments = forkContext.head;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">let bodySegments = context.endOfTestSegments;</span>
+
+        <span class="s3">if </span><span class="s1">(!bodySegments) {</span>
+
+            <span class="s0">/* 
+             * If there is not the `test` part, the `body` path comes from the 
+             * `init` part and the `update` part. 
+             */</span>
+            <span class="s1">const prevForkContext = ForkContext.newEmpty(forkContext);</span>
+
+            <span class="s1">prevForkContext.add(context.endOfInitSegments);</span>
+            <span class="s3">if </span><span class="s1">(context.endOfUpdateSegments) {</span>
+                <span class="s1">prevForkContext.add(context.endOfUpdateSegments);</span>
+            <span class="s1">}</span>
+
+            <span class="s1">bodySegments = prevForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s1">context.continueDestSegments = context.continueDestSegments || bodySegments;</span>
+        <span class="s1">forkContext.replaceHead(bodySegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the left part of a ForInStatement and a 
+     * ForOfStatement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeForInOfLeft() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const leftSegments = forkContext.makeDisconnected(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">context.prevSegments = forkContext.head;</span>
+        <span class="s1">context.leftSegments = context.continueDestSegments = leftSegments;</span>
+        <span class="s1">forkContext.replaceHead(leftSegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the right part of a ForInStatement and a 
+     * ForOfStatement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeForInOfRight() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const temp = ForkContext.newEmpty(forkContext);</span>
+
+        <span class="s1">temp.add(context.prevSegments);</span>
+        <span class="s1">const rightSegments = temp.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">context.endOfLeftSegments = forkContext.head;</span>
+        <span class="s1">forkContext.replaceHead(rightSegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a code path segment for the body part of a ForInStatement and a 
+     * ForOfStatement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeForInOfBody() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.loopContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+        <span class="s1">const temp = ForkContext.newEmpty(forkContext);</span>
+
+        <span class="s1">temp.add(context.endOfLeftSegments);</span>
+        <span class="s1">const bodySegments = temp.makeNext(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">// Make a path: `right` -&gt; `left`.</span>
+        <span class="s1">makeLooped(</span><span class="s3">this</span><span class="s1">, forkContext.head, context.leftSegments);</span>
+
+        <span class="s0">// Update state.</span>
+        <span class="s1">context.brokenForkContext.add(forkContext.head);</span>
+        <span class="s1">forkContext.replaceHead(bodySegments);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">//--------------------------------------------------------------------------</span>
+    <span class="s0">// Control Statements</span>
+    <span class="s0">//--------------------------------------------------------------------------</span>
+
+    <span class="s0">/** 
+     * Creates new context for BreakStatement. 
+     * @param {boolean} breakable The flag to indicate it can break by 
+     *      an unlabeled BreakStatement. 
+     * @param {string|null} label The label of this context. 
+     * @returns {Object} The new context. 
+     */</span>
+    <span class="s1">pushBreakContext(breakable, label) {</span>
+        <span class="s3">this</span><span class="s1">.breakContext = {</span>
+            <span class="s1">upper: </span><span class="s3">this</span><span class="s1">.breakContext,</span>
+            <span class="s1">breakable,</span>
+            <span class="s1">label,</span>
+            <span class="s1">brokenForkContext: ForkContext.newEmpty(</span><span class="s3">this</span><span class="s1">.forkContext)</span>
+        <span class="s1">};</span>
+        <span class="s3">return this</span><span class="s1">.breakContext;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Removes the top item of the break context stack. 
+     * @returns {Object} The removed context. 
+     */</span>
+    <span class="s1">popBreakContext() {</span>
+        <span class="s1">const context = </span><span class="s3">this</span><span class="s1">.breakContext;</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">this</span><span class="s1">.breakContext = context.upper;</span>
+
+        <span class="s0">// Process this context here for other than switches and loops.</span>
+        <span class="s3">if </span><span class="s1">(!context.breakable) {</span>
+            <span class="s1">const brokenForkContext = context.brokenForkContext;</span>
+
+            <span class="s3">if </span><span class="s1">(!brokenForkContext.empty) {</span>
+                <span class="s1">brokenForkContext.add(forkContext.head);</span>
+                <span class="s1">forkContext.replaceHead(brokenForkContext.makeNext(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">context;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a path for a `break` statement. 
+     * 
+     * It registers the head segment to a context of `break`. 
+     * It makes new unreachable segment, then it set the head with the segment. 
+     * @param {string} label A label of the break statement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeBreak(label) {</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(!forkContext.reachable) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const context = getBreakContext(</span><span class="s3">this</span><span class="s1">, label);</span>
+
+
+        <span class="s3">if </span><span class="s1">(context) {</span>
+            <span class="s1">context.brokenForkContext.add(forkContext.head);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">/* c8 ignore next */</span>
+        <span class="s1">forkContext.replaceHead(forkContext.makeUnreachable(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a path for a `continue` statement. 
+     * 
+     * It makes a looping path. 
+     * It makes new unreachable segment, then it set the head with the segment. 
+     * @param {string} label A label of the continue statement. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeContinue(label) {</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(!forkContext.reachable) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const context = getContinueContext(</span><span class="s3">this</span><span class="s1">, label);</span>
+
+        <span class="s3">if </span><span class="s1">(context) {</span>
+            <span class="s3">if </span><span class="s1">(context.continueDestSegments) {</span>
+                <span class="s1">makeLooped(</span><span class="s3">this</span><span class="s1">, forkContext.head, context.continueDestSegments);</span>
+
+                <span class="s0">// If the context is a for-in/of loop, this effects a break also.</span>
+                <span class="s3">if </span><span class="s1">(context.type === </span><span class="s2">&quot;ForInStatement&quot; </span><span class="s1">||</span>
+                    <span class="s1">context.type === </span><span class="s2">&quot;ForOfStatement&quot;</span>
+                <span class="s1">) {</span>
+                    <span class="s1">context.brokenForkContext.add(forkContext.head);</span>
+                <span class="s1">}</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s1">context.continueForkContext.add(forkContext.head);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s1">forkContext.replaceHead(forkContext.makeUnreachable(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a path for a `return` statement. 
+     * 
+     * It registers the head segment to a context of `return`. 
+     * It makes new unreachable segment, then it set the head with the segment. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeReturn() {</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(forkContext.reachable) {</span>
+            <span class="s1">getReturnContext(</span><span class="s3">this</span><span class="s1">).returnedForkContext.add(forkContext.head);</span>
+            <span class="s1">forkContext.replaceHead(forkContext.makeUnreachable(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes a path for a `throw` statement. 
+     * 
+     * It registers the head segment to a context of `throw`. 
+     * It makes new unreachable segment, then it set the head with the segment. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeThrow() {</span>
+        <span class="s1">const forkContext = </span><span class="s3">this</span><span class="s1">.forkContext;</span>
+
+        <span class="s3">if </span><span class="s1">(forkContext.reachable) {</span>
+            <span class="s1">getThrowContext(</span><span class="s3">this</span><span class="s1">).thrownForkContext.add(forkContext.head);</span>
+            <span class="s1">forkContext.replaceHead(forkContext.makeUnreachable(-</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">));</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Makes the final path. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">makeFinal() {</span>
+        <span class="s1">const segments = </span><span class="s3">this</span><span class="s1">.currentSegments;</span>
+
+        <span class="s3">if </span><span class="s1">(segments.length &gt; </span><span class="s4">0 </span><span class="s1">&amp;&amp; segments[</span><span class="s4">0</span><span class="s1">].reachable) {</span>
+            <span class="s3">this</span><span class="s1">.returnedForkContext.add(segments);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = CodePathState;</span>
+</pre>
+</body>
+</html>

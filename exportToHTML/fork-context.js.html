@@ -1,0 +1,269 @@
+<html>
+<head>
+<title>fork-context.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+fork-context.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview A class to operate forking. 
+ * 
+ * This is state of forking. 
+ * This has a fork list and manages it. 
+ * 
+ * @author Toru Nagashima 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const assert = require(</span><span class="s2">&quot;assert&quot;</span><span class="s1">),</span>
+    <span class="s1">CodePathSegment = require(</span><span class="s2">&quot;./code-path-segment&quot;</span><span class="s1">);</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Gets whether or not a given segment is reachable. 
+ * @param {CodePathSegment} segment A segment to get. 
+ * @returns {boolean} `true` if the segment is reachable. 
+ */</span>
+<span class="s3">function </span><span class="s1">isReachable(segment) {</span>
+    <span class="s3">return </span><span class="s1">segment.reachable;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Creates new segments from the specific range of `context.segmentsList`. 
+ * 
+ * When `context.segmentsList` is `[[a, b], [c, d], [e, f]]`, `begin` is `0`, and 
+ * `end` is `-1`, this creates `[g, h]`. This `g` is from `a`, `c`, and `e`. 
+ * This `h` is from `b`, `d`, and `f`. 
+ * @param {ForkContext} context An instance. 
+ * @param {number} begin The first index of the previous segments. 
+ * @param {number} end The last index of the previous segments. 
+ * @param {Function} create A factory function of new segments. 
+ * @returns {CodePathSegment[]} New segments. 
+ */</span>
+<span class="s3">function </span><span class="s1">makeSegments(context, begin, end, create) {</span>
+    <span class="s1">const list = context.segmentsList;</span>
+
+    <span class="s1">const normalizedBegin = begin &gt;= </span><span class="s4">0 </span><span class="s1">? begin : list.length + begin;</span>
+    <span class="s1">const normalizedEnd = end &gt;= </span><span class="s4">0 </span><span class="s1">? end : list.length + end;</span>
+
+    <span class="s1">const segments = [];</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; context.count; ++i) {</span>
+        <span class="s1">const allPrevSegments = [];</span>
+
+        <span class="s3">for </span><span class="s1">(let j = normalizedBegin; j &lt;= normalizedEnd; ++j) {</span>
+            <span class="s1">allPrevSegments.push(list[j][i]);</span>
+        <span class="s1">}</span>
+
+        <span class="s1">segments.push(create(context.idGenerator.next(), allPrevSegments));</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">segments;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * `segments` becomes doubly in a `finally` block. Then if a code path exits by a 
+ * control statement (such as `break`, `continue`) from the `finally` block, the 
+ * destination's segments may be half of the source segments. In that case, this 
+ * merges segments. 
+ * @param {ForkContext} context An instance. 
+ * @param {CodePathSegment[]} segments Segments to merge. 
+ * @returns {CodePathSegment[]} The merged segments. 
+ */</span>
+<span class="s3">function </span><span class="s1">mergeExtraSegments(context, segments) {</span>
+    <span class="s1">let currentSegments = segments;</span>
+
+    <span class="s3">while </span><span class="s1">(currentSegments.length &gt; context.count) {</span>
+        <span class="s1">const merged = [];</span>
+
+        <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">, length = currentSegments.length / </span><span class="s4">2 </span><span class="s1">| </span><span class="s4">0</span><span class="s1">; i &lt; length; ++i) {</span>
+            <span class="s1">merged.push(CodePathSegment.newNext(</span>
+                <span class="s1">context.idGenerator.next(),</span>
+                <span class="s1">[currentSegments[i], currentSegments[i + length]]</span>
+            <span class="s1">));</span>
+        <span class="s1">}</span>
+        <span class="s1">currentSegments = merged;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">currentSegments;</span>
+<span class="s1">}</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Public Interface</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * A class to manage forking. 
+ */</span>
+<span class="s1">class ForkContext {</span>
+
+    <span class="s0">/** 
+     * @param {IdGenerator} idGenerator An identifier generator for segments. 
+     * @param {ForkContext|null} upper An upper fork context. 
+     * @param {number} count A number of parallel segments. 
+     */</span>
+    <span class="s1">constructor(idGenerator, upper, count) {</span>
+        <span class="s3">this</span><span class="s1">.idGenerator = idGenerator;</span>
+        <span class="s3">this</span><span class="s1">.upper = upper;</span>
+        <span class="s3">this</span><span class="s1">.count = count;</span>
+        <span class="s3">this</span><span class="s1">.segmentsList = [];</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * The head segments. 
+     * @type {CodePathSegment[]} 
+     */</span>
+    <span class="s1">get head() {</span>
+        <span class="s1">const list = </span><span class="s3">this</span><span class="s1">.segmentsList;</span>
+
+        <span class="s3">return </span><span class="s1">list.length === </span><span class="s4">0 </span><span class="s1">? [] : list[list.length - </span><span class="s4">1</span><span class="s1">];</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * A flag which shows empty. 
+     * @type {boolean} 
+     */</span>
+    <span class="s1">get empty() {</span>
+        <span class="s3">return this</span><span class="s1">.segmentsList.length === </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * A flag which shows reachable. 
+     * @type {boolean} 
+     */</span>
+    <span class="s1">get reachable() {</span>
+        <span class="s1">const segments = </span><span class="s3">this</span><span class="s1">.head;</span>
+
+        <span class="s3">return </span><span class="s1">segments.length &gt; </span><span class="s4">0 </span><span class="s1">&amp;&amp; segments.some(isReachable);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates new segments from this context. 
+     * @param {number} begin The first index of previous segments. 
+     * @param {number} end The last index of previous segments. 
+     * @returns {CodePathSegment[]} New segments. 
+     */</span>
+    <span class="s1">makeNext(begin, end) {</span>
+        <span class="s3">return </span><span class="s1">makeSegments(</span><span class="s3">this</span><span class="s1">, begin, end, CodePathSegment.newNext);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates new segments from this context. 
+     * The new segments is always unreachable. 
+     * @param {number} begin The first index of previous segments. 
+     * @param {number} end The last index of previous segments. 
+     * @returns {CodePathSegment[]} New segments. 
+     */</span>
+    <span class="s1">makeUnreachable(begin, end) {</span>
+        <span class="s3">return </span><span class="s1">makeSegments(</span><span class="s3">this</span><span class="s1">, begin, end, CodePathSegment.newUnreachable);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates new segments from this context. 
+     * The new segments don't have connections for previous segments. 
+     * But these inherit the reachable flag from this context. 
+     * @param {number} begin The first index of previous segments. 
+     * @param {number} end The last index of previous segments. 
+     * @returns {CodePathSegment[]} New segments. 
+     */</span>
+    <span class="s1">makeDisconnected(begin, end) {</span>
+        <span class="s3">return </span><span class="s1">makeSegments(</span><span class="s3">this</span><span class="s1">, begin, end, CodePathSegment.newDisconnected);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Adds segments into this context. 
+     * The added segments become the head. 
+     * @param {CodePathSegment[]} segments Segments to add. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">add(segments) {</span>
+        <span class="s1">assert(segments.length &gt;= </span><span class="s3">this</span><span class="s1">.count, `${segments.length} &gt;= ${</span><span class="s3">this</span><span class="s1">.count}`);</span>
+
+        <span class="s3">this</span><span class="s1">.segmentsList.push(mergeExtraSegments(</span><span class="s3">this</span><span class="s1">, segments));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Replaces the head segments with given segments. 
+     * The current head segments are removed. 
+     * @param {CodePathSegment[]} segments Segments to add. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">replaceHead(segments) {</span>
+        <span class="s1">assert(segments.length &gt;= </span><span class="s3">this</span><span class="s1">.count, `${segments.length} &gt;= ${</span><span class="s3">this</span><span class="s1">.count}`);</span>
+
+        <span class="s3">this</span><span class="s1">.segmentsList.splice(-</span><span class="s4">1</span><span class="s1">, </span><span class="s4">1</span><span class="s1">, mergeExtraSegments(</span><span class="s3">this</span><span class="s1">, segments));</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Adds all segments of a given fork context into this context. 
+     * @param {ForkContext} context A fork context to add. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">addAll(context) {</span>
+        <span class="s1">assert(context.count === </span><span class="s3">this</span><span class="s1">.count);</span>
+
+        <span class="s1">const source = context.segmentsList;</span>
+
+        <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; source.length; ++i) {</span>
+            <span class="s3">this</span><span class="s1">.segmentsList.push(source[i]);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Clears all segments in this context. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">clear() {</span>
+        <span class="s3">this</span><span class="s1">.segmentsList = [];</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates the root fork context. 
+     * @param {IdGenerator} idGenerator An identifier generator for segments. 
+     * @returns {ForkContext} New fork context. 
+     */</span>
+    <span class="s1">static newRoot(idGenerator) {</span>
+        <span class="s1">const context = </span><span class="s3">new </span><span class="s1">ForkContext(idGenerator, </span><span class="s3">null</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s1">context.add([CodePathSegment.newRoot(idGenerator.next())]);</span>
+
+        <span class="s3">return </span><span class="s1">context;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Creates an empty fork context preceded by a given context. 
+     * @param {ForkContext} parentContext The parent fork context. 
+     * @param {boolean} forkLeavingPath A flag which shows inside of `finally` block. 
+     * @returns {ForkContext} New fork context. 
+     */</span>
+    <span class="s1">static newEmpty(parentContext, forkLeavingPath) {</span>
+        <span class="s3">return new </span><span class="s1">ForkContext(</span>
+            <span class="s1">parentContext.idGenerator,</span>
+            <span class="s1">parentContext,</span>
+            <span class="s1">(forkLeavingPath ? </span><span class="s4">2 </span><span class="s1">: </span><span class="s4">1</span><span class="s1">) * parentContext.count</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = ForkContext;</span>
+</pre>
+</body>
+</html>

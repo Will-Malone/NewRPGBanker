@@ -1,0 +1,378 @@
+<html>
+<head>
+<title>ShadowNode.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ShadowNode.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ShadowNode.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;DynamicPropsUtilities.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;ShadowNodeFragment.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;butter/small_vector.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/ComponentDescriptor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/ShadowNodeFragment.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/DebugStringConvertible.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/debugStringConvertibleUtils.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;utility&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s1">ShadowNode::SharedListOfShared ShadowNode::emptySharedShadowNodeSharedList() {</span>
+  <span class="s4">static const auto </span><span class="s1">emptySharedShadowNodeSharedList =</span>
+      <span class="s1">std::make_shared&lt;ShadowNode::ListOfShared&gt;()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">emptySharedShadowNodeSharedList</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * On iOS, this method returns `props` if provided, `sourceShadowNode`'s props 
+ * otherwise. On Android, we forward props in case `sourceShadowNode` hasn't 
+ * been mounted. `Props::rawProps` are merged from `props` to a copy of 
+ * `sourceShadowNode.props_` and returned. This is necessary to enable 
+ * Background Executor and should be removed once reimplementation of JNI layer 
+ * is finished. 
+ */</span>
+<span class="s1">Props::Shared ShadowNode::propsForClonedShadowNode(</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;sourceShadowNode</span><span class="s4">,</span>
+    <span class="s1">Props::Shared </span><span class="s4">const </span><span class="s1">&amp;props) {</span>
+<span class="s2">#ifdef </span><span class="s1">ANDROID</span>
+  <span class="s4">bool </span><span class="s1">hasBeenMounted = sourceShadowNode.hasBeenMounted_</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">sourceNodeHasRawProps = !sourceShadowNode.getProps()-&gt;rawProps.empty()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!hasBeenMounted &amp;&amp; sourceNodeHasRawProps &amp;&amp; props) {</span>
+    <span class="s4">auto </span><span class="s1">&amp;castedProps = </span><span class="s4">const_cast</span><span class="s1">&lt;Props &amp;&gt;(*props)</span><span class="s4">;</span>
+    <span class="s1">castedProps.rawProps = mergeDynamicProps(</span>
+        <span class="s1">sourceShadowNode.getProps()-&gt;rawProps</span><span class="s4">, </span><span class="s1">props-&gt;rawProps)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">props</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s2">#endif</span>
+  <span class="s4">return </span><span class="s1">props ? props : sourceShadowNode.getProps()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">ShadowNode::sameFamily(</span><span class="s4">const </span><span class="s1">ShadowNode &amp;first</span><span class="s4">, const </span><span class="s1">ShadowNode &amp;second) {</span>
+  <span class="s4">return </span><span class="s1">first.family_ == second.family_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Constructors</span>
+
+<span class="s1">ShadowNode::ShadowNode(</span>
+    <span class="s1">ShadowNodeFragment </span><span class="s4">const </span><span class="s1">&amp;fragment</span><span class="s4">,</span>
+    <span class="s1">ShadowNodeFamily::Shared family</span><span class="s4">,</span>
+    <span class="s1">ShadowNodeTraits traits)</span>
+    <span class="s1">:</span>
+<span class="s2">#if </span><span class="s1">RN_DEBUG_STRING_CONVERTIBLE</span>
+      <span class="s1">revision_(</span><span class="s5">1</span><span class="s1">)</span><span class="s4">,</span>
+<span class="s2">#endif</span>
+      <span class="s1">props_(fragment.props)</span><span class="s4">,</span>
+      <span class="s1">children_(</span>
+          <span class="s1">fragment.children ? fragment.children</span>
+                            <span class="s1">: emptySharedShadowNodeSharedList())</span><span class="s4">,</span>
+      <span class="s1">state_(fragment.state)</span><span class="s4">,</span>
+      <span class="s1">orderIndex_(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">family_(std::move(family))</span><span class="s4">,</span>
+      <span class="s1">traits_(traits) {</span>
+  <span class="s1">react_native_assert(props_)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(children_)</span><span class="s4">;</span>
+
+  <span class="s1">traits_.set(ShadowNodeTraits::Trait::ChildrenAreShared)</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;child : *children_) {</span>
+    <span class="s1">child-&gt;family_-&gt;setParent(family_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// The first node of the family gets its state committed automatically.</span>
+  <span class="s1">family_-&gt;setMostRecentState(state_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::ShadowNode(</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;sourceShadowNode</span><span class="s4">,</span>
+    <span class="s1">ShadowNodeFragment </span><span class="s4">const </span><span class="s1">&amp;fragment)</span>
+    <span class="s1">:</span>
+<span class="s2">#if </span><span class="s1">RN_DEBUG_STRING_CONVERTIBLE</span>
+      <span class="s1">revision_(sourceShadowNode.revision_ + </span><span class="s5">1</span><span class="s1">)</span><span class="s4">,</span>
+<span class="s2">#endif</span>
+      <span class="s1">props_(propsForClonedShadowNode(sourceShadowNode</span><span class="s4">, </span><span class="s1">fragment.props))</span><span class="s4">,</span>
+      <span class="s1">children_(</span>
+          <span class="s1">fragment.children ? fragment.children : sourceShadowNode.children_)</span><span class="s4">,</span>
+      <span class="s1">state_(</span>
+          <span class="s1">fragment.state ? fragment.state</span>
+                         <span class="s1">: sourceShadowNode.getMostRecentState())</span><span class="s4">,</span>
+      <span class="s1">orderIndex_(sourceShadowNode.orderIndex_)</span><span class="s4">,</span>
+      <span class="s1">family_(sourceShadowNode.family_)</span><span class="s4">,</span>
+      <span class="s1">traits_(sourceShadowNode.traits_) {</span>
+
+  <span class="s1">react_native_assert(props_)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(children_)</span><span class="s4">;</span>
+
+  <span class="s1">traits_.set(ShadowNodeTraits::Trait::ChildrenAreShared)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(fragment.children) {</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;child : *children_) {</span>
+      <span class="s1">child-&gt;family_-&gt;setParent(family_)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Unshared ShadowNode::clone(</span>
+    <span class="s4">const </span><span class="s1">ShadowNodeFragment &amp;fragment) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto const </span><span class="s1">&amp;family = *family_</span><span class="s4">;</span>
+  <span class="s4">auto const </span><span class="s1">&amp;componentDescriptor = family.componentDescriptor_</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(family.nativeProps_DEPRECATED != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">auto </span><span class="s1">propsParserContext = PropsParserContext{family_-&gt;getSurfaceId()</span><span class="s4">, </span><span class="s1">{}}</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(fragment.props == ShadowNodeFragment::propsPlaceholder()) {</span>
+      <span class="s0">// Clone existing `props_` with `family.nativeProps_DEPRECATED` to apply</span>
+      <span class="s0">// previously set props via `setNativeProps` API.</span>
+      <span class="s4">auto </span><span class="s1">props = componentDescriptor.cloneProps(</span>
+          <span class="s1">propsParserContext</span><span class="s4">, </span><span class="s1">props_</span><span class="s4">, </span><span class="s1">RawProps(*family.nativeProps_DEPRECATED))</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">clonedNode = componentDescriptor.cloneShadowNode(</span>
+          <span class="s1">*</span><span class="s4">this,</span>
+          <span class="s1">{</span>
+              <span class="s1">props</span><span class="s4">,</span>
+              <span class="s1">fragment.children</span><span class="s4">,</span>
+              <span class="s1">fragment.state</span><span class="s4">,</span>
+          <span class="s1">})</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">clonedNode</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s0">// TODO: We might need to merge fragment.priops with</span>
+      <span class="s0">// `family.nativeProps_DEPRECATED`.</span>
+      <span class="s4">return </span><span class="s1">componentDescriptor.cloneShadowNode(*</span><span class="s4">this, </span><span class="s1">fragment)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">componentDescriptor.cloneShadowNode(*</span><span class="s4">this, </span><span class="s1">fragment)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">ContextContainer::Shared ShadowNode::getContextContainer() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;componentDescriptor_.getContextContainer()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Getters</span>
+
+<span class="s1">ComponentName ShadowNode::getComponentName() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;getComponentName()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ComponentHandle ShadowNode::getComponentHandle() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;getComponentHandle()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">const </span><span class="s1">ShadowNode::ListOfShared &amp;ShadowNode::getChildren() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">*children_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNodeTraits ShadowNode::getTraits() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">traits_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">const </span><span class="s1">Props::Shared &amp;ShadowNode::getProps() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">props_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">const </span><span class="s1">SharedEventEmitter &amp;ShadowNode::getEventEmitter() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;eventEmitter_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">Tag ShadowNode::getTag() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;tag_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SurfaceId ShadowNode::getSurfaceId() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;surfaceId_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">const </span><span class="s1">ComponentDescriptor &amp;ShadowNode::getComponentDescriptor() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;componentDescriptor_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">const </span><span class="s1">State::Shared &amp;ShadowNode::getState() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">state_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">State::Shared ShadowNode::getMostRecentState() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">family_-&gt;getMostRecentState()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">int </span><span class="s1">ShadowNode::getOrderIndex() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">orderIndex_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowNode::sealRecursive() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(getSealed()) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">seal()</span><span class="s4">;</span>
+
+  <span class="s1">props_-&gt;seal()</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;child : *children_) {</span>
+    <span class="s1">child-&gt;sealRecursive()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Mutating Methods</span>
+
+<span class="s4">void </span><span class="s1">ShadowNode::appendChild(</span><span class="s4">const </span><span class="s1">ShadowNode::Shared &amp;child) {</span>
+  <span class="s1">ensureUnsealed()</span><span class="s4">;</span>
+
+  <span class="s1">cloneChildrenIfShared()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">nonConstChildren =</span>
+      <span class="s1">std::const_pointer_cast&lt;ShadowNode::ListOfShared&gt;(children_)</span><span class="s4">;</span>
+  <span class="s1">nonConstChildren-&gt;push_back(child)</span><span class="s4">;</span>
+
+  <span class="s1">child-&gt;family_-&gt;setParent(family_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowNode::replaceChild(</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldChild</span><span class="s4">,</span>
+    <span class="s1">ShadowNode::Shared </span><span class="s4">const </span><span class="s1">&amp;newChild</span><span class="s4">,</span>
+    <span class="s1">size_t suggestedIndex) {</span>
+  <span class="s1">ensureUnsealed()</span><span class="s4">;</span>
+
+  <span class="s1">cloneChildrenIfShared()</span><span class="s4">;</span>
+
+  <span class="s1">newChild-&gt;family_-&gt;setParent(family_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">&amp;children =</span>
+      <span class="s1">*std::const_pointer_cast&lt;ShadowNode::ListOfShared&gt;(children_)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">size = children.size()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(suggestedIndex != -</span><span class="s5">1 </span><span class="s1">&amp;&amp; suggestedIndex &lt; size) {</span>
+    <span class="s0">// If provided `suggestedIndex` is accurate,</span>
+    <span class="s0">// replacing in place using the index.</span>
+    <span class="s4">if </span><span class="s1">(children.at(suggestedIndex).get() == &amp;oldChild) {</span>
+      <span class="s1">children[suggestedIndex] = newChild</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(size_t index = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">index &lt; size</span><span class="s4">; </span><span class="s1">index++) {</span>
+    <span class="s4">if </span><span class="s1">(children.at(index).get() == &amp;oldChild) {</span>
+      <span class="s1">children[index] = newChild</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">react_native_assert(</span><span class="s4">false </span><span class="s1">&amp;&amp; </span><span class="s3">&quot;Child to replace was not found.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowNode::cloneChildrenIfShared() {</span>
+  <span class="s4">if </span><span class="s1">(!traits_.check(ShadowNodeTraits::Trait::ChildrenAreShared)) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">traits_.unset(ShadowNodeTraits::Trait::ChildrenAreShared)</span><span class="s4">;</span>
+  <span class="s1">children_ = std::make_shared&lt;ShadowNode::ListOfShared&gt;(*children_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowNode::setMounted(</span><span class="s4">bool </span><span class="s1">mounted) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(mounted) {</span>
+    <span class="s1">family_-&gt;setMostRecentState(getState())</span><span class="s4">;</span>
+    <span class="s1">hasBeenMounted_ = mounted</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">family_-&gt;eventEmitter_-&gt;setEnabled(mounted)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNodeFamily </span><span class="s4">const </span><span class="s1">&amp;ShadowNode::getFamily() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">*family_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Unshared ShadowNode::cloneTree(</span>
+    <span class="s1">ShadowNodeFamily </span><span class="s4">const </span><span class="s1">&amp;shadowNodeFamily</span><span class="s4">,</span>
+    <span class="s1">std::function&lt;ShadowNode::Unshared(ShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldShadowNode)&gt; </span><span class="s4">const</span>
+        <span class="s1">&amp;callback) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">ancestors = shadowNodeFamily.getAncestors(*</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(ancestors.empty()) {</span>
+    <span class="s4">return </span><span class="s1">ShadowNode::Unshared{</span><span class="s4">nullptr</span><span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">&amp;parent = ancestors.back()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;oldShadowNode = parent.first.get().getChildren().at(parent.second)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">newShadowNode = callback(*oldShadowNode)</span><span class="s4">;</span>
+
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">newShadowNode &amp;&amp;</span>
+      <span class="s3">&quot;`callback` returned `nullptr` which is not allowed value.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">childNode = newShadowNode</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">it = ancestors.rbegin()</span><span class="s4">; </span><span class="s1">it != ancestors.rend()</span><span class="s4">; </span><span class="s1">++it) {</span>
+    <span class="s4">auto </span><span class="s1">&amp;parentNode = it-&gt;first.get()</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">childIndex = it-&gt;second</span><span class="s4">;</span>
+
+    <span class="s4">auto </span><span class="s1">children = parentNode.getChildren()</span><span class="s4">;</span>
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">ShadowNode::sameFamily(*children.at(childIndex)</span><span class="s4">, </span><span class="s1">*childNode))</span><span class="s4">;</span>
+    <span class="s1">children[childIndex] = childNode</span><span class="s4">;</span>
+
+    <span class="s1">childNode = parentNode.clone({</span>
+        <span class="s1">ShadowNodeFragment::propsPlaceholder()</span><span class="s4">,</span>
+        <span class="s1">std::make_shared&lt;ShadowNode::ListOfShared&gt;(children)</span><span class="s4">,</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">std::const_pointer_cast&lt;ShadowNode&gt;(childNode)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - DebugStringConvertible</span>
+
+<span class="s2">#if </span><span class="s1">RN_DEBUG_STRING_CONVERTIBLE</span>
+<span class="s1">std::string ShadowNode::getDebugName() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">getComponentName()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string ShadowNode::getDebugValue() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s3">&quot;r&quot; </span><span class="s1">+ folly::to&lt;std::string&gt;(revision_) + </span><span class="s3">&quot;/sr&quot; </span><span class="s1">+</span>
+      <span class="s1">folly::to&lt;std::string&gt;(state_ ? state_-&gt;getRevision() : </span><span class="s5">0</span><span class="s1">) +</span>
+      <span class="s1">(getSealed() ? </span><span class="s3">&quot;/sealed&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SharedDebugStringConvertibleList ShadowNode::getDebugChildren() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">debugChildren = SharedDebugStringConvertibleList{}</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;child : *children_) {</span>
+    <span class="s4">auto </span><span class="s1">debugChild =</span>
+        <span class="s1">std::dynamic_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">DebugStringConvertible&gt;(child)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(debugChild) {</span>
+      <span class="s1">debugChildren.push_back(debugChild)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">debugChildren</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SharedDebugStringConvertibleList ShadowNode::getDebugProps() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">props_-&gt;getDebugProps() +</span>
+      <span class="s1">SharedDebugStringConvertibleList{</span>
+          <span class="s1">debugStringConvertibleItem(</span><span class="s3">&quot;tag&quot;</span><span class="s4">, </span><span class="s1">folly::to&lt;std::string&gt;(getTag()))}</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s2">#endif</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

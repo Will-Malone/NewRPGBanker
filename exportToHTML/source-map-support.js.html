@@ -1,0 +1,590 @@
+<html>
+<head>
+<title>source-map-support.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+.s6 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+source-map-support.js</font>
+</center></td></tr></table>
+<pre><span class="s0">var </span><span class="s1">SourceMapConsumer = require(</span><span class="s2">'source-map'</span><span class="s1">).SourceMapConsumer;</span>
+<span class="s0">var </span><span class="s1">path = require(</span><span class="s2">'path'</span><span class="s1">);</span>
+
+<span class="s0">var </span><span class="s1">fs;</span>
+<span class="s0">try </span><span class="s1">{</span>
+  <span class="s1">fs = require(</span><span class="s2">'fs'</span><span class="s1">);</span>
+  <span class="s0">if </span><span class="s1">(!fs.existsSync || !fs.readFileSync) {</span>
+    <span class="s3">// fs doesn't have all methods we need</span>
+    <span class="s1">fs = </span><span class="s0">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+<span class="s1">} </span><span class="s0">catch </span><span class="s1">(err) {</span>
+  <span class="s3">/* nop */</span>
+<span class="s1">}</span>
+
+<span class="s0">var </span><span class="s1">bufferFrom = require(</span><span class="s2">'buffer-from'</span><span class="s1">);</span>
+
+<span class="s3">// Only install once if called multiple times</span>
+<span class="s0">var </span><span class="s1">errorFormatterInstalled = </span><span class="s0">false</span><span class="s1">;</span>
+<span class="s0">var </span><span class="s1">uncaughtShimInstalled = </span><span class="s0">false</span><span class="s1">;</span>
+
+<span class="s3">// If true, the caches are reset before a stack trace formatting operation</span>
+<span class="s0">var </span><span class="s1">emptyCacheBetweenOperations = </span><span class="s0">false</span><span class="s1">;</span>
+
+<span class="s3">// Supports {browser, node, auto}</span>
+<span class="s0">var </span><span class="s1">environment = </span><span class="s2">&quot;auto&quot;</span><span class="s1">;</span>
+
+<span class="s3">// Maps a file path to a string containing the file contents</span>
+<span class="s0">var </span><span class="s1">fileContentsCache = {};</span>
+
+<span class="s3">// Maps a file path to a source map for that file</span>
+<span class="s0">var </span><span class="s1">sourceMapCache = {};</span>
+
+<span class="s3">// Regex for detecting source maps</span>
+<span class="s0">var </span><span class="s1">reSourceMap = /^data:application\/json[^,]+base64,/;</span>
+
+<span class="s3">// Priority list of retrieve handlers</span>
+<span class="s0">var </span><span class="s1">retrieveFileHandlers = [];</span>
+<span class="s0">var </span><span class="s1">retrieveMapHandlers = [];</span>
+
+<span class="s0">function </span><span class="s1">isInBrowser() {</span>
+  <span class="s0">if </span><span class="s1">(environment === </span><span class="s2">&quot;browser&quot;</span><span class="s1">)</span>
+    <span class="s0">return true</span><span class="s1">;</span>
+  <span class="s0">if </span><span class="s1">(environment === </span><span class="s2">&quot;node&quot;</span><span class="s1">)</span>
+    <span class="s0">return false</span><span class="s1">;</span>
+  <span class="s0">return </span><span class="s1">((</span><span class="s0">typeof </span><span class="s1">window !== </span><span class="s2">'undefined'</span><span class="s1">) &amp;&amp; (</span><span class="s0">typeof </span><span class="s1">XMLHttpRequest === </span><span class="s2">'function'</span><span class="s1">) &amp;&amp; !(window.require &amp;&amp; window.module &amp;&amp; window.process &amp;&amp; window.process.type === </span><span class="s2">&quot;renderer&quot;</span><span class="s1">));</span>
+<span class="s1">}</span>
+
+<span class="s0">function </span><span class="s1">hasGlobalProcessEventEmitter() {</span>
+  <span class="s0">return </span><span class="s1">((</span><span class="s0">typeof </span><span class="s1">process === </span><span class="s2">'object'</span><span class="s1">) &amp;&amp; (process !== </span><span class="s0">null</span><span class="s1">) &amp;&amp; (</span><span class="s0">typeof </span><span class="s1">process.on === </span><span class="s2">'function'</span><span class="s1">));</span>
+<span class="s1">}</span>
+
+<span class="s0">function </span><span class="s1">handlerExec(list) {</span>
+  <span class="s0">return function</span><span class="s1">(arg) {</span>
+    <span class="s0">for </span><span class="s1">(</span><span class="s0">var </span><span class="s1">i = </span><span class="s4">0</span><span class="s1">; i &lt; list.length; i++) {</span>
+      <span class="s0">var </span><span class="s1">ret = list[i](arg);</span>
+      <span class="s0">if </span><span class="s1">(ret) {</span>
+        <span class="s0">return </span><span class="s1">ret;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">return null</span><span class="s1">;</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s0">var </span><span class="s1">retrieveFile = handlerExec(retrieveFileHandlers);</span>
+
+<span class="s1">retrieveFileHandlers.push(</span><span class="s0">function</span><span class="s1">(path) {</span>
+  <span class="s3">// Trim the path to make sure there is no extra whitespace.</span>
+  <span class="s1">path = path.trim();</span>
+  <span class="s0">if </span><span class="s1">(/^file:/.test(path)) {</span>
+    <span class="s3">// existsSync/readFileSync can't handle file protocol, but once stripped, it works</span>
+    <span class="s1">path = path.replace(/file:\/\/\/(\w:)?/, </span><span class="s0">function</span><span class="s1">(protocol, drive) {</span>
+      <span class="s0">return </span><span class="s1">drive ?</span>
+        <span class="s2">'' </span><span class="s1">: </span><span class="s3">// file:///C:/dir/file -&gt; C:/dir/file</span>
+        <span class="s2">'/'</span><span class="s1">; </span><span class="s3">// file:///root-dir/file -&gt; /root-dir/file</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+  <span class="s0">if </span><span class="s1">(path </span><span class="s0">in </span><span class="s1">fileContentsCache) {</span>
+    <span class="s0">return </span><span class="s1">fileContentsCache[path];</span>
+  <span class="s1">}</span>
+
+  <span class="s0">var </span><span class="s1">contents = </span><span class="s2">''</span><span class="s1">;</span>
+  <span class="s0">try </span><span class="s1">{</span>
+    <span class="s0">if </span><span class="s1">(!fs) {</span>
+      <span class="s3">// Use SJAX if we are in the browser</span>
+      <span class="s0">var </span><span class="s1">xhr = </span><span class="s0">new </span><span class="s1">XMLHttpRequest();</span>
+      <span class="s1">xhr.open(</span><span class="s2">'GET'</span><span class="s1">, path, </span><span class="s3">/** async */ </span><span class="s0">false</span><span class="s1">);</span>
+      <span class="s1">xhr.send(</span><span class="s0">null</span><span class="s1">);</span>
+      <span class="s0">if </span><span class="s1">(xhr.readyState === </span><span class="s4">4 </span><span class="s1">&amp;&amp; xhr.status === </span><span class="s4">200</span><span class="s1">) {</span>
+        <span class="s1">contents = xhr.responseText;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s0">else if </span><span class="s1">(fs.existsSync(path)) {</span>
+      <span class="s3">// Otherwise, use the filesystem</span>
+      <span class="s1">contents = fs.readFileSync(path, </span><span class="s2">'utf8'</span><span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s0">catch </span><span class="s1">(er) {</span>
+    <span class="s3">/* ignore any errors */</span>
+  <span class="s1">}</span>
+
+  <span class="s0">return </span><span class="s1">fileContentsCache[path] = contents;</span>
+<span class="s1">});</span>
+
+<span class="s3">// Support URLs relative to a directory, but be careful about a protocol prefix</span>
+<span class="s3">// in case we are in the browser (i.e. directories may start with &quot;http://&quot; or &quot;file:///&quot;)</span>
+<span class="s0">function </span><span class="s1">supportRelativeURL(file, url) {</span>
+  <span class="s0">if </span><span class="s1">(!file) </span><span class="s0">return </span><span class="s1">url;</span>
+  <span class="s0">var </span><span class="s1">dir = path.dirname(file);</span>
+  <span class="s0">var </span><span class="s1">match = /^\w+:\/\/[^\/]*/.exec(dir);</span>
+  <span class="s0">var </span><span class="s1">protocol = match ? match[</span><span class="s4">0</span><span class="s1">] : </span><span class="s2">''</span><span class="s1">;</span>
+  <span class="s0">var </span><span class="s1">startPath = dir.slice(protocol.length);</span>
+  <span class="s0">if </span><span class="s1">(protocol &amp;&amp; /^\/\w\:/.test(startPath)) {</span>
+    <span class="s3">// handle file:///C:/ paths</span>
+    <span class="s1">protocol += </span><span class="s2">'/'</span><span class="s1">;</span>
+    <span class="s0">return </span><span class="s1">protocol + path.resolve(dir.slice(protocol.length), url).replace(/\\/g, </span><span class="s2">'/'</span><span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s0">return </span><span class="s1">protocol + path.resolve(dir.slice(protocol.length), url);</span>
+<span class="s1">}</span>
+
+<span class="s0">function </span><span class="s1">retrieveSourceMapURL(source) {</span>
+  <span class="s0">var </span><span class="s1">fileData;</span>
+
+  <span class="s0">if </span><span class="s1">(isInBrowser()) {</span>
+     <span class="s0">try </span><span class="s1">{</span>
+       <span class="s0">var </span><span class="s1">xhr = </span><span class="s0">new </span><span class="s1">XMLHttpRequest();</span>
+       <span class="s1">xhr.open(</span><span class="s2">'GET'</span><span class="s1">, source, </span><span class="s0">false</span><span class="s1">);</span>
+       <span class="s1">xhr.send(</span><span class="s0">null</span><span class="s1">);</span>
+       <span class="s1">fileData = xhr.readyState === </span><span class="s4">4 </span><span class="s1">? xhr.responseText : </span><span class="s0">null</span><span class="s1">;</span>
+
+       <span class="s3">// Support providing a sourceMappingURL via the SourceMap header</span>
+       <span class="s0">var </span><span class="s1">sourceMapHeader = xhr.getResponseHeader(</span><span class="s2">&quot;SourceMap&quot;</span><span class="s1">) ||</span>
+                             <span class="s1">xhr.getResponseHeader(</span><span class="s2">&quot;X-SourceMap&quot;</span><span class="s1">);</span>
+       <span class="s0">if </span><span class="s1">(sourceMapHeader) {</span>
+         <span class="s0">return </span><span class="s1">sourceMapHeader;</span>
+       <span class="s1">}</span>
+     <span class="s1">} </span><span class="s0">catch </span><span class="s1">(e) {</span>
+     <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Get the URL of the source map</span>
+  <span class="s1">fileData = retrieveFile(source);</span>
+  <span class="s0">var </span><span class="s1">re = /(?:\/\/[@#][\s]*sourceMappingURL=([^\s</span><span class="s2">'&quot;]+)[</span><span class="s5">\s</span><span class="s2">]*$)|(?:</span><span class="s5">\/\*</span><span class="s2">[@#][</span><span class="s5">\s</span><span class="s2">]*sourceMappingURL=([^</span><span class="s5">\s</span><span class="s2">*'&quot;]+)[</span><span class="s5">\s</span><span class="s2">]*(?:</span><span class="s5">\*\/</span><span class="s2">)[</span><span class="s5">\s</span><span class="s2">]*$)/mg;</span>
+  <span class="s3">// Keep executing the search to find the *last* sourceMappingURL to avoid</span>
+  <span class="s3">// picking up sourceMappingURLs from comments, strings, etc.</span>
+  <span class="s0">var </span><span class="s1">lastMatch, match;</span>
+  <span class="s0">while </span><span class="s1">(match = re.exec(fileData)) lastMatch = match;</span>
+  <span class="s0">if </span><span class="s1">(!lastMatch) </span><span class="s0">return null</span><span class="s1">;</span>
+  <span class="s0">return </span><span class="s1">lastMatch[</span><span class="s4">1</span><span class="s1">];</span>
+<span class="s1">};</span>
+
+<span class="s3">// Can be overridden by the retrieveSourceMap option to install. Takes a</span>
+<span class="s3">// generated source filename; returns a {map, optional url} object, or null if</span>
+<span class="s3">// there is no source map.  The map field may be either a string or the parsed</span>
+<span class="s3">// JSON object (ie, it must be a valid argument to the SourceMapConsumer</span>
+<span class="s3">// constructor).</span>
+<span class="s0">var </span><span class="s1">retrieveSourceMap = handlerExec(retrieveMapHandlers);</span>
+<span class="s1">retrieveMapHandlers.push(</span><span class="s0">function</span><span class="s1">(source) {</span>
+  <span class="s0">var </span><span class="s1">sourceMappingURL = retrieveSourceMapURL(source);</span>
+  <span class="s0">if </span><span class="s1">(!sourceMappingURL) </span><span class="s0">return null</span><span class="s1">;</span>
+
+  <span class="s3">// Read the contents of the source map</span>
+  <span class="s0">var </span><span class="s1">sourceMapData;</span>
+  <span class="s0">if </span><span class="s1">(reSourceMap.test(sourceMappingURL)) {</span>
+    <span class="s3">// Support source map URL as a data url</span>
+    <span class="s0">var </span><span class="s1">rawData = sourceMappingURL.slice(sourceMappingURL.indexOf(</span><span class="s2">','</span><span class="s1">) + </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">sourceMapData = bufferFrom(rawData, </span><span class="s2">&quot;base64&quot;</span><span class="s1">).toString();</span>
+    <span class="s1">sourceMappingURL = source;</span>
+  <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+    <span class="s3">// Support source map URLs relative to the source URL</span>
+    <span class="s1">sourceMappingURL = supportRelativeURL(source, sourceMappingURL);</span>
+    <span class="s1">sourceMapData = retrieveFile(sourceMappingURL);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">if </span><span class="s1">(!sourceMapData) {</span>
+    <span class="s0">return null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">return </span><span class="s1">{</span>
+    <span class="s1">url: sourceMappingURL,</span>
+    <span class="s1">map: sourceMapData</span>
+  <span class="s1">};</span>
+<span class="s1">});</span>
+
+<span class="s0">function </span><span class="s1">mapSourcePosition(position) {</span>
+  <span class="s0">var </span><span class="s1">sourceMap = sourceMapCache[position.source];</span>
+  <span class="s0">if </span><span class="s1">(!sourceMap) {</span>
+    <span class="s3">// Call the (overrideable) retrieveSourceMap function to get the source map.</span>
+    <span class="s0">var </span><span class="s1">urlAndMap = retrieveSourceMap(position.source);</span>
+    <span class="s0">if </span><span class="s1">(urlAndMap) {</span>
+      <span class="s1">sourceMap = sourceMapCache[position.source] = {</span>
+        <span class="s1">url: urlAndMap.url,</span>
+        <span class="s1">map: </span><span class="s0">new </span><span class="s1">SourceMapConsumer(urlAndMap.map)</span>
+      <span class="s1">};</span>
+
+      <span class="s3">// Load all sources stored inline with the source map into the file cache</span>
+      <span class="s3">// to pretend like they are already loaded. They may not exist on disk.</span>
+      <span class="s0">if </span><span class="s1">(sourceMap.map.sourcesContent) {</span>
+        <span class="s1">sourceMap.map.sources.forEach(</span><span class="s0">function</span><span class="s1">(source, i) {</span>
+          <span class="s0">var </span><span class="s1">contents = sourceMap.map.sourcesContent[i];</span>
+          <span class="s0">if </span><span class="s1">(contents) {</span>
+            <span class="s0">var </span><span class="s1">url = supportRelativeURL(sourceMap.url, source);</span>
+            <span class="s1">fileContentsCache[url] = contents;</span>
+          <span class="s1">}</span>
+        <span class="s1">});</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+      <span class="s1">sourceMap = sourceMapCache[position.source] = {</span>
+        <span class="s1">url: </span><span class="s0">null</span><span class="s1">,</span>
+        <span class="s1">map: </span><span class="s0">null</span>
+      <span class="s1">};</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Resolve the source URL relative to the URL of the source map</span>
+  <span class="s0">if </span><span class="s1">(sourceMap &amp;&amp; sourceMap.map &amp;&amp; </span><span class="s0">typeof </span><span class="s1">sourceMap.map.originalPositionFor === </span><span class="s2">'function'</span><span class="s1">) {</span>
+    <span class="s0">var </span><span class="s1">originalPosition = sourceMap.map.originalPositionFor(position);</span>
+
+    <span class="s3">// Only return the original position if a matching line was found. If no</span>
+    <span class="s3">// matching line is found then we return position instead, which will cause</span>
+    <span class="s3">// the stack trace to print the path and line for the compiled file. It is</span>
+    <span class="s3">// better to give a precise location in the compiled file than a vague</span>
+    <span class="s3">// location in the original file.</span>
+    <span class="s0">if </span><span class="s1">(originalPosition.source !== </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s1">originalPosition.source = supportRelativeURL(</span>
+        <span class="s1">sourceMap.url, originalPosition.source);</span>
+      <span class="s0">return </span><span class="s1">originalPosition;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">return </span><span class="s1">position;</span>
+<span class="s1">}</span>
+
+<span class="s3">// Parses code generated by FormatEvalOrigin(), a function inside V8:</span>
+<span class="s3">// https://code.google.com/p/v8/source/browse/trunk/src/messages.js</span>
+<span class="s0">function </span><span class="s1">mapEvalOrigin(origin) {</span>
+  <span class="s3">// Most eval() calls are in this format</span>
+  <span class="s0">var </span><span class="s1">match = /^eval at ([^(]+) \((.+):(\d+):(\d+)\)$/.exec(origin);</span>
+  <span class="s0">if </span><span class="s1">(match) {</span>
+    <span class="s0">var </span><span class="s1">position = mapSourcePosition({</span>
+      <span class="s1">source: match[</span><span class="s4">2</span><span class="s1">],</span>
+      <span class="s1">line: +match[</span><span class="s4">3</span><span class="s1">],</span>
+      <span class="s1">column: match[</span><span class="s4">4</span><span class="s1">] - </span><span class="s4">1</span>
+    <span class="s1">});</span>
+    <span class="s0">return </span><span class="s2">'eval at ' </span><span class="s1">+ match[</span><span class="s4">1</span><span class="s1">] + </span><span class="s2">' (' </span><span class="s1">+ position.source + </span><span class="s2">':' </span><span class="s1">+</span>
+      <span class="s1">position.line + </span><span class="s2">':' </span><span class="s1">+ (position.column + </span><span class="s4">1</span><span class="s1">) + </span><span class="s2">')'</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Parse nested eval() calls using recursion</span>
+  <span class="s1">match = /^eval at ([^(]+) \((.+)\)$/.exec(origin);</span>
+  <span class="s0">if </span><span class="s1">(match) {</span>
+    <span class="s0">return </span><span class="s2">'eval at ' </span><span class="s1">+ match[</span><span class="s4">1</span><span class="s1">] + </span><span class="s2">' (' </span><span class="s1">+ mapEvalOrigin(match[</span><span class="s4">2</span><span class="s1">]) + </span><span class="s2">')'</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Make sure we still return useful information if we didn't find anything</span>
+  <span class="s0">return </span><span class="s1">origin;</span>
+<span class="s1">}</span>
+
+<span class="s3">// This is copied almost verbatim from the V8 source code at</span>
+<span class="s3">// https://code.google.com/p/v8/source/browse/trunk/src/messages.js. The</span>
+<span class="s3">// implementation of wrapCallSite() used to just forward to the actual source</span>
+<span class="s3">// code of CallSite.prototype.toString but unfortunately a new release of V8</span>
+<span class="s3">// did something to the prototype chain and broke the shim. The only fix I</span>
+<span class="s3">// could find was copy/paste.</span>
+<span class="s0">function </span><span class="s1">CallSiteToString() {</span>
+  <span class="s0">var </span><span class="s1">fileName;</span>
+  <span class="s0">var </span><span class="s1">fileLocation = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+  <span class="s0">if </span><span class="s1">(</span><span class="s0">this</span><span class="s1">.isNative()) {</span>
+    <span class="s1">fileLocation = </span><span class="s2">&quot;native&quot;</span><span class="s1">;</span>
+  <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+    <span class="s1">fileName = </span><span class="s0">this</span><span class="s1">.getScriptNameOrSourceURL();</span>
+    <span class="s0">if </span><span class="s1">(!fileName &amp;&amp; </span><span class="s0">this</span><span class="s1">.isEval()) {</span>
+      <span class="s1">fileLocation = </span><span class="s0">this</span><span class="s1">.getEvalOrigin();</span>
+      <span class="s1">fileLocation += </span><span class="s2">&quot;, &quot;</span><span class="s1">;  </span><span class="s3">// Expecting source position to follow.</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(fileName) {</span>
+      <span class="s1">fileLocation += fileName;</span>
+    <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+      <span class="s3">// Source code does not originate from a file and is not native, but we</span>
+      <span class="s3">// can still get the source position inside the source string, e.g. in</span>
+      <span class="s3">// an eval string.</span>
+      <span class="s1">fileLocation += </span><span class="s2">&quot;&lt;anonymous&gt;&quot;</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s0">var </span><span class="s1">lineNumber = </span><span class="s0">this</span><span class="s1">.getLineNumber();</span>
+    <span class="s0">if </span><span class="s1">(lineNumber != </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s1">fileLocation += </span><span class="s2">&quot;:&quot; </span><span class="s1">+ lineNumber;</span>
+      <span class="s0">var </span><span class="s1">columnNumber = </span><span class="s0">this</span><span class="s1">.getColumnNumber();</span>
+      <span class="s0">if </span><span class="s1">(columnNumber) {</span>
+        <span class="s1">fileLocation += </span><span class="s2">&quot;:&quot; </span><span class="s1">+ columnNumber;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">var </span><span class="s1">line = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+  <span class="s0">var </span><span class="s1">functionName = </span><span class="s0">this</span><span class="s1">.getFunctionName();</span>
+  <span class="s0">var </span><span class="s1">addSuffix = </span><span class="s0">true</span><span class="s1">;</span>
+  <span class="s0">var </span><span class="s1">isConstructor = </span><span class="s0">this</span><span class="s1">.isConstructor();</span>
+  <span class="s0">var </span><span class="s1">isMethodCall = !(</span><span class="s0">this</span><span class="s1">.isToplevel() || isConstructor);</span>
+  <span class="s0">if </span><span class="s1">(isMethodCall) {</span>
+    <span class="s0">var </span><span class="s1">typeName = </span><span class="s0">this</span><span class="s1">.getTypeName();</span>
+    <span class="s3">// Fixes shim to be backward compatable with Node v0 to v4</span>
+    <span class="s0">if </span><span class="s1">(typeName === </span><span class="s2">&quot;[object Object]&quot;</span><span class="s1">) {</span>
+      <span class="s1">typeName = </span><span class="s2">&quot;null&quot;</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s0">var </span><span class="s1">methodName = </span><span class="s0">this</span><span class="s1">.getMethodName();</span>
+    <span class="s0">if </span><span class="s1">(functionName) {</span>
+      <span class="s0">if </span><span class="s1">(typeName &amp;&amp; functionName.indexOf(typeName) != </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">line += typeName + </span><span class="s2">&quot;.&quot;</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">line += functionName;</span>
+      <span class="s0">if </span><span class="s1">(methodName &amp;&amp; functionName.indexOf(</span><span class="s2">&quot;.&quot; </span><span class="s1">+ methodName) != functionName.length - methodName.length - </span><span class="s4">1</span><span class="s1">) {</span>
+        <span class="s1">line += </span><span class="s2">&quot; [as &quot; </span><span class="s1">+ methodName + </span><span class="s2">&quot;]&quot;</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+      <span class="s1">line += typeName + </span><span class="s2">&quot;.&quot; </span><span class="s1">+ (methodName || </span><span class="s2">&quot;&lt;anonymous&gt;&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s0">else if </span><span class="s1">(isConstructor) {</span>
+    <span class="s1">line += </span><span class="s2">&quot;new &quot; </span><span class="s1">+ (functionName || </span><span class="s2">&quot;&lt;anonymous&gt;&quot;</span><span class="s1">);</span>
+  <span class="s1">} </span><span class="s0">else if </span><span class="s1">(functionName) {</span>
+    <span class="s1">line += functionName;</span>
+  <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+    <span class="s1">line += fileLocation;</span>
+    <span class="s1">addSuffix = </span><span class="s0">false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s0">if </span><span class="s1">(addSuffix) {</span>
+    <span class="s1">line += </span><span class="s2">&quot; (&quot; </span><span class="s1">+ fileLocation + </span><span class="s2">&quot;)&quot;</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s0">return </span><span class="s1">line;</span>
+<span class="s1">}</span>
+
+<span class="s0">function </span><span class="s1">cloneCallSite(frame) {</span>
+  <span class="s0">var </span><span class="s1">object = {};</span>
+  <span class="s1">Object.getOwnPropertyNames(Object.getPrototypeOf(frame)).forEach(</span><span class="s0">function</span><span class="s1">(name) {</span>
+    <span class="s1">object[name] = /^(?:is|get)/.test(name) ? </span><span class="s0">function</span><span class="s1">() { </span><span class="s0">return </span><span class="s1">frame[name].call(frame); } : frame[name];</span>
+  <span class="s1">});</span>
+  <span class="s1">object.toString = CallSiteToString;</span>
+  <span class="s0">return </span><span class="s1">object;</span>
+<span class="s1">}</span>
+
+<span class="s0">function </span><span class="s1">wrapCallSite(frame) {</span>
+  <span class="s0">if</span><span class="s1">(frame.isNative()) {</span>
+    <span class="s0">return </span><span class="s1">frame;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Most call sites will return the source file from getFileName(), but code</span>
+  <span class="s3">// passed to eval() ending in &quot;//# sourceURL=...&quot; will return the source file</span>
+  <span class="s3">// from getScriptNameOrSourceURL() instead</span>
+  <span class="s0">var </span><span class="s1">source = frame.getFileName() || frame.getScriptNameOrSourceURL();</span>
+  <span class="s0">if </span><span class="s1">(source) {</span>
+    <span class="s0">var </span><span class="s1">line = frame.getLineNumber();</span>
+    <span class="s0">var </span><span class="s1">column = frame.getColumnNumber() - </span><span class="s4">1</span><span class="s1">;</span>
+
+    <span class="s3">// Fix position in Node where some (internal) code is prepended.</span>
+    <span class="s3">// See https://github.com/evanw/node-source-map-support/issues/36</span>
+    <span class="s0">var </span><span class="s1">headerLength = </span><span class="s4">62</span><span class="s1">;</span>
+    <span class="s0">if </span><span class="s1">(line === </span><span class="s4">1 </span><span class="s1">&amp;&amp; column &gt; headerLength &amp;&amp; !isInBrowser() &amp;&amp; !frame.isEval()) {</span>
+      <span class="s1">column -= headerLength;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">var </span><span class="s1">position = mapSourcePosition({</span>
+      <span class="s1">source: source,</span>
+      <span class="s1">line: line,</span>
+      <span class="s1">column: column</span>
+    <span class="s1">});</span>
+    <span class="s1">frame = cloneCallSite(frame);</span>
+    <span class="s0">var </span><span class="s1">originalFunctionName = frame.getFunctionName;</span>
+    <span class="s1">frame.getFunctionName = </span><span class="s0">function</span><span class="s1">() { </span><span class="s0">return </span><span class="s1">position.name || originalFunctionName(); };</span>
+    <span class="s1">frame.getFileName = </span><span class="s0">function</span><span class="s1">() { </span><span class="s0">return </span><span class="s1">position.source; };</span>
+    <span class="s1">frame.getLineNumber = </span><span class="s0">function</span><span class="s1">() { </span><span class="s0">return </span><span class="s1">position.line; };</span>
+    <span class="s1">frame.getColumnNumber = </span><span class="s0">function</span><span class="s1">() { </span><span class="s0">return </span><span class="s1">position.column + </span><span class="s4">1</span><span class="s1">; };</span>
+    <span class="s1">frame.getScriptNameOrSourceURL = </span><span class="s0">function</span><span class="s1">() { </span><span class="s0">return </span><span class="s1">position.source; };</span>
+    <span class="s0">return </span><span class="s1">frame;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Code called using eval() needs special handling</span>
+  <span class="s0">var </span><span class="s1">origin = frame.isEval() &amp;&amp; frame.getEvalOrigin();</span>
+  <span class="s0">if </span><span class="s1">(origin) {</span>
+    <span class="s1">origin = mapEvalOrigin(origin);</span>
+    <span class="s1">frame = cloneCallSite(frame);</span>
+    <span class="s1">frame.getEvalOrigin = </span><span class="s0">function</span><span class="s1">() { </span><span class="s0">return </span><span class="s1">origin; };</span>
+    <span class="s0">return </span><span class="s1">frame;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// If we get here then we were unable to change the source position</span>
+  <span class="s0">return </span><span class="s1">frame;</span>
+<span class="s1">}</span>
+
+<span class="s3">// This function is part of the V8 stack trace API, for more info see:</span>
+<span class="s3">// https://v8.dev/docs/stack-trace-api</span>
+<span class="s0">function </span><span class="s1">prepareStackTrace(error, stack) {</span>
+  <span class="s0">if </span><span class="s1">(emptyCacheBetweenOperations) {</span>
+    <span class="s1">fileContentsCache = {};</span>
+    <span class="s1">sourceMapCache = {};</span>
+  <span class="s1">}</span>
+
+  <span class="s0">var </span><span class="s1">name = error.name || </span><span class="s2">'Error'</span><span class="s1">;</span>
+  <span class="s0">var </span><span class="s1">message = error.message || </span><span class="s2">''</span><span class="s1">;</span>
+  <span class="s0">var </span><span class="s1">errorString = name + </span><span class="s2">&quot;: &quot; </span><span class="s1">+ message;</span>
+
+  <span class="s0">return </span><span class="s1">errorString + stack.map(</span><span class="s0">function</span><span class="s1">(frame) {</span>
+    <span class="s0">return </span><span class="s2">'</span><span class="s6">\n    </span><span class="s2">at ' </span><span class="s1">+ wrapCallSite(frame);</span>
+  <span class="s1">}).join(</span><span class="s2">''</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s3">// Generate position and snippet of original source with pointer</span>
+<span class="s0">function </span><span class="s1">getErrorSource(error) {</span>
+  <span class="s0">var </span><span class="s1">match = /\n    at [^(]+ \((.*):(\d+):(\d+)\)/.exec(error.stack);</span>
+  <span class="s0">if </span><span class="s1">(match) {</span>
+    <span class="s0">var </span><span class="s1">source = match[</span><span class="s4">1</span><span class="s1">];</span>
+    <span class="s0">var </span><span class="s1">line = +match[</span><span class="s4">2</span><span class="s1">];</span>
+    <span class="s0">var </span><span class="s1">column = +match[</span><span class="s4">3</span><span class="s1">];</span>
+
+    <span class="s3">// Support the inline sourceContents inside the source map</span>
+    <span class="s0">var </span><span class="s1">contents = fileContentsCache[source];</span>
+
+    <span class="s3">// Support files on disk</span>
+    <span class="s0">if </span><span class="s1">(!contents &amp;&amp; fs &amp;&amp; fs.existsSync(source)) {</span>
+      <span class="s0">try </span><span class="s1">{</span>
+        <span class="s1">contents = fs.readFileSync(source, </span><span class="s2">'utf8'</span><span class="s1">);</span>
+      <span class="s1">} </span><span class="s0">catch </span><span class="s1">(er) {</span>
+        <span class="s1">contents = </span><span class="s2">''</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s3">// Format the line from the original source code like node does</span>
+    <span class="s0">if </span><span class="s1">(contents) {</span>
+      <span class="s0">var </span><span class="s1">code = contents.split(/(?:\r\n|\r|\n)/)[line - </span><span class="s4">1</span><span class="s1">];</span>
+      <span class="s0">if </span><span class="s1">(code) {</span>
+        <span class="s0">return </span><span class="s1">source + </span><span class="s2">':' </span><span class="s1">+ line + </span><span class="s2">'</span><span class="s6">\n</span><span class="s2">' </span><span class="s1">+ code + </span><span class="s2">'</span><span class="s6">\n</span><span class="s2">' </span><span class="s1">+</span>
+          <span class="s0">new </span><span class="s1">Array(column).join(</span><span class="s2">' '</span><span class="s1">) + </span><span class="s2">'^'</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s0">return null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">function </span><span class="s1">printErrorAndExit (error) {</span>
+  <span class="s0">var </span><span class="s1">source = getErrorSource(error);</span>
+
+  <span class="s3">// Ensure error is printed synchronously and not truncated</span>
+  <span class="s0">if </span><span class="s1">(process.stderr._handle &amp;&amp; process.stderr._handle.setBlocking) {</span>
+    <span class="s1">process.stderr._handle.setBlocking(</span><span class="s0">true</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">if </span><span class="s1">(source) {</span>
+    <span class="s1">console.error();</span>
+    <span class="s1">console.error(source);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">console.error(error.stack);</span>
+  <span class="s1">process.exit(</span><span class="s4">1</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">function </span><span class="s1">shimEmitUncaughtException () {</span>
+  <span class="s0">var </span><span class="s1">origEmit = process.emit;</span>
+
+  <span class="s1">process.emit = </span><span class="s0">function </span><span class="s1">(type) {</span>
+    <span class="s0">if </span><span class="s1">(type === </span><span class="s2">'uncaughtException'</span><span class="s1">) {</span>
+      <span class="s0">var </span><span class="s1">hasStack = (arguments[</span><span class="s4">1</span><span class="s1">] &amp;&amp; arguments[</span><span class="s4">1</span><span class="s1">].stack);</span>
+      <span class="s0">var </span><span class="s1">hasListeners = (</span><span class="s0">this</span><span class="s1">.listeners(type).length &gt; </span><span class="s4">0</span><span class="s1">);</span>
+
+      <span class="s0">if </span><span class="s1">(hasStack &amp;&amp; !hasListeners) {</span>
+        <span class="s0">return </span><span class="s1">printErrorAndExit(arguments[</span><span class="s4">1</span><span class="s1">]);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">return </span><span class="s1">origEmit.apply(</span><span class="s0">this</span><span class="s1">, arguments);</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s0">var </span><span class="s1">originalRetrieveFileHandlers = retrieveFileHandlers.slice(</span><span class="s4">0</span><span class="s1">);</span>
+<span class="s0">var </span><span class="s1">originalRetrieveMapHandlers = retrieveMapHandlers.slice(</span><span class="s4">0</span><span class="s1">);</span>
+
+<span class="s1">exports.wrapCallSite = wrapCallSite;</span>
+<span class="s1">exports.getErrorSource = getErrorSource;</span>
+<span class="s1">exports.mapSourcePosition = mapSourcePosition;</span>
+<span class="s1">exports.retrieveSourceMap = retrieveSourceMap;</span>
+
+<span class="s1">exports.install = </span><span class="s0">function</span><span class="s1">(options) {</span>
+  <span class="s1">options = options || {};</span>
+
+  <span class="s0">if </span><span class="s1">(options.environment) {</span>
+    <span class="s1">environment = options.environment;</span>
+    <span class="s0">if </span><span class="s1">([</span><span class="s2">&quot;node&quot;</span><span class="s1">, </span><span class="s2">&quot;browser&quot;</span><span class="s1">, </span><span class="s2">&quot;auto&quot;</span><span class="s1">].indexOf(environment) === -</span><span class="s4">1</span><span class="s1">) {</span>
+      <span class="s0">throw new </span><span class="s1">Error(</span><span class="s2">&quot;environment &quot; </span><span class="s1">+ environment + </span><span class="s2">&quot; was unknown. Available options are {auto, browser, node}&quot;</span><span class="s1">)</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Allow sources to be found by methods other than reading the files</span>
+  <span class="s3">// directly from disk.</span>
+  <span class="s0">if </span><span class="s1">(options.retrieveFile) {</span>
+    <span class="s0">if </span><span class="s1">(options.overrideRetrieveFile) {</span>
+      <span class="s1">retrieveFileHandlers.length = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">retrieveFileHandlers.unshift(options.retrieveFile);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Allow source maps to be found by methods other than reading the files</span>
+  <span class="s3">// directly from disk.</span>
+  <span class="s0">if </span><span class="s1">(options.retrieveSourceMap) {</span>
+    <span class="s0">if </span><span class="s1">(options.overrideRetrieveSourceMap) {</span>
+      <span class="s1">retrieveMapHandlers.length = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">retrieveMapHandlers.unshift(options.retrieveSourceMap);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Support runtime transpilers that include inline source maps</span>
+  <span class="s0">if </span><span class="s1">(options.hookRequire &amp;&amp; !isInBrowser()) {</span>
+    <span class="s0">var </span><span class="s1">Module;</span>
+    <span class="s0">try </span><span class="s1">{</span>
+      <span class="s1">Module = require(</span><span class="s2">'module'</span><span class="s1">);</span>
+    <span class="s1">} </span><span class="s0">catch </span><span class="s1">(err) {</span>
+      <span class="s3">// NOP: Loading in catch block to convert webpack error to warning.</span>
+    <span class="s1">}</span>
+    <span class="s0">var </span><span class="s1">$compile = Module.prototype._compile;</span>
+
+    <span class="s0">if </span><span class="s1">(!$compile.__sourceMapSupport) {</span>
+      <span class="s1">Module.prototype._compile = </span><span class="s0">function</span><span class="s1">(content, filename) {</span>
+        <span class="s1">fileContentsCache[filename] = content;</span>
+        <span class="s1">sourceMapCache[filename] = undefined;</span>
+        <span class="s0">return </span><span class="s1">$compile.call(</span><span class="s0">this</span><span class="s1">, content, filename);</span>
+      <span class="s1">};</span>
+
+      <span class="s1">Module.prototype._compile.__sourceMapSupport = </span><span class="s0">true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Configure options</span>
+  <span class="s0">if </span><span class="s1">(!emptyCacheBetweenOperations) {</span>
+    <span class="s1">emptyCacheBetweenOperations = </span><span class="s2">'emptyCacheBetweenOperations' </span><span class="s0">in </span><span class="s1">options ?</span>
+      <span class="s1">options.emptyCacheBetweenOperations : </span><span class="s0">false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Install the error reformatter</span>
+  <span class="s0">if </span><span class="s1">(!errorFormatterInstalled) {</span>
+    <span class="s1">errorFormatterInstalled = </span><span class="s0">true</span><span class="s1">;</span>
+    <span class="s1">Error.prepareStackTrace = prepareStackTrace;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">if </span><span class="s1">(!uncaughtShimInstalled) {</span>
+    <span class="s0">var </span><span class="s1">installHandler = </span><span class="s2">'handleUncaughtExceptions' </span><span class="s0">in </span><span class="s1">options ?</span>
+      <span class="s1">options.handleUncaughtExceptions : </span><span class="s0">true</span><span class="s1">;</span>
+
+    <span class="s3">// Provide the option to not install the uncaught exception handler. This is</span>
+    <span class="s3">// to support other uncaught exception handlers (in test frameworks, for</span>
+    <span class="s3">// example). If this handler is not installed and there are no other uncaught</span>
+    <span class="s3">// exception handlers, uncaught exceptions will be caught by node's built-in</span>
+    <span class="s3">// exception handler and the process will still be terminated. However, the</span>
+    <span class="s3">// generated JavaScript code will be shown above the stack trace instead of</span>
+    <span class="s3">// the original source code.</span>
+    <span class="s0">if </span><span class="s1">(installHandler &amp;&amp; hasGlobalProcessEventEmitter()) {</span>
+      <span class="s1">uncaughtShimInstalled = </span><span class="s0">true</span><span class="s1">;</span>
+      <span class="s1">shimEmitUncaughtException();</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">};</span>
+
+<span class="s1">exports.resetRetrieveHandlers = </span><span class="s0">function</span><span class="s1">() {</span>
+  <span class="s1">retrieveFileHandlers.length = </span><span class="s4">0</span><span class="s1">;</span>
+  <span class="s1">retrieveMapHandlers.length = </span><span class="s4">0</span><span class="s1">;</span>
+
+  <span class="s1">retrieveFileHandlers = originalRetrieveFileHandlers.slice(</span><span class="s4">0</span><span class="s1">);</span>
+  <span class="s1">retrieveMapHandlers = originalRetrieveMapHandlers.slice(</span><span class="s4">0</span><span class="s1">);</span>
+  
+  <span class="s1">retrieveSourceMap = handlerExec(retrieveMapHandlers);</span>
+  <span class="s1">retrieveFile = handlerExec(retrieveFileHandlers);</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

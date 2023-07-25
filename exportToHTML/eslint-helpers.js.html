@@ -1,0 +1,926 @@
+<html>
+<head>
+<title>eslint-helpers.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #4646f1;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+eslint-helpers.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Helper functions for ESLint class 
+ * @author Nicholas C. Zakas 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s1">const path = require(</span><span class="s2">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s1">const fs = require(</span><span class="s2">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const fsp = fs.promises;</span>
+<span class="s1">const isGlob = require(</span><span class="s2">&quot;is-glob&quot;</span><span class="s1">);</span>
+<span class="s1">const hash = require(</span><span class="s2">&quot;../cli-engine/hash&quot;</span><span class="s1">);</span>
+<span class="s1">const minimatch = require(</span><span class="s2">&quot;minimatch&quot;</span><span class="s1">);</span>
+<span class="s1">const util = require(</span><span class="s2">&quot;util&quot;</span><span class="s1">);</span>
+<span class="s1">const fswalk = require(</span><span class="s2">&quot;@nodelib/fs.walk&quot;</span><span class="s1">);</span>
+<span class="s1">const globParent = require(</span><span class="s2">&quot;glob-parent&quot;</span><span class="s1">);</span>
+<span class="s1">const isPathInside = require(</span><span class="s2">&quot;is-path-inside&quot;</span><span class="s1">);</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Fixup references</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s1">const doFsWalk = util.promisify(fswalk.walk);</span>
+<span class="s1">const Minimatch = minimatch.Minimatch;</span>
+<span class="s1">const MINIMATCH_OPTIONS = { dot: </span><span class="s3">true </span><span class="s1">};</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Types</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * @typedef {Object} GlobSearch 
+ * @property {Array&lt;string&gt;} patterns The normalized patterns to use for a search. 
+ * @property {Array&lt;string&gt;} rawPatterns The patterns as entered by the user 
+ *      before doing any normalization. 
+ */</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Errors</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * The error type when no files match a glob. 
+ */</span>
+<span class="s1">class NoFilesFoundError extends Error {</span>
+
+    <span class="s0">/** 
+     * @param {string} pattern The glob pattern which was not found. 
+     * @param {boolean} globEnabled If `false` then the pattern was a glob pattern, but glob was disabled. 
+     */</span>
+    <span class="s1">constructor(pattern, globEnabled) {</span>
+        <span class="s1">super(`No files matching </span><span class="s2">'${pattern}' </span><span class="s1">were found${!globEnabled ? </span><span class="s2">&quot; (glob was disabled)&quot; </span><span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s1">}.`);</span>
+        <span class="s3">this</span><span class="s1">.messageTemplate = </span><span class="s2">&quot;file-not-found&quot;</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.messageData = { pattern, globDisabled: !globEnabled };</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * The error type when a search fails to match multiple patterns. 
+ */</span>
+<span class="s1">class UnmatchedSearchPatternsError extends Error {</span>
+
+    <span class="s0">/** 
+     * @param {Object} options The options for the error. 
+     * @param {string} options.basePath The directory that was searched. 
+     * @param {Array&lt;string&gt;} options.unmatchedPatterns The glob patterns 
+     *      which were not found. 
+     * @param {Array&lt;string&gt;} options.patterns The glob patterns that were 
+     *      searched. 
+     * @param {Array&lt;string&gt;} options.rawPatterns The raw glob patterns that 
+     *      were searched. 
+     */</span>
+    <span class="s1">constructor({ basePath, unmatchedPatterns, patterns, rawPatterns }) {</span>
+        <span class="s1">super(`No files matching </span><span class="s2">'${rawPatterns}' </span><span class="s3">in </span><span class="s2">'${basePath}' </span><span class="s1">were found.`);</span>
+        <span class="s3">this</span><span class="s1">.basePath = basePath;</span>
+        <span class="s3">this</span><span class="s1">.unmatchedPatterns = unmatchedPatterns;</span>
+        <span class="s3">this</span><span class="s1">.patterns = patterns;</span>
+        <span class="s3">this</span><span class="s1">.rawPatterns = rawPatterns;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * The error type when there are files matched by a glob, but all of them have been ignored. 
+ */</span>
+<span class="s1">class AllFilesIgnoredError extends Error {</span>
+
+    <span class="s0">/** 
+     * @param {string} pattern The glob pattern which was not found. 
+     */</span>
+    <span class="s1">constructor(pattern) {</span>
+        <span class="s1">super(`All files matched by </span><span class="s2">'${pattern}' </span><span class="s1">are ignored.`);</span>
+        <span class="s3">this</span><span class="s1">.messageTemplate = </span><span class="s2">&quot;all-files-ignored&quot;</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.messageData = { pattern };</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// General Helpers</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Check if a given value is a non-empty string or not. 
+ * @param {any} x The value to check. 
+ * @returns {boolean} `true` if `x` is a non-empty string. 
+ */</span>
+<span class="s3">function </span><span class="s1">isNonEmptyString(x) {</span>
+    <span class="s3">return typeof </span><span class="s1">x === </span><span class="s2">&quot;string&quot; </span><span class="s1">&amp;&amp; x.trim() !== </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Check if a given value is an array of non-empty strings or not. 
+ * @param {any} x The value to check. 
+ * @returns {boolean} `true` if `x` is an array of non-empty strings. 
+ */</span>
+<span class="s3">function </span><span class="s1">isArrayOfNonEmptyString(x) {</span>
+    <span class="s3">return </span><span class="s1">Array.isArray(x) &amp;&amp; x.every(isNonEmptyString);</span>
+<span class="s1">}</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// File-related Helpers</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Normalizes slashes in a file pattern to posix-style. 
+ * @param {string} pattern The pattern to replace slashes in. 
+ * @returns {string} The pattern with slashes normalized. 
+ */</span>
+<span class="s3">function </span><span class="s1">normalizeToPosix(pattern) {</span>
+    <span class="s3">return </span><span class="s1">pattern.replace(/\\/gu, </span><span class="s2">&quot;/&quot;</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Check if a string is a glob pattern or not. 
+ * @param {string} pattern A glob pattern. 
+ * @returns {boolean} `true` if the string is a glob pattern. 
+ */</span>
+<span class="s3">function </span><span class="s1">isGlobPattern(pattern) {</span>
+    <span class="s3">return </span><span class="s1">isGlob(path.sep === </span><span class="s2">&quot;</span><span class="s4">\\</span><span class="s2">&quot; </span><span class="s1">? normalizeToPosix(pattern) : pattern);</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/** 
+ * Determines if a given glob pattern will return any results. 
+ * Used primarily to help with useful error messages. 
+ * @param {Object} options The options for the function. 
+ * @param {string} options.basePath The directory to search. 
+ * @param {string} options.pattern A glob pattern to match. 
+ * @returns {Promise&lt;boolean&gt;} True if there is a glob match, false if not. 
+ */</span>
+<span class="s3">function </span><span class="s1">globMatch({ basePath, pattern }) {</span>
+
+    <span class="s1">let found = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s1">const patternToUse = path.isAbsolute(pattern)</span>
+        <span class="s1">? normalizeToPosix(path.relative(basePath, pattern))</span>
+        <span class="s1">: pattern;</span>
+
+    <span class="s1">const matcher = </span><span class="s3">new </span><span class="s1">Minimatch(patternToUse, MINIMATCH_OPTIONS);</span>
+
+    <span class="s1">const fsWalkSettings = {</span>
+
+        <span class="s1">deepFilter(entry) {</span>
+            <span class="s1">const relativePath = normalizeToPosix(path.relative(basePath, entry.path));</span>
+
+            <span class="s3">return </span><span class="s1">!found &amp;&amp; matcher.match(relativePath, </span><span class="s3">true</span><span class="s1">);</span>
+        <span class="s1">},</span>
+
+        <span class="s1">entryFilter(entry) {</span>
+            <span class="s3">if </span><span class="s1">(found || entry.dirent.isDirectory()) {</span>
+                <span class="s3">return false</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s1">const relativePath = normalizeToPosix(path.relative(basePath, entry.path));</span>
+
+            <span class="s3">if </span><span class="s1">(matcher.match(relativePath)) {</span>
+                <span class="s1">found = </span><span class="s3">true</span><span class="s1">;</span>
+                <span class="s3">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s3">return false</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">};</span>
+
+    <span class="s3">return new </span><span class="s1">Promise(resolve =&gt; {</span>
+
+        <span class="s0">// using a stream so we can exit early because we just need one match</span>
+        <span class="s1">const globStream = fswalk.walkStream(basePath, fsWalkSettings);</span>
+
+        <span class="s1">globStream.on(</span><span class="s2">&quot;data&quot;</span><span class="s1">, () =&gt; {</span>
+            <span class="s1">globStream.destroy();</span>
+            <span class="s1">resolve(</span><span class="s3">true</span><span class="s1">);</span>
+        <span class="s1">});</span>
+
+        <span class="s0">// swallow errors as they're not important here</span>
+        <span class="s1">globStream.on(</span><span class="s2">&quot;error&quot;</span><span class="s1">, () =&gt; { });</span>
+
+        <span class="s1">globStream.on(</span><span class="s2">&quot;end&quot;</span><span class="s1">, () =&gt; {</span>
+            <span class="s1">resolve(</span><span class="s3">false</span><span class="s1">);</span>
+        <span class="s1">});</span>
+        <span class="s1">globStream.read();</span>
+    <span class="s1">});</span>
+
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Searches a directory looking for matching glob patterns. This uses 
+ * the config array's logic to determine if a directory or file should 
+ * be ignored, so it is consistent with how ignoring works throughout 
+ * ESLint. 
+ * @param {Object} options The options for this function. 
+ * @param {string} options.basePath The directory to search. 
+ * @param {Array&lt;string&gt;} options.patterns An array of glob patterns 
+ *      to match. 
+ * @param {Array&lt;string&gt;} options.rawPatterns An array of glob patterns 
+ *      as the user inputted them. Used for errors. 
+ * @param {FlatConfigArray} options.configs The config array to use for 
+ *      determining what to ignore. 
+ * @param {boolean} options.errorOnUnmatchedPattern Determines if an error 
+ *      should be thrown when a pattern is unmatched. 
+ * @returns {Promise&lt;Array&lt;string&gt;&gt;} An array of matching file paths 
+ *      or an empty array if there are no matches. 
+ * @throws {UnmatchedSearchPatternsError} If there is a pattern that doesn't 
+ *      match any files. 
+ */</span>
+<span class="s1">async </span><span class="s3">function </span><span class="s1">globSearch({</span>
+    <span class="s1">basePath,</span>
+    <span class="s1">patterns,</span>
+    <span class="s1">rawPatterns,</span>
+    <span class="s1">configs,</span>
+    <span class="s1">errorOnUnmatchedPattern</span>
+<span class="s1">}) {</span>
+
+    <span class="s3">if </span><span class="s1">(patterns.length === </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">[];</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* 
+     * In this section we are converting the patterns into Minimatch 
+     * instances for performance reasons. Because we are doing the same 
+     * matches repeatedly, it's best to compile those patterns once and 
+     * reuse them multiple times. 
+     * 
+     * To do that, we convert any patterns with an absolute path into a 
+     * relative path and normalize it to Posix-style slashes. We also keep 
+     * track of the relative patterns to map them back to the original 
+     * patterns, which we need in order to throw an error if there are any 
+     * unmatched patterns. 
+     */</span>
+    <span class="s1">const relativeToPatterns = </span><span class="s3">new </span><span class="s1">Map();</span>
+    <span class="s1">const matchers = patterns.map((pattern, i) =&gt; {</span>
+        <span class="s1">const patternToUse = path.isAbsolute(pattern)</span>
+            <span class="s1">? normalizeToPosix(path.relative(basePath, pattern))</span>
+            <span class="s1">: pattern;</span>
+
+        <span class="s1">relativeToPatterns.set(patternToUse, patterns[i]);</span>
+
+        <span class="s3">return new </span><span class="s1">Minimatch(patternToUse, MINIMATCH_OPTIONS);</span>
+    <span class="s1">});</span>
+
+    <span class="s0">/* 
+     * We track unmatched patterns because we may want to throw an error when 
+     * they occur. To start, this set is initialized with all of the patterns. 
+     * Every time a match occurs, the pattern is removed from the set, making 
+     * it easy to tell if we have any unmatched patterns left at the end of 
+     * search. 
+     */</span>
+    <span class="s1">const unmatchedPatterns = </span><span class="s3">new </span><span class="s1">Set([...relativeToPatterns.keys()]);</span>
+
+    <span class="s1">const filePaths = (await doFsWalk(basePath, {</span>
+
+        <span class="s1">deepFilter(entry) {</span>
+            <span class="s1">const relativePath = normalizeToPosix(path.relative(basePath, entry.path));</span>
+            <span class="s1">const matchesPattern = matchers.some(matcher =&gt; matcher.match(relativePath, </span><span class="s3">true</span><span class="s1">));</span>
+
+            <span class="s3">return </span><span class="s1">matchesPattern &amp;&amp; !configs.isDirectoryIgnored(entry.path);</span>
+        <span class="s1">},</span>
+        <span class="s1">entryFilter(entry) {</span>
+            <span class="s1">const relativePath = normalizeToPosix(path.relative(basePath, entry.path));</span>
+
+            <span class="s0">// entries may be directories or files so filter out directories</span>
+            <span class="s3">if </span><span class="s1">(entry.dirent.isDirectory()) {</span>
+                <span class="s3">return false</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">/* 
+             * Optimization: We need to track when patterns are left unmatched 
+             * and so we use `unmatchedPatterns` to do that. There is a bit of 
+             * complexity here because the same file can be matched by more than 
+             * one pattern. So, when we start, we actually need to test every 
+             * pattern against every file. Once we know there are no remaining 
+             * unmatched patterns, then we can switch to just looking for the 
+             * first matching pattern for improved speed. 
+             */</span>
+            <span class="s1">const matchesPattern = unmatchedPatterns.size &gt; </span><span class="s5">0</span>
+                <span class="s1">? matchers.reduce((previousValue, matcher) =&gt; {</span>
+                    <span class="s1">const pathMatches = matcher.match(relativePath);</span>
+
+                    <span class="s0">/* 
+                     * We updated the unmatched patterns set only if the path 
+                     * matches and the file isn't ignored. If the file is 
+                     * ignored, that means there wasn't a match for the 
+                     * pattern so it should not be removed. 
+                     * 
+                     * Performance note: isFileIgnored() aggressively caches 
+                     * results so there is no performance penalty for calling 
+                     * it twice with the same argument. 
+                     */</span>
+                    <span class="s3">if </span><span class="s1">(pathMatches &amp;&amp; !configs.isFileIgnored(entry.path)) {</span>
+                        <span class="s1">unmatchedPatterns.</span><span class="s3">delete</span><span class="s1">(matcher.pattern);</span>
+                    <span class="s1">}</span>
+
+                    <span class="s3">return </span><span class="s1">pathMatches || previousValue;</span>
+                <span class="s1">}, </span><span class="s3">false</span><span class="s1">)</span>
+                <span class="s1">: matchers.some(matcher =&gt; matcher.match(relativePath));</span>
+
+            <span class="s3">return </span><span class="s1">matchesPattern &amp;&amp; !configs.isFileIgnored(entry.path);</span>
+        <span class="s1">}</span>
+
+    <span class="s1">})).map(entry =&gt; entry.path);</span>
+
+    <span class="s0">// now check to see if we have any unmatched patterns</span>
+    <span class="s3">if </span><span class="s1">(errorOnUnmatchedPattern &amp;&amp; unmatchedPatterns.size &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s3">throw new </span><span class="s1">UnmatchedSearchPatternsError({</span>
+            <span class="s1">basePath,</span>
+            <span class="s1">unmatchedPatterns: [...unmatchedPatterns].map(</span>
+                <span class="s1">pattern =&gt; relativeToPatterns.get(pattern)</span>
+            <span class="s1">),</span>
+            <span class="s1">patterns,</span>
+            <span class="s1">rawPatterns</span>
+        <span class="s1">});</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">filePaths;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Throws an error for unmatched patterns. The error will only contain information about the first one. 
+ * Checks to see if there are any ignored results for a given search. 
+ * @param {Object} options The options for this function. 
+ * @param {string} options.basePath The directory to search. 
+ * @param {Array&lt;string&gt;} options.patterns An array of glob patterns 
+ *      that were used in the original search. 
+ * @param {Array&lt;string&gt;} options.rawPatterns An array of glob patterns 
+ *      as the user inputted them. Used for errors. 
+ * @param {Array&lt;string&gt;} options.unmatchedPatterns A non-empty array of glob patterns 
+ *      that were unmatched in the original search. 
+ * @returns {void} Always throws an error. 
+ * @throws {NoFilesFoundError} If the first unmatched pattern 
+ *      doesn't match any files even when there are no ignores. 
+ * @throws {AllFilesIgnoredError} If the first unmatched pattern 
+ *      matches some files when there are no ignores. 
+ */</span>
+<span class="s1">async </span><span class="s3">function </span><span class="s1">throwErrorForUnmatchedPatterns({</span>
+    <span class="s1">basePath,</span>
+    <span class="s1">patterns,</span>
+    <span class="s1">rawPatterns,</span>
+    <span class="s1">unmatchedPatterns</span>
+<span class="s1">}) {</span>
+
+    <span class="s1">const pattern = unmatchedPatterns[</span><span class="s5">0</span><span class="s1">];</span>
+    <span class="s1">const rawPattern = rawPatterns[patterns.indexOf(pattern)];</span>
+
+    <span class="s1">const patternHasMatch = await globMatch({</span>
+        <span class="s1">basePath,</span>
+        <span class="s1">pattern</span>
+    <span class="s1">});</span>
+
+    <span class="s3">if </span><span class="s1">(patternHasMatch) {</span>
+        <span class="s3">throw new </span><span class="s1">AllFilesIgnoredError(rawPattern);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// if we get here there are truly no matches</span>
+    <span class="s3">throw new </span><span class="s1">NoFilesFoundError(rawPattern, </span><span class="s3">true</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Performs multiple glob searches in parallel. 
+ * @param {Object} options The options for this function. 
+ * @param {Map&lt;string,GlobSearch&gt;} options.searches 
+ *      An array of glob patterns to match. 
+ * @param {FlatConfigArray} options.configs The config array to use for 
+ *      determining what to ignore. 
+ * @param {boolean} options.errorOnUnmatchedPattern Determines if an 
+ *      unmatched glob pattern should throw an error. 
+ * @returns {Promise&lt;Array&lt;string&gt;&gt;} An array of matching file paths 
+ *      or an empty array if there are no matches. 
+ */</span>
+<span class="s1">async </span><span class="s3">function </span><span class="s1">globMultiSearch({ searches, configs, errorOnUnmatchedPattern }) {</span>
+
+    <span class="s0">/* 
+     * For convenience, we normalized the search map into an array of objects. 
+     * Next, we filter out all searches that have no patterns. This happens 
+     * primarily for the cwd, which is prepopulated in the searches map as an 
+     * optimization. However, if it has no patterns, it means all patterns 
+     * occur outside of the cwd and we can safely filter out that search. 
+     */</span>
+    <span class="s1">const normalizedSearches = [...searches].map(</span>
+        <span class="s1">([basePath, { patterns, rawPatterns }]) =&gt; ({ basePath, patterns, rawPatterns })</span>
+    <span class="s1">).filter(({ patterns }) =&gt; patterns.length &gt; </span><span class="s5">0</span><span class="s1">);</span>
+
+    <span class="s1">const results = await Promise.allSettled(</span>
+        <span class="s1">normalizedSearches.map(</span>
+            <span class="s1">({ basePath, patterns, rawPatterns }) =&gt; globSearch({</span>
+                <span class="s1">basePath,</span>
+                <span class="s1">patterns,</span>
+                <span class="s1">rawPatterns,</span>
+                <span class="s1">configs,</span>
+                <span class="s1">errorOnUnmatchedPattern</span>
+            <span class="s1">})</span>
+        <span class="s1">)</span>
+    <span class="s1">);</span>
+
+    <span class="s1">const filePaths = [];</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s5">0</span><span class="s1">; i &lt; results.length; i++) {</span>
+
+        <span class="s1">const result = results[i];</span>
+        <span class="s1">const currentSearch = normalizedSearches[i];</span>
+
+        <span class="s3">if </span><span class="s1">(result.status === </span><span class="s2">&quot;fulfilled&quot;</span><span class="s1">) {</span>
+
+            <span class="s0">// if the search was successful just add the results</span>
+            <span class="s3">if </span><span class="s1">(result.value.length &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+                <span class="s1">filePaths.push(...result.value);</span>
+            <span class="s1">}</span>
+
+            <span class="s3">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// if we make it here then there was an error</span>
+        <span class="s1">const error = result.reason;</span>
+
+        <span class="s0">// unexpected errors should be re-thrown</span>
+        <span class="s3">if </span><span class="s1">(!error.basePath) {</span>
+            <span class="s3">throw </span><span class="s1">error;</span>
+        <span class="s1">}</span>
+
+        <span class="s3">if </span><span class="s1">(errorOnUnmatchedPattern) {</span>
+
+            <span class="s1">await throwErrorForUnmatchedPatterns({</span>
+                <span class="s1">...currentSearch,</span>
+                <span class="s1">unmatchedPatterns: error.unmatchedPatterns</span>
+            <span class="s1">});</span>
+
+        <span class="s1">}</span>
+
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">[...</span><span class="s3">new </span><span class="s1">Set(filePaths)];</span>
+
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Finds all files matching the options specified. 
+ * @param {Object} args The arguments objects. 
+ * @param {Array&lt;string&gt;} args.patterns An array of glob patterns. 
+ * @param {boolean} args.globInputPaths true to interpret glob patterns, 
+ *      false to not interpret glob patterns. 
+ * @param {string} args.cwd The current working directory to find from. 
+ * @param {FlatConfigArray} args.configs The configs for the current run. 
+ * @param {boolean} args.errorOnUnmatchedPattern Determines if an unmatched pattern 
+ *      should throw an error. 
+ * @returns {Promise&lt;Array&lt;string&gt;&gt;} The fully resolved file paths. 
+ * @throws {AllFilesIgnoredError} If there are no results due to an ignore pattern. 
+ * @throws {NoFilesFoundError} If no files matched the given patterns. 
+ */</span>
+<span class="s1">async </span><span class="s3">function </span><span class="s1">findFiles({</span>
+    <span class="s1">patterns,</span>
+    <span class="s1">globInputPaths,</span>
+    <span class="s1">cwd,</span>
+    <span class="s1">configs,</span>
+    <span class="s1">errorOnUnmatchedPattern</span>
+<span class="s1">}) {</span>
+
+    <span class="s1">const results = [];</span>
+    <span class="s1">const missingPatterns = [];</span>
+    <span class="s1">let globbyPatterns = [];</span>
+    <span class="s1">let rawPatterns = [];</span>
+    <span class="s1">const searches = </span><span class="s3">new </span><span class="s1">Map([[cwd, { patterns: globbyPatterns, rawPatterns: [] }]]);</span>
+
+    <span class="s0">// check to see if we have explicit files and directories</span>
+    <span class="s1">const filePaths = patterns.map(filePath =&gt; path.resolve(cwd, filePath));</span>
+    <span class="s1">const stats = await Promise.all(</span>
+        <span class="s1">filePaths.map(</span>
+            <span class="s1">filePath =&gt; fsp.stat(filePath).</span><span class="s3">catch</span><span class="s1">(() =&gt; { })</span>
+        <span class="s1">)</span>
+    <span class="s1">);</span>
+
+    <span class="s1">stats.forEach((stat, index) =&gt; {</span>
+
+        <span class="s1">const filePath = filePaths[index];</span>
+        <span class="s1">const pattern = normalizeToPosix(patterns[index]);</span>
+
+        <span class="s3">if </span><span class="s1">(stat) {</span>
+
+            <span class="s0">// files are added directly to the list</span>
+            <span class="s3">if </span><span class="s1">(stat.isFile()) {</span>
+                <span class="s1">results.push({</span>
+                    <span class="s1">filePath,</span>
+                    <span class="s1">ignored: configs.isFileIgnored(filePath)</span>
+                <span class="s1">});</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// directories need extensions attached</span>
+            <span class="s3">if </span><span class="s1">(stat.isDirectory()) {</span>
+
+                <span class="s0">// group everything in cwd together and split out others</span>
+                <span class="s3">if </span><span class="s1">(isPathInside(filePath, cwd)) {</span>
+                    <span class="s1">({ patterns: globbyPatterns, rawPatterns } = searches.get(cwd));</span>
+                <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                    <span class="s3">if </span><span class="s1">(!searches.has(filePath)) {</span>
+                        <span class="s1">searches.set(filePath, { patterns: [], rawPatterns: [] });</span>
+                    <span class="s1">}</span>
+                    <span class="s1">({ patterns: globbyPatterns, rawPatterns } = searches.get(filePath));</span>
+                <span class="s1">}</span>
+
+                <span class="s1">globbyPatterns.push(`${normalizeToPosix(filePath)}</span><span class="s0">/**`); 
+                rawPatterns.push(pattern); 
+            } 
+ 
+            return; 
+        } 
+ 
+        // save patterns for later use based on whether globs are enabled 
+        if (globInputPaths &amp;&amp; isGlobPattern(pattern)) { 
+ 
+            const basePath = path.resolve(cwd, globParent(pattern)); 
+ 
+            // group in cwd if possible and split out others 
+            if (isPathInside(basePath, cwd)) { 
+                ({ patterns: globbyPatterns, rawPatterns } = searches.get(cwd)); 
+            } else { 
+                if (!searches.has(basePath)) { 
+                    searches.set(basePath, { patterns: [], rawPatterns: [] }); 
+                } 
+                ({ patterns: globbyPatterns, rawPatterns } = searches.get(basePath)); 
+            } 
+ 
+            globbyPatterns.push(filePath); 
+            rawPatterns.push(pattern); 
+        } else { 
+            missingPatterns.push(pattern); 
+        } 
+    }); 
+ 
+    // there were patterns that didn't match anything, tell the user 
+    if (errorOnUnmatchedPattern &amp;&amp; missingPatterns.length) { 
+        throw new NoFilesFoundError(missingPatterns[0], globInputPaths); 
+    } 
+ 
+    // now we are safe to do the search 
+    const globbyResults = await globMultiSearch({ 
+        searches, 
+        configs, 
+        errorOnUnmatchedPattern 
+    }); 
+ 
+    return [ 
+        ...results, 
+        ...globbyResults.map(filePath =&gt; ({ 
+            filePath: path.resolve(filePath), 
+            ignored: false 
+        })) 
+    ]; 
+} 
+ 
+//----------------------------------------------------------------------------- 
+// Results-related Helpers 
+//----------------------------------------------------------------------------- 
+ 
+/** 
+ * Checks if the given message is an error message. 
+ * @param {LintMessage} message The message to check. 
+ * @returns {boolean} Whether or not the message is an error message. 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">isErrorMessage(message) {</span>
+    <span class="s3">return </span><span class="s1">message.severity === </span><span class="s5">2</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Returns result with warning by ignore settings 
+ * @param {string} filePath File path of checked code 
+ * @param {string} baseDir Absolute path of base directory 
+ * @returns {LintResult} Result with single warning 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">createIgnoreResult(filePath, baseDir) {</span>
+    <span class="s1">let message;</span>
+    <span class="s1">const isInNodeModules = baseDir &amp;&amp; path.dirname(path.relative(baseDir, filePath)).split(path.sep).includes(</span><span class="s2">&quot;node_modules&quot;</span><span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(isInNodeModules) {</span>
+        <span class="s1">message = </span><span class="s2">&quot;File ignored by default because it is located under the node_modules directory. Use ignore pattern </span><span class="s4">\&quot;</span><span class="s2">!**/node_modules/</span><span class="s4">\&quot; </span><span class="s2">to override.&quot;</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">message = </span><span class="s2">&quot;File ignored because of a matching ignore pattern. Use </span><span class="s4">\&quot;</span><span class="s2">--no-ignore</span><span class="s4">\&quot; </span><span class="s2">to override.&quot;</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">filePath: path.resolve(filePath),</span>
+        <span class="s1">messages: [</span>
+            <span class="s1">{</span>
+                <span class="s1">ruleId: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">fatal: </span><span class="s3">false</span><span class="s1">,</span>
+                <span class="s1">severity: </span><span class="s5">1</span><span class="s1">,</span>
+                <span class="s1">message,</span>
+                <span class="s1">nodeType: </span><span class="s3">null</span>
+            <span class="s1">}</span>
+        <span class="s1">],</span>
+        <span class="s1">suppressedMessages: [],</span>
+        <span class="s1">errorCount: </span><span class="s5">0</span><span class="s1">,</span>
+        <span class="s1">warningCount: </span><span class="s5">1</span><span class="s1">,</span>
+        <span class="s1">fatalErrorCount: </span><span class="s5">0</span><span class="s1">,</span>
+        <span class="s1">fixableErrorCount: </span><span class="s5">0</span><span class="s1">,</span>
+        <span class="s1">fixableWarningCount: </span><span class="s5">0</span>
+    <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Options-related Helpers</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+
+<span class="s0">/** 
+ * Check if a given value is a valid fix type or not. 
+ * @param {any} x The value to check. 
+ * @returns {boolean} `true` if `x` is valid fix type. 
+ */</span>
+<span class="s3">function </span><span class="s1">isFixType(x) {</span>
+    <span class="s3">return </span><span class="s1">x === </span><span class="s2">&quot;directive&quot; </span><span class="s1">|| x === </span><span class="s2">&quot;problem&quot; </span><span class="s1">|| x === </span><span class="s2">&quot;suggestion&quot; </span><span class="s1">|| x === </span><span class="s2">&quot;layout&quot;</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Check if a given value is an array of fix types or not. 
+ * @param {any} x The value to check. 
+ * @returns {boolean} `true` if `x` is an array of fix types. 
+ */</span>
+<span class="s3">function </span><span class="s1">isFixTypeArray(x) {</span>
+    <span class="s3">return </span><span class="s1">Array.isArray(x) &amp;&amp; x.every(isFixType);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * The error for invalid options. 
+ */</span>
+<span class="s1">class ESLintInvalidOptionsError extends Error {</span>
+    <span class="s1">constructor(messages) {</span>
+        <span class="s1">super(`Invalid Options:\n- ${messages.join(</span><span class="s2">&quot;</span><span class="s4">\n</span><span class="s2">- &quot;</span><span class="s1">)}`);</span>
+        <span class="s3">this</span><span class="s1">.code = </span><span class="s2">&quot;ESLINT_INVALID_OPTIONS&quot;</span><span class="s1">;</span>
+        <span class="s1">Error.captureStackTrace(</span><span class="s3">this</span><span class="s1">, ESLintInvalidOptionsError);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Validates and normalizes options for the wrapped CLIEngine instance. 
+ * @param {FlatESLintOptions} options The options to process. 
+ * @throws {ESLintInvalidOptionsError} If of any of a variety of type errors. 
+ * @returns {FlatESLintOptions} The normalized options. 
+ */</span>
+<span class="s3">function </span><span class="s1">processOptions({</span>
+    <span class="s1">allowInlineConfig = </span><span class="s3">true</span><span class="s1">, </span><span class="s0">// ← we cannot use `overrideConfig.noInlineConfig` instead because `allowInlineConfig` has side-effect that suppress warnings that show inline configs are ignored.</span>
+    <span class="s1">baseConfig = </span><span class="s3">null</span><span class="s1">,</span>
+    <span class="s1">cache = </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">cacheLocation = </span><span class="s2">&quot;.eslintcache&quot;</span><span class="s1">,</span>
+    <span class="s1">cacheStrategy = </span><span class="s2">&quot;metadata&quot;</span><span class="s1">,</span>
+    <span class="s1">cwd = process.cwd(),</span>
+    <span class="s1">errorOnUnmatchedPattern = </span><span class="s3">true</span><span class="s1">,</span>
+    <span class="s1">fix = </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">fixTypes = </span><span class="s3">null</span><span class="s1">, </span><span class="s0">// ← should be null by default because if it's an array then it suppresses rules that don't have the `meta.type` property.</span>
+    <span class="s1">globInputPaths = </span><span class="s3">true</span><span class="s1">,</span>
+    <span class="s1">ignore = </span><span class="s3">true</span><span class="s1">,</span>
+    <span class="s1">ignorePatterns = </span><span class="s3">null</span><span class="s1">,</span>
+    <span class="s1">overrideConfig = </span><span class="s3">null</span><span class="s1">,</span>
+    <span class="s1">overrideConfigFile = </span><span class="s3">null</span><span class="s1">,</span>
+    <span class="s1">plugins = {},</span>
+    <span class="s1">reportUnusedDisableDirectives = </span><span class="s3">null</span><span class="s1">, </span><span class="s0">// ← should be null by default because if it's a string then it overrides the 'reportUnusedDisableDirectives' setting in config files. And we cannot use `overrideConfig.reportUnusedDisableDirectives` instead because we cannot configure the `error` severity with that.</span>
+    <span class="s1">...unknownOptions</span>
+<span class="s1">}) {</span>
+    <span class="s1">const errors = [];</span>
+    <span class="s1">const unknownOptionKeys = Object.keys(unknownOptions);</span>
+
+    <span class="s3">if </span><span class="s1">(unknownOptionKeys.length &gt;= </span><span class="s5">1</span><span class="s1">) {</span>
+        <span class="s1">errors.push(`Unknown options: ${unknownOptionKeys.join(</span><span class="s2">&quot;, &quot;</span><span class="s1">)}`);</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;cacheFile&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'cacheFile' has been removed. Please use the 'cacheLocation' option instead.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;configFile&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'configFile' has been removed. Please use the 'overrideConfigFile' option instead.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;envs&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'envs' has been removed.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;extensions&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'extensions' has been removed.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;resolvePluginsRelativeTo&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'resolvePluginsRelativeTo' has been removed.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;globals&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'globals' has been removed. Please use the 'overrideConfig.languageOptions.globals' option instead.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;ignorePath&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'ignorePath' has been removed.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;ignorePattern&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'ignorePattern' has been removed. Please use the 'overrideConfig.ignorePatterns' option instead.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;parser&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'parser' has been removed. Please use the 'overrideConfig.languageOptions.parser' option instead.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;parserOptions&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'parserOptions' has been removed. Please use the 'overrideConfig.languageOptions.parserOptions' option instead.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;rules&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'rules' has been removed. Please use the 'overrideConfig.rules' option instead.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(unknownOptionKeys.includes(</span><span class="s2">&quot;rulePaths&quot;</span><span class="s1">)) {</span>
+            <span class="s1">errors.push(</span><span class="s2">&quot;'rulePaths' has been removed. Please define your rules using plugins.&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">allowInlineConfig !== </span><span class="s2">&quot;boolean&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'allowInlineConfig' must be a boolean.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">baseConfig !== </span><span class="s2">&quot;object&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'baseConfig' must be an object or null.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">cache !== </span><span class="s2">&quot;boolean&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'cache' must be a boolean.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(!isNonEmptyString(cacheLocation)) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'cacheLocation' must be a non-empty string.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">cacheStrategy !== </span><span class="s2">&quot;metadata&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">cacheStrategy !== </span><span class="s2">&quot;content&quot;</span>
+    <span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'cacheStrategy' must be any of </span><span class="s4">\&quot;</span><span class="s2">metadata</span><span class="s4">\&quot;</span><span class="s2">, </span><span class="s4">\&quot;</span><span class="s2">content</span><span class="s4">\&quot;</span><span class="s2">.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(!isNonEmptyString(cwd) || !path.isAbsolute(cwd)) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'cwd' must be an absolute path.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">errorOnUnmatchedPattern !== </span><span class="s2">&quot;boolean&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'errorOnUnmatchedPattern' must be a boolean.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">fix !== </span><span class="s2">&quot;boolean&quot; </span><span class="s1">&amp;&amp; </span><span class="s3">typeof </span><span class="s1">fix !== </span><span class="s2">&quot;function&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'fix' must be a boolean or a function.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(fixTypes !== </span><span class="s3">null </span><span class="s1">&amp;&amp; !isFixTypeArray(fixTypes)) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'fixTypes' must be an array of any of </span><span class="s4">\&quot;</span><span class="s2">directive</span><span class="s4">\&quot;</span><span class="s2">, </span><span class="s4">\&quot;</span><span class="s2">problem</span><span class="s4">\&quot;</span><span class="s2">, </span><span class="s4">\&quot;</span><span class="s2">suggestion</span><span class="s4">\&quot;</span><span class="s2">, and </span><span class="s4">\&quot;</span><span class="s2">layout</span><span class="s4">\&quot;</span><span class="s2">.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">globInputPaths !== </span><span class="s2">&quot;boolean&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'globInputPaths' must be a boolean.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">ignore !== </span><span class="s2">&quot;boolean&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'ignore' must be a boolean.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(!isArrayOfNonEmptyString(ignorePatterns) &amp;&amp; ignorePatterns !== </span><span class="s3">null</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'ignorePatterns' must be an array of non-empty strings or null.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">overrideConfig !== </span><span class="s2">&quot;object&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'overrideConfig' must be an object or null.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(!isNonEmptyString(overrideConfigFile) &amp;&amp; overrideConfigFile !== </span><span class="s3">null </span><span class="s1">&amp;&amp; overrideConfigFile !== </span><span class="s3">true</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'overrideConfigFile' must be a non-empty string, null, or true.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">plugins !== </span><span class="s2">&quot;object&quot;</span><span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'plugins' must be an object or null.&quot;</span><span class="s1">);</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(plugins !== </span><span class="s3">null </span><span class="s1">&amp;&amp; Object.keys(plugins).includes(</span><span class="s2">&quot;&quot;</span><span class="s1">)) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'plugins' must not include an empty string.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(Array.isArray(plugins)) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'plugins' doesn't add plugins to configuration to load. Please use the 'overrideConfig.plugins' option instead.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">reportUnusedDisableDirectives !== </span><span class="s2">&quot;error&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">reportUnusedDisableDirectives !== </span><span class="s2">&quot;warn&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">reportUnusedDisableDirectives !== </span><span class="s2">&quot;off&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">reportUnusedDisableDirectives !== </span><span class="s3">null</span>
+    <span class="s1">) {</span>
+        <span class="s1">errors.push(</span><span class="s2">&quot;'reportUnusedDisableDirectives' must be any of </span><span class="s4">\&quot;</span><span class="s2">error</span><span class="s4">\&quot;</span><span class="s2">, </span><span class="s4">\&quot;</span><span class="s2">warn</span><span class="s4">\&quot;</span><span class="s2">, </span><span class="s4">\&quot;</span><span class="s2">off</span><span class="s4">\&quot;</span><span class="s2">, and null.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(errors.length &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s3">throw new </span><span class="s1">ESLintInvalidOptionsError(errors);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">allowInlineConfig,</span>
+        <span class="s1">baseConfig,</span>
+        <span class="s1">cache,</span>
+        <span class="s1">cacheLocation,</span>
+        <span class="s1">cacheStrategy,</span>
+
+        <span class="s0">// when overrideConfigFile is true that means don't do config file lookup</span>
+        <span class="s1">configFile: overrideConfigFile === </span><span class="s3">true </span><span class="s1">? </span><span class="s3">false </span><span class="s1">: overrideConfigFile,</span>
+        <span class="s1">overrideConfig,</span>
+        <span class="s1">cwd: path.normalize(cwd),</span>
+        <span class="s1">errorOnUnmatchedPattern,</span>
+        <span class="s1">fix,</span>
+        <span class="s1">fixTypes,</span>
+        <span class="s1">globInputPaths,</span>
+        <span class="s1">ignore,</span>
+        <span class="s1">ignorePatterns,</span>
+        <span class="s1">reportUnusedDisableDirectives</span>
+    <span class="s1">};</span>
+<span class="s1">}</span>
+
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Cache-related helpers</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * return the cacheFile to be used by eslint, based on whether the provided parameter is 
+ * a directory or looks like a directory (ends in `path.sep`), in which case the file 
+ * name will be the `cacheFile/.cache_hashOfCWD` 
+ * 
+ * if cacheFile points to a file or looks like a file then in will just use that file 
+ * @param {string} cacheFile The name of file to be used to store the cache 
+ * @param {string} cwd Current working directory 
+ * @returns {string} the resolved path to the cache file 
+ */</span>
+<span class="s3">function </span><span class="s1">getCacheFile(cacheFile, cwd) {</span>
+
+    <span class="s0">/* 
+     * make sure the path separators are normalized for the environment/os 
+     * keeping the trailing path separator if present 
+     */</span>
+    <span class="s1">const normalizedCacheFile = path.normalize(cacheFile);</span>
+
+    <span class="s1">const resolvedCacheFile = path.resolve(cwd, normalizedCacheFile);</span>
+    <span class="s1">const looksLikeADirectory = normalizedCacheFile.slice(-</span><span class="s5">1</span><span class="s1">) === path.sep;</span>
+
+    <span class="s0">/** 
+     * return the name for the cache file in case the provided parameter is a directory 
+     * @returns {string} the resolved path to the cacheFile 
+     */</span>
+    <span class="s3">function </span><span class="s1">getCacheFileForDirectory() {</span>
+        <span class="s3">return </span><span class="s1">path.join(resolvedCacheFile, `.cache_${hash(cwd)}`);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let fileStats;</span>
+
+    <span class="s3">try </span><span class="s1">{</span>
+        <span class="s1">fileStats = fs.lstatSync(resolvedCacheFile);</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">{</span>
+        <span class="s1">fileStats = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+
+    <span class="s0">/* 
+     * in case the file exists we need to verify if the provided path 
+     * is a directory or a file. If it is a directory we want to create a file 
+     * inside that directory 
+     */</span>
+    <span class="s3">if </span><span class="s1">(fileStats) {</span>
+
+        <span class="s0">/* 
+         * is a directory or is a file, but the original file the user provided 
+         * looks like a directory but `path.resolve` removed the `last path.sep` 
+         * so we need to still treat this like a directory 
+         */</span>
+        <span class="s3">if </span><span class="s1">(fileStats.isDirectory() || looksLikeADirectory) {</span>
+            <span class="s3">return </span><span class="s1">getCacheFileForDirectory();</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// is file so just use that file</span>
+        <span class="s3">return </span><span class="s1">resolvedCacheFile;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* 
+     * here we known the file or directory doesn't exist, 
+     * so we will try to infer if its a directory if it looks like a directory 
+     * for the current operating system. 
+     */</span>
+
+    <span class="s0">// if the last character passed is a path separator we assume is a directory</span>
+    <span class="s3">if </span><span class="s1">(looksLikeADirectory) {</span>
+        <span class="s3">return </span><span class="s1">getCacheFileForDirectory();</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">resolvedCacheFile;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Exports</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s1">module.exports = {</span>
+    <span class="s1">isGlobPattern,</span>
+    <span class="s1">findFiles,</span>
+
+    <span class="s1">isNonEmptyString,</span>
+    <span class="s1">isArrayOfNonEmptyString,</span>
+
+    <span class="s1">createIgnoreResult,</span>
+    <span class="s1">isErrorMessage,</span>
+
+    <span class="s1">processOptions,</span>
+
+    <span class="s1">getCacheFile</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

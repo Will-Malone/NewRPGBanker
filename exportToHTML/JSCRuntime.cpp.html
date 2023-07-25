@@ -1,0 +1,1583 @@
+<html>
+<head>
+<title>JSCRuntime.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JSCRuntime.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;JSCRuntime.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;JavaScriptCore/JavaScript.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsilib.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;array&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;atomic&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;condition_variable&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cstdlib&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;queue&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;sstream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;thread&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">jsc {</span>
+
+<span class="s4">namespace </span><span class="s1">detail {</span>
+<span class="s4">class </span><span class="s1">ArgsConverter</span><span class="s4">;</span>
+<span class="s1">} </span><span class="s0">// namespace detail</span>
+
+<span class="s4">class </span><span class="s1">JSCRuntime</span><span class="s4">;</span>
+
+<span class="s4">struct </span><span class="s1">Lock {</span>
+  <span class="s4">void </span><span class="s1">lock(</span><span class="s4">const </span><span class="s1">jsc::JSCRuntime &amp;) </span><span class="s4">const </span><span class="s1">{}</span>
+  <span class="s4">void </span><span class="s1">unlock(</span><span class="s4">const </span><span class="s1">jsc::JSCRuntime &amp;) </span><span class="s4">const </span><span class="s1">{}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">JSCRuntime : </span><span class="s4">public </span><span class="s1">jsi::Runtime {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s0">// Creates new context in new context group</span>
+  <span class="s1">JSCRuntime()</span><span class="s4">;</span>
+  <span class="s0">// Retains ctx</span>
+  <span class="s1">JSCRuntime(JSGlobalContextRef ctx)</span><span class="s4">;</span>
+  <span class="s1">~JSCRuntime()</span><span class="s4">;</span>
+
+  <span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::PreparedJavaScript&gt; prepareJavaScript(</span>
+      <span class="s4">const </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::Buffer&gt; &amp;buffer</span><span class="s4">,</span>
+      <span class="s1">std::string sourceURL) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Value evaluatePreparedJavaScript(</span>
+      <span class="s4">const </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::PreparedJavaScript&gt; &amp;js) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Value evaluateJavaScript(</span>
+      <span class="s4">const </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::Buffer&gt; &amp;buffer</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;sourceURL) override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">drainMicrotasks(</span><span class="s4">int </span><span class="s1">maxMicrotasksHint = -</span><span class="s5">1</span><span class="s1">) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Object global() override</span><span class="s4">;</span>
+
+  <span class="s1">std::string description() override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">isInspectable() override</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">setDescription(</span><span class="s4">const </span><span class="s1">std::string &amp;desc)</span><span class="s4">;</span>
+
+  <span class="s0">// Please don't use the following two functions, only exposed for</span>
+  <span class="s0">// integration efforts.</span>
+  <span class="s1">JSGlobalContextRef getContext() {</span>
+    <span class="s4">return </span><span class="s1">ctx_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// JSValueRef-&gt;JSValue (needs make.*Value so it must be member function)</span>
+  <span class="s1">jsi::Value createValue(JSValueRef value) </span><span class="s4">const;</span>
+
+  <span class="s0">// Value-&gt;JSValueRef (similar to above)</span>
+  <span class="s1">JSValueRef valueRef(</span><span class="s4">const </span><span class="s1">jsi::Value &amp;value)</span><span class="s4">;</span>
+
+ <span class="s4">protected</span><span class="s1">:</span>
+  <span class="s4">friend class </span><span class="s1">detail::ArgsConverter</span><span class="s4">;</span>
+  <span class="s4">class </span><span class="s1">JSCSymbolValue final : </span><span class="s4">public </span><span class="s1">PointerValue {</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+    <span class="s1">JSCSymbolValue(</span>
+        <span class="s1">JSGlobalContextRef ctx</span><span class="s4">,</span>
+        <span class="s4">const </span><span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; &amp;ctxInvalid</span><span class="s4">,</span>
+        <span class="s1">JSValueRef sym</span><span class="s4">,</span>
+        <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+    <span class="s1">JSCSymbolValue(</span>
+        <span class="s1">JSGlobalContextRef ctx</span><span class="s4">,</span>
+        <span class="s4">const </span><span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; &amp;ctxInvalid</span><span class="s4">,</span>
+        <span class="s1">JSValueRef sym)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+    <span class="s4">void </span><span class="s1">invalidate() override</span><span class="s4">;</span>
+
+    <span class="s1">JSGlobalContextRef ctx_</span><span class="s4">;</span>
+    <span class="s4">const </span><span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; &amp;ctxInvalid_</span><span class="s4">;</span>
+    <span class="s0">// There is no C type in the JSC API to represent Symbol, so this stored</span>
+    <span class="s0">// a JSValueRef which contains the Symbol.</span>
+    <span class="s1">JSValueRef sym_</span><span class="s4">;</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+    <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter_</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+   <span class="s4">protected</span><span class="s1">:</span>
+    <span class="s4">friend class </span><span class="s1">JSCRuntime</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">class </span><span class="s1">JSCStringValue final : </span><span class="s4">public </span><span class="s1">PointerValue {</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+    <span class="s1">JSCStringValue(JSStringRef str</span><span class="s4">, </span><span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+    <span class="s1">JSCStringValue(JSStringRef str)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+    <span class="s4">void </span><span class="s1">invalidate() override</span><span class="s4">;</span>
+
+    <span class="s1">JSStringRef str_</span><span class="s4">;</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+    <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter_</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+   <span class="s4">protected</span><span class="s1">:</span>
+    <span class="s4">friend class </span><span class="s1">JSCRuntime</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">class </span><span class="s1">JSCObjectValue final : </span><span class="s4">public </span><span class="s1">PointerValue {</span>
+    <span class="s1">JSCObjectValue(</span>
+        <span class="s1">JSGlobalContextRef ctx</span><span class="s4">,</span>
+        <span class="s4">const </span><span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; &amp;ctxInvalid</span><span class="s4">,</span>
+        <span class="s1">JSObjectRef obj</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+        <span class="s4">,</span>
+        <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter</span>
+<span class="s2">#endif</span>
+    <span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s4">void </span><span class="s1">invalidate() override</span><span class="s4">;</span>
+
+    <span class="s1">JSGlobalContextRef ctx_</span><span class="s4">;</span>
+    <span class="s4">const </span><span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; &amp;ctxInvalid_</span><span class="s4">;</span>
+    <span class="s1">JSObjectRef obj_</span><span class="s4">;</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+    <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter_</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+   <span class="s4">protected</span><span class="s1">:</span>
+    <span class="s4">friend class </span><span class="s1">JSCRuntime</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">PointerValue *cloneSymbol(</span><span class="s4">const </span><span class="s1">Runtime::PointerValue *pv) override</span><span class="s4">;</span>
+  <span class="s1">PointerValue *cloneBigInt(</span><span class="s4">const </span><span class="s1">Runtime::PointerValue *pv) override</span><span class="s4">;</span>
+  <span class="s1">PointerValue *cloneString(</span><span class="s4">const </span><span class="s1">Runtime::PointerValue *pv) override</span><span class="s4">;</span>
+  <span class="s1">PointerValue *cloneObject(</span><span class="s4">const </span><span class="s1">Runtime::PointerValue *pv) override</span><span class="s4">;</span>
+  <span class="s1">PointerValue *clonePropNameID(</span><span class="s4">const </span><span class="s1">Runtime::PointerValue *pv) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::PropNameID createPropNameIDFromAscii(</span><span class="s4">const char </span><span class="s1">*str</span><span class="s4">, </span><span class="s1">size_t length)</span>
+      <span class="s1">override</span><span class="s4">;</span>
+  <span class="s1">jsi::PropNameID createPropNameIDFromUtf8(</span><span class="s4">const </span><span class="s1">uint8_t *utf8</span><span class="s4">, </span><span class="s1">size_t length)</span>
+      <span class="s1">override</span><span class="s4">;</span>
+  <span class="s1">jsi::PropNameID createPropNameIDFromString(</span><span class="s4">const </span><span class="s1">jsi::String &amp;str) override</span><span class="s4">;</span>
+  <span class="s1">jsi::PropNameID createPropNameIDFromSymbol(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;sym) override</span><span class="s4">;</span>
+  <span class="s1">std::string utf8(</span><span class="s4">const </span><span class="s1">jsi::PropNameID &amp;) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">compare(</span><span class="s4">const </span><span class="s1">jsi::PropNameID &amp;</span><span class="s4">, const </span><span class="s1">jsi::PropNameID &amp;) override</span><span class="s4">;</span>
+
+  <span class="s1">std::string symbolToString(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::BigInt createBigIntFromInt64(int64_t) override</span><span class="s4">;</span>
+  <span class="s1">jsi::BigInt createBigIntFromUint64(uint64_t) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">bigintIsInt64(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">bigintIsUint64(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;) override</span><span class="s4">;</span>
+  <span class="s1">uint64_t truncate(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;) override</span><span class="s4">;</span>
+  <span class="s1">jsi::String bigintToString(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;</span><span class="s4">, int</span><span class="s1">) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::String createStringFromAscii(</span><span class="s4">const char </span><span class="s1">*str</span><span class="s4">, </span><span class="s1">size_t length) override</span><span class="s4">;</span>
+  <span class="s1">jsi::String createStringFromUtf8(</span><span class="s4">const </span><span class="s1">uint8_t *utf8</span><span class="s4">, </span><span class="s1">size_t length) override</span><span class="s4">;</span>
+  <span class="s1">std::string utf8(</span><span class="s4">const </span><span class="s1">jsi::String &amp;) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Object createObject() override</span><span class="s4">;</span>
+  <span class="s1">jsi::Object createObject(std::shared_ptr&lt;jsi::HostObject&gt; ho) override</span><span class="s4">;</span>
+  <span class="s4">virtual </span><span class="s1">std::shared_ptr&lt;jsi::HostObject&gt; getHostObject(</span>
+      <span class="s4">const </span><span class="s1">jsi::Object &amp;) override</span><span class="s4">;</span>
+  <span class="s1">jsi::HostFunctionType &amp;getHostFunction(</span><span class="s4">const </span><span class="s1">jsi::Function &amp;) override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">hasNativeState(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) override</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;jsi::NativeState&gt; getNativeState(</span>
+      <span class="s4">const </span><span class="s1">jsi::Object &amp;) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">setNativeState(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">, </span><span class="s1">std::shared_ptr&lt;jsi::NativeState&gt;)</span>
+      <span class="s1">override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Value getProperty(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">, const </span><span class="s1">jsi::String &amp;name) override</span><span class="s4">;</span>
+  <span class="s1">jsi::Value getProperty(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">, const </span><span class="s1">jsi::PropNameID &amp;name)</span>
+      <span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">hasProperty(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">, const </span><span class="s1">jsi::String &amp;name) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">hasProperty(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">, const </span><span class="s1">jsi::PropNameID &amp;name) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">setPropertyValue(</span>
+      <span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::String &amp;name</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::Value &amp;value) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">setPropertyValue(</span>
+      <span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::PropNameID &amp;name</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::Value &amp;value) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">isArray(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">isArrayBuffer(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">isFunction(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">isHostObject(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">isHostFunction(</span><span class="s4">const </span><span class="s1">jsi::Function &amp;) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s1">jsi::Array getPropertyNames(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) override</span><span class="s4">;</span>
+
+  <span class="s0">// TODO: revisit this implementation</span>
+  <span class="s1">jsi::WeakObject createWeakObject(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) override</span><span class="s4">;</span>
+  <span class="s1">jsi::Value lockWeakObject(</span><span class="s4">const </span><span class="s1">jsi::WeakObject &amp;) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Array createArray(size_t length) override</span><span class="s4">;</span>
+  <span class="s1">jsi::ArrayBuffer createArrayBuffer(</span>
+      <span class="s1">std::shared_ptr&lt;jsi::MutableBuffer&gt; buffer) override</span><span class="s4">;</span>
+  <span class="s1">size_t size(</span><span class="s4">const </span><span class="s1">jsi::Array &amp;) override</span><span class="s4">;</span>
+  <span class="s1">size_t size(</span><span class="s4">const </span><span class="s1">jsi::ArrayBuffer &amp;) override</span><span class="s4">;</span>
+  <span class="s1">uint8_t *data(</span><span class="s4">const </span><span class="s1">jsi::ArrayBuffer &amp;) override</span><span class="s4">;</span>
+  <span class="s1">jsi::Value getValueAtIndex(</span><span class="s4">const </span><span class="s1">jsi::Array &amp;</span><span class="s4">, </span><span class="s1">size_t i) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">setValueAtIndexImpl(</span>
+      <span class="s4">const </span><span class="s1">jsi::Array &amp;</span><span class="s4">,</span>
+      <span class="s1">size_t i</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::Value &amp;value) override</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Function createFunctionFromHostFunction(</span>
+      <span class="s4">const </span><span class="s1">jsi::PropNameID &amp;name</span><span class="s4">,</span>
+      <span class="s4">unsigned int </span><span class="s1">paramCount</span><span class="s4">,</span>
+      <span class="s1">jsi::HostFunctionType func) override</span><span class="s4">;</span>
+  <span class="s1">jsi::Value call(</span>
+      <span class="s4">const </span><span class="s1">jsi::Function &amp;</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::Value &amp;jsThis</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+      <span class="s1">size_t count) override</span><span class="s4">;</span>
+  <span class="s1">jsi::Value callAsConstructor(</span>
+      <span class="s4">const </span><span class="s1">jsi::Function &amp;</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+      <span class="s1">size_t count) override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">strictEquals(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;a</span><span class="s4">, const </span><span class="s1">jsi::Symbol &amp;b) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">strictEquals(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;a</span><span class="s4">, const </span><span class="s1">jsi::BigInt &amp;b) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">strictEquals(</span><span class="s4">const </span><span class="s1">jsi::String &amp;a</span><span class="s4">, const </span><span class="s1">jsi::String &amp;b) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">strictEquals(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;a</span><span class="s4">, const </span><span class="s1">jsi::Object &amp;b) </span><span class="s4">const </span><span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">instanceOf(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;o</span><span class="s4">, const </span><span class="s1">jsi::Function &amp;f) override</span><span class="s4">;</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s0">// Basically convenience casts</span>
+  <span class="s4">static </span><span class="s1">JSValueRef symbolRef(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;str)</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">JSStringRef stringRef(</span><span class="s4">const </span><span class="s1">jsi::String &amp;str)</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">JSStringRef stringRef(</span><span class="s4">const </span><span class="s1">jsi::PropNameID &amp;sym)</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">JSObjectRef objectRef(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj)</span><span class="s4">;</span>
+
+<span class="s2">#ifdef </span><span class="s1">RN_FABRIC_ENABLED</span>
+  <span class="s4">static </span><span class="s1">JSObjectRef objectRef(</span><span class="s4">const </span><span class="s1">jsi::WeakObject &amp;obj)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s0">// Factory methods for creating String/Object</span>
+  <span class="s1">jsi::Symbol createSymbol(JSValueRef symbolRef) </span><span class="s4">const;</span>
+  <span class="s1">jsi::String createString(JSStringRef stringRef) </span><span class="s4">const;</span>
+  <span class="s1">jsi::PropNameID createPropNameID(JSStringRef stringRef)</span><span class="s4">;</span>
+  <span class="s1">jsi::Object createObject(JSObjectRef objectRef) </span><span class="s4">const;</span>
+
+  <span class="s0">// Used by factory methods and clone methods</span>
+  <span class="s1">jsi::Runtime::PointerValue *makeSymbolValue(JSValueRef sym) </span><span class="s4">const;</span>
+  <span class="s1">jsi::Runtime::PointerValue *makeStringValue(JSStringRef str) </span><span class="s4">const;</span>
+  <span class="s1">jsi::Runtime::PointerValue *makeObjectValue(JSObjectRef obj) </span><span class="s4">const;</span>
+
+  <span class="s4">void </span><span class="s1">checkException(JSValueRef exc)</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">checkException(JSValueRef res</span><span class="s4">, </span><span class="s1">JSValueRef exc)</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">checkException(JSValueRef exc</span><span class="s4">, const char </span><span class="s1">*msg)</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">checkException(JSValueRef res</span><span class="s4">, </span><span class="s1">JSValueRef exc</span><span class="s4">, const char </span><span class="s1">*msg)</span><span class="s4">;</span>
+
+  <span class="s1">JSGlobalContextRef ctx_</span><span class="s4">;</span>
+  <span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; ctxInvalid_</span><span class="s4">;</span>
+  <span class="s1">std::string desc_</span><span class="s4">;</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s4">mutable </span><span class="s1">std::atomic&lt;intptr_t&gt; objectCounter_</span><span class="s4">;</span>
+  <span class="s4">mutable </span><span class="s1">std::atomic&lt;intptr_t&gt; symbolCounter_</span><span class="s4">;</span>
+  <span class="s4">mutable </span><span class="s1">std::atomic&lt;intptr_t&gt; stringCounter_</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s2">#ifndef </span><span class="s1">__has_builtin</span>
+<span class="s2">#define </span><span class="s1">__has_builtin(x) </span><span class="s5">0</span>
+<span class="s2">#endif</span>
+
+<span class="s2">#if </span><span class="s1">__has_builtin(__builtin_expect) || defined(__GNUC__)</span>
+<span class="s2">#define </span><span class="s1">JSC_LIKELY(EXPR) __builtin_expect((</span><span class="s4">bool</span><span class="s1">)(EXPR)</span><span class="s4">, true</span><span class="s1">)</span>
+<span class="s2">#define </span><span class="s1">JSC_UNLIKELY(EXPR) __builtin_expect((</span><span class="s4">bool</span><span class="s1">)(EXPR)</span><span class="s4">, false</span><span class="s1">)</span>
+<span class="s2">#else</span>
+<span class="s2">#define </span><span class="s1">JSC_LIKELY(EXPR) (EXPR)</span>
+<span class="s2">#define </span><span class="s1">JSC_UNLIKELY(EXPR) (EXPR)</span>
+<span class="s2">#endif</span>
+
+<span class="s2">#define </span><span class="s1">JSC_ASSERT(x)          \ 
+  </span><span class="s4">do </span><span class="s1">{                         \ 
+    </span><span class="s4">if </span><span class="s1">(JSC_UNLIKELY(!!(x))) { \ 
+      abort()</span><span class="s4">;                 </span><span class="s1">\ 
+    }                          \ 
+  } </span><span class="s4">while </span><span class="s1">(</span><span class="s5">0</span><span class="s1">)</span>
+
+<span class="s2">#if </span><span class="s1">defined(__IPHONE_OS_VERSION_MIN_REQUIRED)</span>
+<span class="s0">// This takes care of watch and tvos (due to backwards compatibility in</span>
+<span class="s0">// Availability.h</span>
+<span class="s2">#if </span><span class="s1">__IPHONE_OS_VERSION_MIN_REQUIRED &gt;= __IPHONE_9_0</span>
+<span class="s2">#define </span><span class="s1">_JSC_FAST_IS_ARRAY</span>
+<span class="s2">#endif</span>
+<span class="s2">#if </span><span class="s1">__IPHONE_OS_VERSION_MIN_REQUIRED &lt; __IPHONE_10_0</span>
+<span class="s2">#define </span><span class="s1">_JSC_NO_ARRAY_BUFFERS</span>
+<span class="s2">#endif</span>
+<span class="s2">#endif</span>
+<span class="s2">#if </span><span class="s1">defined(__MAC_OS_X_VERSION_MIN_REQUIRED)</span>
+<span class="s2">#if </span><span class="s1">__MAC_OS_X_VERSION_MIN_REQUIRED &gt;= __MAC_10_11</span>
+<span class="s0">// Only one of these should be set for a build.  If somehow that's not</span>
+<span class="s0">// true, this will be a compile-time error and it can be resolved when</span>
+<span class="s0">// we understand why.</span>
+<span class="s2">#define </span><span class="s1">_JSC_FAST_IS_ARRAY</span>
+<span class="s2">#endif</span>
+<span class="s2">#if </span><span class="s1">__MAC_OS_X_VERSION_MIN_REQUIRED &lt; __MAC_10_12</span>
+<span class="s2">#define </span><span class="s1">_JSC_NO_ARRAY_BUFFERS</span>
+<span class="s2">#endif</span>
+<span class="s2">#endif</span>
+
+<span class="s0">// JSStringRef utilities</span>
+<span class="s4">namespace </span><span class="s1">{</span>
+<span class="s1">std::string JSStringToSTLString(JSStringRef str) {</span>
+  <span class="s0">// Small string optimization: Avoid one heap allocation for strings that fit</span>
+  <span class="s0">// in stackBuffer.size() bytes of UTF-8 (including the null terminator).</span>
+  <span class="s1">std::array&lt;</span><span class="s4">char, </span><span class="s5">20</span><span class="s1">&gt; stackBuffer</span><span class="s4">;</span>
+  <span class="s1">std::unique_ptr&lt;</span><span class="s4">char</span><span class="s1">[]&gt; heapBuffer</span><span class="s4">;</span>
+  <span class="s4">char </span><span class="s1">*buffer</span><span class="s4">;</span>
+  <span class="s0">// NOTE: By definition, maxBytes &gt;= 1 since the null terminator is included.</span>
+  <span class="s1">size_t maxBytes = JSStringGetMaximumUTF8CStringSize(str)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(maxBytes &lt;= stackBuffer.size()) {</span>
+    <span class="s1">buffer = stackBuffer.data()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">heapBuffer = std::make_unique&lt;</span><span class="s4">char</span><span class="s1">[]&gt;(maxBytes)</span><span class="s4">;</span>
+    <span class="s1">buffer = heapBuffer.get()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">size_t actualBytes = JSStringGetUTF8CString(str</span><span class="s4">, </span><span class="s1">buffer</span><span class="s4">, </span><span class="s1">maxBytes)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!actualBytes) {</span>
+    <span class="s0">// Happens if maxBytes == 0 (never the case here) or if str contains</span>
+    <span class="s0">// invalid UTF-16 data, since JSStringGetUTF8CString attempts a strict</span>
+    <span class="s0">// conversion.</span>
+    <span class="s0">// When converting an invalid string, JSStringGetUTF8CString writes a null</span>
+    <span class="s0">// terminator before returning. So we can reliably treat our buffer as a C</span>
+    <span class="s0">// string and return the truncated data to our caller. This is slightly</span>
+    <span class="s0">// slower than if we knew the length (like below) but better than crashing.</span>
+    <span class="s0">// TODO(T62295565): Perform a non-strict, best effort conversion of the</span>
+    <span class="s0">// full string instead, like we did before the JSI migration.</span>
+    <span class="s4">return </span><span class="s1">std::string(buffer)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">std::string(buffer</span><span class="s4">, </span><span class="s1">actualBytes - </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSStringRef getLengthString() {</span>
+  <span class="s4">static </span><span class="s1">JSStringRef length = JSStringCreateWithUTF8CString(</span><span class="s3">&quot;length&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">length</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSStringRef getNameString() {</span>
+  <span class="s4">static </span><span class="s1">JSStringRef name = JSStringCreateWithUTF8CString(</span><span class="s3">&quot;name&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">name</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSStringRef getFunctionString() {</span>
+  <span class="s4">static </span><span class="s1">JSStringRef func = JSStringCreateWithUTF8CString(</span><span class="s3">&quot;Function&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">func</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#if </span><span class="s1">!defined(_JSC_FAST_IS_ARRAY)</span>
+<span class="s1">JSStringRef getArrayString() {</span>
+  <span class="s4">static </span><span class="s1">JSStringRef array = JSStringCreateWithUTF8CString(</span><span class="s3">&quot;Array&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">array</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSStringRef getIsArrayString() {</span>
+  <span class="s4">static </span><span class="s1">JSStringRef isArray = JSStringCreateWithUTF8CString(</span><span class="s3">&quot;isArray&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">isArray</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s2">#endif</span>
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s0">// std::string utility</span>
+<span class="s4">namespace </span><span class="s1">{</span>
+<span class="s1">std::string to_string(</span><span class="s4">void </span><span class="s1">*value) {</span>
+  <span class="s1">std::ostringstream ss</span><span class="s4">;</span>
+  <span class="s1">ss &lt;&lt; value</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">ss.str()</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">JSCRuntime::JSCRuntime()</span>
+    <span class="s1">: JSCRuntime(JSGlobalContextCreateInGroup(</span><span class="s4">nullptr, nullptr</span><span class="s1">)) {</span>
+  <span class="s1">JSGlobalContextRelease(ctx_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSCRuntime::JSCRuntime(JSGlobalContextRef ctx)</span>
+    <span class="s1">: ctx_(JSGlobalContextRetain(ctx))</span><span class="s4">,</span>
+      <span class="s1">ctxInvalid_(</span><span class="s4">false</span><span class="s1">)</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+      <span class="s4">,</span>
+      <span class="s1">objectCounter_(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">stringCounter_(</span><span class="s5">0</span><span class="s1">)</span>
+<span class="s2">#endif</span>
+<span class="s1">{</span>
+<span class="s1">}</span>
+
+<span class="s1">JSCRuntime::~JSCRuntime() {</span>
+  <span class="s0">// On shutting down and cleaning up: when JSC is actually torn down,</span>
+  <span class="s0">// it calls JSC::Heap::lastChanceToFinalize internally which</span>
+  <span class="s0">// finalizes anything left over.  But at this point,</span>
+  <span class="s0">// JSValueUnprotect() can no longer be called.  We use an</span>
+  <span class="s0">// atomic&lt;bool&gt; to avoid unsafe unprotects happening after shutdown</span>
+  <span class="s0">// has started.</span>
+  <span class="s1">ctxInvalid_ = </span><span class="s4">true;</span>
+  <span class="s1">JSGlobalContextRelease(ctx_)</span><span class="s4">;</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s1">assert(</span>
+      <span class="s1">objectCounter_ == </span><span class="s5">0 </span><span class="s1">&amp;&amp; </span><span class="s3">&quot;JSCRuntime destroyed with a dangling API object&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">assert(</span>
+      <span class="s1">stringCounter_ == </span><span class="s5">0 </span><span class="s1">&amp;&amp; </span><span class="s3">&quot;JSCRuntime destroyed with a dangling API string&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::PreparedJavaScript&gt; JSCRuntime::prepareJavaScript(</span>
+    <span class="s4">const </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::Buffer&gt; &amp;buffer</span><span class="s4">,</span>
+    <span class="s1">std::string sourceURL) {</span>
+  <span class="s4">return </span><span class="s1">std::make_shared&lt;jsi::SourceJavaScriptPreparation&gt;(</span>
+      <span class="s1">buffer</span><span class="s4">, </span><span class="s1">std::move(sourceURL))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::evaluatePreparedJavaScript(</span>
+    <span class="s4">const </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::PreparedJavaScript&gt; &amp;js) {</span>
+  <span class="s1">assert(</span>
+      <span class="s4">dynamic_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">jsi::SourceJavaScriptPreparation *&gt;(js.get()) &amp;&amp;</span>
+      <span class="s3">&quot;preparedJavaScript must be a SourceJavaScriptPreparation&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">sourceJs =</span>
+      <span class="s1">std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">jsi::SourceJavaScriptPreparation&gt;(js)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">evaluateJavaScript(sourceJs</span><span class="s4">, </span><span class="s1">sourceJs-&gt;sourceURL())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::evaluateJavaScript(</span>
+    <span class="s4">const </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">jsi::Buffer&gt; &amp;buffer</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;sourceURL) {</span>
+  <span class="s1">std::string tmp(</span>
+      <span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">const char </span><span class="s1">*&gt;(buffer-&gt;data())</span><span class="s4">, </span><span class="s1">buffer-&gt;size())</span><span class="s4">;</span>
+  <span class="s1">JSStringRef sourceRef = JSStringCreateWithUTF8CString(tmp.c_str())</span><span class="s4">;</span>
+  <span class="s1">JSStringRef sourceURLRef = </span><span class="s4">nullptr;</span>
+  <span class="s4">if </span><span class="s1">(!sourceURL.empty()) {</span>
+    <span class="s1">sourceURLRef = JSStringCreateWithUTF8CString(sourceURL.c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSValueRef res =</span>
+      <span class="s1">JSEvaluateScript(ctx_</span><span class="s4">, </span><span class="s1">sourceRef</span><span class="s4">, nullptr, </span><span class="s1">sourceURLRef</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">JSStringRelease(sourceRef)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(sourceURLRef) {</span>
+    <span class="s1">JSStringRelease(sourceURLRef)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">checkException(res</span><span class="s4">, </span><span class="s1">exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createValue(res)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::drainMicrotasks(</span><span class="s4">int </span><span class="s1">maxMicrotasksHint) {</span>
+  <span class="s4">return true;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Object JSCRuntime::global() {</span>
+  <span class="s4">return </span><span class="s1">createObject(JSContextGetGlobalObject(ctx_))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string JSCRuntime::description() {</span>
+  <span class="s4">if </span><span class="s1">(desc_.empty()) {</span>
+    <span class="s1">desc_ = std::string(</span><span class="s3">&quot;&lt;JSCRuntime@&quot;</span><span class="s1">) + to_string(</span><span class="s4">this</span><span class="s1">) + </span><span class="s3">&quot;&gt;&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">desc_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::isInspectable() {</span>
+  <span class="s4">return false;</span>
+<span class="s1">}</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">bool </span><span class="s1">smellsLikeES6Symbol(JSGlobalContextRef ctx</span><span class="s4">, </span><span class="s1">JSValueRef ref) {</span>
+  <span class="s0">// Since iOS 13, JSValueGetType will return kJSTypeSymbol</span>
+  <span class="s0">// Before: Empirically, an es6 Symbol is not an object, but its type is</span>
+  <span class="s0">// object.  This makes no sense, but we'll run with it.</span>
+  <span class="s0">// https://github.com/WebKit/webkit/blob/master/Source/JavaScriptCore/API/JSValueRef.cpp#L79-L82</span>
+
+  <span class="s1">JSType type = JSValueGetType(ctx</span><span class="s4">, </span><span class="s1">ref)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(type == </span><span class="s0">/* kJSTypeSymbol */ </span><span class="s5">6</span><span class="s1">) {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">(!JSValueIsObject(ctx</span><span class="s4">, </span><span class="s1">ref) &amp;&amp; type == kJSTypeObject)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">JSCRuntime::JSCSymbolValue::JSCSymbolValue(</span>
+    <span class="s1">JSGlobalContextRef ctx</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; &amp;ctxInvalid</span><span class="s4">,</span>
+    <span class="s1">JSValueRef sym</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+    <span class="s4">,</span>
+    <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter</span>
+<span class="s2">#endif</span>
+    <span class="s1">)</span>
+    <span class="s1">: ctx_(ctx)</span><span class="s4">,</span>
+      <span class="s1">ctxInvalid_(ctxInvalid)</span><span class="s4">,</span>
+      <span class="s1">sym_(sym)</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+      <span class="s4">,</span>
+      <span class="s1">counter_(counter)</span>
+<span class="s2">#endif</span>
+<span class="s1">{</span>
+  <span class="s1">assert(smellsLikeES6Symbol(ctx_</span><span class="s4">, </span><span class="s1">sym_))</span><span class="s4">;</span>
+  <span class="s1">JSValueProtect(ctx_</span><span class="s4">, </span><span class="s1">sym_)</span><span class="s4">;</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s1">counter_ += </span><span class="s5">1</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::JSCSymbolValue::invalidate() {</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s1">counter_ -= </span><span class="s5">1</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s4">if </span><span class="s1">(!ctxInvalid_) {</span>
+    <span class="s1">JSValueUnprotect(ctx_</span><span class="s4">, </span><span class="s1">sym_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">delete this;</span>
+<span class="s1">}</span>
+
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+<span class="s1">JSCRuntime::JSCStringValue::JSCStringValue(</span>
+    <span class="s1">JSStringRef str</span><span class="s4">,</span>
+    <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter)</span>
+    <span class="s1">: str_(JSStringRetain(str))</span><span class="s4">, </span><span class="s1">counter_(counter) {</span>
+  <span class="s0">// Since std::atomic returns a copy instead of a reference when calling</span>
+  <span class="s0">// operator+= we must do this explicitly in the constructor</span>
+  <span class="s1">counter_ += </span><span class="s5">1</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s2">#else</span>
+<span class="s1">JSCRuntime::JSCStringValue::JSCStringValue(JSStringRef str)</span>
+    <span class="s1">: str_(JSStringRetain(str)) {}</span>
+<span class="s2">#endif</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::JSCStringValue::invalidate() {</span>
+  <span class="s0">// These JSC{String,Object}Value objects are implicitly owned by the</span>
+  <span class="s0">// {String,Object} objects, thus when a String/Object is destructed</span>
+  <span class="s0">// the JSC{String,Object}Value should be released.</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s1">counter_ -= </span><span class="s5">1</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+  <span class="s1">JSStringRelease(str_)</span><span class="s4">;</span>
+  <span class="s0">// Angery reaccs only</span>
+  <span class="s4">delete this;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSCRuntime::JSCObjectValue::JSCObjectValue(</span>
+    <span class="s1">JSGlobalContextRef ctx</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; &amp;ctxInvalid</span><span class="s4">,</span>
+    <span class="s1">JSObjectRef obj</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+    <span class="s4">,</span>
+    <span class="s1">std::atomic&lt;intptr_t&gt; &amp;counter</span>
+<span class="s2">#endif</span>
+    <span class="s1">)</span>
+    <span class="s1">: ctx_(ctx)</span><span class="s4">,</span>
+      <span class="s1">ctxInvalid_(ctxInvalid)</span><span class="s4">,</span>
+      <span class="s1">obj_(obj)</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+      <span class="s4">,</span>
+      <span class="s1">counter_(counter)</span>
+<span class="s2">#endif</span>
+<span class="s1">{</span>
+  <span class="s1">JSValueProtect(ctx_</span><span class="s4">, </span><span class="s1">obj_)</span><span class="s4">;</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s1">counter_ += </span><span class="s5">1</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::JSCObjectValue::invalidate() {</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s1">counter_ -= </span><span class="s5">1</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+  <span class="s0">// When shutting down the VM, if there is a HostObject which</span>
+  <span class="s0">// contains or otherwise owns a jsi::Object, then the final GC will</span>
+  <span class="s0">// finalize the HostObject, leading to a call to invalidate().  But</span>
+  <span class="s0">// at that point, making calls to JSValueUnprotect will crash.</span>
+  <span class="s0">// It is up to the application to make sure that any other calls to</span>
+  <span class="s0">// invalidate() happen before VM destruction; see the comment on</span>
+  <span class="s0">// jsi::Runtime.</span>
+  <span class="s0">//</span>
+  <span class="s0">// Another potential concern here is that in the non-shutdown case,</span>
+  <span class="s0">// if a HostObject is GCd, JSValueUnprotect will be called from the</span>
+  <span class="s0">// JSC finalizer.  The documentation warns against this: &quot;You must</span>
+  <span class="s0">// not call any function that may cause a garbage collection or an</span>
+  <span class="s0">// allocation of a garbage collected object from within a</span>
+  <span class="s0">// JSObjectFinalizeCallback. This includes all functions that have a</span>
+  <span class="s0">// JSContextRef parameter.&quot; However, an audit of the source code for</span>
+  <span class="s0">// JSValueUnprotect in late 2018 shows that it cannot cause</span>
+  <span class="s0">// allocation or a GC, and further, this code has not changed in</span>
+  <span class="s0">// about two years.  In the future, we may choose to reintroduce the</span>
+  <span class="s0">// mechanism previously used here which uses a separate thread for</span>
+  <span class="s0">// JSValueUnprotect, in order to conform to the documented API, but</span>
+  <span class="s0">// use the &quot;unsafe&quot; synchronous version on iOS 11 and earlier.</span>
+
+  <span class="s4">if </span><span class="s1">(!ctxInvalid_) {</span>
+    <span class="s1">JSValueUnprotect(ctx_</span><span class="s4">, </span><span class="s1">obj_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">delete this;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::cloneSymbol(</span>
+    <span class="s4">const </span><span class="s1">jsi::Runtime::PointerValue *pv) {</span>
+  <span class="s4">if </span><span class="s1">(!pv) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+  <span class="s4">const </span><span class="s1">JSCSymbolValue *symbol = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCSymbolValue *&gt;(pv)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">makeSymbolValue(symbol-&gt;sym_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::cloneBigInt(</span>
+    <span class="s4">const </span><span class="s1">Runtime::PointerValue *) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::cloneString(</span>
+    <span class="s4">const </span><span class="s1">jsi::Runtime::PointerValue *pv) {</span>
+  <span class="s4">if </span><span class="s1">(!pv) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+  <span class="s4">const </span><span class="s1">JSCStringValue *string = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCStringValue *&gt;(pv)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">makeStringValue(string-&gt;str_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::cloneObject(</span>
+    <span class="s4">const </span><span class="s1">jsi::Runtime::PointerValue *pv) {</span>
+  <span class="s4">if </span><span class="s1">(!pv) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+  <span class="s4">const </span><span class="s1">JSCObjectValue *object = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCObjectValue *&gt;(pv)</span><span class="s4">;</span>
+  <span class="s1">assert(</span>
+      <span class="s1">object-&gt;ctx_ == ctx_ &amp;&amp;</span>
+      <span class="s3">&quot;Don't try to clone an object backed by a different Runtime&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">makeObjectValue(object-&gt;obj_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::clonePropNameID(</span>
+    <span class="s4">const </span><span class="s1">jsi::Runtime::PointerValue *pv) {</span>
+  <span class="s4">if </span><span class="s1">(!pv) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+  <span class="s4">const </span><span class="s1">JSCStringValue *string = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCStringValue *&gt;(pv)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">makeStringValue(string-&gt;str_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::PropNameID JSCRuntime::createPropNameIDFromAscii(</span>
+    <span class="s4">const char </span><span class="s1">*str</span><span class="s4">,</span>
+    <span class="s1">size_t length) {</span>
+  <span class="s0">// For system JSC this must is identical to a string</span>
+  <span class="s1">std::string tmp(str</span><span class="s4">, </span><span class="s1">length)</span><span class="s4">;</span>
+  <span class="s1">JSStringRef strRef = JSStringCreateWithUTF8CString(tmp.c_str())</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">res = createPropNameID(strRef)</span><span class="s4">;</span>
+  <span class="s1">JSStringRelease(strRef)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">res</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::PropNameID JSCRuntime::createPropNameIDFromUtf8(</span>
+    <span class="s4">const </span><span class="s1">uint8_t *utf8</span><span class="s4">,</span>
+    <span class="s1">size_t length) {</span>
+  <span class="s1">std::string tmp(</span><span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">const char </span><span class="s1">*&gt;(utf8)</span><span class="s4">, </span><span class="s1">length)</span><span class="s4">;</span>
+  <span class="s1">JSStringRef strRef = JSStringCreateWithUTF8CString(tmp.c_str())</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">res = createPropNameID(strRef)</span><span class="s4">;</span>
+  <span class="s1">JSStringRelease(strRef)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">res</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::PropNameID JSCRuntime::createPropNameIDFromString(</span><span class="s4">const </span><span class="s1">jsi::String &amp;str) {</span>
+  <span class="s4">return </span><span class="s1">createPropNameID(stringRef(str))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::PropNameID JSCRuntime::createPropNameIDFromSymbol(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;sym) {</span>
+  <span class="s0">// TODO: Support for symbols through the native API in JSC is very limited.</span>
+  <span class="s0">// While we could construct a PropNameID here, we would not be able to get a</span>
+  <span class="s0">// symbol property through the C++ API.</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string JSCRuntime::utf8(</span><span class="s4">const </span><span class="s1">jsi::PropNameID &amp;sym) {</span>
+  <span class="s4">return </span><span class="s1">JSStringToSTLString(stringRef(sym))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::compare(</span><span class="s4">const </span><span class="s1">jsi::PropNameID &amp;a</span><span class="s4">, const </span><span class="s1">jsi::PropNameID &amp;b) {</span>
+  <span class="s4">return </span><span class="s1">JSStringIsEqual(stringRef(a)</span><span class="s4">, </span><span class="s1">stringRef(b))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string JSCRuntime::symbolToString(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;sym) {</span>
+  <span class="s4">return </span><span class="s1">jsi::Value(*</span><span class="s4">this, </span><span class="s1">sym).toString(*</span><span class="s4">this</span><span class="s1">).utf8(*</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::BigInt JSCRuntime::createBigIntFromInt64(int64_t) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::BigInt JSCRuntime::createBigIntFromUint64(uint64_t) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::bigintIsInt64(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::bigintIsUint64(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">uint64_t JSCRuntime::truncate(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::String JSCRuntime::bigintToString(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;</span><span class="s4">, int</span><span class="s1">) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::String JSCRuntime::createStringFromAscii(</span><span class="s4">const char </span><span class="s1">*str</span><span class="s4">, </span><span class="s1">size_t length) {</span>
+  <span class="s0">// Yes we end up double casting for semantic reasons (UTF8 contains ASCII,</span>
+  <span class="s0">// not the other way around)</span>
+  <span class="s4">return this</span><span class="s1">-&gt;createStringFromUtf8(</span>
+      <span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">uint8_t *&gt;(str)</span><span class="s4">, </span><span class="s1">length)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::String JSCRuntime::createStringFromUtf8(</span>
+    <span class="s4">const </span><span class="s1">uint8_t *str</span><span class="s4">,</span>
+    <span class="s1">size_t length) {</span>
+  <span class="s1">std::string tmp(</span><span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">const char </span><span class="s1">*&gt;(str)</span><span class="s4">, </span><span class="s1">length)</span><span class="s4">;</span>
+  <span class="s1">JSStringRef stringRef = JSStringCreateWithUTF8CString(tmp.c_str())</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">result = createString(stringRef)</span><span class="s4">;</span>
+  <span class="s1">JSStringRelease(stringRef)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string JSCRuntime::utf8(</span><span class="s4">const </span><span class="s1">jsi::String &amp;str) {</span>
+  <span class="s4">return </span><span class="s1">JSStringToSTLString(stringRef(str))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Object JSCRuntime::createObject() {</span>
+  <span class="s4">return </span><span class="s1">createObject(</span><span class="s4">static_cast</span><span class="s1">&lt;JSObjectRef&gt;(</span><span class="s4">nullptr</span><span class="s1">))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// HostObject details</span>
+<span class="s4">namespace </span><span class="s1">detail {</span>
+<span class="s4">struct </span><span class="s1">HostObjectProxyBase {</span>
+  <span class="s1">HostObjectProxyBase(</span>
+      <span class="s1">JSCRuntime &amp;rt</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::shared_ptr&lt;jsi::HostObject&gt; &amp;sho)</span>
+      <span class="s1">: runtime(rt)</span><span class="s4">, </span><span class="s1">hostObject(sho) {}</span>
+
+  <span class="s1">JSCRuntime &amp;runtime</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;jsi::HostObject&gt; hostObject</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+<span class="s1">} </span><span class="s0">// namespace detail</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+<span class="s1">std::once_flag hostObjectClassOnceFlag</span><span class="s4">;</span>
+<span class="s1">JSClassRef hostObjectClass{}</span><span class="s4">;</span>
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">jsi::Object JSCRuntime::createObject(std::shared_ptr&lt;jsi::HostObject&gt; ho) {</span>
+  <span class="s4">struct </span><span class="s1">HostObjectProxy : </span><span class="s4">public </span><span class="s1">detail::HostObjectProxyBase {</span>
+    <span class="s4">static </span><span class="s1">JSValueRef getProperty(</span>
+        <span class="s1">JSContextRef ctx</span><span class="s4">,</span>
+        <span class="s1">JSObjectRef object</span><span class="s4">,</span>
+        <span class="s1">JSStringRef propName</span><span class="s4">,</span>
+        <span class="s1">JSValueRef *exception) {</span>
+      <span class="s4">auto </span><span class="s1">proxy = </span><span class="s4">static_cast</span><span class="s1">&lt;HostObjectProxy *&gt;(JSObjectGetPrivate(object))</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">&amp;rt = proxy-&gt;runtime</span><span class="s4">;</span>
+      <span class="s1">jsi::PropNameID sym = rt.createPropNameID(propName)</span><span class="s4">;</span>
+      <span class="s1">jsi::Value ret</span><span class="s4">;</span>
+      <span class="s4">try </span><span class="s1">{</span>
+        <span class="s1">ret = proxy-&gt;hostObject-&gt;get(rt</span><span class="s4">, </span><span class="s1">sym)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">jsi::JSError &amp;error) {</span>
+        <span class="s1">*exception = rt.valueRef(error.value())</span><span class="s4">;</span>
+        <span class="s4">return </span><span class="s1">JSValueMakeUndefined(ctx)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::exception &amp;ex) {</span>
+        <span class="s4">auto </span><span class="s1">excValue =</span>
+            <span class="s1">rt.global()</span>
+                <span class="s1">.getPropertyAsFunction(rt</span><span class="s4">, </span><span class="s3">&quot;Error&quot;</span><span class="s1">)</span>
+                <span class="s1">.call(</span>
+                    <span class="s1">rt</span><span class="s4">,</span>
+                    <span class="s1">std::string(</span><span class="s3">&quot;Exception in HostObject::get(propName:&quot;</span><span class="s1">) +</span>
+                        <span class="s1">JSStringToSTLString(propName) + std::string(</span><span class="s3">&quot;): &quot;</span><span class="s1">) +</span>
+                        <span class="s1">ex.what())</span><span class="s4">;</span>
+        <span class="s1">*exception = rt.valueRef(excValue)</span><span class="s4">;</span>
+        <span class="s4">return </span><span class="s1">JSValueMakeUndefined(ctx)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+        <span class="s4">auto </span><span class="s1">excValue =</span>
+            <span class="s1">rt.global()</span>
+                <span class="s1">.getPropertyAsFunction(rt</span><span class="s4">, </span><span class="s3">&quot;Error&quot;</span><span class="s1">)</span>
+                <span class="s1">.call(</span>
+                    <span class="s1">rt</span><span class="s4">,</span>
+                    <span class="s1">std::string(</span><span class="s3">&quot;Exception in HostObject::get(propName:&quot;</span><span class="s1">) +</span>
+                        <span class="s1">JSStringToSTLString(propName) +</span>
+                        <span class="s1">std::string(</span><span class="s3">&quot;): &lt;unknown&gt;&quot;</span><span class="s1">))</span><span class="s4">;</span>
+        <span class="s1">*exception = rt.valueRef(excValue)</span><span class="s4">;</span>
+        <span class="s4">return </span><span class="s1">JSValueMakeUndefined(ctx)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">return </span><span class="s1">rt.valueRef(ret)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+<span class="s2">#define </span><span class="s1">JSC_UNUSED(x) (</span><span class="s4">void</span><span class="s1">)(x)</span><span class="s4">;</span>
+
+    <span class="s4">static bool </span><span class="s1">setProperty(</span>
+        <span class="s1">JSContextRef ctx</span><span class="s4">,</span>
+        <span class="s1">JSObjectRef object</span><span class="s4">,</span>
+        <span class="s1">JSStringRef propName</span><span class="s4">,</span>
+        <span class="s1">JSValueRef value</span><span class="s4">,</span>
+        <span class="s1">JSValueRef *exception) {</span>
+      <span class="s1">JSC_UNUSED(ctx)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">proxy = </span><span class="s4">static_cast</span><span class="s1">&lt;HostObjectProxy *&gt;(JSObjectGetPrivate(object))</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">&amp;rt = proxy-&gt;runtime</span><span class="s4">;</span>
+      <span class="s1">jsi::PropNameID sym = rt.createPropNameID(propName)</span><span class="s4">;</span>
+      <span class="s4">try </span><span class="s1">{</span>
+        <span class="s1">proxy-&gt;hostObject-&gt;set(rt</span><span class="s4">, </span><span class="s1">sym</span><span class="s4">, </span><span class="s1">rt.createValue(value))</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">jsi::JSError &amp;error) {</span>
+        <span class="s1">*exception = rt.valueRef(error.value())</span><span class="s4">;</span>
+        <span class="s4">return false;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::exception &amp;ex) {</span>
+        <span class="s4">auto </span><span class="s1">excValue =</span>
+            <span class="s1">rt.global()</span>
+                <span class="s1">.getPropertyAsFunction(rt</span><span class="s4">, </span><span class="s3">&quot;Error&quot;</span><span class="s1">)</span>
+                <span class="s1">.call(</span>
+                    <span class="s1">rt</span><span class="s4">,</span>
+                    <span class="s1">std::string(</span><span class="s3">&quot;Exception in HostObject::set(propName:&quot;</span><span class="s1">) +</span>
+                        <span class="s1">JSStringToSTLString(propName) + std::string(</span><span class="s3">&quot;): &quot;</span><span class="s1">) +</span>
+                        <span class="s1">ex.what())</span><span class="s4">;</span>
+        <span class="s1">*exception = rt.valueRef(excValue)</span><span class="s4">;</span>
+        <span class="s4">return false;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+        <span class="s4">auto </span><span class="s1">excValue =</span>
+            <span class="s1">rt.global()</span>
+                <span class="s1">.getPropertyAsFunction(rt</span><span class="s4">, </span><span class="s3">&quot;Error&quot;</span><span class="s1">)</span>
+                <span class="s1">.call(</span>
+                    <span class="s1">rt</span><span class="s4">,</span>
+                    <span class="s1">std::string(</span><span class="s3">&quot;Exception in HostObject::set(propName:&quot;</span><span class="s1">) +</span>
+                        <span class="s1">JSStringToSTLString(propName) +</span>
+                        <span class="s1">std::string(</span><span class="s3">&quot;): &lt;unknown&gt;&quot;</span><span class="s1">))</span><span class="s4">;</span>
+        <span class="s1">*exception = rt.valueRef(excValue)</span><span class="s4">;</span>
+        <span class="s4">return false;</span>
+      <span class="s1">}</span>
+      <span class="s4">return true;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// JSC does not provide means to communicate errors from this callback,</span>
+    <span class="s0">// so the error handling strategy is very brutal - we'll just crash</span>
+    <span class="s0">// due to noexcept.</span>
+    <span class="s4">static void </span><span class="s1">getPropertyNames(</span>
+        <span class="s1">JSContextRef ctx</span><span class="s4">,</span>
+        <span class="s1">JSObjectRef object</span><span class="s4">,</span>
+        <span class="s1">JSPropertyNameAccumulatorRef propertyNames) </span><span class="s4">noexcept </span><span class="s1">{</span>
+      <span class="s1">JSC_UNUSED(ctx)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">proxy = </span><span class="s4">static_cast</span><span class="s1">&lt;HostObjectProxy *&gt;(JSObjectGetPrivate(object))</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">&amp;rt = proxy-&gt;runtime</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">names = proxy-&gt;hostObject-&gt;getPropertyNames(rt)</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;name : names) {</span>
+        <span class="s1">JSPropertyNameAccumulatorAddName(propertyNames</span><span class="s4">, </span><span class="s1">stringRef(name))</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+<span class="s2">#undef </span><span class="s1">JSC_UNUSED</span>
+
+    <span class="s4">static void </span><span class="s1">finalize(JSObjectRef obj) {</span>
+      <span class="s4">auto </span><span class="s1">hostObject = </span><span class="s4">static_cast</span><span class="s1">&lt;HostObjectProxy *&gt;(JSObjectGetPrivate(obj))</span><span class="s4">;</span>
+      <span class="s1">JSObjectSetPrivate(obj</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">delete </span><span class="s1">hostObject</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">using </span><span class="s1">HostObjectProxyBase::HostObjectProxyBase</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">std::call_once(hostObjectClassOnceFlag</span><span class="s4">, </span><span class="s1">[]() {</span>
+    <span class="s1">JSClassDefinition hostObjectClassDef = kJSClassDefinitionEmpty</span><span class="s4">;</span>
+    <span class="s1">hostObjectClassDef.version = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">hostObjectClassDef.attributes = kJSClassAttributeNoAutomaticPrototype</span><span class="s4">;</span>
+    <span class="s1">hostObjectClassDef.finalize = HostObjectProxy::finalize</span><span class="s4">;</span>
+    <span class="s1">hostObjectClassDef.getProperty = HostObjectProxy::getProperty</span><span class="s4">;</span>
+    <span class="s1">hostObjectClassDef.setProperty = HostObjectProxy::setProperty</span><span class="s4">;</span>
+    <span class="s1">hostObjectClassDef.getPropertyNames = HostObjectProxy::getPropertyNames</span><span class="s4">;</span>
+    <span class="s1">hostObjectClass = JSClassCreate(&amp;hostObjectClassDef)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">JSObjectRef obj =</span>
+      <span class="s1">JSObjectMake(ctx_</span><span class="s4">, </span><span class="s1">hostObjectClass</span><span class="s4">, new </span><span class="s1">HostObjectProxy(*</span><span class="s4">this, </span><span class="s1">ho))</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createObject(obj)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;jsi::HostObject&gt; JSCRuntime::getHostObject(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;obj) {</span>
+  <span class="s0">// We are guaranteed at this point to have isHostObject(obj) == true</span>
+  <span class="s0">// so the private data should be HostObjectMetadata</span>
+  <span class="s1">JSObjectRef object = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">metadata =</span>
+      <span class="s4">static_cast</span><span class="s1">&lt;detail::HostObjectProxyBase *&gt;(JSObjectGetPrivate(object))</span><span class="s4">;</span>
+  <span class="s1">assert(metadata)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">metadata-&gt;hostObject</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::hasNativeState(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;jsi::NativeState&gt; JSCRuntime::getNativeState(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::setNativeState(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;jsi::NativeState&gt;) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::getProperty(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;obj</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::String &amp;name) {</span>
+  <span class="s1">JSObjectRef objRef = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSValueRef res = JSObjectGetProperty(ctx_</span><span class="s4">, </span><span class="s1">objRef</span><span class="s4">, </span><span class="s1">stringRef(name)</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createValue(res)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::getProperty(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;obj</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::PropNameID &amp;name) {</span>
+  <span class="s1">JSObjectRef objRef = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSValueRef res = JSObjectGetProperty(ctx_</span><span class="s4">, </span><span class="s1">objRef</span><span class="s4">, </span><span class="s1">stringRef(name)</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createValue(res)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::hasProperty(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj</span><span class="s4">, const </span><span class="s1">jsi::String &amp;name) {</span>
+  <span class="s1">JSObjectRef objRef = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">JSObjectHasProperty(ctx_</span><span class="s4">, </span><span class="s1">objRef</span><span class="s4">, </span><span class="s1">stringRef(name))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::hasProperty(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;obj</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::PropNameID &amp;name) {</span>
+  <span class="s1">JSObjectRef objRef = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">JSObjectHasProperty(ctx_</span><span class="s4">, </span><span class="s1">objRef</span><span class="s4">, </span><span class="s1">stringRef(name))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::setPropertyValue(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;object</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::PropNameID &amp;name</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value &amp;value) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSObjectSetProperty(</span>
+      <span class="s1">ctx_</span><span class="s4">,</span>
+      <span class="s1">objectRef(object)</span><span class="s4">,</span>
+      <span class="s1">stringRef(name)</span><span class="s4">,</span>
+      <span class="s1">valueRef(value)</span><span class="s4">,</span>
+      <span class="s1">kJSPropertyAttributeNone</span><span class="s4">,</span>
+      <span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::setPropertyValue(</span>
+    <span class="s4">const </span><span class="s1">jsi::Object &amp;object</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::String &amp;name</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value &amp;value) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSObjectSetProperty(</span>
+      <span class="s1">ctx_</span><span class="s4">,</span>
+      <span class="s1">objectRef(object)</span><span class="s4">,</span>
+      <span class="s1">stringRef(name)</span><span class="s4">,</span>
+      <span class="s1">valueRef(value)</span><span class="s4">,</span>
+      <span class="s1">kJSPropertyAttributeNone</span><span class="s4">,</span>
+      <span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::isArray(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj) </span><span class="s4">const </span><span class="s1">{</span>
+<span class="s2">#if </span><span class="s1">!defined(_JSC_FAST_IS_ARRAY)</span>
+  <span class="s1">JSObjectRef global = JSContextGetGlobalObject(ctx_)</span><span class="s4">;</span>
+  <span class="s1">JSStringRef arrayString = getArrayString()</span><span class="s4">;</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSValueRef arrayCtorValue =</span>
+      <span class="s1">JSObjectGetProperty(ctx_</span><span class="s4">, </span><span class="s1">global</span><span class="s4">, </span><span class="s1">arrayString</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">JSC_ASSERT(exc)</span><span class="s4">;</span>
+  <span class="s1">JSObjectRef arrayCtor = JSValueToObject(ctx_</span><span class="s4">, </span><span class="s1">arrayCtorValue</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">JSC_ASSERT(exc)</span><span class="s4">;</span>
+  <span class="s1">JSStringRef isArrayString = getIsArrayString()</span><span class="s4">;</span>
+  <span class="s1">JSValueRef isArrayValue =</span>
+      <span class="s1">JSObjectGetProperty(ctx_</span><span class="s4">, </span><span class="s1">arrayCtor</span><span class="s4">, </span><span class="s1">isArrayString</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">JSC_ASSERT(exc)</span><span class="s4">;</span>
+  <span class="s1">JSObjectRef isArray = JSValueToObject(ctx_</span><span class="s4">, </span><span class="s1">isArrayValue</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">JSC_ASSERT(exc)</span><span class="s4">;</span>
+  <span class="s1">JSValueRef arg = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s1">JSValueRef result =</span>
+      <span class="s1">JSObjectCallAsFunction(ctx_</span><span class="s4">, </span><span class="s1">isArray</span><span class="s4">, nullptr, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">&amp;arg</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">JSC_ASSERT(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">JSValueToBoolean(ctx_</span><span class="s4">, </span><span class="s1">result)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">return </span><span class="s1">JSValueIsArray(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj))</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::isArrayBuffer(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj) </span><span class="s4">const </span><span class="s1">{</span>
+<span class="s2">#if </span><span class="s1">defined(_JSC_NO_ARRAY_BUFFERS)</span>
+  <span class="s4">throw </span><span class="s1">std::runtime_error(</span><span class="s3">&quot;Unsupported&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">auto </span><span class="s1">typedArrayType = JSValueGetTypedArrayType(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj)</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">typedArrayType == kJSTypedArrayTypeArrayBuffer</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">uint8_t *JSCRuntime::data(</span><span class="s4">const </span><span class="s1">jsi::ArrayBuffer &amp;obj) {</span>
+<span class="s2">#if </span><span class="s1">defined(_JSC_NO_ARRAY_BUFFERS)</span>
+  <span class="s4">throw </span><span class="s1">std::runtime_error(</span><span class="s3">&quot;Unsupported&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">return static_cast</span><span class="s1">&lt;uint8_t *&gt;(</span>
+      <span class="s1">JSObjectGetArrayBufferBytesPtr(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj)</span><span class="s4">, nullptr</span><span class="s1">))</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">size_t JSCRuntime::size(</span><span class="s4">const </span><span class="s1">jsi::ArrayBuffer &amp;obj) {</span>
+<span class="s2">#if </span><span class="s1">defined(_JSC_NO_ARRAY_BUFFERS)</span>
+  <span class="s4">throw </span><span class="s1">std::runtime_error(</span><span class="s3">&quot;Unsupported&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">return </span><span class="s1">JSObjectGetArrayBufferByteLength(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj)</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::isFunction(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">JSObjectIsFunction(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::isHostObject(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">cls = hostObjectClass</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">cls != </span><span class="s4">nullptr </span><span class="s1">&amp;&amp; JSValueIsObjectOfClass(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj)</span><span class="s4">, </span><span class="s1">cls)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// Very expensive</span>
+<span class="s1">jsi::Array JSCRuntime::getPropertyNames(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj) {</span>
+  <span class="s1">JSPropertyNameArrayRef names =</span>
+      <span class="s1">JSObjectCopyPropertyNames(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj))</span><span class="s4">;</span>
+  <span class="s1">size_t len = JSPropertyNameArrayGetCount(names)</span><span class="s4">;</span>
+  <span class="s0">// Would be better if we could create an array with explicit elements</span>
+  <span class="s4">auto </span><span class="s1">result = createArray(len)</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(size_t i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; len</span><span class="s4">; </span><span class="s1">i++) {</span>
+    <span class="s1">JSStringRef str = JSPropertyNameArrayGetNameAtIndex(names</span><span class="s4">, </span><span class="s1">i)</span><span class="s4">;</span>
+    <span class="s1">result.setValueAtIndex(*</span><span class="s4">this, </span><span class="s1">i</span><span class="s4">, </span><span class="s1">createString(str))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">JSPropertyNameArrayRelease(names)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::WeakObject JSCRuntime::createWeakObject(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj) {</span>
+<span class="s2">#ifdef </span><span class="s1">RN_FABRIC_ENABLED</span>
+  <span class="s0">// TODO: revisit this implementation</span>
+  <span class="s1">JSObjectRef objRef = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">make&lt;jsi::WeakObject&gt;(makeObjectValue(objRef))</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::lockWeakObject(</span><span class="s4">const </span><span class="s1">jsi::WeakObject &amp;obj) {</span>
+<span class="s2">#ifdef </span><span class="s1">RN_FABRIC_ENABLED</span>
+  <span class="s0">// TODO: revisit this implementation</span>
+  <span class="s1">JSObjectRef objRef = objectRef(obj)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">jsi::Value(createObject(objRef))</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Array JSCRuntime::createArray(size_t length) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSObjectRef obj = JSObjectMakeArray(ctx_</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, nullptr, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(obj</span><span class="s4">, </span><span class="s1">exc)</span><span class="s4">;</span>
+  <span class="s1">JSObjectSetProperty(</span>
+      <span class="s1">ctx_</span><span class="s4">,</span>
+      <span class="s1">obj</span><span class="s4">,</span>
+      <span class="s1">getLengthString()</span><span class="s4">,</span>
+      <span class="s1">JSValueMakeNumber(ctx_</span><span class="s4">, static_cast</span><span class="s1">&lt;</span><span class="s4">double</span><span class="s1">&gt;(length))</span><span class="s4">,</span>
+      <span class="s5">0</span><span class="s4">,</span>
+      <span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createObject(obj).getArray(*</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::ArrayBuffer JSCRuntime::createArrayBuffer(</span>
+    <span class="s1">std::shared_ptr&lt;jsi::MutableBuffer&gt; buffer) {</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">size_t JSCRuntime::size(</span><span class="s4">const </span><span class="s1">jsi::Array &amp;arr) {</span>
+  <span class="s4">return static_cast</span><span class="s1">&lt;size_t&gt;(</span>
+      <span class="s1">getProperty(arr</span><span class="s4">, </span><span class="s1">createPropNameID(getLengthString())).getNumber())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::getValueAtIndex(</span><span class="s4">const </span><span class="s1">jsi::Array &amp;arr</span><span class="s4">, </span><span class="s1">size_t i) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s4">auto </span><span class="s1">res = JSObjectGetPropertyAtIndex(ctx_</span><span class="s4">, </span><span class="s1">objectRef(arr)</span><span class="s4">, </span><span class="s1">(</span><span class="s4">int</span><span class="s1">)i</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createValue(res)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::setValueAtIndexImpl(</span>
+    <span class="s4">const </span><span class="s1">jsi::Array &amp;arr</span><span class="s4">,</span>
+    <span class="s1">size_t i</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value &amp;value) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s1">JSObjectSetPropertyAtIndex(</span>
+      <span class="s1">ctx_</span><span class="s4">, </span><span class="s1">objectRef(arr)</span><span class="s4">, </span><span class="s1">(</span><span class="s4">int</span><span class="s1">)i</span><span class="s4">, </span><span class="s1">valueRef(value)</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+<span class="s1">std::once_flag hostFunctionClassOnceFlag</span><span class="s4">;</span>
+<span class="s1">JSClassRef hostFunctionClass{}</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">HostFunctionProxy {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">HostFunctionProxy(jsi::HostFunctionType hostFunction)</span>
+      <span class="s1">: hostFunction_(hostFunction) {}</span>
+
+  <span class="s1">jsi::HostFunctionType &amp;getHostFunction() {</span>
+    <span class="s4">return </span><span class="s1">hostFunction_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">protected</span><span class="s1">:</span>
+  <span class="s1">jsi::HostFunctionType hostFunction_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">jsi::Function JSCRuntime::createFunctionFromHostFunction(</span>
+    <span class="s4">const </span><span class="s1">jsi::PropNameID &amp;name</span><span class="s4">,</span>
+    <span class="s4">unsigned int </span><span class="s1">paramCount</span><span class="s4">,</span>
+    <span class="s1">jsi::HostFunctionType func) {</span>
+  <span class="s4">class </span><span class="s1">HostFunctionMetadata : </span><span class="s4">public </span><span class="s1">HostFunctionProxy {</span>
+   <span class="s4">public</span><span class="s1">:</span>
+    <span class="s4">static void </span><span class="s1">initialize(JSContextRef ctx</span><span class="s4">, </span><span class="s1">JSObjectRef object) {</span>
+      <span class="s0">// We need to set up the prototype chain properly here. In theory we</span>
+      <span class="s0">// could set func.prototype.prototype = Function.prototype to get the</span>
+      <span class="s0">// same result. Not sure which approach is better.</span>
+      <span class="s1">HostFunctionMetadata *metadata =</span>
+          <span class="s4">static_cast</span><span class="s1">&lt;HostFunctionMetadata *&gt;(JSObjectGetPrivate(object))</span><span class="s4">;</span>
+
+      <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+      <span class="s1">JSObjectSetProperty(</span>
+          <span class="s1">ctx</span><span class="s4">,</span>
+          <span class="s1">object</span><span class="s4">,</span>
+          <span class="s1">getLengthString()</span><span class="s4">,</span>
+          <span class="s1">JSValueMakeNumber(ctx</span><span class="s4">, </span><span class="s1">metadata-&gt;argCount)</span><span class="s4">,</span>
+          <span class="s1">kJSPropertyAttributeReadOnly | kJSPropertyAttributeDontEnum |</span>
+              <span class="s1">kJSPropertyAttributeDontDelete</span><span class="s4">,</span>
+          <span class="s1">&amp;exc)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(exc) {</span>
+        <span class="s0">// Silently fail to set length</span>
+        <span class="s1">exc = </span><span class="s4">nullptr;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">JSStringRef name = </span><span class="s4">nullptr;</span>
+      <span class="s1">std::swap(metadata-&gt;name</span><span class="s4">, </span><span class="s1">name)</span><span class="s4">;</span>
+      <span class="s1">JSObjectSetProperty(</span>
+          <span class="s1">ctx</span><span class="s4">,</span>
+          <span class="s1">object</span><span class="s4">,</span>
+          <span class="s1">getNameString()</span><span class="s4">,</span>
+          <span class="s1">JSValueMakeString(ctx</span><span class="s4">, </span><span class="s1">name)</span><span class="s4">,</span>
+          <span class="s1">kJSPropertyAttributeReadOnly | kJSPropertyAttributeDontEnum |</span>
+              <span class="s1">kJSPropertyAttributeDontDelete</span><span class="s4">,</span>
+          <span class="s1">&amp;exc)</span><span class="s4">;</span>
+      <span class="s1">JSStringRelease(name)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(exc) {</span>
+        <span class="s0">// Silently fail to set name</span>
+        <span class="s1">exc = </span><span class="s4">nullptr;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">JSObjectRef global = JSContextGetGlobalObject(ctx)</span><span class="s4">;</span>
+      <span class="s1">JSValueRef value =</span>
+          <span class="s1">JSObjectGetProperty(ctx</span><span class="s4">, </span><span class="s1">global</span><span class="s4">, </span><span class="s1">getFunctionString()</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+      <span class="s0">// If we don't have Function then something bad is going on.</span>
+      <span class="s4">if </span><span class="s1">(JSC_UNLIKELY(exc)) {</span>
+        <span class="s1">abort()</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">JSObjectRef funcCtor = JSValueToObject(ctx</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(!funcCtor) {</span>
+        <span class="s0">// We can't do anything if Function is not an object</span>
+        <span class="s4">return;</span>
+      <span class="s1">}</span>
+      <span class="s1">JSValueRef funcProto = JSObjectGetPrototype(ctx</span><span class="s4">, </span><span class="s1">funcCtor)</span><span class="s4">;</span>
+      <span class="s1">JSObjectSetPrototype(ctx</span><span class="s4">, </span><span class="s1">object</span><span class="s4">, </span><span class="s1">funcProto)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">static </span><span class="s1">JSValueRef makeError(JSCRuntime &amp;rt</span><span class="s4">, const </span><span class="s1">std::string &amp;desc) {</span>
+      <span class="s1">jsi::Value value =</span>
+          <span class="s1">rt.global().getPropertyAsFunction(rt</span><span class="s4">, </span><span class="s3">&quot;Error&quot;</span><span class="s1">).call(rt</span><span class="s4">, </span><span class="s1">desc)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">rt.valueRef(value)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">static </span><span class="s1">JSValueRef call(</span>
+        <span class="s1">JSContextRef ctx</span><span class="s4">,</span>
+        <span class="s1">JSObjectRef function</span><span class="s4">,</span>
+        <span class="s1">JSObjectRef thisObject</span><span class="s4">,</span>
+        <span class="s1">size_t argumentCount</span><span class="s4">,</span>
+        <span class="s4">const </span><span class="s1">JSValueRef arguments[]</span><span class="s4">,</span>
+        <span class="s1">JSValueRef *exception) {</span>
+      <span class="s1">HostFunctionMetadata *metadata =</span>
+          <span class="s4">static_cast</span><span class="s1">&lt;HostFunctionMetadata *&gt;(JSObjectGetPrivate(function))</span><span class="s4">;</span>
+      <span class="s1">JSCRuntime &amp;rt = *(metadata-&gt;runtime)</span><span class="s4">;</span>
+      <span class="s4">const unsigned </span><span class="s1">maxStackArgCount = </span><span class="s5">8</span><span class="s4">;</span>
+      <span class="s1">jsi::Value stackArgs[maxStackArgCount]</span><span class="s4">;</span>
+      <span class="s1">std::unique_ptr&lt;jsi::Value[]&gt; heapArgs</span><span class="s4">;</span>
+      <span class="s1">jsi::Value *args</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(argumentCount &gt; maxStackArgCount) {</span>
+        <span class="s1">heapArgs = std::make_unique&lt;jsi::Value[]&gt;(argumentCount)</span><span class="s4">;</span>
+        <span class="s4">for </span><span class="s1">(size_t i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; argumentCount</span><span class="s4">; </span><span class="s1">i++) {</span>
+          <span class="s1">heapArgs[i] = rt.createValue(arguments[i])</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s1">args = heapArgs.get()</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s4">for </span><span class="s1">(size_t i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; argumentCount</span><span class="s4">; </span><span class="s1">i++) {</span>
+          <span class="s1">stackArgs[i] = rt.createValue(arguments[i])</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s1">args = stackArgs</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">JSValueRef res</span><span class="s4">;</span>
+      <span class="s1">jsi::Value thisVal(rt.createObject(thisObject))</span><span class="s4">;</span>
+      <span class="s4">try </span><span class="s1">{</span>
+        <span class="s1">res = rt.valueRef(</span>
+            <span class="s1">metadata-&gt;hostFunction_(rt</span><span class="s4">, </span><span class="s1">thisVal</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">argumentCount))</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">jsi::JSError &amp;error) {</span>
+        <span class="s1">*exception = rt.valueRef(error.value())</span><span class="s4">;</span>
+        <span class="s1">res = JSValueMakeUndefined(ctx)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::exception &amp;ex) {</span>
+        <span class="s1">std::string exceptionString(</span><span class="s3">&quot;Exception in HostFunction: &quot;</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">exceptionString += ex.what()</span><span class="s4">;</span>
+        <span class="s1">*exception = makeError(rt</span><span class="s4">, </span><span class="s1">exceptionString)</span><span class="s4">;</span>
+        <span class="s1">res = JSValueMakeUndefined(ctx)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+        <span class="s1">std::string exceptionString(</span><span class="s3">&quot;Exception in HostFunction: &lt;unknown&gt;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">*exception = makeError(rt</span><span class="s4">, </span><span class="s1">exceptionString)</span><span class="s4">;</span>
+        <span class="s1">res = JSValueMakeUndefined(ctx)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">return </span><span class="s1">res</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">static void </span><span class="s1">finalize(JSObjectRef object) {</span>
+      <span class="s1">HostFunctionMetadata *metadata =</span>
+          <span class="s4">static_cast</span><span class="s1">&lt;HostFunctionMetadata *&gt;(JSObjectGetPrivate(object))</span><span class="s4">;</span>
+      <span class="s1">JSObjectSetPrivate(object</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">delete </span><span class="s1">metadata</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">HostFunctionMetadata(</span>
+        <span class="s1">JSCRuntime *rt</span><span class="s4">,</span>
+        <span class="s1">jsi::HostFunctionType hf</span><span class="s4">,</span>
+        <span class="s4">unsigned </span><span class="s1">ac</span><span class="s4">,</span>
+        <span class="s1">JSStringRef n)</span>
+        <span class="s1">: HostFunctionProxy(hf)</span><span class="s4">,</span>
+          <span class="s1">runtime(rt)</span><span class="s4">,</span>
+          <span class="s1">argCount(ac)</span><span class="s4">,</span>
+          <span class="s1">name(JSStringRetain(n)) {}</span>
+
+    <span class="s1">JSCRuntime *runtime</span><span class="s4">;</span>
+    <span class="s4">unsigned </span><span class="s1">argCount</span><span class="s4">;</span>
+    <span class="s1">JSStringRef name</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">std::call_once(hostFunctionClassOnceFlag</span><span class="s4">, </span><span class="s1">[]() {</span>
+    <span class="s1">JSClassDefinition functionClass = kJSClassDefinitionEmpty</span><span class="s4">;</span>
+    <span class="s1">functionClass.version = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">functionClass.attributes = kJSClassAttributeNoAutomaticPrototype</span><span class="s4">;</span>
+    <span class="s1">functionClass.initialize = HostFunctionMetadata::initialize</span><span class="s4">;</span>
+    <span class="s1">functionClass.finalize = HostFunctionMetadata::finalize</span><span class="s4">;</span>
+    <span class="s1">functionClass.callAsFunction = HostFunctionMetadata::call</span><span class="s4">;</span>
+
+    <span class="s1">hostFunctionClass = JSClassCreate(&amp;functionClass)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">JSObjectRef funcRef = JSObjectMake(</span>
+      <span class="s1">ctx_</span><span class="s4">,</span>
+      <span class="s1">hostFunctionClass</span><span class="s4">,</span>
+      <span class="s4">new </span><span class="s1">HostFunctionMetadata(</span><span class="s4">this, </span><span class="s1">func</span><span class="s4">, </span><span class="s1">paramCount</span><span class="s4">, </span><span class="s1">stringRef(name)))</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createObject(funcRef).getFunction(*</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">namespace </span><span class="s1">detail {</span>
+
+<span class="s4">class </span><span class="s1">ArgsConverter {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">ArgsConverter(JSCRuntime &amp;rt</span><span class="s4">, const </span><span class="s1">jsi::Value *args</span><span class="s4">, </span><span class="s1">size_t count) {</span>
+    <span class="s1">JSValueRef *destination = inline_</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(count &gt; maxStackArgs) {</span>
+      <span class="s1">outOfLine_ = std::make_unique&lt;JSValueRef[]&gt;(count)</span><span class="s4">;</span>
+      <span class="s1">destination = outOfLine_.get()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">for </span><span class="s1">(size_t i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; count</span><span class="s4">; </span><span class="s1">++i) {</span>
+      <span class="s1">destination[i] = rt.valueRef(args[i])</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">operator </span><span class="s1">JSValueRef *() {</span>
+    <span class="s4">return </span><span class="s1">outOfLine_ ? outOfLine_.get() : inline_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s4">constexpr static unsigned </span><span class="s1">maxStackArgs = </span><span class="s5">8</span><span class="s4">;</span>
+  <span class="s1">JSValueRef inline_[maxStackArgs]</span><span class="s4">;</span>
+  <span class="s1">std::unique_ptr&lt;JSValueRef[]&gt; outOfLine_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+<span class="s1">} </span><span class="s0">// namespace detail</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::isHostFunction(</span><span class="s4">const </span><span class="s1">jsi::Function &amp;obj) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">cls = hostFunctionClass</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">cls != </span><span class="s4">nullptr </span><span class="s1">&amp;&amp; JSValueIsObjectOfClass(ctx_</span><span class="s4">, </span><span class="s1">objectRef(obj)</span><span class="s4">, </span><span class="s1">cls)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::HostFunctionType &amp;JSCRuntime::getHostFunction(</span><span class="s4">const </span><span class="s1">jsi::Function &amp;obj) {</span>
+  <span class="s0">// We know that isHostFunction(obj) is true here, so its safe to proceed</span>
+  <span class="s4">auto </span><span class="s1">proxy =</span>
+      <span class="s4">static_cast</span><span class="s1">&lt;HostFunctionProxy *&gt;(JSObjectGetPrivate(objectRef(obj)))</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">proxy-&gt;getHostFunction()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::call(</span>
+    <span class="s4">const </span><span class="s1">jsi::Function &amp;f</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value &amp;jsThis</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+    <span class="s1">size_t count) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s4">auto </span><span class="s1">res = JSObjectCallAsFunction(</span>
+      <span class="s1">ctx_</span><span class="s4">,</span>
+      <span class="s1">objectRef(f)</span><span class="s4">,</span>
+      <span class="s1">jsThis.isUndefined() ? </span><span class="s4">nullptr </span><span class="s1">: objectRef(jsThis.getObject(*</span><span class="s4">this</span><span class="s1">))</span><span class="s4">,</span>
+      <span class="s1">count</span><span class="s4">,</span>
+      <span class="s1">detail::ArgsConverter(*</span><span class="s4">this, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">count)</span><span class="s4">,</span>
+      <span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createValue(res)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::callAsConstructor(</span>
+    <span class="s4">const </span><span class="s1">jsi::Function &amp;f</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+    <span class="s1">size_t count) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s4">auto </span><span class="s1">res = JSObjectCallAsConstructor(</span>
+      <span class="s1">ctx_</span><span class="s4">,</span>
+      <span class="s1">objectRef(f)</span><span class="s4">,</span>
+      <span class="s1">count</span><span class="s4">,</span>
+      <span class="s1">detail::ArgsConverter(*</span><span class="s4">this, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">count)</span><span class="s4">,</span>
+      <span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">createValue(res)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::strictEquals(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;a</span><span class="s4">, const </span><span class="s1">jsi::Symbol &amp;b)</span>
+    <span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s4">bool </span><span class="s1">ret = JSValueIsEqual(ctx_</span><span class="s4">, </span><span class="s1">symbolRef(a)</span><span class="s4">, </span><span class="s1">symbolRef(b)</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s4">const_cast</span><span class="s1">&lt;JSCRuntime *&gt;(</span><span class="s4">this</span><span class="s1">)-&gt;checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">ret</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::strictEquals(</span><span class="s4">const </span><span class="s1">jsi::BigInt &amp;a</span><span class="s4">, const </span><span class="s1">jsi::BigInt &amp;b)</span>
+    <span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">throw </span><span class="s1">std::logic_error(</span><span class="s3">&quot;Not implemented&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::strictEquals(</span><span class="s4">const </span><span class="s1">jsi::String &amp;a</span><span class="s4">, const </span><span class="s1">jsi::String &amp;b)</span>
+    <span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">JSStringIsEqual(stringRef(a)</span><span class="s4">, </span><span class="s1">stringRef(b))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::strictEquals(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;a</span><span class="s4">, const </span><span class="s1">jsi::Object &amp;b)</span>
+    <span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">objectRef(a) == objectRef(b)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSCRuntime::instanceOf(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;o</span><span class="s4">, const </span><span class="s1">jsi::Function &amp;f) {</span>
+  <span class="s1">JSValueRef exc = </span><span class="s4">nullptr;</span>
+  <span class="s4">bool </span><span class="s1">res =</span>
+      <span class="s1">JSValueIsInstanceOfConstructor(ctx_</span><span class="s4">, </span><span class="s1">objectRef(o)</span><span class="s4">, </span><span class="s1">objectRef(f)</span><span class="s4">, </span><span class="s1">&amp;exc)</span><span class="s4">;</span>
+  <span class="s1">checkException(exc)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">res</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::makeSymbolValue(</span>
+    <span class="s1">JSValueRef symbolRef) </span><span class="s4">const </span><span class="s1">{</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s4">return new </span><span class="s1">JSCSymbolValue(ctx_</span><span class="s4">, </span><span class="s1">ctxInvalid_</span><span class="s4">, </span><span class="s1">symbolRef</span><span class="s4">, </span><span class="s1">symbolCounter_)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">return new </span><span class="s1">JSCSymbolValue(ctx_</span><span class="s4">, </span><span class="s1">ctxInvalid_</span><span class="s4">, </span><span class="s1">symbolRef)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+<span class="s1">JSStringRef getEmptyString() {</span>
+  <span class="s4">static </span><span class="s1">JSStringRef empty = JSStringCreateWithUTF8CString(</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">empty</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::makeStringValue(</span>
+    <span class="s1">JSStringRef stringRef) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!stringRef) {</span>
+    <span class="s1">stringRef = getEmptyString()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s4">return new </span><span class="s1">JSCStringValue(stringRef</span><span class="s4">, </span><span class="s1">stringCounter_)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">return new </span><span class="s1">JSCStringValue(stringRef)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Symbol JSCRuntime::createSymbol(JSValueRef sym) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">make&lt;jsi::Symbol&gt;(makeSymbolValue(sym))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::String JSCRuntime::createString(JSStringRef str) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">make&lt;jsi::String&gt;(makeStringValue(str))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::PropNameID JSCRuntime::createPropNameID(JSStringRef str) {</span>
+  <span class="s4">return </span><span class="s1">make&lt;jsi::PropNameID&gt;(makeStringValue(str))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Runtime::PointerValue *JSCRuntime::makeObjectValue(</span>
+    <span class="s1">JSObjectRef objectRef) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!objectRef) {</span>
+    <span class="s1">objectRef = JSObjectMake(ctx_</span><span class="s4">, nullptr, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+  <span class="s4">return new </span><span class="s1">JSCObjectValue(ctx_</span><span class="s4">, </span><span class="s1">ctxInvalid_</span><span class="s4">, </span><span class="s1">objectRef</span><span class="s4">, </span><span class="s1">objectCounter_)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">return new </span><span class="s1">JSCObjectValue(ctx_</span><span class="s4">, </span><span class="s1">ctxInvalid_</span><span class="s4">, </span><span class="s1">objectRef)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Object JSCRuntime::createObject(JSObjectRef obj) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">make&lt;jsi::Object&gt;(makeObjectValue(obj))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value JSCRuntime::createValue(JSValueRef value) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">JSType type = JSValueGetType(ctx_</span><span class="s4">, </span><span class="s1">value)</span><span class="s4">;</span>
+
+  <span class="s4">switch </span><span class="s1">(type) {</span>
+    <span class="s4">case </span><span class="s1">kJSTypeNumber:</span>
+      <span class="s4">return </span><span class="s1">jsi::Value(JSValueToNumber(ctx_</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, nullptr</span><span class="s1">))</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">kJSTypeBoolean:</span>
+      <span class="s4">return </span><span class="s1">jsi::Value(JSValueToBoolean(ctx_</span><span class="s4">, </span><span class="s1">value))</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">kJSTypeNull:</span>
+      <span class="s4">return </span><span class="s1">jsi::Value(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">kJSTypeUndefined:</span>
+      <span class="s4">return </span><span class="s1">jsi::Value()</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">kJSTypeString: {</span>
+      <span class="s1">JSStringRef str = JSValueToStringCopy(ctx_</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">result = jsi::Value(createString(str))</span><span class="s4">;</span>
+      <span class="s1">JSStringRelease(str)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">kJSTypeObject: {</span>
+      <span class="s1">JSObjectRef objRef = JSValueToObject(ctx_</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">jsi::Value(createObject(objRef))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+      <span class="s0">// TODO: Uncomment this when all supported JSC versions have this symbol</span>
+      <span class="s0">//    case kJSTypeSymbol:</span>
+    <span class="s4">default</span><span class="s1">: {</span>
+      <span class="s4">if </span><span class="s1">(smellsLikeES6Symbol(ctx_</span><span class="s4">, </span><span class="s1">value)) {</span>
+        <span class="s4">return </span><span class="s1">jsi::Value(createSymbol(value))</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s0">// WHAT ARE YOU</span>
+        <span class="s1">abort()</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">JSValueRef JSCRuntime::valueRef(</span><span class="s4">const </span><span class="s1">jsi::Value &amp;value) {</span>
+  <span class="s0">// I would rather switch on value.kind_</span>
+  <span class="s4">if </span><span class="s1">(value.isUndefined()) {</span>
+    <span class="s4">return </span><span class="s1">JSValueMakeUndefined(ctx_)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(value.isNull()) {</span>
+    <span class="s4">return </span><span class="s1">JSValueMakeNull(ctx_)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(value.isBool()) {</span>
+    <span class="s4">return </span><span class="s1">JSValueMakeBoolean(ctx_</span><span class="s4">, </span><span class="s1">value.getBool())</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(value.isNumber()) {</span>
+    <span class="s4">return </span><span class="s1">JSValueMakeNumber(ctx_</span><span class="s4">, </span><span class="s1">value.getNumber())</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(value.isSymbol()) {</span>
+    <span class="s4">return </span><span class="s1">symbolRef(value.getSymbol(*</span><span class="s4">this</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(value.isString()) {</span>
+    <span class="s4">return </span><span class="s1">JSValueMakeString(ctx_</span><span class="s4">, </span><span class="s1">stringRef(value.getString(*</span><span class="s4">this</span><span class="s1">)))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(value.isObject()) {</span>
+    <span class="s4">return </span><span class="s1">objectRef(value.getObject(*</span><span class="s4">this</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s0">// What are you?</span>
+    <span class="s1">abort()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">JSValueRef JSCRuntime::symbolRef(</span><span class="s4">const </span><span class="s1">jsi::Symbol &amp;sym) {</span>
+  <span class="s4">return static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCSymbolValue *&gt;(getPointerValue(sym))-&gt;sym_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSStringRef JSCRuntime::stringRef(</span><span class="s4">const </span><span class="s1">jsi::String &amp;str) {</span>
+  <span class="s4">return static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCStringValue *&gt;(getPointerValue(str))-&gt;str_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSStringRef JSCRuntime::stringRef(</span><span class="s4">const </span><span class="s1">jsi::PropNameID &amp;sym) {</span>
+  <span class="s4">return static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCStringValue *&gt;(getPointerValue(sym))-&gt;str_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSObjectRef JSCRuntime::objectRef(</span><span class="s4">const </span><span class="s1">jsi::Object &amp;obj) {</span>
+  <span class="s4">return static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCObjectValue *&gt;(getPointerValue(obj))-&gt;obj_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#ifdef </span><span class="s1">RN_FABRIC_ENABLED</span>
+<span class="s1">JSObjectRef JSCRuntime::objectRef(</span><span class="s4">const </span><span class="s1">jsi::WeakObject &amp;obj) {</span>
+  <span class="s0">// TODO: revisit this implementation</span>
+  <span class="s4">return static_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">JSCObjectValue *&gt;(getPointerValue(obj))-&gt;obj_</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s2">#endif</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::checkException(JSValueRef exc) {</span>
+  <span class="s4">if </span><span class="s1">(JSC_UNLIKELY(exc)) {</span>
+    <span class="s4">throw </span><span class="s1">jsi::JSError(*</span><span class="s4">this, </span><span class="s1">createValue(exc))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::checkException(JSValueRef res</span><span class="s4">, </span><span class="s1">JSValueRef exc) {</span>
+  <span class="s4">if </span><span class="s1">(JSC_UNLIKELY(!res)) {</span>
+    <span class="s4">throw </span><span class="s1">jsi::JSError(*</span><span class="s4">this, </span><span class="s1">createValue(exc))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::checkException(JSValueRef exc</span><span class="s4">, const char </span><span class="s1">*msg) {</span>
+  <span class="s4">if </span><span class="s1">(JSC_UNLIKELY(exc)) {</span>
+    <span class="s4">throw </span><span class="s1">jsi::JSError(std::string(msg)</span><span class="s4">, </span><span class="s1">*</span><span class="s4">this, </span><span class="s1">createValue(exc))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSCRuntime::checkException(</span>
+    <span class="s1">JSValueRef res</span><span class="s4">,</span>
+    <span class="s1">JSValueRef exc</span><span class="s4">,</span>
+    <span class="s4">const char </span><span class="s1">*msg) {</span>
+  <span class="s4">if </span><span class="s1">(JSC_UNLIKELY(!res)) {</span>
+    <span class="s4">throw </span><span class="s1">jsi::JSError(std::string(msg)</span><span class="s4">, </span><span class="s1">*</span><span class="s4">this, </span><span class="s1">createValue(exc))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">std::unique_ptr&lt;jsi::Runtime&gt; makeJSCRuntime() {</span>
+  <span class="s4">return </span><span class="s1">std::make_unique&lt;JSCRuntime&gt;()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace jsc</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

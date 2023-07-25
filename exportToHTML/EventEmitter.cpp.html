@@ -1,0 +1,156 @@
+<html>
+<head>
+<title>EventEmitter.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+EventEmitter.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;EventEmitter.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;folly/dynamic.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/JSIDynamic.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;RawEvent.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s0">// TODO(T29874519): Get rid of &quot;top&quot; prefix once and for all.</span>
+<span class="s0">/* 
+ * Capitalizes the first letter of the event type and adds &quot;top&quot; prefix if 
+ * necessary (e.g. &quot;layout&quot; becames &quot;topLayout&quot;). 
+ */</span>
+<span class="s4">static </span><span class="s1">std::string normalizeEventType(std::string type) {</span>
+  <span class="s4">auto </span><span class="s1">prefixedType = std::move(type)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(prefixedType.find(</span><span class="s3">&quot;top&quot;</span><span class="s4">, </span><span class="s5">0</span><span class="s1">) != </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">prefixedType.insert(</span><span class="s5">0</span><span class="s4">, </span><span class="s3">&quot;top&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">prefixedType[</span><span class="s5">3</span><span class="s1">] = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">char</span><span class="s1">&gt;(toupper(prefixedType[</span><span class="s5">3</span><span class="s1">]))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">prefixedType</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::mutex &amp;EventEmitter::DispatchMutex() {</span>
+  <span class="s4">static </span><span class="s1">std::mutex mutex</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">mutex</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ValueFactory EventEmitter::defaultPayloadFactory() {</span>
+  <span class="s4">static auto </span><span class="s1">payloadFactory =</span>
+      <span class="s1">ValueFactory{[](jsi::Runtime &amp;runtime) { </span><span class="s4">return </span><span class="s1">jsi::Object(runtime)</span><span class="s4">; </span><span class="s1">}}</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">payloadFactory</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">EventEmitter::EventEmitter(</span>
+    <span class="s1">SharedEventTarget eventTarget</span><span class="s4">,</span>
+    <span class="s1">Tag </span><span class="s0">/*tag*/</span><span class="s4">,</span>
+    <span class="s1">EventDispatcher::Weak eventDispatcher)</span>
+    <span class="s1">: eventTarget_(std::move(eventTarget))</span><span class="s4">,</span>
+      <span class="s1">eventDispatcher_(std::move(eventDispatcher)) {}</span>
+
+<span class="s4">void </span><span class="s1">EventEmitter::dispatchEvent(</span>
+    <span class="s1">std::string type</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;payload</span><span class="s4">,</span>
+    <span class="s1">EventPriority priority</span><span class="s4">,</span>
+    <span class="s1">RawEvent::Category category) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">dispatchEvent(</span>
+      <span class="s1">std::move(type)</span><span class="s4">,</span>
+      <span class="s1">[payload](jsi::Runtime &amp;runtime) {</span>
+        <span class="s4">return </span><span class="s1">valueFromDynamic(runtime</span><span class="s4">, </span><span class="s1">payload)</span><span class="s4">;</span>
+      <span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">priority</span><span class="s4">,</span>
+      <span class="s1">category)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventEmitter::dispatchUniqueEvent(</span>
+    <span class="s1">std::string type</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;payload) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">dispatchUniqueEvent(std::move(type)</span><span class="s4">, </span><span class="s1">[payload](jsi::Runtime &amp;runtime) {</span>
+    <span class="s4">return </span><span class="s1">valueFromDynamic(runtime</span><span class="s4">, </span><span class="s1">payload)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventEmitter::dispatchEvent(</span>
+    <span class="s1">std::string type</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">ValueFactory &amp;payloadFactory</span><span class="s4">,</span>
+    <span class="s1">EventPriority priority</span><span class="s4">,</span>
+    <span class="s1">RawEvent::Category category) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;EventEmitter::dispatchEvent&quot;</span><span class="s4">, </span><span class="s3">&quot;type&quot;</span><span class="s4">, </span><span class="s1">type)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">eventDispatcher = eventDispatcher_.lock()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!eventDispatcher) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">eventDispatcher-&gt;dispatchEvent(</span>
+      <span class="s1">RawEvent(</span>
+          <span class="s1">normalizeEventType(std::move(type))</span><span class="s4">,</span>
+          <span class="s1">payloadFactory</span><span class="s4">,</span>
+          <span class="s1">eventTarget_</span><span class="s4">,</span>
+          <span class="s1">category)</span><span class="s4">,</span>
+      <span class="s1">priority)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventEmitter::dispatchUniqueEvent(</span>
+    <span class="s1">std::string type</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">ValueFactory &amp;payloadFactory) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;EventEmitter::dispatchUniqueEvent&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">eventDispatcher = eventDispatcher_.lock()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!eventDispatcher) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">eventDispatcher-&gt;dispatchUniqueEvent(RawEvent(</span>
+      <span class="s1">normalizeEventType(std::move(type))</span><span class="s4">,</span>
+      <span class="s1">payloadFactory</span><span class="s4">,</span>
+      <span class="s1">eventTarget_</span><span class="s4">,</span>
+      <span class="s1">RawEvent::Category::Continuous))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventEmitter::setEnabled(</span><span class="s4">bool </span><span class="s1">enabled) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">enableCounter_ += enabled ? </span><span class="s5">1 </span><span class="s1">: -</span><span class="s5">1</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">shouldBeEnabled = enableCounter_ &gt; </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(isEnabled_ != shouldBeEnabled) {</span>
+    <span class="s1">isEnabled_ = shouldBeEnabled</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(eventTarget_) {</span>
+      <span class="s1">eventTarget_-&gt;setEnabled(isEnabled_)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Note: Initially, the state of `eventTarget_` and the value `enableCounter_`</span>
+  <span class="s0">// is mismatched intentionally (it's `non-null` and `0` accordingly). We need</span>
+  <span class="s0">// this to support an initial nebula state where the event target must be</span>
+  <span class="s0">// retained without any associated mounted node.</span>
+  <span class="s4">bool </span><span class="s1">shouldBeRetained = enableCounter_ &gt; </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(shouldBeRetained != (eventTarget_ != </span><span class="s4">nullptr</span><span class="s1">)) {</span>
+    <span class="s4">if </span><span class="s1">(!shouldBeRetained) {</span>
+      <span class="s1">eventTarget_.reset()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

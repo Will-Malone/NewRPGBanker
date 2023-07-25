@@ -1,0 +1,766 @@
+<html>
+<head>
+<title>Inspector.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Inspector.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;Inspector.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;Exceptions.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;InspectorState.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;functional&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;string&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/detail/SerialExecutor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/detail/Thread.h&gt;</span>
+
+<span class="s2">#ifdef </span><span class="s1">HERMES_INSPECTOR_FOLLY_KLUDGE</span>
+<span class="s0">// &lt;kludge&gt; This is here, instead of linking against</span>
+<span class="s0">// folly/futures/Future.cpp, to avoid pulling in another pile of</span>
+<span class="s0">// dependencies, including the separate dependency libevent.  This is</span>
+<span class="s0">// likely specific to the version of folly RN uses, so may need to be</span>
+<span class="s0">// changed.  Even better, perhaps folly can be refactored to simplify</span>
+<span class="s0">// this.  Providing a RN-specific Timekeeper impl may also help.</span>
+
+<span class="s4">template class </span><span class="s1">folly::Future&lt;folly::Unit&gt;</span><span class="s4">;</span>
+<span class="s4">template class </span><span class="s1">folly::Future&lt;</span><span class="s4">bool</span><span class="s1">&gt;</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">folly {</span>
+<span class="s4">namespace </span><span class="s1">futures {</span>
+
+<span class="s1">SemiFuture&lt;Unit&gt; sleep(Duration</span><span class="s4">, </span><span class="s1">Timekeeper *) {</span>
+  <span class="s1">LOG(FATAL) &lt;&lt; </span><span class="s3">&quot;folly::futures::sleep() not implemented&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace futures</span>
+
+<span class="s4">namespace </span><span class="s1">detail {</span>
+
+<span class="s1">std::shared_ptr&lt;Timekeeper&gt; getTimekeeperSingleton() {</span>
+  <span class="s1">LOG(FATAL) &lt;&lt; </span><span class="s3">&quot;folly::detail::getTimekeeperSingleton() not implemented&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace detail</span>
+<span class="s1">} </span><span class="s0">// namespace folly</span>
+
+<span class="s0">// &lt;/kludge&gt;</span>
+<span class="s2">#endif</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">hermes {</span>
+<span class="s4">namespace </span><span class="s1">inspector {</span>
+
+<span class="s4">using </span><span class="s1">folly::Unit</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">debugger = ::facebook::hermes::debugger</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * Threading notes: 
+ * 
+ *  1. mutex_ must be held before using state_ or any InspectorState methods. 
+ *  2. Methods that are callable by the client (like enable, resume, etc.) call 
+ *     various InspectorState methods via state_. This implies that they must 
+ *     acquire mutex_. 
+ *  3. Since some InspectorState methods call back out to the client (e.g. via 
+ *     fulfilling promises, or via the InspectorObserver callbacks), we have to 
+ *     be careful about reentrancy from a callback causing a deadlock when (1) 
+ *     and (2) interact. Consider: 
+ * 
+ *       1) Debugger pauses, which causes InspectorObserve::onPause to fire. 
+ *          onPause is called by InspectorState::Paused::onEnter on the JS 
+ *          thread with mutex_ held. 
+ *       2) Client calls setBreakpoint from the onPause callback. 
+ *       3) If setBreakpoint directly tried to acquire mutex_ here, we would 
+ *          deadlock since our thread already owns the mutex_ (see 1). 
+ * 
+ * For this reason, all client-facing methods are executed on executor_, which 
+ * runs on its own thread. The pattern is: 
+ * 
+ *  1. The client-facing method foo (e.g. enable) enqueues a call to 
+ *      fooOnExecutor (e.g. enableOnExecutor) on executor_. 
+ *  2. fooOnExecutor is responsible for acquiring mutex_. 
+ * 
+ */</span>
+
+<span class="s0">// TODO: read this out of an env variable or config</span>
+<span class="s4">static constexpr bool </span><span class="s1">kShouldLog = </span><span class="s4">false;</span>
+
+<span class="s0">// Logging state transitions is done outside of transition() in a macro so that</span>
+<span class="s0">// function and line numbers in the log will be accurate.</span>
+<span class="s2">#define </span><span class="s1">TRANSITION(nextState)                                            \ 
+  </span><span class="s4">do </span><span class="s1">{                                                                   \ 
+    </span><span class="s4">if </span><span class="s1">(kShouldLog) {                                                    \ 
+      </span><span class="s4">if </span><span class="s1">(state_ == </span><span class="s4">nullptr</span><span class="s1">) {                                           \ 
+        LOG(INFO) &lt;&lt; </span><span class="s3">&quot;Inspector::&quot; </span><span class="s1">&lt;&lt; __func__                           \ 
+                  &lt;&lt; </span><span class="s3">&quot; transitioning to initial state &quot; </span><span class="s1">&lt;&lt; *(nextState)</span><span class="s4">; </span><span class="s1">\ 
+      } </span><span class="s4">else </span><span class="s1">{                                                           \ 
+        LOG(INFO) &lt;&lt; </span><span class="s3">&quot;Inspector::&quot; </span><span class="s1">&lt;&lt; __func__ &lt;&lt; </span><span class="s3">&quot; transitioning from &quot; </span><span class="s1">\ 
+                  &lt;&lt; *state_ &lt;&lt; </span><span class="s3">&quot; to &quot; </span><span class="s1">&lt;&lt; *(nextState)</span><span class="s4">;                  </span><span class="s1">\ 
+      }                                                                  \ 
+    }                                                                    \ 
+    transition((nextState))</span><span class="s4">;                                             </span><span class="s1">\ 
+  } </span><span class="s4">while </span><span class="s1">(</span><span class="s5">0</span><span class="s1">)</span>
+
+<span class="s1">Inspector::Inspector(</span>
+    <span class="s1">std::shared_ptr&lt;RuntimeAdapter&gt; adapter</span><span class="s4">,</span>
+    <span class="s1">InspectorObserver &amp;observer</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">pauseOnFirstStatement)</span>
+    <span class="s1">: adapter_(adapter)</span><span class="s4">,</span>
+      <span class="s1">debugger_(adapter-&gt;getRuntime().getDebugger())</span><span class="s4">,</span>
+      <span class="s1">observer_(observer)</span><span class="s4">,</span>
+      <span class="s1">executor_(std::make_unique&lt;detail::SerialExecutor&gt;(</span><span class="s3">&quot;hermes-inspector&quot;</span><span class="s1">)) {</span>
+  <span class="s0">// TODO (t26491391): make tickleJs a real Hermes runtime API</span>
+  <span class="s1">std::string src = </span><span class="s3">&quot;function __tickleJs() { return Math.random(); }&quot;</span><span class="s4">;</span>
+  <span class="s1">adapter-&gt;getRuntime().evaluateJavaScript(</span>
+      <span class="s1">std::make_shared&lt;jsi::StringBuffer&gt;(src)</span><span class="s4">, </span><span class="s3">&quot;__tickleJsHackUrl&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(pauseOnFirstStatement) {</span>
+      <span class="s1">awaitingDebuggerOnStart_ = </span><span class="s4">true;</span>
+      <span class="s1">TRANSITION(std::make_unique&lt;InspectorState::RunningWaitEnable&gt;(*</span><span class="s4">this</span><span class="s1">))</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">TRANSITION(std::make_unique&lt;InspectorState::RunningDetached&gt;(*</span><span class="s4">this</span><span class="s1">))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">debugger_.setShouldPauseOnScriptLoad(</span><span class="s4">true</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">debugger_.setEventObserver(</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">Inspector::~Inspector() {</span>
+  <span class="s1">debugger_.setEventObserver(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static bool </span><span class="s1">toBoolean(jsi::Runtime &amp;runtime</span><span class="s4">, const </span><span class="s1">jsi::Value &amp;val) {</span>
+  <span class="s0">// Based on Operations.cpp:toBoolean in the Hermes VM.</span>
+  <span class="s4">if </span><span class="s1">(val.isUndefined() || val.isNull()) {</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(val.isBool()) {</span>
+    <span class="s4">return </span><span class="s1">val.getBool()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(val.isNumber()) {</span>
+    <span class="s4">double </span><span class="s1">m = val.getNumber()</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">m != </span><span class="s5">0 </span><span class="s1">&amp;&amp; !std::isnan(m)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(val.isSymbol() || val.isObject()) {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(val.isString()) {</span>
+    <span class="s1">std::string s = val.getString(runtime).utf8(runtime)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">!s.empty()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">assert(</span><span class="s4">false </span><span class="s1">&amp;&amp; </span><span class="s3">&quot;All cases should be covered&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return false;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::installConsoleFunction(</span>
+    <span class="s1">jsi::Object &amp;console</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;jsi::Object&gt; &amp;originalConsole</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;name</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;chromeTypeDefault = </span><span class="s3">&quot;&quot;</span><span class="s1">) {</span>
+  <span class="s1">jsi::Runtime &amp;rt = adapter_-&gt;getRuntime()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">chromeType = chromeTypeDefault == </span><span class="s3">&quot;&quot; </span><span class="s1">? name : chromeTypeDefault</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">nameID = jsi::PropNameID::forUtf8(rt</span><span class="s4">, </span><span class="s1">name)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">weakInspector = std::weak_ptr&lt;Inspector&gt;(shared_from_this())</span><span class="s4">;</span>
+  <span class="s1">console.setProperty(</span>
+      <span class="s1">rt</span><span class="s4">,</span>
+      <span class="s1">nameID</span><span class="s4">,</span>
+      <span class="s1">jsi::Function::createFromHostFunction(</span>
+          <span class="s1">rt</span><span class="s4">,</span>
+          <span class="s1">nameID</span><span class="s4">,</span>
+          <span class="s5">1</span><span class="s4">,</span>
+          <span class="s1">[weakInspector</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">chromeType](</span>
+              <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value &amp;thisVal</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+              <span class="s1">size_t count) {</span>
+            <span class="s4">if </span><span class="s1">(originalConsole) {</span>
+              <span class="s4">auto </span><span class="s1">val = originalConsole-&gt;getProperty(runtime</span><span class="s4">, </span><span class="s1">name.c_str())</span><span class="s4">;</span>
+              <span class="s4">if </span><span class="s1">(val.isObject()) {</span>
+                <span class="s4">auto </span><span class="s1">obj = val.getObject(runtime)</span><span class="s4">;</span>
+                <span class="s4">if </span><span class="s1">(obj.isFunction(runtime)) {</span>
+                  <span class="s4">auto </span><span class="s1">func = obj.getFunction(runtime)</span><span class="s4">;</span>
+                  <span class="s1">func.callWithThis(runtime</span><span class="s4">, </span><span class="s1">*originalConsole</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">count)</span><span class="s4">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s4">if </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">inspector = weakInspector.lock()) {</span>
+              <span class="s4">if </span><span class="s1">(name != </span><span class="s3">&quot;assert&quot;</span><span class="s1">) {</span>
+                <span class="s0">// All cases other than assert just log a simple message.</span>
+                <span class="s1">jsi::Array argsArray(runtime</span><span class="s4">, </span><span class="s1">count)</span><span class="s4">;</span>
+                <span class="s4">for </span><span class="s1">(size_t index = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">index &lt; count</span><span class="s4">; </span><span class="s1">++index)</span>
+                  <span class="s1">argsArray.setValueAtIndex(runtime</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">args[index])</span><span class="s4">;</span>
+                <span class="s1">inspector-&gt;logMessage(</span>
+                    <span class="s1">ConsoleMessageInfo{chromeType</span><span class="s4">, </span><span class="s1">std::move(argsArray)})</span><span class="s4">;</span>
+                <span class="s4">return </span><span class="s1">jsi::Value::undefined()</span><span class="s4">;</span>
+              <span class="s1">}</span>
+              <span class="s0">// console.assert needs to check the first parameter before</span>
+              <span class="s0">// logging.</span>
+              <span class="s4">if </span><span class="s1">(count == </span><span class="s5">0</span><span class="s1">) {</span>
+                <span class="s0">// No parameters, throw a blank assertion failed message.</span>
+                <span class="s1">inspector-&gt;logMessage(</span>
+                    <span class="s1">ConsoleMessageInfo{chromeType</span><span class="s4">, </span><span class="s1">jsi::Array(runtime</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)})</span><span class="s4">;</span>
+              <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!toBoolean(runtime</span><span class="s4">, </span><span class="s1">args[</span><span class="s5">0</span><span class="s1">])) {</span>
+                <span class="s0">// Shift the message array down by one to not include the</span>
+                <span class="s0">// condition.</span>
+                <span class="s1">jsi::Array argsArray(runtime</span><span class="s4">, </span><span class="s1">count - </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+                <span class="s4">for </span><span class="s1">(size_t index = </span><span class="s5">1</span><span class="s4">; </span><span class="s1">index &lt; count</span><span class="s4">; </span><span class="s1">++index)</span>
+                  <span class="s1">argsArray.setValueAtIndex(runtime</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">args[index])</span><span class="s4">;</span>
+                <span class="s1">inspector-&gt;logMessage(</span>
+                    <span class="s1">ConsoleMessageInfo{chromeType</span><span class="s4">, </span><span class="s1">std::move(argsArray)})</span><span class="s4">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s4">return </span><span class="s1">jsi::Value::undefined()</span><span class="s4">;</span>
+          <span class="s1">}))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::installLogHandler() {</span>
+  <span class="s1">jsi::Runtime &amp;rt = adapter_-&gt;getRuntime()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">console = jsi::Object(rt)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">val = rt.global().getProperty(rt</span><span class="s4">, </span><span class="s3">&quot;console&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;jsi::Object&gt; originalConsole</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(val.isObject()) {</span>
+    <span class="s1">originalConsole = std::make_shared&lt;jsi::Object&gt;(val.getObject(rt))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;assert&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;clear&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;debug&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;dir&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;dirxml&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;error&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;group&quot;</span><span class="s4">, </span><span class="s3">&quot;startGroup&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(</span>
+      <span class="s1">console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;groupCollapsed&quot;</span><span class="s4">, </span><span class="s3">&quot;startGroupCollapsed&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;groupEnd&quot;</span><span class="s4">, </span><span class="s3">&quot;endGroup&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;info&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;log&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;profile&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;profileEnd&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;table&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;trace&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">installConsoleFunction(console</span><span class="s4">, </span><span class="s1">originalConsole</span><span class="s4">, </span><span class="s3">&quot;warn&quot;</span><span class="s4">, </span><span class="s3">&quot;warning&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">rt.global().setProperty(rt</span><span class="s4">, </span><span class="s3">&quot;console&quot;</span><span class="s4">, </span><span class="s1">console)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::triggerAsyncPause(</span><span class="s4">bool </span><span class="s1">andTickle) {</span>
+  <span class="s0">// In order to ensure that we pause soon, we both set the async pause flag on</span>
+  <span class="s0">// the runtime, and we run a bit of dummy JS to ensure we enter the Hermes</span>
+  <span class="s0">// interpreter loop.</span>
+  <span class="s1">debugger_.triggerAsyncPause(</span>
+      <span class="s1">pendingPauseState_ == AsyncPauseState::Implicit</span>
+          <span class="s1">? debugger::AsyncPauseKind::Implicit</span>
+          <span class="s1">: debugger::AsyncPauseKind::Explicit)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(andTickle) {</span>
+    <span class="s0">// We run the dummy JS on a background thread to avoid any reentrancy issues</span>
+    <span class="s0">// in case this thread is called with the inspector mutex held.</span>
+    <span class="s1">std::shared_ptr&lt;RuntimeAdapter&gt; adapter = adapter_</span><span class="s4">;</span>
+    <span class="s1">detail::Thread tickleJsLater(</span>
+        <span class="s3">&quot;inspectorTickleJs&quot;</span><span class="s4">, </span><span class="s1">[adapter]() { adapter-&gt;tickleJs()</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">tickleJsLater.detach()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::notifyContextCreated() {</span>
+  <span class="s1">observer_.onContextCreated(*</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ScriptInfo Inspector::getScriptInfoFromTopCallFrame() {</span>
+  <span class="s1">ScriptInfo info{}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">stackTrace = debugger_.getProgramState().getStackTrace()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(stackTrace.callFrameCount() &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">debugger::SourceLocation loc = stackTrace.callFrameForIndex(</span><span class="s5">0</span><span class="s1">).location</span><span class="s4">;</span>
+
+    <span class="s1">info.fileId = loc.fileId</span><span class="s4">;</span>
+    <span class="s1">info.fileName = loc.fileName</span><span class="s4">;</span>
+    <span class="s1">info.sourceMappingUrl = debugger_.getSourceMappingUrl(info.fileId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">info</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::addCurrentScriptToLoadedScripts() {</span>
+  <span class="s1">ScriptInfo info = getScriptInfoFromTopCallFrame()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!loadedScripts_.count(info.fileId)) {</span>
+    <span class="s1">loadedScriptIdByName_[info.fileName] = info.fileId</span><span class="s4">;</span>
+    <span class="s1">loadedScripts_[info.fileId] = LoadedScriptInfo{std::move(info)</span><span class="s4">, false</span><span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::removeAllBreakpoints() {</span>
+  <span class="s1">debugger_.deleteAllBreakpoints()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::resetScriptsLoaded() {</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;it : loadedScripts_) {</span>
+    <span class="s1">it.second.notifiedClient = </span><span class="s4">false;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::notifyScriptsLoaded() {</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;it : loadedScripts_) {</span>
+    <span class="s1">LoadedScriptInfo &amp;loadedScriptInfo = it.second</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!loadedScriptInfo.notifiedClient) {</span>
+      <span class="s1">loadedScriptInfo.notifiedClient = </span><span class="s4">true;</span>
+      <span class="s1">observer_.onScriptParsed(*</span><span class="s4">this, </span><span class="s1">loadedScriptInfo.info)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::disable() {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this, </span><span class="s1">promise] { disableOnExecutor(promise)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::enable() {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this, </span><span class="s1">promise] { enableOnExecutor(promise)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::executeIfEnabled(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;description</span><span class="s4">,</span>
+    <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">debugger::ProgramState &amp;)&gt; func) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add(</span>
+      <span class="s1">[</span><span class="s4">this, </span><span class="s1">description</span><span class="s4">, </span><span class="s1">func = std::move(func)</span><span class="s4">, </span><span class="s1">promise]() </span><span class="s4">mutable </span><span class="s1">{</span>
+        <span class="s1">executeIfEnabledOnExecutor(description</span><span class="s4">, </span><span class="s1">std::move(func)</span><span class="s4">, </span><span class="s1">promise)</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;debugger::BreakpointInfo&gt; Inspector::setBreakpoint(</span>
+    <span class="s1">debugger::SourceLocation loc</span><span class="s4">,</span>
+    <span class="s1">std::optional&lt;std::string&gt; condition) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;debugger::BreakpointInfo&gt;&gt;()</span><span class="s4">;</span>
+  <span class="s0">// Automatically re-enable breakpoints since the user presumably wants this</span>
+  <span class="s0">// to start triggering.</span>
+  <span class="s1">breakpointsActive_ = </span><span class="s4">true;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this, </span><span class="s1">loc</span><span class="s4">, </span><span class="s1">condition</span><span class="s4">, </span><span class="s1">promise] {</span>
+    <span class="s1">setBreakpointOnExecutor(loc</span><span class="s4">, </span><span class="s1">condition</span><span class="s4">, </span><span class="s1">promise)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;folly::Unit&gt; Inspector::removeBreakpoint(</span>
+    <span class="s1">debugger::BreakpointID breakpointId) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;folly::Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this, </span><span class="s1">breakpointId</span><span class="s4">, </span><span class="s1">promise] {</span>
+    <span class="s1">removeBreakpointOnExecutor(breakpointId</span><span class="s4">, </span><span class="s1">promise)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;folly::Unit&gt; Inspector::logMessage(ConsoleMessageInfo info) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;folly::Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this,</span>
+                  <span class="s1">pInfo = std::make_unique&lt;ConsoleMessageInfo&gt;(std::move(info))</span><span class="s4">,</span>
+                  <span class="s1">promise] { logOnExecutor(std::move(*pInfo)</span><span class="s4">, </span><span class="s1">promise)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::setPendingCommand(debugger::Command command) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this, </span><span class="s1">promise</span><span class="s4">, </span><span class="s1">cmd = std::move(command)]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s1">setPendingCommandOnExecutor(std::move(cmd)</span><span class="s4">, </span><span class="s1">promise)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::resume() {</span>
+  <span class="s4">return </span><span class="s1">setPendingCommand(debugger::Command::continueExecution())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::stepIn() {</span>
+  <span class="s4">return </span><span class="s1">setPendingCommand(debugger::Command::step(debugger::StepMode::Into))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::stepOver() {</span>
+  <span class="s4">return </span><span class="s1">setPendingCommand(debugger::Command::step(debugger::StepMode::Over))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::stepOut() {</span>
+  <span class="s4">return </span><span class="s1">setPendingCommand(debugger::Command::step(debugger::StepMode::Out))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;Unit&gt; Inspector::pause() {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this, </span><span class="s1">promise]() { pauseOnExecutor(promise)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;debugger::EvalResult&gt; Inspector::evaluate(</span>
+    <span class="s1">uint32_t frameIndex</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;src</span><span class="s4">,</span>
+    <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+        <span class="s1">resultTransformer) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;debugger::EvalResult&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this,</span>
+                  <span class="s1">frameIndex</span><span class="s4">,</span>
+                  <span class="s1">src</span><span class="s4">,</span>
+                  <span class="s1">promise</span><span class="s4">,</span>
+                  <span class="s1">resultTransformer = std::move(resultTransformer)]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s1">evaluateOnExecutor(frameIndex</span><span class="s4">, </span><span class="s1">src</span><span class="s4">, </span><span class="s1">promise</span><span class="s4">, </span><span class="s1">std::move(resultTransformer))</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::Future&lt;folly::Unit&gt; Inspector::setPauseOnExceptions(</span>
+    <span class="s4">const </span><span class="s1">debugger::PauseOnThrowMode &amp;mode) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s1">executor_-&gt;add([</span><span class="s4">this, </span><span class="s1">mode</span><span class="s4">, </span><span class="s1">promise]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s1">setPauseOnExceptionsOnExecutor(mode</span><span class="s4">, </span><span class="s1">promise)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">folly::Future&lt;folly::Unit&gt; Inspector::setPauseOnLoads(</span>
+    <span class="s4">const </span><span class="s1">PauseOnLoadMode mode) {</span>
+  <span class="s0">// This flag does not touch the runtime, so it doesn't need the executor.</span>
+  <span class="s0">// Return a future anyways for consistency.</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+  <span class="s1">pauseOnLoadMode_ = mode</span><span class="s4">;</span>
+  <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">folly::Future&lt;folly::Unit&gt; Inspector::setBreakpointsActive(</span><span class="s4">bool </span><span class="s1">active) {</span>
+  <span class="s0">// Same logic as setPauseOnLoads.</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+  <span class="s1">breakpointsActive_ = active</span><span class="s4">;</span>
+  <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">promise-&gt;getFuture()</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">bool </span><span class="s1">Inspector::shouldPauseOnThisScriptLoad() {</span>
+  <span class="s4">switch </span><span class="s1">(pauseOnLoadMode_) {</span>
+    <span class="s4">case </span><span class="s1">None:</span>
+      <span class="s4">return false;</span>
+    <span class="s4">case </span><span class="s1">All:</span>
+      <span class="s4">return true;</span>
+    <span class="s4">case </span><span class="s1">Smart:</span>
+      <span class="s0">// If we don't have active breakpoints, there's nothing to set or update.</span>
+      <span class="s4">if </span><span class="s1">(debugger_.getBreakpoints().size() == </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s4">return false;</span>
+      <span class="s1">}</span>
+      <span class="s0">// If there's no source map URL, it's probably not a file we care about.</span>
+      <span class="s4">if </span><span class="s1">(getScriptInfoFromTopCallFrame().sourceMappingUrl.size() == </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s4">return false;</span>
+      <span class="s1">}</span>
+      <span class="s4">return true;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">debugger::Command Inspector::didPause(debugger::Debugger &amp;debugger) {</span>
+  <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(kShouldLog) {</span>
+    <span class="s1">LOG(INFO) &lt;&lt; </span><span class="s3">&quot;received didPause for reason: &quot;</span>
+              <span class="s1">&lt;&lt; </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(debugger.getProgramState().getPauseReason())</span>
+              <span class="s1">&lt;&lt; </span><span class="s3">&quot; in state: &quot; </span><span class="s1">&lt;&lt; *state_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">while </span><span class="s1">(</span><span class="s4">true</span><span class="s1">) {</span>
+    <span class="s0">/* 
+     * Keep sending the onPause event to the current state until we get a 
+     * command to return. For instance, this handles the transition from 
+     * Running to Paused to Running: 
+     * 
+     * 1) (R =&gt; P) We're currently in Running, so we call Running::didPause, 
+     *    which returns {nextState: Paused, command: null}. There isn't a 
+     *    command to return yet. 
+     * 2) (P =&gt; R) Now we're in Paused, so we call Paused::didPause, which 
+     *    returns {nextState: Running, command: someCommand} where someCommand 
+     *    is non-null (e.g. continue or step over). This terminates the loop. 
+     */</span>
+    <span class="s4">auto </span><span class="s1">result = state_-&gt;didPause(lock)</span><span class="s4">;</span>
+
+    <span class="s1">std::unique_ptr&lt;InspectorState&gt; nextState = std::move(result.first)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(nextState) {</span>
+      <span class="s1">TRANSITION(std::move(nextState))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">std::unique_ptr&lt;debugger::Command&gt; command = std::move(result.second)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(command) {</span>
+      <span class="s4">return </span><span class="s1">std::move(*command)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::breakpointResolved(</span>
+    <span class="s1">debugger::Debugger &amp;debugger</span><span class="s4">,</span>
+    <span class="s1">debugger::BreakpointID breakpointId) {</span>
+  <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s1">debugger::BreakpointInfo info = debugger.getBreakpointInfo(breakpointId)</span><span class="s4">;</span>
+  <span class="s1">observer_.onBreakpointResolved(*</span><span class="s4">this, </span><span class="s1">info)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::transition(std::unique_ptr&lt;InspectorState&gt; nextState) {</span>
+  <span class="s1">assert(nextState)</span><span class="s4">;</span>
+  <span class="s1">assert(state_ != nextState)</span><span class="s4">;</span>
+
+  <span class="s1">std::unique_ptr&lt;InspectorState&gt; prevState = std::move(state_)</span><span class="s4">;</span>
+  <span class="s1">state_ = std::move(nextState)</span><span class="s4">;</span>
+  <span class="s1">state_-&gt;onEnter(prevState.get())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::disableOnExecutor(</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s1">debugger_.setIsDebuggerAttached(</span><span class="s4">false</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">state_-&gt;detach(promise)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::enableOnExecutor(</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">result = state_-&gt;enable()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * We fulfill the promise before changing state because fulfilling the promise 
+   * responds to the Debugger.enable request, and changing state could send a 
+   * notification (like Debugger.paused). It seems like a good idea to respond 
+   * to enable before sending out any notifications. 
+   */</span>
+  <span class="s4">bool </span><span class="s1">enabled = result.second</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(enabled) {</span>
+    <span class="s1">debugger_.setIsDebuggerAttached(</span><span class="s4">true</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">promise-&gt;setException(AlreadyEnabledException())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::unique_ptr&lt;InspectorState&gt; nextState = std::move(result.first)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(nextState) {</span>
+    <span class="s1">TRANSITION(std::move(nextState))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::executeIfEnabledOnExecutor(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;description</span><span class="s4">,</span>
+    <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">debugger::ProgramState &amp;)&gt; func</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!state_-&gt;isPaused() &amp;&amp; !state_-&gt;isRunning()) {</span>
+    <span class="s1">promise-&gt;setException(InvalidStateException(</span>
+        <span class="s1">description</span><span class="s4">, </span><span class="s1">state_-&gt;description()</span><span class="s4">, </span><span class="s3">&quot;paused or running&quot;</span><span class="s1">))</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">folly::Func wrappedFunc = [</span><span class="s4">this, </span><span class="s1">func = std::move(func)]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s1">func(debugger_.getProgramState())</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">state_-&gt;pushPendingFunc(</span>
+      <span class="s1">[wrappedFunc = std::move(wrappedFunc)</span><span class="s4">, </span><span class="s1">promise]() </span><span class="s4">mutable </span><span class="s1">{</span>
+        <span class="s4">if </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">userCallbackException = runUserCallback(wrappedFunc)) {</span>
+          <span class="s1">promise-&gt;setException(*userCallbackException)</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::setBreakpointOnExecutor(</span>
+    <span class="s1">debugger::SourceLocation loc</span><span class="s4">,</span>
+    <span class="s1">std::optional&lt;std::string&gt; condition</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;debugger::BreakpointInfo&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">pushed = state_-&gt;pushPendingFunc([</span><span class="s4">this, </span><span class="s1">loc</span><span class="s4">, </span><span class="s1">condition</span><span class="s4">, </span><span class="s1">promise] {</span>
+    <span class="s1">debugger::BreakpointID id = debugger_.setBreakpoint(loc)</span><span class="s4">;</span>
+    <span class="s1">debugger::BreakpointInfo info{debugger::kInvalidBreakpoint}</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(id != debugger::kInvalidBreakpoint) {</span>
+      <span class="s1">info = debugger_.getBreakpointInfo(id)</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(condition) {</span>
+        <span class="s1">debugger_.setBreakpointCondition(id</span><span class="s4">, </span><span class="s1">condition.value())</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">promise-&gt;setValue(std::move(info))</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!pushed) {</span>
+    <span class="s1">promise-&gt;setException(NotEnabledException(</span><span class="s3">&quot;setBreakpoint&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::removeBreakpointOnExecutor(</span>
+    <span class="s1">debugger::BreakpointID breakpointId</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">pushed = state_-&gt;pushPendingFunc([</span><span class="s4">this, </span><span class="s1">breakpointId</span><span class="s4">, </span><span class="s1">promise] {</span>
+    <span class="s1">debugger_.deleteBreakpoint(breakpointId)</span><span class="s4">;</span>
+    <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!pushed) {</span>
+    <span class="s1">promise-&gt;setException(NotEnabledException(</span><span class="s3">&quot;removeBreakpoint&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::logOnExecutor(</span>
+    <span class="s1">ConsoleMessageInfo info</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s1">state_-&gt;pushPendingFunc([</span><span class="s4">this, </span><span class="s1">info = std::move(info)] {</span>
+    <span class="s1">observer_.onMessageAdded(*</span><span class="s4">this, </span><span class="s1">info)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::setPendingCommandOnExecutor(</span>
+    <span class="s1">debugger::Command command</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s1">state_-&gt;setPendingCommand(std::move(command)</span><span class="s4">, </span><span class="s1">promise)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::pauseOnExecutor(std::shared_ptr&lt;folly::Promise&lt;Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">canPause = state_-&gt;pause()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(canPause) {</span>
+    <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">promise-&gt;setException(NotEnabledException(</span><span class="s3">&quot;pause&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::evaluateOnExecutor(</span>
+    <span class="s1">uint32_t frameIndex</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;src</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;debugger::EvalResult&gt;&gt; promise</span><span class="s4">,</span>
+    <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+        <span class="s1">resultTransformer) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s1">state_-&gt;pushPendingEval(</span>
+      <span class="s1">frameIndex</span><span class="s4">, </span><span class="s1">src</span><span class="s4">, </span><span class="s1">promise</span><span class="s4">, </span><span class="s1">std::move(resultTransformer))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Inspector::setPauseOnExceptionsOnExecutor(</span>
+    <span class="s4">const </span><span class="s1">debugger::PauseOnThrowMode &amp;mode</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; local(mutex_)</span><span class="s4">;</span>
+
+  <span class="s1">state_-&gt;pushPendingFunc([</span><span class="s4">this, </span><span class="s1">mode</span><span class="s4">, </span><span class="s1">promise] {</span>
+    <span class="s1">debugger_.setPauseOnThrowMode(mode)</span><span class="s4">;</span>
+    <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static const char </span><span class="s1">*kSuppressionVariable = </span><span class="s3">&quot;_hermes_suppress_superseded_warning&quot;</span><span class="s4">;</span>
+<span class="s4">void </span><span class="s1">Inspector::alertIfPausedInSupersededFile() {</span>
+  <span class="s4">if </span><span class="s1">(isExecutingSupersededFile() &amp;&amp;</span>
+      <span class="s1">!shouldSuppressAlertAboutSupersededFiles()) {</span>
+    <span class="s1">ScriptInfo info = getScriptInfoFromTopCallFrame()</span><span class="s4">;</span>
+    <span class="s1">std::string warning =</span>
+        <span class="s3">&quot;You have loaded the current file multiple times, and you are &quot;</span>
+        <span class="s3">&quot;now paused in one of the previous instances. The source &quot;</span>
+        <span class="s3">&quot;code you see may not correspond to what's being executed &quot;</span>
+        <span class="s3">&quot;(set JS variable &quot; </span><span class="s1">+</span>
+        <span class="s1">std::string(kSuppressionVariable) +</span>
+        <span class="s3">&quot;=true to &quot;</span>
+        <span class="s3">&quot;suppress this warning. Filename: &quot; </span><span class="s1">+</span>
+        <span class="s1">info.fileName + </span><span class="s3">&quot;).&quot;</span><span class="s4">;</span>
+    <span class="s1">jsi::Array jsiArray(adapter_-&gt;getRuntime()</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">jsiArray.setValueAtIndex(adapter_-&gt;getRuntime()</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">warning)</span><span class="s4">;</span>
+
+    <span class="s1">ConsoleMessageInfo logMessage(</span><span class="s3">&quot;warning&quot;</span><span class="s4">, </span><span class="s1">std::move(jsiArray))</span><span class="s4">;</span>
+    <span class="s1">observer_.onMessageAdded(*</span><span class="s4">this, </span><span class="s1">logMessage)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">Inspector::shouldSuppressAlertAboutSupersededFiles() {</span>
+  <span class="s1">jsi::Runtime &amp;rt = adapter_-&gt;getRuntime()</span><span class="s4">;</span>
+  <span class="s1">jsi::Value setting = rt.global().getProperty(rt</span><span class="s4">, </span><span class="s1">kSuppressionVariable)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(setting.isUndefined() || !setting.isBool())</span>
+    <span class="s4">return false;</span>
+  <span class="s4">return </span><span class="s1">setting.getBool()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">Inspector::isExecutingSupersededFile() {</span>
+  <span class="s1">ScriptInfo info = getScriptInfoFromTopCallFrame()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(info.fileName.empty())</span>
+    <span class="s4">return false;</span>
+
+  <span class="s4">auto </span><span class="s1">it = loadedScriptIdByName_.find(info.fileName)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(it != loadedScriptIdByName_.end()) {</span>
+    <span class="s4">return </span><span class="s1">it-&gt;second &gt; info.fileId</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return false;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">Inspector::isAwaitingDebuggerOnStart() {</span>
+  <span class="s4">return </span><span class="s1">awaitingDebuggerOnStart_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace inspector</span>
+<span class="s1">} </span><span class="s0">// namespace hermes</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

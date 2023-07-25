@@ -1,0 +1,313 @@
+<html>
+<head>
+<title>IncrementalBundler.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+IncrementalBundler.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const Bundler = require(</span><span class="s2">&quot;./Bundler&quot;</span><span class="s1">);</span>
+<span class="s1">const DeltaBundler = require(</span><span class="s2">&quot;./DeltaBundler&quot;</span><span class="s1">);</span>
+<span class="s1">const ResourceNotFoundError = require(</span><span class="s2">&quot;./IncrementalBundler/ResourceNotFoundError&quot;</span><span class="s1">);</span>
+<span class="s1">const getGraphId = require(</span><span class="s2">&quot;./lib/getGraphId&quot;</span><span class="s1">);</span>
+<span class="s1">const getPrependedScripts = require(</span><span class="s2">&quot;./lib/getPrependedScripts&quot;</span><span class="s1">);</span>
+<span class="s1">const transformHelpers = require(</span><span class="s2">&quot;./lib/transformHelpers&quot;</span><span class="s1">);</span>
+<span class="s1">const crypto = require(</span><span class="s2">&quot;crypto&quot;</span><span class="s1">);</span>
+<span class="s1">const fs = require(</span><span class="s2">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const path = require(</span><span class="s2">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s3">function </span><span class="s1">createRevisionId() {</span>
+  <span class="s3">return </span><span class="s1">crypto.randomBytes(</span><span class="s4">8</span><span class="s1">).toString(</span><span class="s2">&quot;hex&quot;</span><span class="s1">);</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">revisionIdFromString(str) {</span>
+  <span class="s3">return </span><span class="s1">str;</span>
+<span class="s1">}</span>
+<span class="s1">class IncrementalBundler {</span>
+  <span class="s1">_revisionsById = </span><span class="s3">new </span><span class="s1">Map();</span>
+  <span class="s1">_revisionsByGraphId = </span><span class="s3">new </span><span class="s1">Map();</span>
+  <span class="s1">static revisionIdFromString = revisionIdFromString;</span>
+  <span class="s1">constructor(config, options) {</span>
+    <span class="s3">this</span><span class="s1">._config = config;</span>
+    <span class="s3">this</span><span class="s1">._bundler = </span><span class="s3">new </span><span class="s1">Bundler(config, options);</span>
+    <span class="s3">this</span><span class="s1">._deltaBundler = </span><span class="s3">new </span><span class="s1">DeltaBundler(</span><span class="s3">this</span><span class="s1">._bundler.getWatcher());</span>
+  <span class="s1">}</span>
+  <span class="s1">end() {</span>
+    <span class="s3">this</span><span class="s1">._deltaBundler.end();</span>
+    <span class="s0">// $FlowFixMe[unused-promise]</span>
+    <span class="s3">this</span><span class="s1">._bundler.end();</span>
+  <span class="s1">}</span>
+  <span class="s1">getBundler() {</span>
+    <span class="s3">return this</span><span class="s1">._bundler;</span>
+  <span class="s1">}</span>
+  <span class="s1">getDeltaBundler() {</span>
+    <span class="s3">return this</span><span class="s1">._deltaBundler;</span>
+  <span class="s1">}</span>
+  <span class="s1">getRevision(revisionId) {</span>
+    <span class="s3">return this</span><span class="s1">._revisionsById.get(revisionId);</span>
+  <span class="s1">}</span>
+  <span class="s1">getRevisionByGraphId(graphId) {</span>
+    <span class="s3">return this</span><span class="s1">._revisionsByGraphId.get(graphId);</span>
+  <span class="s1">}</span>
+  <span class="s1">async buildGraphForEntries(</span>
+    <span class="s1">entryFiles,</span>
+    <span class="s1">transformOptions,</span>
+    <span class="s1">resolverOptions,</span>
+    <span class="s1">otherOptions = {</span>
+      <span class="s1">onProgress: </span><span class="s3">null</span><span class="s1">,</span>
+      <span class="s1">shallow: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">lazy: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">}</span>
+  <span class="s1">) {</span>
+    <span class="s1">const absoluteEntryFiles = await </span><span class="s3">this</span><span class="s1">._getAbsoluteEntryFiles(entryFiles);</span>
+    <span class="s1">const graph = await </span><span class="s3">this</span><span class="s1">._deltaBundler.buildGraph(absoluteEntryFiles, {</span>
+      <span class="s1">resolve: await transformHelpers.getResolveDependencyFn(</span>
+        <span class="s3">this</span><span class="s1">._bundler,</span>
+        <span class="s1">transformOptions.platform,</span>
+        <span class="s1">resolverOptions</span>
+      <span class="s1">),</span>
+      <span class="s1">transform: await transformHelpers.getTransformFn(</span>
+        <span class="s1">absoluteEntryFiles,</span>
+        <span class="s3">this</span><span class="s1">._bundler,</span>
+        <span class="s3">this</span><span class="s1">._deltaBundler,</span>
+        <span class="s3">this</span><span class="s1">._config,</span>
+        <span class="s1">transformOptions,</span>
+        <span class="s1">resolverOptions</span>
+      <span class="s1">),</span>
+      <span class="s1">transformOptions,</span>
+      <span class="s1">onProgress: otherOptions.onProgress,</span>
+      <span class="s1">lazy: otherOptions.lazy,</span>
+      <span class="s1">unstable_allowRequireContext:</span>
+        <span class="s3">this</span><span class="s1">._config.transformer.unstable_allowRequireContext,</span>
+      <span class="s1">unstable_enablePackageExports:</span>
+        <span class="s3">this</span><span class="s1">._config.resolver.unstable_enablePackageExports,</span>
+      <span class="s1">shallow: otherOptions.shallow,</span>
+    <span class="s1">});</span>
+    <span class="s3">this</span><span class="s1">._config.serializer.experimentalSerializerHook(graph, {</span>
+      <span class="s1">added: graph.dependencies,</span>
+      <span class="s1">modified: </span><span class="s3">new </span><span class="s1">Map(),</span>
+      <span class="s1">deleted: </span><span class="s3">new </span><span class="s1">Set(),</span>
+      <span class="s1">reset: </span><span class="s3">true</span><span class="s1">,</span>
+    <span class="s1">});</span>
+    <span class="s3">return </span><span class="s1">graph;</span>
+  <span class="s1">}</span>
+  <span class="s1">async getDependencies(</span>
+    <span class="s1">entryFiles,</span>
+    <span class="s1">transformOptions,</span>
+    <span class="s1">resolverOptions,</span>
+    <span class="s1">otherOptions = {</span>
+      <span class="s1">onProgress: </span><span class="s3">null</span><span class="s1">,</span>
+      <span class="s1">shallow: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">lazy: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">}</span>
+  <span class="s1">) {</span>
+    <span class="s1">const absoluteEntryFiles = await </span><span class="s3">this</span><span class="s1">._getAbsoluteEntryFiles(entryFiles);</span>
+    <span class="s1">const dependencies = await </span><span class="s3">this</span><span class="s1">._deltaBundler.getDependencies(</span>
+      <span class="s1">absoluteEntryFiles,</span>
+      <span class="s1">{</span>
+        <span class="s1">resolve: await transformHelpers.getResolveDependencyFn(</span>
+          <span class="s3">this</span><span class="s1">._bundler,</span>
+          <span class="s1">transformOptions.platform,</span>
+          <span class="s1">resolverOptions</span>
+        <span class="s1">),</span>
+        <span class="s1">transform: await transformHelpers.getTransformFn(</span>
+          <span class="s1">absoluteEntryFiles,</span>
+          <span class="s3">this</span><span class="s1">._bundler,</span>
+          <span class="s3">this</span><span class="s1">._deltaBundler,</span>
+          <span class="s3">this</span><span class="s1">._config,</span>
+          <span class="s1">transformOptions,</span>
+          <span class="s1">resolverOptions</span>
+        <span class="s1">),</span>
+        <span class="s1">transformOptions,</span>
+        <span class="s1">onProgress: otherOptions.onProgress,</span>
+        <span class="s1">lazy: otherOptions.lazy,</span>
+        <span class="s1">unstable_allowRequireContext:</span>
+          <span class="s3">this</span><span class="s1">._config.transformer.unstable_allowRequireContext,</span>
+        <span class="s1">unstable_enablePackageExports:</span>
+          <span class="s3">this</span><span class="s1">._config.resolver.unstable_enablePackageExports,</span>
+        <span class="s1">shallow: otherOptions.shallow,</span>
+      <span class="s1">}</span>
+    <span class="s1">);</span>
+    <span class="s3">return </span><span class="s1">dependencies;</span>
+  <span class="s1">}</span>
+  <span class="s1">async buildGraph(</span>
+    <span class="s1">entryFile,</span>
+    <span class="s1">transformOptions,</span>
+    <span class="s1">resolverOptions,</span>
+    <span class="s1">otherOptions = {</span>
+      <span class="s1">onProgress: </span><span class="s3">null</span><span class="s1">,</span>
+      <span class="s1">shallow: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">lazy: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">}</span>
+  <span class="s1">) {</span>
+    <span class="s1">const graph = await </span><span class="s3">this</span><span class="s1">.buildGraphForEntries(</span>
+      <span class="s1">[entryFile],</span>
+      <span class="s1">transformOptions,</span>
+      <span class="s1">resolverOptions,</span>
+      <span class="s1">otherOptions</span>
+    <span class="s1">);</span>
+    <span class="s1">const { type: _, ...transformOptionsWithoutType } = transformOptions;</span>
+    <span class="s1">const prepend = await getPrependedScripts(</span>
+      <span class="s3">this</span><span class="s1">._config,</span>
+      <span class="s1">transformOptionsWithoutType,</span>
+      <span class="s1">resolverOptions,</span>
+      <span class="s3">this</span><span class="s1">._bundler,</span>
+      <span class="s3">this</span><span class="s1">._deltaBundler</span>
+    <span class="s1">);</span>
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s1">prepend,</span>
+      <span class="s1">graph,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// TODO T34760750 (alexkirsz) Eventually, I'd like to get to a point where</span>
+  <span class="s0">// this class exposes only initializeGraph and updateGraph.</span>
+  <span class="s1">async initializeGraph(</span>
+    <span class="s1">entryFile,</span>
+    <span class="s1">transformOptions,</span>
+    <span class="s1">resolverOptions,</span>
+    <span class="s1">otherOptions = {</span>
+      <span class="s1">onProgress: </span><span class="s3">null</span><span class="s1">,</span>
+      <span class="s1">shallow: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">lazy: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">}</span>
+  <span class="s1">) {</span>
+    <span class="s1">const graphId = getGraphId(entryFile, transformOptions, {</span>
+      <span class="s1">resolverOptions,</span>
+      <span class="s1">shallow: otherOptions.shallow,</span>
+      <span class="s1">lazy: otherOptions.lazy,</span>
+      <span class="s1">unstable_allowRequireContext:</span>
+        <span class="s3">this</span><span class="s1">._config.transformer.unstable_allowRequireContext,</span>
+    <span class="s1">});</span>
+    <span class="s1">const revisionId = createRevisionId();</span>
+    <span class="s1">const revisionPromise = (async () =&gt; {</span>
+      <span class="s1">const { graph, prepend } = await </span><span class="s3">this</span><span class="s1">.buildGraph(</span>
+        <span class="s1">entryFile,</span>
+        <span class="s1">transformOptions,</span>
+        <span class="s1">resolverOptions,</span>
+        <span class="s1">otherOptions</span>
+      <span class="s1">);</span>
+      <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">id: revisionId,</span>
+        <span class="s1">date: </span><span class="s3">new </span><span class="s1">Date(),</span>
+        <span class="s1">graphId,</span>
+        <span class="s1">graph,</span>
+        <span class="s1">prepend,</span>
+      <span class="s1">};</span>
+    <span class="s1">})();</span>
+    <span class="s3">this</span><span class="s1">._revisionsById.set(revisionId, revisionPromise);</span>
+    <span class="s3">this</span><span class="s1">._revisionsByGraphId.set(graphId, revisionPromise);</span>
+    <span class="s3">try </span><span class="s1">{</span>
+      <span class="s1">const revision = await revisionPromise;</span>
+      <span class="s1">const delta = {</span>
+        <span class="s1">added: revision.graph.dependencies,</span>
+        <span class="s1">modified: </span><span class="s3">new </span><span class="s1">Map(),</span>
+        <span class="s1">deleted: </span><span class="s3">new </span><span class="s1">Set(),</span>
+        <span class="s1">reset: </span><span class="s3">true</span><span class="s1">,</span>
+      <span class="s1">};</span>
+      <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">revision,</span>
+        <span class="s1">delta,</span>
+      <span class="s1">};</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(err) {</span>
+      <span class="s0">// Evict a bad revision from the cache since otherwise</span>
+      <span class="s0">// we'll keep getting it even after the build is fixed.</span>
+      <span class="s3">this</span><span class="s1">._revisionsById.</span><span class="s3">delete</span><span class="s1">(revisionId);</span>
+      <span class="s3">this</span><span class="s1">._revisionsByGraphId.</span><span class="s3">delete</span><span class="s1">(graphId);</span>
+      <span class="s3">throw </span><span class="s1">err;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">async updateGraph(revision, reset) {</span>
+    <span class="s1">const delta = await </span><span class="s3">this</span><span class="s1">._deltaBundler.getDelta(revision.graph, {</span>
+      <span class="s1">reset,</span>
+      <span class="s1">shallow: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">});</span>
+    <span class="s3">this</span><span class="s1">._config.serializer.experimentalSerializerHook(revision.graph, delta);</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">delta.added.size &gt; </span><span class="s4">0 </span><span class="s1">||</span>
+      <span class="s1">delta.modified.size &gt; </span><span class="s4">0 </span><span class="s1">||</span>
+      <span class="s1">delta.deleted.size &gt; </span><span class="s4">0</span>
+    <span class="s1">) {</span>
+      <span class="s3">this</span><span class="s1">._revisionsById.</span><span class="s3">delete</span><span class="s1">(revision.id);</span>
+      <span class="s1">revision = {</span>
+        <span class="s1">...revision,</span>
+        <span class="s0">// Generate a new revision id, to be used to verify the next incremental</span>
+        <span class="s0">// request.</span>
+        <span class="s1">id: crypto.randomBytes(</span><span class="s4">8</span><span class="s1">).toString(</span><span class="s2">&quot;hex&quot;</span><span class="s1">),</span>
+        <span class="s1">date: </span><span class="s3">new </span><span class="s1">Date(),</span>
+      <span class="s1">};</span>
+      <span class="s1">const revisionPromise = Promise.resolve(revision);</span>
+      <span class="s3">this</span><span class="s1">._revisionsById.set(revision.id, revisionPromise);</span>
+      <span class="s3">this</span><span class="s1">._revisionsByGraphId.set(revision.graphId, revisionPromise);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s1">revision,</span>
+      <span class="s1">delta,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+  <span class="s1">async endGraph(graphId) {</span>
+    <span class="s1">const revPromise = </span><span class="s3">this</span><span class="s1">._revisionsByGraphId.get(graphId);</span>
+    <span class="s3">if </span><span class="s1">(!revPromise) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const revision = await revPromise;</span>
+    <span class="s3">this</span><span class="s1">._deltaBundler.endGraph(revision.graph);</span>
+    <span class="s3">this</span><span class="s1">._revisionsByGraphId.</span><span class="s3">delete</span><span class="s1">(graphId);</span>
+    <span class="s3">this</span><span class="s1">._revisionsById.</span><span class="s3">delete</span><span class="s1">(revision.id);</span>
+  <span class="s1">}</span>
+  <span class="s1">async _getAbsoluteEntryFiles(entryFiles) {</span>
+    <span class="s1">const absoluteEntryFiles = entryFiles.map((entryFile) =&gt;</span>
+      <span class="s1">path.resolve(</span>
+        <span class="s3">this</span><span class="s1">._config.server.unstable_serverRoot ?? </span><span class="s3">this</span><span class="s1">._config.projectRoot,</span>
+        <span class="s1">entryFile</span>
+      <span class="s1">)</span>
+    <span class="s1">);</span>
+    <span class="s1">await Promise.all(</span>
+      <span class="s1">absoluteEntryFiles.map(</span>
+        <span class="s1">(entryFile) =&gt;</span>
+          <span class="s3">new </span><span class="s1">Promise((resolve, reject) =&gt; {</span>
+            <span class="s0">// This should throw an error if the file doesn't exist.</span>
+            <span class="s0">// Using this instead of fs.exists to account for SimLinks.</span>
+            <span class="s1">fs.realpath(entryFile, (err) =&gt; {</span>
+              <span class="s3">if </span><span class="s1">(err) {</span>
+                <span class="s1">reject(</span><span class="s3">new </span><span class="s1">ResourceNotFoundError(entryFile));</span>
+              <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s1">resolve();</span>
+              <span class="s1">}</span>
+            <span class="s1">});</span>
+          <span class="s1">})</span>
+      <span class="s1">)</span>
+    <span class="s1">);</span>
+    <span class="s3">return </span><span class="s1">absoluteEntryFiles;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Wait for the bundler to become ready.</span>
+  <span class="s1">async ready() {</span>
+    <span class="s1">await </span><span class="s3">this</span><span class="s1">._bundler.ready();</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = IncrementalBundler;</span>
+</pre>
+</body>
+</html>

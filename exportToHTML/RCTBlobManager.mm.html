@@ -1,0 +1,348 @@
+<html>
+<head>
+<title>RCTBlobManager.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTBlobManager.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBlobManager.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;mutex&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;FBReactNativeSpec/FBReactNativeSpec.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConvert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTNetworking.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTWebSocketModule.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTBlobCollector.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBlobPlugins.h&quot;</span>
+
+<span class="s4">static </span><span class="s1">NSString *</span><span class="s4">const </span><span class="s1">kBlobURIScheme = </span><span class="s4">@</span><span class="s3">&quot;blob&quot;</span><span class="s4">;</span>
+
+<span class="s4">@interface </span><span class="s1">RCTBlobManager () &lt;</span>
+    <span class="s1">RCTNetworkingRequestHandler</span><span class="s4">,</span>
+    <span class="s1">RCTNetworkingResponseHandler</span><span class="s4">,</span>
+    <span class="s1">RCTWebSocketContentHandler</span><span class="s4">,</span>
+    <span class="s1">NativeBlobModuleSpec&gt;</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTBlobManager {</span>
+  <span class="s0">// Blobs should be thread safe since they are used from the websocket and networking module,</span>
+  <span class="s0">// make sure to use proper locking when accessing this.</span>
+  <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">NSData *&gt; *_blobs</span><span class="s4">;</span>
+  <span class="s1">std::mutex _blobsMutex</span><span class="s4">;</span>
+
+  <span class="s1">NSOperationQueue *_queue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_MODULE(BlobModule)</span>
+
+<span class="s4">@synthesize </span><span class="s1">bridge = _bridge</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">moduleRegistry = _moduleRegistry</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">methodQueue = _methodQueue</span><span class="s4">;</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)initialize</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_blobsMutex)</span><span class="s4">;</span>
+  <span class="s1">_blobs = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">facebook::react::RCTBlobCollector::install(self)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (BOOL)requiresMainQueueSetup</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)constantsToExport</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self getConstants]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)getConstants</span>
+<span class="s1">{</span>
+  <span class="s4">return @</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;BLOB_URI_SCHEME&quot; </span><span class="s1">: kBlobURIScheme</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;BLOB_URI_HOST&quot; </span><span class="s1">: [NSNull null]</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSString *)store:(NSData *)data</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *blobId = [NSUUID UUID].UUIDString</span><span class="s4">;</span>
+  <span class="s1">[self store:data withId:blobId]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">blobId</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)store:(NSData *)data withId:(NSString *)blobId</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_blobsMutex)</span><span class="s4">;</span>
+  <span class="s1">_blobs[blobId] = data</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSData *)resolve:(NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)blob</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *blobId = [RCTConvert NSString:blob[</span><span class="s4">@</span><span class="s3">&quot;blobId&quot;</span><span class="s1">]]</span><span class="s4">;</span>
+  <span class="s1">NSNumber *offset = [RCTConvert NSNumber:blob[</span><span class="s4">@</span><span class="s3">&quot;offset&quot;</span><span class="s1">]]</span><span class="s4">;</span>
+  <span class="s1">NSNumber *size = [RCTConvert NSNumber:blob[</span><span class="s4">@</span><span class="s3">&quot;size&quot;</span><span class="s1">]]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[self resolve:blobId offset:offset ? [offset integerValue] : </span><span class="s5">0 </span><span class="s1">size:size ? [size integerValue] : -</span><span class="s5">1</span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSData *)resolve:(NSString *)blobId offset:(NSInteger)offset size:(NSInteger)size</span>
+<span class="s1">{</span>
+  <span class="s1">NSData *data</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_blobsMutex)</span><span class="s4">;</span>
+    <span class="s1">data = _blobs[blobId]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!data) {</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(offset != </span><span class="s5">0 </span><span class="s1">|| (size != -</span><span class="s5">1 </span><span class="s1">&amp;&amp; size != data.length)) {</span>
+    <span class="s1">data = [data subdataWithRange:NSMakeRange(offset</span><span class="s4">, </span><span class="s1">size)]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">data</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSData *)resolveURL:(NSURL *)url</span>
+<span class="s1">{</span>
+  <span class="s1">NSURLComponents *components = [[NSURLComponents alloc] initWithURL:url resolvingAgainstBaseURL:NO]</span><span class="s4">;</span>
+
+  <span class="s1">NSString *blobId = components.path</span><span class="s4">;</span>
+  <span class="s1">NSInteger offset = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">NSInteger size = -</span><span class="s5">1</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(components.queryItems) {</span>
+    <span class="s4">for </span><span class="s1">(NSURLQueryItem *queryItem in components.queryItems) {</span>
+      <span class="s4">if </span><span class="s1">([queryItem.name isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;offset&quot;</span><span class="s1">]) {</span>
+        <span class="s1">offset = [queryItem.value integerValue]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">([queryItem.name isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;size&quot;</span><span class="s1">]) {</span>
+        <span class="s1">size = [queryItem.value integerValue]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(blobId) {</span>
+    <span class="s4">return </span><span class="s1">[self resolve:blobId offset:offset size:size]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)remove:(NSString *)blobId</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_blobsMutex)</span><span class="s4">;</span>
+  <span class="s1">[_blobs removeObjectForKey:blobId]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(addNetworkingHandler)</span>
+<span class="s1">{</span>
+  <span class="s1">RCTNetworking *</span><span class="s4">const </span><span class="s1">networking = [_moduleRegistry moduleForName:</span><span class="s3">&quot;Networking&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s0">// TODO(T63516227): Why can methodQueue be nil here?</span>
+  <span class="s0">// We don't want to do anything when methodQueue is nil.</span>
+  <span class="s4">if </span><span class="s1">(!networking.methodQueue) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">dispatch_async(networking.methodQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">[networking addRequestHandler:self]</span><span class="s4">;</span>
+    <span class="s1">[networking addResponseHandler:self]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(addWebSocketHandler : (</span><span class="s4">double</span><span class="s1">)socketID)</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_async(((RCTWebSocketModule *)[_moduleRegistry moduleForName:</span><span class="s3">&quot;WebSocketModule&quot;</span><span class="s1">]).methodQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">[[self-&gt;_moduleRegistry moduleForName:</span><span class="s3">&quot;WebSocketModule&quot;</span><span class="s1">] setContentHandler:self</span>
+                                                                   <span class="s1">forSocketID:[NSNumber numberWithDouble:socketID]]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(removeWebSocketHandler : (</span><span class="s4">double</span><span class="s1">)socketID)</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_async(((RCTWebSocketModule *)[_moduleRegistry moduleForName:</span><span class="s3">&quot;WebSocketModule&quot;</span><span class="s1">]).methodQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">[[self-&gt;_moduleRegistry moduleForName:</span><span class="s3">&quot;WebSocketModule&quot;</span><span class="s1">] setContentHandler:nil</span>
+                                                                   <span class="s1">forSocketID:[NSNumber numberWithDouble:socketID]]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// @lint-ignore FBOBJCUNTYPEDCOLLECTION1</span>
+<span class="s1">RCT_EXPORT_METHOD(sendOverSocket : (NSDictionary *)blob socketID : (</span><span class="s4">double</span><span class="s1">)socketID)</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_async(((RCTWebSocketModule *)[_moduleRegistry moduleForName:</span><span class="s3">&quot;WebSocketModule&quot;</span><span class="s1">]).methodQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">[[self-&gt;_moduleRegistry moduleForName:</span><span class="s3">&quot;WebSocketModule&quot;</span><span class="s1">] sendData:[self resolve:blob]</span>
+                                                          <span class="s1">forSocketID:[NSNumber numberWithDouble:socketID]]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(createFromParts : (NSArray&lt;NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *&gt; *)parts withId : (NSString *)blobId)</span>
+<span class="s1">{</span>
+  <span class="s1">NSMutableData *data = [NSMutableData </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *part in parts) {</span>
+    <span class="s1">NSString *type = [RCTConvert NSString:part[</span><span class="s4">@</span><span class="s3">&quot;type&quot;</span><span class="s1">]]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">([type isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;blob&quot;</span><span class="s1">]) {</span>
+      <span class="s1">NSData *partData = [self resolve:part[</span><span class="s4">@</span><span class="s3">&quot;data&quot;</span><span class="s1">]]</span><span class="s4">;</span>
+      <span class="s1">[data appendData:partData]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">([type isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;string&quot;</span><span class="s1">]) {</span>
+      <span class="s1">NSData *partData = [[RCTConvert NSString:part[</span><span class="s4">@</span><span class="s3">&quot;data&quot;</span><span class="s1">]] dataUsingEncoding:NSUTF8StringEncoding]</span><span class="s4">;</span>
+      <span class="s1">[data appendData:partData]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">[NSException raise:</span><span class="s4">@</span><span class="s3">&quot;Invalid type for blob&quot; </span><span class="s1">format:</span><span class="s4">@</span><span class="s3">&quot;%@ is invalid&quot;</span><span class="s4">, </span><span class="s1">type]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">[self store:data withId:blobId]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(release : (NSString *)blobId)</span>
+<span class="s1">{</span>
+  <span class="s1">[self remove:blobId]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTURLRequestHandler methods</span>
+
+<span class="s1">- (BOOL)canHandleRequest:(NSURLRequest *)request</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[request.URL.scheme caseInsensitiveCompare:kBlobURIScheme] == NSOrderedSame</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id)sendRequest:(NSURLRequest *)request withDelegate:(id&lt;RCTURLRequestDelegate&gt;)delegate</span>
+<span class="s1">{</span>
+  <span class="s0">// Lazy setup</span>
+  <span class="s4">if </span><span class="s1">(!_queue) {</span>
+    <span class="s1">_queue = [NSOperationQueue </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">_queue.maxConcurrentOperationCount = </span><span class="s5">2</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">__weak __typeof</span><span class="s1">(self) weakSelf = self</span><span class="s4">;</span>
+  <span class="s4">__weak </span><span class="s1">__block NSBlockOperation *weakOp</span><span class="s4">;</span>
+  <span class="s1">__block NSBlockOperation *op = [NSBlockOperation blockOperationWithBlock:^{</span>
+    <span class="s4">__typeof</span><span class="s1">(self) strongSelf = weakSelf</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!strongSelf) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">NSURLResponse *response = [[NSURLResponse alloc] initWithURL:request.URL</span>
+                                                        <span class="s1">MIMEType:nil</span>
+                                           <span class="s1">expectedContentLength:-</span><span class="s5">1</span>
+                                                <span class="s1">textEncodingName:nil]</span><span class="s4">;</span>
+
+    <span class="s1">[delegate URLRequest:weakOp didReceiveResponse:response]</span><span class="s4">;</span>
+
+    <span class="s1">NSData *data = [strongSelf resolveURL:response.URL]</span><span class="s4">;</span>
+    <span class="s1">NSError *error</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(data) {</span>
+      <span class="s1">[delegate URLRequest:weakOp didReceiveData:data]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">error = [[NSError alloc] initWithDomain:NSURLErrorDomain code:NSURLErrorBadURL userInfo:nil]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">[delegate URLRequest:weakOp didCompleteWithError:error]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s1">weakOp = op</span><span class="s4">;</span>
+  <span class="s1">[_queue addOperation:op]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">op</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)cancelRequest:(NSOperation *)op</span>
+<span class="s1">{</span>
+  <span class="s1">[op cancel]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTNetworkingRequestHandler methods</span>
+
+<span class="s0">// @lint-ignore FBOBJCUNTYPEDCOLLECTION1</span>
+<span class="s1">- (BOOL)canHandleNetworkingRequest:(NSDictionary *)data</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">data[</span><span class="s4">@</span><span class="s3">&quot;blob&quot;</span><span class="s1">] != nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// @lint-ignore FBOBJCUNTYPEDCOLLECTION1</span>
+<span class="s1">- (NSDictionary *)handleNetworkingRequest:(NSDictionary *)data</span>
+<span class="s1">{</span>
+  <span class="s0">// @lint-ignore FBOBJCUNTYPEDCOLLECTION1</span>
+  <span class="s1">NSDictionary *blob = [RCTConvert NSDictionary:data[</span><span class="s4">@</span><span class="s3">&quot;blob&quot;</span><span class="s1">]]</span><span class="s4">;</span>
+
+  <span class="s1">NSString *contentType = </span><span class="s4">@</span><span class="s3">&quot;application/octet-stream&quot;</span><span class="s4">;</span>
+  <span class="s1">NSString *blobType = [RCTConvert NSString:RCTNilIfNull(blob[</span><span class="s4">@</span><span class="s3">&quot;type&quot;</span><span class="s1">])]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(blobType != nil &amp;&amp; blobType.length &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">contentType = blob[</span><span class="s4">@</span><span class="s3">&quot;type&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return @</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;body&quot; </span><span class="s1">: [self resolve:blob]</span><span class="s4">, @</span><span class="s3">&quot;contentType&quot; </span><span class="s1">: contentType}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)canHandleNetworkingResponse:(NSString *)responseType</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[responseType isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;blob&quot;</span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id)handleNetworkingResponse:(NSURLResponse *)response data:(NSData *)data</span>
+<span class="s1">{</span>
+  <span class="s0">// An empty body will have nil for data, in this case we need to return</span>
+  <span class="s0">// an empty blob as per the XMLHttpRequest spec.</span>
+  <span class="s1">data = data ?: [NSData </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">return @</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;blobId&quot; </span><span class="s1">: [self store:data]</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;offset&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s5">0</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;size&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(data.length)</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;name&quot; </span><span class="s1">: RCTNullIfNil([response suggestedFilename])</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;type&quot; </span><span class="s1">: RCTNullIfNil([response MIMEType])</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTWebSocketContentHandler methods</span>
+
+<span class="s1">- (id)processWebsocketMessage:(id)message</span>
+                  <span class="s1">forSocketID:(NSNumber *)socketID</span>
+                     <span class="s1">withType:(NSString *</span><span class="s4">__autoreleasing _Nonnull </span><span class="s1">*)type</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(![message isKindOfClass:[NSData </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s1">*type = </span><span class="s4">@</span><span class="s3">&quot;text&quot;</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">message</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">*type = </span><span class="s4">@</span><span class="s3">&quot;blob&quot;</span><span class="s4">;</span>
+  <span class="s4">return @</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;blobId&quot; </span><span class="s1">: [self store:message]</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;offset&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s5">0</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;size&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(((NSData *)message).length)</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (std::shared_ptr&lt;facebook::react::TurboModule&gt;)getTurboModule:</span>
+    <span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::react::ObjCTurboModule::InitParams &amp;)params</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">std::make_shared&lt;facebook::react::NativeBlobModuleSpecJSI&gt;(params)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s1">Class RCTBlobManagerCls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTBlobManager.</span><span class="s4">class;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

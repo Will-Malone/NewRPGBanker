@@ -1,0 +1,628 @@
+<html>
+<head>
+<title>Binding.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Binding.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;Binding.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;AsyncEventBeat.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;EventEmitterWrapper.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JBackgroundExecutor.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;ReactNativeConfigHolder.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;StateWrapperImpl.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cfenv&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cmath&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;fbjni/fbjni.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/JSIDynamic.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/animations/LayoutAnimationDriver.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/componentregistry/ComponentDescriptorFactory.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/components/scrollview/ScrollViewProps.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/CoreFeatures.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/EventBeat.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/EventEmitter.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/conversions.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/scheduler/Scheduler.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/scheduler/SchedulerDelegate.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/scheduler/SchedulerToolbox.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/uimanager/primitives.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/utils/ContextContainer.h&gt;</span>
+
+<span class="s0">// Included to set BaseTextProps config; can be deleted later.</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/components/text/BaseTextProps.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::jni</span><span class="s4">;</span>
+<span class="s4">using namespace </span><span class="s1">facebook::jsi</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s1">jni::local_ref&lt;Binding::jhybriddata&gt; Binding::initHybrid(</span>
+    <span class="s1">jni::alias_ref&lt;jclass&gt;) {</span>
+  <span class="s4">return </span><span class="s1">makeCxxInstance()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// Thread-safe getter</span>
+<span class="s1">std::shared_ptr&lt;Scheduler&gt; Binding::getScheduler() {</span>
+  <span class="s1">std::shared_lock lock(installMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">scheduler_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jni::local_ref&lt;ReadableNativeMap::jhybridobject&gt;</span>
+<span class="s1">Binding::getInspectorDataForInstance(</span>
+    <span class="s1">jni::alias_ref&lt;EventEmitterWrapper::javaobject&gt; eventEmitterWrapper) {</span>
+  <span class="s1">std::shared_ptr&lt;Scheduler&gt; scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::startSurface: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">ReadableNativeMap::newObjectCxxArgs(folly::dynamic::object())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">EventEmitterWrapper *cEventEmitter = cthis(eventEmitterWrapper)</span><span class="s4">;</span>
+  <span class="s1">InspectorData data =</span>
+      <span class="s1">scheduler-&gt;getInspectorDataForInstance(*cEventEmitter-&gt;eventEmitter)</span><span class="s4">;</span>
+
+  <span class="s1">folly::dynamic result = folly::dynamic::object</span><span class="s4">;</span>
+  <span class="s1">result[</span><span class="s3">&quot;fileName&quot;</span><span class="s1">] = data.fileName</span><span class="s4">;</span>
+  <span class="s1">result[</span><span class="s3">&quot;lineNumber&quot;</span><span class="s1">] = data.lineNumber</span><span class="s4">;</span>
+  <span class="s1">result[</span><span class="s3">&quot;columnNumber&quot;</span><span class="s1">] = data.columnNumber</span><span class="s4">;</span>
+  <span class="s1">result[</span><span class="s3">&quot;selectedIndex&quot;</span><span class="s1">] = data.selectedIndex</span><span class="s4">;</span>
+  <span class="s1">result[</span><span class="s3">&quot;props&quot;</span><span class="s1">] = data.props</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">hierarchy = folly::dynamic::array()</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;hierarchyItem : data.hierarchy) {</span>
+    <span class="s1">hierarchy.push_back(hierarchyItem)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">result[</span><span class="s3">&quot;hierarchy&quot;</span><span class="s1">] = hierarchy</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">ReadableNativeMap::newObjectCxxArgs(result)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">constexpr static auto </span><span class="s1">ReactFeatureFlagsJavaDescriptor =</span>
+    <span class="s3">&quot;com/facebook/react/config/ReactFeatureFlags&quot;</span><span class="s4">;</span>
+
+<span class="s4">static bool </span><span class="s1">getFeatureFlagValue(</span><span class="s4">const char </span><span class="s1">*name) {</span>
+  <span class="s4">static const auto </span><span class="s1">reactFeatureFlagsJavaDescriptor =</span>
+      <span class="s1">jni::findClassStatic(ReactFeatureFlagsJavaDescriptor)</span><span class="s4">;</span>
+  <span class="s4">const auto </span><span class="s1">field =</span>
+      <span class="s1">reactFeatureFlagsJavaDescriptor-&gt;getStaticField&lt;jboolean&gt;(name)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">reactFeatureFlagsJavaDescriptor-&gt;getStaticFieldValue(field)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::setPixelDensity(</span><span class="s4">float </span><span class="s1">pointScaleFactor) {</span>
+  <span class="s1">pointScaleFactor_ = pointScaleFactor</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::driveCxxAnimations() {</span>
+  <span class="s1">scheduler_-&gt;animationTick()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Surface management</span>
+
+<span class="s4">void </span><span class="s1">Binding::startSurface(</span>
+    <span class="s1">jint surfaceId</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;jstring&gt; moduleName</span><span class="s4">,</span>
+    <span class="s1">NativeMap *initialProps) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;FabricUIManagerBinding::startSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">std::shared_ptr&lt;Scheduler&gt; scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::startSurface: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">layoutContext = LayoutContext{}</span><span class="s4">;</span>
+  <span class="s1">layoutContext.pointScaleFactor = pointScaleFactor_</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">surfaceHandler = SurfaceHandler{moduleName-&gt;toStdString()</span><span class="s4">, </span><span class="s1">surfaceId}</span><span class="s4">;</span>
+  <span class="s1">surfaceHandler.setContextContainer(scheduler-&gt;getContextContainer())</span><span class="s4">;</span>
+  <span class="s1">surfaceHandler.setProps(initialProps-&gt;consume())</span><span class="s4">;</span>
+  <span class="s1">surfaceHandler.constraintLayout({}</span><span class="s4">, </span><span class="s1">layoutContext)</span><span class="s4">;</span>
+
+  <span class="s1">scheduler-&gt;registerSurface(surfaceHandler)</span><span class="s4">;</span>
+
+  <span class="s1">surfaceHandler.start()</span><span class="s4">;</span>
+
+  <span class="s1">surfaceHandler.getMountingCoordinator()-&gt;setMountingOverrideDelegate(</span>
+      <span class="s1">animationDriver_)</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">SystraceSection s2(</span><span class="s3">&quot;FabricUIManagerBinding::startSurface::surfaceId::lock&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">std::unique_lock lock(surfaceHandlerRegistryMutex_)</span><span class="s4">;</span>
+    <span class="s1">SystraceSection s3(</span><span class="s3">&quot;FabricUIManagerBinding::startSurface::surfaceId&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">surfaceHandlerRegistry_.emplace(surfaceId</span><span class="s4">, </span><span class="s1">std::move(surfaceHandler))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;FabricUIManagerBinding::startSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">mountingManager-&gt;onSurfaceStart(surfaceId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::startSurfaceWithConstraints(</span>
+    <span class="s1">jint surfaceId</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;jstring&gt; moduleName</span><span class="s4">,</span>
+    <span class="s1">NativeMap *initialProps</span><span class="s4">,</span>
+    <span class="s1">jfloat minWidth</span><span class="s4">,</span>
+    <span class="s1">jfloat maxWidth</span><span class="s4">,</span>
+    <span class="s1">jfloat minHeight</span><span class="s4">,</span>
+    <span class="s1">jfloat maxHeight</span><span class="s4">,</span>
+    <span class="s1">jfloat offsetX</span><span class="s4">,</span>
+    <span class="s1">jfloat offsetY</span><span class="s4">,</span>
+    <span class="s1">jboolean isRTL</span><span class="s4">,</span>
+    <span class="s1">jboolean doLeftAndRightSwapInRTL) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;FabricUIManagerBinding::startSurfaceWithConstraints&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(enableFabricLogs_) {</span>
+    <span class="s1">LOG(WARNING)</span>
+        <span class="s1">&lt;&lt; </span><span class="s3">&quot;Binding::startSurfaceWithConstraints() was called (address: &quot;</span>
+        <span class="s1">&lt;&lt; </span><span class="s4">this </span><span class="s1">&lt;&lt; </span><span class="s3">&quot;, surfaceId: &quot; </span><span class="s1">&lt;&lt; surfaceId &lt;&lt; </span><span class="s3">&quot;).&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::shared_ptr&lt;Scheduler&gt; scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::startSurfaceWithConstraints: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">minimumSize =</span>
+      <span class="s1">Size{minWidth / pointScaleFactor_</span><span class="s4">, </span><span class="s1">minHeight / pointScaleFactor_}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">maximumSize =</span>
+      <span class="s1">Size{maxWidth / pointScaleFactor_</span><span class="s4">, </span><span class="s1">maxHeight / pointScaleFactor_}</span><span class="s4">;</span>
+
+  <span class="s1">LayoutContext context</span><span class="s4">;</span>
+  <span class="s1">context.viewportOffset =</span>
+      <span class="s1">Point{offsetX / pointScaleFactor_</span><span class="s4">, </span><span class="s1">offsetY / pointScaleFactor_}</span><span class="s4">;</span>
+  <span class="s1">context.pointScaleFactor = {pointScaleFactor_}</span><span class="s4">;</span>
+  <span class="s1">context.swapLeftAndRightInRTL = doLeftAndRightSwapInRTL</span><span class="s4">;</span>
+  <span class="s1">LayoutConstraints constraints = {}</span><span class="s4">;</span>
+  <span class="s1">constraints.minimumSize = minimumSize</span><span class="s4">;</span>
+  <span class="s1">constraints.maximumSize = maximumSize</span><span class="s4">;</span>
+  <span class="s1">constraints.layoutDirection =</span>
+      <span class="s1">isRTL ? LayoutDirection::RightToLeft : LayoutDirection::LeftToRight</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">surfaceHandler = SurfaceHandler{moduleName-&gt;toStdString()</span><span class="s4">, </span><span class="s1">surfaceId}</span><span class="s4">;</span>
+  <span class="s1">surfaceHandler.setContextContainer(scheduler_-&gt;getContextContainer())</span><span class="s4">;</span>
+  <span class="s1">surfaceHandler.setProps(initialProps-&gt;consume())</span><span class="s4">;</span>
+  <span class="s1">surfaceHandler.constraintLayout(constraints</span><span class="s4">, </span><span class="s1">context)</span><span class="s4">;</span>
+
+  <span class="s1">scheduler-&gt;registerSurface(surfaceHandler)</span><span class="s4">;</span>
+
+  <span class="s1">surfaceHandler.start()</span><span class="s4">;</span>
+
+  <span class="s1">surfaceHandler.getMountingCoordinator()-&gt;setMountingOverrideDelegate(</span>
+      <span class="s1">animationDriver_)</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">SystraceSection s2(</span>
+        <span class="s3">&quot;FabricUIManagerBinding::startSurfaceWithConstraints::surfaceId::lock&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">std::unique_lock lock(surfaceHandlerRegistryMutex_)</span><span class="s4">;</span>
+    <span class="s1">SystraceSection s3(</span>
+        <span class="s3">&quot;FabricUIManagerBinding::startSurfaceWithConstraints::surfaceId&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">surfaceHandlerRegistry_.emplace(surfaceId</span><span class="s4">, </span><span class="s1">std::move(surfaceHandler))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">mountingManager = verifyMountingManager(</span>
+      <span class="s3">&quot;FabricUIManagerBinding::startSurfaceWithConstraints&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">mountingManager-&gt;onSurfaceStart(surfaceId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::renderTemplateToSurface(jint surfaceId</span><span class="s4">, </span><span class="s1">jstring uiTemplate) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;FabricUIManagerBinding::renderTemplateToSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">std::shared_ptr&lt;Scheduler&gt; scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::renderTemplateToSurface: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">env = Environment::current()</span><span class="s4">;</span>
+  <span class="s4">const char </span><span class="s1">*nativeString = env-&gt;GetStringUTFChars(uiTemplate</span><span class="s4">, </span><span class="s1">JNI_FALSE)</span><span class="s4">;</span>
+  <span class="s1">scheduler-&gt;renderTemplateToSurface(surfaceId</span><span class="s4">, </span><span class="s1">nativeString)</span><span class="s4">;</span>
+  <span class="s1">env-&gt;ReleaseStringUTFChars(uiTemplate</span><span class="s4">, </span><span class="s1">nativeString)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::stopSurface(jint surfaceId) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;FabricUIManagerBinding::stopSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(enableFabricLogs_) {</span>
+    <span class="s1">LOG(WARNING) &lt;&lt; </span><span class="s3">&quot;Binding::stopSurface() was called (address: &quot; </span><span class="s1">&lt;&lt; </span><span class="s4">this</span>
+                 <span class="s1">&lt;&lt; </span><span class="s3">&quot;, surfaceId: &quot; </span><span class="s1">&lt;&lt; surfaceId &lt;&lt; </span><span class="s3">&quot;).&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::shared_ptr&lt;Scheduler&gt; scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::stopSurface: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock lock(surfaceHandlerRegistryMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">auto </span><span class="s1">iterator = surfaceHandlerRegistry_.find(surfaceId)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(iterator == surfaceHandlerRegistry_.end()) {</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::stopSurface: Surface with given id is not found&quot;</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">surfaceHandler = std::move(iterator-&gt;second)</span><span class="s4">;</span>
+    <span class="s1">surfaceHandlerRegistry_.erase(iterator)</span><span class="s4">;</span>
+    <span class="s1">surfaceHandler.stop()</span><span class="s4">;</span>
+    <span class="s1">scheduler-&gt;unregisterSurface(surfaceHandler)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;FabricUIManagerBinding::stopSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">mountingManager-&gt;onSurfaceStop(surfaceId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::registerSurface(SurfaceHandlerBinding *surfaceHandlerBinding) {</span>
+  <span class="s4">auto const </span><span class="s1">&amp;surfaceHandler = surfaceHandlerBinding-&gt;getSurfaceHandler()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::registerSurface: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">scheduler-&gt;registerSurface(surfaceHandler)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;FabricUIManagerBinding::registerSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">mountingManager-&gt;onSurfaceStart(surfaceHandler.getSurfaceId())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::unregisterSurface(SurfaceHandlerBinding *surfaceHandlerBinding) {</span>
+  <span class="s4">auto const </span><span class="s1">&amp;surfaceHandler = surfaceHandlerBinding-&gt;getSurfaceHandler()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::unregisterSurface: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">scheduler-&gt;unregisterSurface(surfaceHandler)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;FabricUIManagerBinding::unregisterSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">mountingManager-&gt;onSurfaceStop(surfaceHandler.getSurfaceId())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::setConstraints(</span>
+    <span class="s1">jint surfaceId</span><span class="s4">,</span>
+    <span class="s1">jfloat minWidth</span><span class="s4">,</span>
+    <span class="s1">jfloat maxWidth</span><span class="s4">,</span>
+    <span class="s1">jfloat minHeight</span><span class="s4">,</span>
+    <span class="s1">jfloat maxHeight</span><span class="s4">,</span>
+    <span class="s1">jfloat offsetX</span><span class="s4">,</span>
+    <span class="s1">jfloat offsetY</span><span class="s4">,</span>
+    <span class="s1">jboolean isRTL</span><span class="s4">,</span>
+    <span class="s1">jboolean doLeftAndRightSwapInRTL) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;FabricUIManagerBinding::setConstraints&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">std::shared_ptr&lt;Scheduler&gt; scheduler = getScheduler()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::setConstraints: scheduler disappeared&quot;</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">minimumSize =</span>
+      <span class="s1">Size{minWidth / pointScaleFactor_</span><span class="s4">, </span><span class="s1">minHeight / pointScaleFactor_}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">maximumSize =</span>
+      <span class="s1">Size{maxWidth / pointScaleFactor_</span><span class="s4">, </span><span class="s1">maxHeight / pointScaleFactor_}</span><span class="s4">;</span>
+
+  <span class="s1">LayoutContext context</span><span class="s4">;</span>
+  <span class="s1">context.viewportOffset =</span>
+      <span class="s1">Point{offsetX / pointScaleFactor_</span><span class="s4">, </span><span class="s1">offsetY / pointScaleFactor_}</span><span class="s4">;</span>
+  <span class="s1">context.pointScaleFactor = {pointScaleFactor_}</span><span class="s4">;</span>
+  <span class="s1">context.swapLeftAndRightInRTL = doLeftAndRightSwapInRTL</span><span class="s4">;</span>
+  <span class="s1">LayoutConstraints constraints = {}</span><span class="s4">;</span>
+  <span class="s1">constraints.minimumSize = minimumSize</span><span class="s4">;</span>
+  <span class="s1">constraints.maximumSize = maximumSize</span><span class="s4">;</span>
+  <span class="s1">constraints.layoutDirection =</span>
+      <span class="s1">isRTL ? LayoutDirection::RightToLeft : LayoutDirection::LeftToRight</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::shared_lock lock(surfaceHandlerRegistryMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">auto </span><span class="s1">iterator = surfaceHandlerRegistry_.find(surfaceId)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(iterator == surfaceHandlerRegistry_.end()) {</span>
+      <span class="s1">LOG(ERROR)</span>
+          <span class="s1">&lt;&lt; </span><span class="s3">&quot;Binding::setConstraints: Surface with given id is not found&quot;</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">&amp;surfaceHandler = iterator-&gt;second</span><span class="s4">;</span>
+    <span class="s1">surfaceHandler.constraintLayout(constraints</span><span class="s4">, </span><span class="s1">context)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Install/uninstall java binding</span>
+
+<span class="s4">void </span><span class="s1">Binding::installFabricUIManager(</span>
+    <span class="s1">jni::alias_ref&lt;JRuntimeExecutor::javaobject&gt; runtimeExecutorHolder</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;JRuntimeScheduler::javaobject&gt; runtimeSchedulerHolder</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;jobject&gt; javaUIManager</span><span class="s4">,</span>
+    <span class="s1">EventBeatManager *eventBeatManager</span><span class="s4">,</span>
+    <span class="s1">ComponentFactory *componentsRegistry</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;jobject&gt; reactNativeConfig) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;FabricUIManagerBinding::installFabricUIManager&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">ReactNativeConfig&gt; config =</span>
+      <span class="s1">std::make_shared&lt;</span><span class="s4">const </span><span class="s1">ReactNativeConfigHolder&gt;(reactNativeConfig)</span><span class="s4">;</span>
+
+  <span class="s1">enableFabricLogs_ =</span>
+      <span class="s1">config-&gt;getBool(</span><span class="s3">&quot;react_fabric:enabled_android_fabric_logs&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(enableFabricLogs_) {</span>
+    <span class="s1">LOG(WARNING) &lt;&lt; </span><span class="s3">&quot;Binding::installFabricUIManager() was called (address: &quot;</span>
+                 <span class="s1">&lt;&lt; </span><span class="s4">this </span><span class="s1">&lt;&lt; </span><span class="s3">&quot;).&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Use std::lock and std::adopt_lock to prevent deadlocks by locking mutexes</span>
+  <span class="s0">// at the same time</span>
+  <span class="s1">std::unique_lock lock(installMutex_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">globalJavaUiManager = make_global(javaUIManager)</span><span class="s4">;</span>
+  <span class="s1">mountingManager_ =</span>
+      <span class="s1">std::make_shared&lt;FabricMountingManager&gt;(config</span><span class="s4">, </span><span class="s1">globalJavaUiManager)</span><span class="s4">;</span>
+
+  <span class="s1">ContextContainer::Shared contextContainer =</span>
+      <span class="s1">std::make_shared&lt;ContextContainer&gt;()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">runtimeExecutor = runtimeExecutorHolder-&gt;cthis()-&gt;get()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(runtimeSchedulerHolder) {</span>
+    <span class="s4">auto </span><span class="s1">runtimeScheduler = runtimeSchedulerHolder-&gt;cthis()-&gt;get().lock()</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(runtimeScheduler) {</span>
+      <span class="s1">runtimeExecutor =</span>
+          <span class="s1">[runtimeScheduler](</span>
+              <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp; runtime)&gt; &amp;&amp;callback) {</span>
+            <span class="s1">runtimeScheduler-&gt;scheduleWork(std::move(callback))</span><span class="s4">;</span>
+          <span class="s1">}</span><span class="s4">;</span>
+      <span class="s1">contextContainer-&gt;insert(</span>
+          <span class="s3">&quot;RuntimeScheduler&quot;</span><span class="s4">,</span>
+          <span class="s1">std::weak_ptr&lt;RuntimeScheduler&gt;(runtimeScheduler))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// TODO: T31905686 Create synchronous Event Beat</span>
+  <span class="s1">EventBeat::Factory synchronousBeatFactory =</span>
+      <span class="s1">[eventBeatManager</span><span class="s4">, </span><span class="s1">runtimeExecutor</span><span class="s4">, </span><span class="s1">globalJavaUiManager](</span>
+          <span class="s1">EventBeat::SharedOwnerBox </span><span class="s4">const </span><span class="s1">&amp;ownerBox)</span>
+      <span class="s1">-&gt; std::unique_ptr&lt;EventBeat&gt; {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;AsyncEventBeat&gt;(</span>
+        <span class="s1">ownerBox</span><span class="s4">, </span><span class="s1">eventBeatManager</span><span class="s4">, </span><span class="s1">runtimeExecutor</span><span class="s4">, </span><span class="s1">globalJavaUiManager)</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">EventBeat::Factory asynchronousBeatFactory =</span>
+      <span class="s1">[eventBeatManager</span><span class="s4">, </span><span class="s1">runtimeExecutor</span><span class="s4">, </span><span class="s1">globalJavaUiManager](</span>
+          <span class="s1">EventBeat::SharedOwnerBox </span><span class="s4">const </span><span class="s1">&amp;ownerBox)</span>
+      <span class="s1">-&gt; std::unique_ptr&lt;EventBeat&gt; {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;AsyncEventBeat&gt;(</span>
+        <span class="s1">ownerBox</span><span class="s4">, </span><span class="s1">eventBeatManager</span><span class="s4">, </span><span class="s1">runtimeExecutor</span><span class="s4">, </span><span class="s1">globalJavaUiManager)</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">contextContainer-&gt;insert(</span><span class="s3">&quot;ReactNativeConfig&quot;</span><span class="s4">, </span><span class="s1">config)</span><span class="s4">;</span>
+  <span class="s1">contextContainer-&gt;insert(</span><span class="s3">&quot;FabricUIManager&quot;</span><span class="s4">, </span><span class="s1">globalJavaUiManager)</span><span class="s4">;</span>
+
+  <span class="s0">// Keep reference to config object and cache some feature flags here</span>
+  <span class="s1">reactNativeConfig_ = config</span><span class="s4">;</span>
+
+  <span class="s1">contextContainer-&gt;insert(</span>
+      <span class="s3">&quot;CalculateTransformedFramesEnabled&quot;</span><span class="s4">,</span>
+      <span class="s1">getFeatureFlagValue(</span><span class="s3">&quot;calculateTransformedFramesEnabled&quot;</span><span class="s1">))</span><span class="s4">;</span>
+
+  <span class="s1">CoreFeatures::cacheLastTextMeasurement =</span>
+      <span class="s1">getFeatureFlagValue(</span><span class="s3">&quot;enableTextMeasureCachePerShadowNode&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// Props setter pattern feature</span>
+  <span class="s1">CoreFeatures::enablePropIteratorSetter =</span>
+      <span class="s1">getFeatureFlagValue(</span><span class="s3">&quot;enableCppPropsIteratorSetter&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// NativeState experiment</span>
+  <span class="s1">CoreFeatures::useNativeState = getFeatureFlagValue(</span><span class="s3">&quot;useNativeState&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// RemoveDelete mega-op</span>
+  <span class="s1">ShadowViewMutation::PlatformSupportsRemoveDeleteTreeInstruction =</span>
+      <span class="s1">getFeatureFlagValue(</span><span class="s3">&quot;enableRemoveDeleteTreeInstruction&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">toolbox = SchedulerToolbox{}</span><span class="s4">;</span>
+  <span class="s1">toolbox.contextContainer = contextContainer</span><span class="s4">;</span>
+  <span class="s1">toolbox.componentRegistryFactory = componentsRegistry-&gt;buildRegistryFunction</span><span class="s4">;</span>
+
+  <span class="s0">// TODO: (T130208323) runtimeExecutor should execute lambdas after</span>
+  <span class="s0">// main bundle eval, and bindingsInstallExecutor should execute before.</span>
+  <span class="s1">toolbox.bridgelessBindingsExecutor = std::nullopt</span><span class="s4">;</span>
+  <span class="s1">toolbox.runtimeExecutor = runtimeExecutor</span><span class="s4">;</span>
+
+  <span class="s1">toolbox.synchronousEventBeatFactory = synchronousBeatFactory</span><span class="s4">;</span>
+  <span class="s1">toolbox.asynchronousEventBeatFactory = asynchronousBeatFactory</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(reactNativeConfig_-&gt;getBool(</span>
+          <span class="s3">&quot;react_fabric:enable_background_executor_android&quot;</span><span class="s1">)) {</span>
+    <span class="s1">backgroundExecutor_ = JBackgroundExecutor::create(</span><span class="s3">&quot;fabric_bg&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">toolbox.backgroundExecutor = backgroundExecutor_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">animationDriver_ = std::make_shared&lt;LayoutAnimationDriver&gt;(</span>
+      <span class="s1">runtimeExecutor</span><span class="s4">, </span><span class="s1">contextContainer</span><span class="s4">, this</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">scheduler_ =</span>
+      <span class="s1">std::make_shared&lt;Scheduler&gt;(toolbox</span><span class="s4">, </span><span class="s1">animationDriver_.get()</span><span class="s4">, this</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::uninstallFabricUIManager() {</span>
+  <span class="s4">if </span><span class="s1">(enableFabricLogs_) {</span>
+    <span class="s1">LOG(WARNING) &lt;&lt; </span><span class="s3">&quot;Binding::uninstallFabricUIManager() was called (address: &quot;</span>
+                 <span class="s1">&lt;&lt; </span><span class="s4">this </span><span class="s1">&lt;&lt; </span><span class="s3">&quot;).&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::unique_lock lock(installMutex_)</span><span class="s4">;</span>
+  <span class="s1">animationDriver_ = </span><span class="s4">nullptr;</span>
+  <span class="s1">scheduler_ = </span><span class="s4">nullptr;</span>
+  <span class="s1">mountingManager_ = </span><span class="s4">nullptr;</span>
+  <span class="s1">reactNativeConfig_ = </span><span class="s4">nullptr;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;FabricMountingManager&gt; Binding::verifyMountingManager(</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;hint) {</span>
+  <span class="s1">std::shared_lock lock(installMutex_)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager_) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; hint &lt;&lt; </span><span class="s3">&quot; mounting manager disappeared.&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">mountingManager_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::schedulerDidFinishTransaction(</span>
+    <span class="s1">MountingCoordinator::Shared mountingCoordinator) {</span>
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;Binding::schedulerDidFinishTransaction&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mountingManager-&gt;executeMount(std::move(mountingCoordinator))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::schedulerDidRequestPreliminaryViewAllocation(</span>
+    <span class="s4">const </span><span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">ShadowNode &amp;shadowNode) {</span>
+  <span class="s4">if </span><span class="s1">(!shadowNode.getTraits().check(ShadowNodeTraits::Trait::FormsView)) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">preallocateView(surfaceId</span><span class="s4">, </span><span class="s1">shadowNode)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::preallocateView(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;shadowNode) {</span>
+  <span class="s4">auto </span><span class="s1">name = std::string(shadowNode.getComponentName())</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">shadowView = ShadowView(shadowNode)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">mountingManager = verifyMountingManager(</span><span class="s3">&quot;Binding::preallocateView&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mountingManager-&gt;preallocateShadowView(surfaceId</span><span class="s4">, </span><span class="s1">shadowView)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::schedulerDidDispatchCommand(</span>
+    <span class="s4">const </span><span class="s1">ShadowView &amp;shadowView</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;commandName</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;args) {</span>
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;Binding::schedulerDidDispatchCommand&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mountingManager-&gt;dispatchCommand(shadowView</span><span class="s4">, </span><span class="s1">commandName</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::schedulerDidSendAccessibilityEvent(</span>
+    <span class="s4">const </span><span class="s1">ShadowView &amp;shadowView</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;eventType) {</span>
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;Binding::schedulerDidSendAccessibilityEvent&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mountingManager-&gt;sendAccessibilityEvent(shadowView</span><span class="s4">, </span><span class="s1">eventType)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::schedulerDidSetIsJSResponder(</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">isJSResponder</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">blockNativeResponder) {</span>
+  <span class="s4">auto </span><span class="s1">mountingManager =</span>
+      <span class="s1">verifyMountingManager(</span><span class="s3">&quot;Binding::schedulerDidSetIsJSResponder&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mountingManager-&gt;setIsJSResponder(</span>
+      <span class="s1">shadowView</span><span class="s4">, </span><span class="s1">isJSResponder</span><span class="s4">, </span><span class="s1">blockNativeResponder)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::onAnimationStarted() {</span>
+  <span class="s4">auto </span><span class="s1">mountingManager = verifyMountingManager(</span><span class="s3">&quot;Binding::onAnimationStarted&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mountingManager-&gt;onAnimationStarted()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::onAllAnimationsComplete() {</span>
+  <span class="s4">auto </span><span class="s1">mountingManager = verifyMountingManager(</span><span class="s3">&quot;Binding::onAnimationComplete&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!mountingManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mountingManager-&gt;onAllAnimationsComplete()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Binding::registerNatives() {</span>
+  <span class="s1">registerHybrid({</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;initHybrid&quot;</span><span class="s4">, </span><span class="s1">Binding::initHybrid)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;installFabricUIManager&quot;</span><span class="s4">, </span><span class="s1">Binding::installFabricUIManager)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;startSurface&quot;</span><span class="s4">, </span><span class="s1">Binding::startSurface)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;getInspectorDataForInstance&quot;</span><span class="s4">, </span><span class="s1">Binding::getInspectorDataForInstance)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;startSurfaceWithConstraints&quot;</span><span class="s4">, </span><span class="s1">Binding::startSurfaceWithConstraints)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;renderTemplateToSurface&quot;</span><span class="s4">, </span><span class="s1">Binding::renderTemplateToSurface)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;stopSurface&quot;</span><span class="s4">, </span><span class="s1">Binding::stopSurface)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;setConstraints&quot;</span><span class="s4">, </span><span class="s1">Binding::setConstraints)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;setPixelDensity&quot;</span><span class="s4">, </span><span class="s1">Binding::setPixelDensity)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;driveCxxAnimations&quot;</span><span class="s4">, </span><span class="s1">Binding::driveCxxAnimations)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;uninstallFabricUIManager&quot;</span><span class="s4">, </span><span class="s1">Binding::uninstallFabricUIManager)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;registerSurface&quot;</span><span class="s4">, </span><span class="s1">Binding::registerSurface)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;unregisterSurface&quot;</span><span class="s4">, </span><span class="s1">Binding::unregisterSurface)</span><span class="s4">,</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

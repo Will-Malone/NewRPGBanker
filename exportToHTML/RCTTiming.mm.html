@@ -1,0 +1,437 @@
+<html>
+<head>
+<title>RCTTiming.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTTiming.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTTiming.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;FBReactNativeSpec/FBReactNativeSpec.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTAssert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBridge+Private.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBridge.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConvert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTLog.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;CoreModulesPlugins.h&quot;</span>
+
+<span class="s4">static const </span><span class="s1">NSTimeInterval kMinimumSleepInterval = </span><span class="s5">1</span><span class="s4">;</span>
+
+<span class="s0">// These timing contants should be kept in sync with the ones in `JSTimers.js`.</span>
+<span class="s0">// The duration of a frame. This assumes that we want to run at 60 fps.</span>
+<span class="s4">static const </span><span class="s1">NSTimeInterval kFrameDuration = </span><span class="s5">1.0 </span><span class="s1">/ </span><span class="s5">60.0</span><span class="s4">;</span>
+<span class="s0">// The minimum time left in a frame to trigger the idle callback.</span>
+<span class="s4">static const </span><span class="s1">NSTimeInterval kIdleCallbackFrameDeadline = </span><span class="s5">0.001</span><span class="s4">;</span>
+
+<span class="s4">@interface </span><span class="s1">_RCTTimer : NSObject</span>
+
+<span class="s4">@property </span><span class="s1">(nonatomic</span><span class="s4">, </span><span class="s1">strong</span><span class="s4">, </span><span class="s1">readonly) NSDate *target</span><span class="s4">;</span>
+<span class="s4">@property </span><span class="s1">(nonatomic</span><span class="s4">, </span><span class="s1">assign</span><span class="s4">, </span><span class="s1">readonly) BOOL repeats</span><span class="s4">;</span>
+<span class="s4">@property </span><span class="s1">(nonatomic</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">, </span><span class="s1">readonly) NSNumber *callbackID</span><span class="s4">;</span>
+<span class="s4">@property </span><span class="s1">(nonatomic</span><span class="s4">, </span><span class="s1">assign</span><span class="s4">, </span><span class="s1">readonly) NSTimeInterval interval</span><span class="s4">;</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">_RCTTimer</span>
+
+<span class="s1">- (instancetype)initWithCallbackID:(NSNumber *)callbackID</span>
+                          <span class="s1">interval:(NSTimeInterval)interval</span>
+                        <span class="s1">targetTime:(NSTimeInterval)targetTime</span>
+                           <span class="s1">repeats:(BOOL)repeats</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">((self = [super init])) {</span>
+    <span class="s1">_interval = interval</span><span class="s4">;</span>
+    <span class="s1">_repeats = repeats</span><span class="s4">;</span>
+    <span class="s1">_callbackID = callbackID</span><span class="s4">;</span>
+    <span class="s1">_target = [NSDate dateWithTimeIntervalSinceNow:targetTime]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Returns `YES` if we should invoke the JS callback. 
+ */</span>
+<span class="s1">- (BOOL)shouldFire:(NSDate *)now</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_target &amp;&amp; [_target timeIntervalSinceDate:now] &lt;= </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)reschedule</span>
+<span class="s1">{</span>
+  <span class="s0">// The JS Timers will do fine grained calculating of expired timeouts.</span>
+  <span class="s1">_target = [NSDate dateWithTimeIntervalSinceNow:_interval]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@interface </span><span class="s1">_RCTTimingProxy : NSObject</span>
+
+<span class="s4">@end</span>
+
+<span class="s0">// NSTimer retains its target, insert this class to break potential retain cycles</span>
+<span class="s4">@implementation </span><span class="s1">_RCTTimingProxy {</span>
+  <span class="s4">__weak </span><span class="s1">id _target</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (instancetype)proxyWithTarget:(id)target</span>
+<span class="s1">{</span>
+  <span class="s1">_RCTTimingProxy *proxy = [self </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(proxy) {</span>
+    <span class="s1">proxy-&gt;_target = target</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">proxy</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)timerDidFire</span>
+<span class="s1">{</span>
+  <span class="s1">[_target timerDidFire]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTTiming {</span>
+  <span class="s1">NSMutableDictionary&lt;NSNumber *</span><span class="s4">, </span><span class="s1">_RCTTimer *&gt; *_timers</span><span class="s4">;</span>
+  <span class="s1">NSTimer *_sleepTimer</span><span class="s4">;</span>
+  <span class="s1">BOOL _sendIdleEvents</span><span class="s4">;</span>
+  <span class="s1">BOOL _inBackground</span><span class="s4">;</span>
+  <span class="s1">id&lt;RCTTimingDelegate&gt; _timingDelegate</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@synthesize </span><span class="s1">bridge = _bridge</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">paused = _paused</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">pauseCallback = _pauseCallback</span><span class="s4">;</span>
+
+<span class="s1">RCT_EXPORT_MODULE()</span>
+
+<span class="s1">- (instancetype)initWithDelegate:(id&lt;RCTTimingDelegate&gt;)delegate</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">[self setup]</span><span class="s4">;</span>
+    <span class="s1">_timingDelegate = delegate</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)initialize</span>
+<span class="s1">{</span>
+  <span class="s1">[self setup]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setup</span>
+<span class="s1">{</span>
+  <span class="s1">_paused = YES</span><span class="s4">;</span>
+  <span class="s1">_timers = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_inBackground = NO</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(NSString *name in </span><span class="s4">@</span><span class="s1">[</span>
+         <span class="s1">UIApplicationWillResignActiveNotification</span><span class="s4">,</span>
+         <span class="s1">UIApplicationDidEnterBackgroundNotification</span><span class="s4">,</span>
+         <span class="s1">UIApplicationWillTerminateNotification</span>
+       <span class="s1">]) {</span>
+    <span class="s1">[[NSNotificationCenter defaultCenter] addObserver:self</span>
+                                             <span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(appDidMoveToBackground)</span>
+                                                 <span class="s1">name:name</span>
+                                               <span class="s1">object:nil]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(NSString *name in </span><span class="s4">@</span><span class="s1">[ UIApplicationDidBecomeActiveNotification</span><span class="s4">, </span><span class="s1">UIApplicationWillEnterForegroundNotification ]) {</span>
+    <span class="s1">[[NSNotificationCenter defaultCenter] addObserver:self</span>
+                                             <span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(appDidMoveToForeground)</span>
+                                                 <span class="s1">name:name</span>
+                                               <span class="s1">object:nil]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dealloc</span>
+<span class="s1">{</span>
+  <span class="s1">[_sleepTimer invalidate]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (dispatch_queue_t)methodQueue</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTJSThread</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)invalidate</span>
+<span class="s1">{</span>
+  <span class="s1">[self stopTimers]</span><span class="s4">;</span>
+  <span class="s1">_bridge = nil</span><span class="s4">;</span>
+  <span class="s1">_timingDelegate = nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)appDidMoveToBackground</span>
+<span class="s1">{</span>
+  <span class="s0">// Deactivate the CADisplayLink while in the background.</span>
+  <span class="s1">[self stopTimers]</span><span class="s4">;</span>
+  <span class="s1">_inBackground = YES</span><span class="s4">;</span>
+
+  <span class="s0">// Issue one final timer callback, which will schedule a</span>
+  <span class="s0">// background NSTimer, if needed.</span>
+  <span class="s1">[self didUpdateFrame:nil]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)appDidMoveToForeground</span>
+<span class="s1">{</span>
+  <span class="s1">_inBackground = NO</span><span class="s4">;</span>
+  <span class="s1">[self startTimers]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)stopTimers</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_inBackground) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!_paused) {</span>
+    <span class="s1">_paused = YES</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(_pauseCallback) {</span>
+      <span class="s1">_pauseCallback()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)startTimers</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">((!_bridge &amp;&amp; !_timingDelegate) || _inBackground || ![self hasPendingTimers]) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(_paused) {</span>
+    <span class="s1">_paused = NO</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(_pauseCallback) {</span>
+      <span class="s1">_pauseCallback()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)hasPendingTimers</span>
+<span class="s1">{</span>
+  <span class="s4">@synchronized</span><span class="s1">(_timers) {</span>
+    <span class="s4">return </span><span class="s1">_sendIdleEvents || _timers.count &gt; </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)didUpdateFrame:(RCTFrameUpdate *)update</span>
+<span class="s1">{</span>
+  <span class="s1">NSDate *nextScheduledTarget = [NSDate distantFuture]</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray&lt;_RCTTimer *&gt; *timersToCall = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSDate *now = [NSDate date]</span><span class="s4">; </span><span class="s0">// compare all the timers to the same base time</span>
+  <span class="s4">@synchronized</span><span class="s1">(_timers) {</span>
+    <span class="s4">for </span><span class="s1">(_RCTTimer *timer in _timers.allValues) {</span>
+      <span class="s4">if </span><span class="s1">([timer shouldFire:now]) {</span>
+        <span class="s1">[timersToCall addObject:timer]</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">nextScheduledTarget = [nextScheduledTarget earlierDate:timer.target]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Call timers that need to be called</span>
+  <span class="s4">if </span><span class="s1">(timersToCall.count &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">NSArray&lt;NSNumber *&gt; *sortedTimers = [[timersToCall sortedArrayUsingComparator:^(_RCTTimer *a</span><span class="s4">, </span><span class="s1">_RCTTimer *b) {</span>
+      <span class="s4">return </span><span class="s1">[a.target compare:b.target]</span><span class="s4">;</span>
+    <span class="s1">}] valueForKey:</span><span class="s4">@</span><span class="s3">&quot;callbackID&quot;</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(_bridge) {</span>
+      <span class="s1">[_bridge enqueueJSCall:</span><span class="s4">@</span><span class="s3">&quot;JSTimers&quot; </span><span class="s1">method:</span><span class="s4">@</span><span class="s3">&quot;callTimers&quot; </span><span class="s1">args:</span><span class="s4">@</span><span class="s1">[ sortedTimers ] completion:NULL]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">[_timingDelegate callTimers:sortedTimers]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(_RCTTimer *timer in timersToCall) {</span>
+    <span class="s4">if </span><span class="s1">(timer.repeats) {</span>
+      <span class="s1">[timer reschedule]</span><span class="s4">;</span>
+      <span class="s1">nextScheduledTarget = [nextScheduledTarget earlierDate:timer.target]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">@synchronized</span><span class="s1">(_timers) {</span>
+        <span class="s1">[_timers removeObjectForKey:timer.callbackID]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(_sendIdleEvents) {</span>
+    <span class="s1">NSTimeInterval currentTimestamp = [[NSDate date] timeIntervalSince1970]</span><span class="s4">;</span>
+    <span class="s1">NSTimeInterval frameElapsed = currentTimestamp - update.timestamp</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(kFrameDuration - frameElapsed &gt;= kIdleCallbackFrameDeadline) {</span>
+      <span class="s1">NSNumber *absoluteFrameStartMS = </span><span class="s4">@</span><span class="s1">((currentTimestamp - frameElapsed) * </span><span class="s5">1000</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(_bridge) {</span>
+        <span class="s1">[_bridge enqueueJSCall:</span><span class="s4">@</span><span class="s3">&quot;JSTimers&quot; </span><span class="s1">method:</span><span class="s4">@</span><span class="s3">&quot;callIdleCallbacks&quot; </span><span class="s1">args:</span><span class="s4">@</span><span class="s1">[ absoluteFrameStartMS ] completion:NULL]</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">[_timingDelegate callIdleCallbacks:absoluteFrameStartMS]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Switch to a paused state only if we didn't call any timer this frame, so if</span>
+  <span class="s0">// in response to this timer another timer is scheduled, we don't pause and unpause</span>
+  <span class="s0">// the displaylink frivolously.</span>
+  <span class="s1">NSUInteger timerCount</span><span class="s4">;</span>
+  <span class="s4">@synchronized</span><span class="s1">(_timers) {</span>
+    <span class="s1">timerCount = _timers.count</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(_inBackground) {</span>
+    <span class="s4">if </span><span class="s1">(timerCount) {</span>
+      <span class="s1">[self scheduleSleepTimer:nextScheduledTarget]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!_sendIdleEvents &amp;&amp; timersToCall.count == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s0">// No need to call the pauseCallback as RCTDisplayLink will ask us about our paused</span>
+    <span class="s0">// status immediately after completing this call</span>
+    <span class="s4">if </span><span class="s1">(timerCount == </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">_paused = YES</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s0">// If the next timer is more than 1 second out, pause and schedule an NSTimer;</span>
+    <span class="s4">else if </span><span class="s1">([nextScheduledTarget timeIntervalSinceNow] &gt; kMinimumSleepInterval) {</span>
+      <span class="s1">[self scheduleSleepTimer:nextScheduledTarget]</span><span class="s4">;</span>
+      <span class="s1">_paused = YES</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scheduleSleepTimer:(NSDate *)sleepTarget</span>
+<span class="s1">{</span>
+  <span class="s4">@synchronized</span><span class="s1">(self) {</span>
+    <span class="s4">if </span><span class="s1">(!_sleepTimer || !_sleepTimer.valid) {</span>
+      <span class="s1">_sleepTimer = [[NSTimer alloc] initWithFireDate:sleepTarget</span>
+                                             <span class="s1">interval:</span><span class="s5">0</span>
+                                               <span class="s1">target:[_RCTTimingProxy proxyWithTarget:self]</span>
+                                             <span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(timerDidFire)</span>
+                                             <span class="s1">userInfo:nil</span>
+                                              <span class="s1">repeats:NO]</span><span class="s4">;</span>
+      <span class="s1">[[NSRunLoop currentRunLoop] addTimer:_sleepTimer forMode:NSDefaultRunLoopMode]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">_sleepTimer.fireDate = [_sleepTimer.fireDate earlierDate:sleepTarget]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)timerDidFire</span>
+<span class="s1">{</span>
+  <span class="s1">_sleepTimer = nil</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(_paused) {</span>
+    <span class="s1">[self startTimers]</span><span class="s4">;</span>
+
+    <span class="s0">// Immediately dispatch frame, so we don't have to wait on the displaylink.</span>
+    <span class="s1">[self didUpdateFrame:nil]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * A method used for asynchronously creating a timer. If the timer has already expired, 
+ * (based on the provided jsSchedulingTime) then it will be immediately invoked. 
+ * 
+ * There's a small difference between the time when we call 
+ * setTimeout/setInterval/requestAnimation frame and the time it actually makes 
+ * it here. This is important and needs to be taken into account when 
+ * calculating the timer's target time. We calculate this by passing in 
+ * Date.now() from JS and then subtracting that from the current time here. 
+ */</span>
+<span class="s1">RCT_EXPORT_METHOD(createTimer</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)callbackID duration</span>
+                  <span class="s1">: (NSTimeInterval)jsDuration jsSchedulingTime</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)jsSchedulingTime repeats</span>
+                  <span class="s1">: (BOOL)repeats)</span>
+<span class="s1">{</span>
+  <span class="s1">NSNumber *callbackIdObjc = [NSNumber numberWithDouble:callbackID]</span><span class="s4">;</span>
+  <span class="s1">NSDate *schedulingTime = [RCTConvert NSDate:[NSNumber numberWithDouble:jsSchedulingTime]]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(jsDuration == </span><span class="s5">0 </span><span class="s1">&amp;&amp; repeats == NO) {</span>
+    <span class="s0">// For super fast, one-off timers, just enqueue them immediately rather than waiting a frame.</span>
+    <span class="s4">if </span><span class="s1">(_bridge) {</span>
+      <span class="s1">[_bridge _immediatelyCallTimer:callbackIdObjc]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">[_timingDelegate immediatelyCallTimer:callbackIdObjc]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self createTimerForNextFrame:callbackIdObjc duration:jsDuration jsSchedulingTime:schedulingTime repeats:repeats]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * A method used for synchronously creating a timer. The timer will not be invoked until the 
+ * next frame, regardless of whether it has already expired (i.e. jsSchedulingTime is 0). 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)createTimerForNextFrame:(nonnull NSNumber *)callbackID</span>
+                       <span class="s1">duration:(NSTimeInterval)jsDuration</span>
+               <span class="s1">jsSchedulingTime:(NSDate *)jsSchedulingTime</span>
+                        <span class="s1">repeats:(BOOL)repeats</span>
+<span class="s1">{</span>
+  <span class="s1">NSTimeInterval jsSchedulingOverhead = MAX(-jsSchedulingTime.timeIntervalSinceNow</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">NSTimeInterval targetTime = jsDuration - jsSchedulingOverhead</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(jsDuration &lt; </span><span class="s5">0.018</span><span class="s1">) { </span><span class="s0">// Make sure short intervals run each frame</span>
+    <span class="s1">jsDuration = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_RCTTimer *timer = [[_RCTTimer alloc] initWithCallbackID:callbackID</span>
+                                                  <span class="s1">interval:jsDuration</span>
+                                                <span class="s1">targetTime:targetTime</span>
+                                                   <span class="s1">repeats:repeats]</span><span class="s4">;</span>
+  <span class="s4">@synchronized</span><span class="s1">(_timers) {</span>
+    <span class="s1">_timers[callbackID] = timer</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(_inBackground) {</span>
+    <span class="s1">[self scheduleSleepTimer:timer.target]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(_paused) {</span>
+    <span class="s4">if </span><span class="s1">([timer.target timeIntervalSinceNow] &gt; kMinimumSleepInterval) {</span>
+      <span class="s1">[self scheduleSleepTimer:timer.target]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">[self startTimers]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(deleteTimer : (</span><span class="s4">double</span><span class="s1">)timerID)</span>
+<span class="s1">{</span>
+  <span class="s4">@synchronized</span><span class="s1">(_timers) {</span>
+    <span class="s1">[_timers removeObjectForKey:[NSNumber numberWithDouble:timerID]]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(![self hasPendingTimers]) {</span>
+    <span class="s1">[self stopTimers]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(setSendIdleEvents : (BOOL)sendIdleEvents)</span>
+<span class="s1">{</span>
+  <span class="s1">_sendIdleEvents = sendIdleEvents</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(sendIdleEvents) {</span>
+    <span class="s1">[self startTimers]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(![self hasPendingTimers]) {</span>
+    <span class="s1">[self stopTimers]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s1">Class RCTTimingCls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTTiming.</span><span class="s4">class;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

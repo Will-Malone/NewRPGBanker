@@ -1,0 +1,147 @@
+<html>
+<head>
+<title>worker.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+worker.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict-local</span>
+ <span class="s0">* @format</span>
+ <span class="s0">*/</span>
+
+<span class="s0">/*::</span>
+<span class="s0">import type {WorkerMessage, WorkerMetadata} from './flow-types';</span>
+<span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">const H = require('./constants');</span>
+<span class="s0">const dependencyExtractor = require('./lib/dependencyExtractor');</span>
+<span class="s0">const excludedExtensions = require('./workerExclusionList');</span>
+<span class="s0">const {createHash} = require('crypto');</span>
+<span class="s0">const fs = require('graceful-fs');</span>
+<span class="s0">const {promises: fsPromises} = require('fs');</span>
+<span class="s0">const path = require('path');</span>
+
+<span class="s0">const PACKAGE_JSON = path.sep + 'package.json';</span>
+
+<span class="s0">let hasteImpl /*: ?{getHasteName: string =&gt; ?string} */ = null;</span>
+<span class="s0">let hasteImplModulePath /*: ?string */ = null;</span>
+
+<span class="s0">function getHasteImpl(</span>
+  <span class="s0">requestedModulePath /*: string */,</span>
+<span class="s0">) /*: {getHasteName: string =&gt; ?string} */ {</span>
+  <span class="s0">if (hasteImpl) {</span>
+    <span class="s0">if (requestedModulePath !== hasteImplModulePath) {</span>
+      <span class="s0">throw new Error('metro-file-map: hasteImplModulePath changed');</span>
+    <span class="s0">}</span>
+    <span class="s0">return hasteImpl;</span>
+  <span class="s0">}</span>
+  <span class="s0">hasteImplModulePath = requestedModulePath;</span>
+  <span class="s0">// $FlowFixMe[unsupported-syntax] - dynamic require</span>
+  <span class="s0">hasteImpl = require(hasteImplModulePath);</span>
+  <span class="s0">return hasteImpl;</span>
+<span class="s0">}</span>
+
+<span class="s0">function sha1hex(content /*: string | Buffer */) /*: string */ {</span>
+  <span class="s0">return createHash('sha1').update(content).digest('hex');</span>
+<span class="s0">}</span>
+
+<span class="s0">async function worker(</span>
+  <span class="s0">data /*: WorkerMessage */,</span>
+<span class="s0">) /*: Promise&lt;WorkerMetadata&gt; */ {</span>
+  <span class="s0">let content /*: ?Buffer */;</span>
+  <span class="s0">let dependencies /*: WorkerMetadata['dependencies'] */;</span>
+  <span class="s0">let id /*: WorkerMetadata['id'] */;</span>
+  <span class="s0">let module /*: WorkerMetadata['module'] */;</span>
+  <span class="s0">let sha1 /*: WorkerMetadata['sha1'] */;</span>
+  <span class="s0">let symlinkTarget /*: WorkerMetadata['symlinkTarget'] */;</span>
+
+  <span class="s0">const {</span>
+    <span class="s0">computeDependencies,</span>
+    <span class="s0">computeSha1,</span>
+    <span class="s0">enableHastePackages,</span>
+    <span class="s0">readLink,</span>
+    <span class="s0">rootDir,</span>
+    <span class="s0">filePath,</span>
+  <span class="s0">} = data;</span>
+
+  <span class="s0">const getContent = () /*: Buffer */ =&gt; {</span>
+    <span class="s0">if (content == null) {</span>
+      <span class="s0">content = fs.readFileSync(filePath);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return content;</span>
+  <span class="s0">};</span>
+
+  <span class="s0">if (enableHastePackages &amp;&amp; filePath.endsWith(PACKAGE_JSON)) {</span>
+    <span class="s0">// Process a package.json that is returned as a PACKAGE type with its name.</span>
+    <span class="s0">try {</span>
+      <span class="s0">const fileData = JSON.parse(getContent().toString());</span>
+
+      <span class="s0">if (fileData.name) {</span>
+        <span class="s0">const relativeFilePath = path.relative(rootDir, filePath);</span>
+        <span class="s0">id = fileData.name;</span>
+        <span class="s0">module = [relativeFilePath, H.PACKAGE];</span>
+      <span class="s0">}</span>
+    <span class="s0">} catch (err) {</span>
+      <span class="s0">throw new Error(`Cannot parse ${filePath} as JSON: ${err.message}`);</span>
+    <span class="s0">}</span>
+  <span class="s0">} else if (</span>
+    <span class="s0">(data.hasteImplModulePath != null || computeDependencies) &amp;&amp;</span>
+    <span class="s0">!excludedExtensions.has(filePath.substr(filePath.lastIndexOf('.')))</span>
+  <span class="s0">) {</span>
+    <span class="s0">// Process a random file that is returned as a MODULE.</span>
+    <span class="s0">if (data.hasteImplModulePath != null) {</span>
+      <span class="s0">id = getHasteImpl(data.hasteImplModulePath).getHasteName(filePath);</span>
+      <span class="s0">if (id != null) {</span>
+        <span class="s0">const relativeFilePath = path.relative(rootDir, filePath);</span>
+        <span class="s0">module = [relativeFilePath, H.MODULE];</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (computeDependencies) {</span>
+      <span class="s0">dependencies = Array.from(</span>
+        <span class="s0">data.dependencyExtractor != null</span>
+          <span class="s0">? // $FlowFixMe[unsupported-syntax] - dynamic require</span>
+            <span class="s0">require(data.dependencyExtractor).extract(</span>
+              <span class="s0">getContent().toString(),</span>
+              <span class="s0">filePath,</span>
+              <span class="s0">dependencyExtractor.extract,</span>
+            <span class="s0">)</span>
+          <span class="s0">: dependencyExtractor.extract(getContent().toString()),</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// If a SHA-1 is requested on update, compute it.</span>
+  <span class="s0">if (computeSha1) {</span>
+    <span class="s0">sha1 = sha1hex(getContent());</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (readLink) {</span>
+    <span class="s0">symlinkTarget = await fsPromises.readlink(filePath);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return {dependencies, id, module, sha1, symlinkTarget};</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">worker,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

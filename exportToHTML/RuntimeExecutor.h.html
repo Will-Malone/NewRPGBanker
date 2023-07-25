@@ -1,0 +1,150 @@
+<html>
+<head>
+<title>RuntimeExecutor.h</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RuntimeExecutor.h</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#pragma </span><span class="s1">once</span>
+
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;thread&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s0">/* 
+ * Takes a function and calls it with a reference to a Runtime. The function 
+ * will be called when it is safe to do so (i.e. it ensures non-concurrent 
+ * access) and may be invoked asynchronously, depending on the implementation. 
+ * If you need to access a Runtime, it's encouraged to use a RuntimeExecutor 
+ * instead of storing a pointer to the Runtime itself, which makes it more 
+ * difficult to ensure that the Runtime is being accessed safely. 
+ */</span>
+<span class="s4">using </span><span class="s1">RuntimeExecutor =</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp;runtime)&gt; &amp;&amp;callback)&gt;</span><span class="s4">;</span>
+
+<span class="s0">/* 
+ * The caller can expect that the callback will be executed sometime later on an 
+ * unspecified thread. 
+ * Use this method when the caller prefers to not be blocked by executing the 
+ * `callback`. 
+ * Note that this method does not provide any guarantees 
+ * about when the `callback` will be executed (before returning to the caller, 
+ * after that, or in parallel), the only thing that is guaranteed is that there 
+ * is no synchronization. 
+ */</span>
+<span class="s4">inline static void </span><span class="s1">executeAsynchronously(</span>
+    <span class="s1">RuntimeExecutor </span><span class="s4">const </span><span class="s1">&amp;runtimeExecutor</span><span class="s4">,</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp;runtime)&gt; &amp;&amp;callback) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s1">std::thread([callback = std::move(callback)</span><span class="s4">, </span><span class="s1">runtimeExecutor]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s1">runtimeExecutor(std::move(callback))</span><span class="s4">;</span>
+  <span class="s1">}).detach()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Executes a `callback` in a *synchronous* manner using given 
+ * `RuntimeExecutor`. 
+ * Use this method when the caller needs to *be blocked* by executing the 
+ * callback but does not concerned about the particular thread on which the 
+ * `callback` will be executed. 
+ */</span>
+<span class="s4">inline static void </span><span class="s1">executeSynchronously_CAN_DEADLOCK(</span>
+    <span class="s1">RuntimeExecutor </span><span class="s4">const </span><span class="s1">&amp;runtimeExecutor</span><span class="s4">,</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp;runtime)&gt; &amp;&amp;callback) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s1">std::mutex mutex</span><span class="s4">;</span>
+  <span class="s1">mutex.lock()</span><span class="s4">;</span>
+
+  <span class="s1">runtimeExecutor(</span>
+      <span class="s1">[callback = std::move(callback)</span><span class="s4">, </span><span class="s1">&amp;mutex](jsi::Runtime &amp;runtime) {</span>
+        <span class="s1">callback(runtime)</span><span class="s4">;</span>
+        <span class="s1">mutex.unlock()</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">mutex.lock()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Executes a `callback` in a *synchronous* manner on the same thread using 
+ * given `RuntimeExecutor`. 
+ * Use this method when the caller needs to *be blocked* by executing the 
+ * `callback` and requires that the callback will be executed on the same 
+ * thread. 
+ */</span>
+<span class="s4">inline static void </span><span class="s1">executeSynchronouslyOnSameThread_CAN_DEADLOCK(</span>
+    <span class="s1">RuntimeExecutor </span><span class="s4">const </span><span class="s1">&amp;runtimeExecutor</span><span class="s4">,</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp;runtime)&gt; &amp;&amp;callback) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s0">// Note: We need the third mutex to get back to the main thread before</span>
+  <span class="s0">// the lambda is finished (because all mutexes are allocated on the stack).</span>
+
+  <span class="s1">std::mutex mutex1</span><span class="s4">;</span>
+  <span class="s1">std::mutex mutex2</span><span class="s4">;</span>
+  <span class="s1">std::mutex mutex3</span><span class="s4">;</span>
+
+  <span class="s1">mutex1.lock()</span><span class="s4">;</span>
+  <span class="s1">mutex2.lock()</span><span class="s4">;</span>
+  <span class="s1">mutex3.lock()</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Runtime *runtimePtr</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">threadId = std::this_thread::get_id()</span><span class="s4">;</span>
+
+  <span class="s1">runtimeExecutor([&amp;](jsi::Runtime &amp;runtime) {</span>
+    <span class="s1">runtimePtr = &amp;runtime</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(threadId == std::this_thread::get_id()) {</span>
+      <span class="s0">// In case of a synchronous call, we should unlock mutexes and return.</span>
+      <span class="s1">mutex1.unlock()</span><span class="s4">;</span>
+      <span class="s1">mutex3.unlock()</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mutex1.unlock()</span><span class="s4">;</span>
+    <span class="s0">// `callback` is called somewhere here.</span>
+    <span class="s1">mutex2.lock()</span><span class="s4">;</span>
+    <span class="s1">mutex3.unlock()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">mutex1.lock()</span><span class="s4">;</span>
+  <span class="s1">callback(*runtimePtr)</span><span class="s4">;</span>
+  <span class="s1">mutex2.unlock()</span><span class="s4">;</span>
+  <span class="s1">mutex3.lock()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">template </span><span class="s1">&lt;</span><span class="s4">typename </span><span class="s1">DataT&gt;</span>
+<span class="s4">inline static </span><span class="s1">DataT executeSynchronouslyOnSameThread_CAN_DEADLOCK(</span>
+    <span class="s1">RuntimeExecutor </span><span class="s4">const </span><span class="s1">&amp;runtimeExecutor</span><span class="s4">,</span>
+    <span class="s1">std::function&lt;DataT(jsi::Runtime &amp;runtime)&gt; &amp;&amp;callback) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s1">DataT data</span><span class="s4">;</span>
+
+  <span class="s1">executeSynchronouslyOnSameThread_CAN_DEADLOCK(</span>
+      <span class="s1">runtimeExecutor</span><span class="s4">,</span>
+      <span class="s1">[&amp;](jsi::Runtime &amp;runtime) { data = callback(runtime)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">data</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

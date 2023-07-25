@@ -1,0 +1,209 @@
+<html>
+<head>
+<title>as-indexed-file.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+as-indexed-file.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const relativizeSourceMapInline = require(</span><span class="s2">&quot;../../../lib/relativizeSourceMap&quot;</span><span class="s1">);</span>
+<span class="s1">const buildSourcemapWithMetadata = require(</span><span class="s2">&quot;./buildSourcemapWithMetadata&quot;</span><span class="s1">);</span>
+<span class="s1">const MAGIC_UNBUNDLE_FILE_HEADER = require(</span><span class="s2">&quot;./magic-number&quot;</span><span class="s1">);</span>
+<span class="s1">const { joinModules } = require(</span><span class="s2">&quot;./util&quot;</span><span class="s1">);</span>
+<span class="s1">const writeSourceMap = require(</span><span class="s2">&quot;./write-sourcemap&quot;</span><span class="s1">);</span>
+<span class="s1">const fs = require(</span><span class="s2">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const SIZEOF_UINT32 = </span><span class="s3">4</span><span class="s1">;</span>
+
+<span class="s0">/** 
+ * Saves all JS modules of an app as a single file, separated with null bytes. 
+ * The file begins with an offset table that contains module ids and their 
+ * lengths/offsets. 
+ * The module id for the startup code (prelude, polyfills etc.) is the 
+ * empty string. 
+ */</span>
+<span class="s4">function </span><span class="s1">saveAsIndexedFile(bundle, options, log) {</span>
+  <span class="s1">const {</span>
+    <span class="s1">bundleOutput,</span>
+    <span class="s1">bundleEncoding: encoding,</span>
+    <span class="s1">sourcemapOutput,</span>
+    <span class="s1">sourcemapSourcesRoot,</span>
+  <span class="s1">} = options;</span>
+  <span class="s1">log(</span><span class="s2">&quot;start&quot;</span><span class="s1">);</span>
+  <span class="s1">const { startupModules, lazyModules, groups } = bundle;</span>
+  <span class="s1">log(</span><span class="s2">&quot;finish&quot;</span><span class="s1">);</span>
+  <span class="s1">const moduleGroups = createModuleGroups(groups, lazyModules);</span>
+  <span class="s1">const startupCode = joinModules(startupModules);</span>
+  <span class="s1">log(</span><span class="s2">&quot;Writing unbundle output to:&quot;</span><span class="s1">, bundleOutput);</span>
+  <span class="s1">const writeUnbundle = writeBuffers(</span>
+    <span class="s1">fs.createWriteStream(bundleOutput),</span>
+    <span class="s1">buildTableAndContents(startupCode, lazyModules, moduleGroups, encoding)</span>
+  <span class="s1">).then(() =&gt; log(</span><span class="s2">&quot;Done writing unbundle output&quot;</span><span class="s1">));</span>
+  <span class="s4">if </span><span class="s1">(sourcemapOutput) {</span>
+    <span class="s1">const sourceMap = buildSourcemapWithMetadata({</span>
+      <span class="s1">startupModules: startupModules.concat(),</span>
+      <span class="s1">lazyModules: lazyModules.concat(),</span>
+      <span class="s1">moduleGroups,</span>
+      <span class="s1">fixWrapperOffset: </span><span class="s4">true</span><span class="s1">,</span>
+    <span class="s1">});</span>
+    <span class="s4">if </span><span class="s1">(sourcemapSourcesRoot !== undefined) {</span>
+      <span class="s1">relativizeSourceMapInline(sourceMap, sourcemapSourcesRoot);</span>
+    <span class="s1">}</span>
+    <span class="s1">const wroteSourceMap = writeSourceMap(</span>
+      <span class="s1">sourcemapOutput,</span>
+      <span class="s1">JSON.stringify(sourceMap),</span>
+      <span class="s1">log</span>
+    <span class="s1">);</span>
+    <span class="s4">return </span><span class="s1">Promise.all([writeUnbundle, wroteSourceMap]);</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">writeUnbundle;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">const fileHeader = Buffer.alloc(</span><span class="s3">4</span><span class="s1">);</span>
+<span class="s1">fileHeader.writeUInt32LE(MAGIC_UNBUNDLE_FILE_HEADER, </span><span class="s3">0</span><span class="s1">);</span>
+<span class="s1">const nullByteBuffer = Buffer.alloc(</span><span class="s3">1</span><span class="s1">).fill(</span><span class="s3">0</span><span class="s1">);</span>
+<span class="s4">function </span><span class="s1">writeBuffers(stream, buffers) {</span>
+  <span class="s1">buffers.forEach((buffer) =&gt; stream.write(buffer));</span>
+  <span class="s4">return new </span><span class="s1">Promise((resolve, reject) =&gt; {</span>
+    <span class="s1">stream.on(</span><span class="s2">&quot;error&quot;</span><span class="s1">, reject);</span>
+    <span class="s1">stream.on(</span><span class="s2">&quot;finish&quot;</span><span class="s1">, () =&gt; resolve());</span>
+    <span class="s1">stream.end();</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">nullTerminatedBuffer(contents, encoding) {</span>
+  <span class="s4">return </span><span class="s1">Buffer.concat([Buffer.from(contents, encoding), nullByteBuffer]);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">moduleToBuffer(id, code, encoding) {</span>
+  <span class="s4">return </span><span class="s1">{</span>
+    <span class="s1">id,</span>
+    <span class="s1">buffer: nullTerminatedBuffer(code, encoding),</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">entryOffset(n) {</span>
+  <span class="s0">// 2: num_entries + startup_code_len</span>
+  <span class="s0">// n * 2: each entry consists of two uint32s</span>
+  <span class="s4">return </span><span class="s1">(</span><span class="s3">2 </span><span class="s1">+ n * </span><span class="s3">2</span><span class="s1">) * SIZEOF_UINT32;</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">buildModuleTable(startupCode, moduleBuffers, moduleGroups) {</span>
+  <span class="s0">// table format:</span>
+  <span class="s0">// - num_entries:      uint_32  number of entries</span>
+  <span class="s0">// - startup_code_len: uint_32  length of the startup section</span>
+  <span class="s0">// - entries:          entry...</span>
+  <span class="s0">//</span>
+  <span class="s0">// entry:</span>
+  <span class="s0">//  - module_offset:   uint_32  offset into the modules blob</span>
+  <span class="s0">//  - module_length:   uint_32  length of the module code in bytes</span>
+
+  <span class="s1">const moduleIds = [...moduleGroups.modulesById.keys()];</span>
+  <span class="s1">const maxId = moduleIds.reduce((max, id) =&gt; Math.max(max, id));</span>
+  <span class="s1">const numEntries = maxId + </span><span class="s3">1</span><span class="s1">;</span>
+  <span class="s1">const table = Buffer.alloc(entryOffset(numEntries)).fill(</span><span class="s3">0</span><span class="s1">);</span>
+
+  <span class="s0">// num_entries</span>
+  <span class="s1">table.writeUInt32LE(numEntries, </span><span class="s3">0</span><span class="s1">);</span>
+
+  <span class="s0">// startup_code_len</span>
+  <span class="s1">table.writeUInt32LE(startupCode.length, SIZEOF_UINT32);</span>
+
+  <span class="s0">// entries</span>
+  <span class="s1">let codeOffset = startupCode.length;</span>
+  <span class="s1">moduleBuffers.forEach(({ id, buffer }) =&gt; {</span>
+    <span class="s1">const group = moduleGroups.groups.get(id);</span>
+    <span class="s1">const idsInGroup = group ? [id].concat(Array.from(group)) : [id];</span>
+    <span class="s1">idsInGroup.forEach((moduleId) =&gt; {</span>
+      <span class="s1">const offset = entryOffset(moduleId);</span>
+      <span class="s0">// module_offset</span>
+      <span class="s1">table.writeUInt32LE(codeOffset, offset);</span>
+      <span class="s0">// module_length</span>
+      <span class="s1">table.writeUInt32LE(buffer.length, offset + SIZEOF_UINT32);</span>
+    <span class="s1">});</span>
+    <span class="s1">codeOffset += buffer.length;</span>
+  <span class="s1">});</span>
+  <span class="s4">return </span><span class="s1">table;</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">groupCode(rootCode, moduleGroup, modulesById) {</span>
+  <span class="s4">if </span><span class="s1">(!moduleGroup || !moduleGroup.size) {</span>
+    <span class="s4">return </span><span class="s1">rootCode;</span>
+  <span class="s1">}</span>
+  <span class="s1">const code = [rootCode];</span>
+  <span class="s4">for </span><span class="s1">(const id of moduleGroup) {</span>
+    <span class="s1">code.push(</span>
+      <span class="s1">(</span>
+        <span class="s1">modulesById.get(id) || {</span>
+          <span class="s1">code: </span><span class="s2">&quot;&quot;</span><span class="s1">,</span>
+        <span class="s1">}</span>
+      <span class="s1">).code</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">code.join(</span><span class="s2">&quot;</span><span class="s5">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">buildModuleBuffers(modules, moduleGroups, encoding) {</span>
+  <span class="s4">return </span><span class="s1">modules</span>
+    <span class="s1">.filter((m) =&gt; !moduleGroups.modulesInGroups.has(m.id))</span>
+    <span class="s1">.map(({ id, code }) =&gt;</span>
+      <span class="s1">moduleToBuffer(</span>
+        <span class="s1">id,</span>
+        <span class="s1">groupCode(code, moduleGroups.groups.get(id), moduleGroups.modulesById),</span>
+        <span class="s1">encoding</span>
+      <span class="s1">)</span>
+    <span class="s1">);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">buildTableAndContents(startupCode, modules, moduleGroups, encoding) {</span>
+  <span class="s0">// file contents layout:</span>
+  <span class="s0">// - magic number      char[4]  0xE5 0xD1 0x0B 0xFB (0xFB0BD1E5 uint32 LE)</span>
+  <span class="s0">// - offset table      table    see `buildModuleTables`</span>
+  <span class="s0">// - code blob         char[]   null-terminated code strings, starting with</span>
+  <span class="s0">//                              the startup code</span>
+
+  <span class="s1">const startupCodeBuffer = nullTerminatedBuffer(startupCode, encoding);</span>
+  <span class="s1">const moduleBuffers = buildModuleBuffers(modules, moduleGroups, encoding);</span>
+  <span class="s1">const table = buildModuleTable(</span>
+    <span class="s1">startupCodeBuffer,</span>
+    <span class="s1">moduleBuffers,</span>
+    <span class="s1">moduleGroups</span>
+  <span class="s1">);</span>
+  <span class="s4">return </span><span class="s1">[fileHeader, table, startupCodeBuffer].concat(</span>
+    <span class="s1">moduleBuffers.map(({ buffer }) =&gt; buffer)</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">createModuleGroups(groups, modules) {</span>
+  <span class="s4">return </span><span class="s1">{</span>
+    <span class="s1">groups,</span>
+    <span class="s1">modulesById: </span><span class="s4">new </span><span class="s1">Map(modules.map((m) =&gt; [m.id, m])),</span>
+    <span class="s1">modulesInGroups: </span><span class="s4">new </span><span class="s1">Set(concat(groups.values())),</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+<span class="s4">function</span><span class="s1">* concat(iterators) {</span>
+  <span class="s4">for </span><span class="s1">(const it of iterators) {</span>
+    <span class="s1">yield* it;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">exports.save = saveAsIndexedFile;</span>
+<span class="s1">exports.buildTableAndContents = buildTableAndContents;</span>
+<span class="s1">exports.createModuleGroups = createModuleGroups;</span>
+</pre>
+</body>
+</html>

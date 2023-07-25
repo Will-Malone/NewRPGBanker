@@ -1,0 +1,324 @@
+<html>
+<head>
+<title>Instance.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Instance.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;Instance.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ErrorUtils.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JSBigString.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JSBundleType.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JSExecutor.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;MessageQueueThread.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;MethodCall.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;NativeToJsBridge.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;RAMBundleRegistry.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;RecoverableError.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;SystraceSection.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSIndexedRAMBundle.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/MoveWrapper.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/json.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;condition_variable&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;exception&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;string&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s1">Instance::~Instance() {</span>
+  <span class="s4">if </span><span class="s1">(nativeToJsBridge_) {</span>
+    <span class="s1">nativeToJsBridge_-&gt;destroy()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::initializeBridge(</span>
+    <span class="s1">std::unique_ptr&lt;InstanceCallback&gt; callback</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;JSExecutorFactory&gt; jsef</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;MessageQueueThread&gt; jsQueue</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;ModuleRegistry&gt; moduleRegistry) {</span>
+  <span class="s1">callback_ = std::move(callback)</span><span class="s4">;</span>
+  <span class="s1">moduleRegistry_ = std::move(moduleRegistry)</span><span class="s4">;</span>
+  <span class="s1">jsQueue-&gt;runOnQueueSync([</span><span class="s4">this, </span><span class="s1">&amp;jsef</span><span class="s4">, </span><span class="s1">jsQueue]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s1">nativeToJsBridge_ = std::make_shared&lt;NativeToJsBridge&gt;(</span>
+        <span class="s1">jsef.get()</span><span class="s4">, </span><span class="s1">moduleRegistry_</span><span class="s4">, </span><span class="s1">jsQueue</span><span class="s4">, </span><span class="s1">callback_)</span><span class="s4">;</span>
+
+    <span class="s1">nativeToJsBridge_-&gt;initializeRuntime()</span><span class="s4">;</span>
+
+    <span class="s0">/** 
+     * After NativeToJsBridge is created, the jsi::Runtime should exist. 
+     * Also, the JS message queue thread exists. So, it's safe to 
+     * schedule all queued up js Calls. 
+     */</span>
+    <span class="s1">jsCallInvoker_-&gt;setNativeToJsBridgeAndFlushCalls(nativeToJsBridge_)</span><span class="s4">;</span>
+
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(m_syncMutex)</span><span class="s4">;</span>
+    <span class="s1">m_syncReady = </span><span class="s4">true;</span>
+    <span class="s1">m_syncCV.notify_all()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">CHECK(nativeToJsBridge_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::loadBundle(</span>
+    <span class="s1">std::unique_ptr&lt;RAMBundleRegistry&gt; bundleRegistry</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; string</span><span class="s4">,</span>
+    <span class="s1">std::string sourceURL) {</span>
+  <span class="s1">callback_-&gt;incrementPendingJSCalls()</span><span class="s4">;</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Instance::loadBundle&quot;</span><span class="s4">, </span><span class="s3">&quot;sourceURL&quot;</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+  <span class="s1">nativeToJsBridge_-&gt;loadBundle(</span>
+      <span class="s1">std::move(bundleRegistry)</span><span class="s4">, </span><span class="s1">std::move(string)</span><span class="s4">, </span><span class="s1">std::move(sourceURL))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::loadBundleSync(</span>
+    <span class="s1">std::unique_ptr&lt;RAMBundleRegistry&gt; bundleRegistry</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; string</span><span class="s4">,</span>
+    <span class="s1">std::string sourceURL) {</span>
+  <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(m_syncMutex)</span><span class="s4">;</span>
+  <span class="s1">m_syncCV.wait(lock</span><span class="s4">, </span><span class="s1">[</span><span class="s4">this</span><span class="s1">] { </span><span class="s4">return </span><span class="s1">m_syncReady</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Instance::loadBundleSync&quot;</span><span class="s4">, </span><span class="s3">&quot;sourceURL&quot;</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+  <span class="s1">nativeToJsBridge_-&gt;loadBundleSync(</span>
+      <span class="s1">std::move(bundleRegistry)</span><span class="s4">, </span><span class="s1">std::move(string)</span><span class="s4">, </span><span class="s1">std::move(sourceURL))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::setSourceURL(std::string sourceURL) {</span>
+  <span class="s1">callback_-&gt;incrementPendingJSCalls()</span><span class="s4">;</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Instance::setSourceURL&quot;</span><span class="s4">, </span><span class="s3">&quot;sourceURL&quot;</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+
+  <span class="s1">nativeToJsBridge_-&gt;loadBundle(</span><span class="s4">nullptr, nullptr, </span><span class="s1">std::move(sourceURL))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::loadScriptFromString(</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; string</span><span class="s4">,</span>
+    <span class="s1">std::string sourceURL</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">loadSynchronously) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Instance::loadScriptFromString&quot;</span><span class="s4">, </span><span class="s3">&quot;sourceURL&quot;</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(loadSynchronously) {</span>
+    <span class="s1">loadBundleSync(</span><span class="s4">nullptr, </span><span class="s1">std::move(string)</span><span class="s4">, </span><span class="s1">std::move(sourceURL))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">loadBundle(</span><span class="s4">nullptr, </span><span class="s1">std::move(string)</span><span class="s4">, </span><span class="s1">std::move(sourceURL))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::loadRAMBundleFromString(</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; script</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;sourceURL) {</span>
+  <span class="s4">auto </span><span class="s1">bundle = std::make_unique&lt;JSIndexedRAMBundle&gt;(std::move(script))</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">startupScript = bundle-&gt;getStartupCode()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">registry = RAMBundleRegistry::singleBundleRegistry(std::move(bundle))</span><span class="s4">;</span>
+  <span class="s1">loadRAMBundle(std::move(registry)</span><span class="s4">, </span><span class="s1">std::move(startupScript)</span><span class="s4">, </span><span class="s1">sourceURL</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::loadRAMBundleFromFile(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;sourcePath</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;sourceURL</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">loadSynchronously) {</span>
+  <span class="s4">auto </span><span class="s1">bundle = std::make_unique&lt;JSIndexedRAMBundle&gt;(sourcePath.c_str())</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">startupScript = bundle-&gt;getStartupCode()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">registry = RAMBundleRegistry::multipleBundlesRegistry(</span>
+      <span class="s1">std::move(bundle)</span><span class="s4">, </span><span class="s1">JSIndexedRAMBundle::buildFactory())</span><span class="s4">;</span>
+  <span class="s1">loadRAMBundle(</span>
+      <span class="s1">std::move(registry)</span><span class="s4">,</span>
+      <span class="s1">std::move(startupScript)</span><span class="s4">,</span>
+      <span class="s1">sourceURL</span><span class="s4">,</span>
+      <span class="s1">loadSynchronously)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::loadRAMBundle(</span>
+    <span class="s1">std::unique_ptr&lt;RAMBundleRegistry&gt; bundleRegistry</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; startupScript</span><span class="s4">,</span>
+    <span class="s1">std::string startupScriptSourceURL</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">loadSynchronously) {</span>
+  <span class="s4">if </span><span class="s1">(loadSynchronously) {</span>
+    <span class="s1">loadBundleSync(</span>
+        <span class="s1">std::move(bundleRegistry)</span><span class="s4">,</span>
+        <span class="s1">std::move(startupScript)</span><span class="s4">,</span>
+        <span class="s1">std::move(startupScriptSourceURL))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">loadBundle(</span>
+        <span class="s1">std::move(bundleRegistry)</span><span class="s4">,</span>
+        <span class="s1">std::move(startupScript)</span><span class="s4">,</span>
+        <span class="s1">std::move(startupScriptSourceURL))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::setGlobalVariable(</span>
+    <span class="s1">std::string propName</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; jsonValue) {</span>
+  <span class="s1">nativeToJsBridge_-&gt;setGlobalVariable(</span>
+      <span class="s1">std::move(propName)</span><span class="s4">, </span><span class="s1">std::move(jsonValue))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">*Instance::getJavaScriptContext() {</span>
+  <span class="s4">return </span><span class="s1">nativeToJsBridge_ ? nativeToJsBridge_-&gt;getJavaScriptContext()</span>
+                           <span class="s1">: </span><span class="s4">nullptr;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">Instance::isInspectable() {</span>
+  <span class="s4">return </span><span class="s1">nativeToJsBridge_ ? nativeToJsBridge_-&gt;isInspectable() : </span><span class="s4">false;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">Instance::isBatchActive() {</span>
+  <span class="s4">return </span><span class="s1">nativeToJsBridge_ ? nativeToJsBridge_-&gt;isBatchActive() : </span><span class="s4">false;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::callJSFunction(</span>
+    <span class="s1">std::string &amp;&amp;module</span><span class="s4">,</span>
+    <span class="s1">std::string &amp;&amp;method</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic &amp;&amp;params) {</span>
+  <span class="s1">callback_-&gt;incrementPendingJSCalls()</span><span class="s4">;</span>
+  <span class="s1">nativeToJsBridge_-&gt;callFunction(</span>
+      <span class="s1">std::move(module)</span><span class="s4">, </span><span class="s1">std::move(method)</span><span class="s4">, </span><span class="s1">std::move(params))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::callJSCallback(uint64_t callbackId</span><span class="s4">, </span><span class="s1">folly::dynamic &amp;&amp;params) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Instance::callJSCallback&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">callback_-&gt;incrementPendingJSCalls()</span><span class="s4">;</span>
+  <span class="s1">nativeToJsBridge_-&gt;invokeCallback((</span><span class="s4">double</span><span class="s1">)callbackId</span><span class="s4">, </span><span class="s1">std::move(params))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::registerBundle(</span>
+    <span class="s1">uint32_t bundleId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;bundlePath) {</span>
+  <span class="s1">nativeToJsBridge_-&gt;registerBundle(bundleId</span><span class="s4">, </span><span class="s1">bundlePath)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">const </span><span class="s1">ModuleRegistry &amp;Instance::getModuleRegistry() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">*moduleRegistry_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ModuleRegistry &amp;Instance::getModuleRegistry() {</span>
+  <span class="s4">return </span><span class="s1">*moduleRegistry_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::handleMemoryPressure(</span><span class="s4">int </span><span class="s1">pressureLevel) {</span>
+  <span class="s4">if </span><span class="s1">(nativeToJsBridge_) {</span>
+    <span class="s0">// This class resets `nativeToJsBridge_` only in the destructor,</span>
+    <span class="s0">// hence a race is not possible there.</span>
+    <span class="s1">nativeToJsBridge_-&gt;handleMemoryPressure(pressureLevel)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;CallInvoker&gt; Instance::getJSCallInvoker() {</span>
+  <span class="s4">return </span><span class="s1">std::static_pointer_cast&lt;CallInvoker&gt;(jsCallInvoker_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RuntimeExecutor Instance::getRuntimeExecutor() {</span>
+  <span class="s0">// HACK: RuntimeExecutor is not compatible with non-JSIExecutor, we return</span>
+  <span class="s0">// a null callback, which the caller should handle.</span>
+  <span class="s4">if </span><span class="s1">(!getJavaScriptContext()) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::weak_ptr&lt;NativeToJsBridge&gt; weakNativeToJsBridge = nativeToJsBridge_</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[weakNativeToJsBridge](</span>
+             <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp; runtime)&gt; &amp;&amp;callback) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">strongNativeToJsBridge = weakNativeToJsBridge.lock()) {</span>
+      <span class="s1">strongNativeToJsBridge-&gt;runOnExecutorQueue(</span>
+          <span class="s1">[callback = std::move(callback)](JSExecutor *executor) {</span>
+            <span class="s0">// Assumes the underlying executor is a JSIExecutor</span>
+            <span class="s1">jsi::Runtime *runtime =</span>
+                <span class="s1">(jsi::Runtime *)executor-&gt;getJavaScriptContext()</span><span class="s4">;</span>
+            <span class="s4">try </span><span class="s1">{</span>
+              <span class="s1">react_native_assert(runtime != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+              <span class="s1">callback(*runtime)</span><span class="s4">;</span>
+              <span class="s1">executor-&gt;flush()</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">catch </span><span class="s1">(jsi::JSError &amp;originalError) {</span>
+              <span class="s1">handleJSError(*runtime</span><span class="s4">, </span><span class="s1">originalError</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;CallInvoker&gt; Instance::getDecoratedNativeCallInvoker(</span>
+    <span class="s1">std::shared_ptr&lt;CallInvoker&gt; nativeInvoker) {</span>
+  <span class="s4">return </span><span class="s1">nativeToJsBridge_-&gt;getDecoratedNativeCallInvoker(nativeInvoker)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::JSCallInvoker::setNativeToJsBridgeAndFlushCalls(</span>
+    <span class="s1">std::weak_ptr&lt;NativeToJsBridge&gt; nativeToJsBridge) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; guard(m_mutex)</span><span class="s4">;</span>
+
+  <span class="s1">m_shouldBuffer = </span><span class="s4">false;</span>
+  <span class="s1">m_nativeToJsBridge = nativeToJsBridge</span><span class="s4">;</span>
+  <span class="s4">while </span><span class="s1">(m_workBuffer.size() &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">scheduleAsync(std::move(m_workBuffer.front()))</span><span class="s4">;</span>
+    <span class="s1">m_workBuffer.pop_front()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::JSCallInvoker::invokeSync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;work) {</span>
+  <span class="s0">// TODO: Replace JS Callinvoker with RuntimeExecutor.</span>
+  <span class="s4">throw </span><span class="s1">std::runtime_error(</span>
+      <span class="s3">&quot;Synchronous native -&gt; JS calls are currently not supported.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::JSCallInvoker::invokeAsync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;work) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; guard(m_mutex)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Why is is necessary to queue up async work? 
+   * 
+   * 1. TurboModuleManager must be created synchronously after the Instance, 
+   *    before we load the source code. This is when the NativeModule system 
+   *    is initialized. RCTDevLoadingView shows bundle download progress. 
+   * 2. TurboModuleManager requires a JS CallInvoker. 
+   * 3. The JS CallInvoker requires the NativeToJsBridge, which is created on 
+   *    the JS thread in Instance::initializeBridge. 
+   * 
+   * Therefore, although we don't call invokeAsync before the JS bundle is 
+   * executed, this buffering is implemented anyways to ensure that work 
+   * isn't discarded. 
+   */</span>
+  <span class="s4">if </span><span class="s1">(m_shouldBuffer) {</span>
+    <span class="s1">m_workBuffer.push_back(std::move(work))</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">scheduleAsync(std::move(work))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Instance::JSCallInvoker::scheduleAsync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;work) {</span>
+  <span class="s4">if </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">strongNativeToJsBridge = m_nativeToJsBridge.lock()) {</span>
+    <span class="s1">strongNativeToJsBridge-&gt;runOnExecutorQueue(</span>
+        <span class="s1">[work = std::move(work)](JSExecutor *executor) {</span>
+          <span class="s1">work()</span><span class="s4">;</span>
+          <span class="s1">executor-&gt;flush()</span><span class="s4">;</span>
+        <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

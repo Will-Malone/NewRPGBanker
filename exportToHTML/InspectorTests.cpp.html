@@ -1,0 +1,432 @@
+<html>
+<head>
+<title>InspectorTests.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+InspectorTests.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/Inspector.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;atomic&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;chrono&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;functional&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;iostream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;folly/futures/Future.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;gtest/gtest.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/RuntimeAdapter.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">hermes {</span>
+<span class="s4">namespace </span><span class="s1">inspector {</span>
+
+<span class="s4">namespace </span><span class="s1">debugger = facebook::hermes::debugger</span><span class="s4">;</span>
+<span class="s4">using namespace </span><span class="s1">std::chrono_literals</span><span class="s4">;</span>
+<span class="s4">using </span><span class="s1">Unit = folly::Unit</span><span class="s4">;</span>
+
+<span class="s4">static auto constexpr </span><span class="s1">kDefaultTimeout = </span><span class="s5">5000</span><span class="s1">ms</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">int </span><span class="s1">getCurrentLine(</span><span class="s4">const </span><span class="s1">debugger::ProgramState &amp;state) {</span>
+  <span class="s4">return </span><span class="s1">state.getStackTrace().callFrameForIndex(</span><span class="s5">0</span><span class="s1">).location.line</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">debugger::SourceLocation locationForLine(</span><span class="s4">int </span><span class="s1">line) {</span>
+  <span class="s1">debugger::SourceLocation loc</span><span class="s4">;</span>
+  <span class="s1">loc.line = line</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">loc</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s0">/* 
+ * LambdaInspectorObserver is useful for sequencing calls to the debugger based 
+ * on the number of onPause() callbacks. 
+ */</span>
+
+<span class="s4">using </span><span class="s1">OnPauseFunction =</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(Inspector &amp;</span><span class="s4">, const </span><span class="s1">debugger::ProgramState &amp;</span><span class="s4">, int</span><span class="s1">)&gt;</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">LambdaInspectorObserver : </span><span class="s4">public </span><span class="s1">InspectorObserver {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">LambdaInspectorObserver(OnPauseFunction func)</span>
+      <span class="s1">: onPauseFunc_(func)</span><span class="s4">, </span><span class="s1">pauseCount_(</span><span class="s5">0</span><span class="s1">) {}</span>
+  <span class="s1">~LambdaInspectorObserver() = </span><span class="s4">default;</span>
+
+  <span class="s4">void </span><span class="s1">onBreakpointResolved(</span>
+      <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">debugger::BreakpointInfo &amp;info) override {}</span>
+
+  <span class="s4">void </span><span class="s1">onContextCreated(Inspector &amp;inspector) override {}</span>
+
+  <span class="s4">void </span><span class="s1">onPause(Inspector &amp;inspector</span><span class="s4">, const </span><span class="s1">debugger::ProgramState &amp;state)</span>
+      <span class="s1">override {</span>
+    <span class="s1">pauseCount_++</span><span class="s4">;</span>
+    <span class="s1">onPauseFunc_(inspector</span><span class="s4">, </span><span class="s1">state</span><span class="s4">, </span><span class="s1">pauseCount_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">onResume(Inspector &amp;inspector) override {}</span>
+
+  <span class="s4">void </span><span class="s1">onScriptParsed(Inspector &amp;inspector</span><span class="s4">, const </span><span class="s1">ScriptInfo &amp;info) override {}</span>
+
+  <span class="s4">void </span><span class="s1">onMessageAdded(Inspector &amp;inspector</span><span class="s4">, const </span><span class="s1">ConsoleMessageInfo &amp;info)</span>
+      <span class="s1">override{}</span><span class="s4">;</span>
+
+  <span class="s4">int </span><span class="s1">getPauseCount() {</span>
+    <span class="s4">return </span><span class="s1">pauseCount_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">OnPauseFunction onPauseFunc_</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">pauseCount_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/* 
+ * Helpers for running JS in a separate thread. 
+ */</span>
+
+<span class="s4">struct </span><span class="s1">HermesDebugContext {</span>
+  <span class="s1">HermesDebugContext(</span>
+      <span class="s1">InspectorObserver &amp;observer</span><span class="s4">,</span>
+      <span class="s1">folly::Future&lt;Unit&gt; &amp;&amp;finished)</span>
+      <span class="s1">: runtime(makeHermesRuntime())</span><span class="s4">,</span>
+        <span class="s1">inspector(</span>
+            <span class="s1">std::make_shared&lt;SharedRuntimeAdapter&gt;(runtime)</span><span class="s4">,</span>
+            <span class="s1">observer</span><span class="s4">,</span>
+            <span class="s4">false</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">stopFlag(</span><span class="s4">false</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">finished(std::move(finished)) {</span>
+    <span class="s1">runtime-&gt;global().setProperty(</span>
+        <span class="s1">*runtime</span><span class="s4">,</span>
+        <span class="s3">&quot;shouldStop&quot;</span><span class="s4">,</span>
+        <span class="s1">jsi::Function::createFromHostFunction(</span>
+            <span class="s1">*runtime</span><span class="s4">,</span>
+            <span class="s1">jsi::PropNameID::forAscii(*runtime</span><span class="s4">, </span><span class="s3">&quot;shouldStop&quot;</span><span class="s1">)</span><span class="s4">,</span>
+            <span class="s5">0</span><span class="s4">,</span>
+            <span class="s1">[</span><span class="s4">this</span><span class="s1">](</span>
+                <span class="s1">jsi::Runtime &amp;</span><span class="s4">,</span>
+                <span class="s4">const </span><span class="s1">jsi::Value &amp;</span><span class="s4">,</span>
+                <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+                <span class="s1">size_t count) {</span>
+              <span class="s4">return </span><span class="s1">stopFlag.load() ? jsi::Value(</span><span class="s4">true</span><span class="s1">) : jsi::Value(</span><span class="s4">false</span><span class="s1">)</span><span class="s4">;</span>
+            <span class="s1">}))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">~HermesDebugContext() = </span><span class="s4">default;</span>
+
+  <span class="s4">void </span><span class="s1">setStopFlag() {</span>
+    <span class="s1">stopFlag.store(</span><span class="s4">true</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">wait(std::chrono::milliseconds timeout = kDefaultTimeout) {</span>
+    <span class="s1">std::move(finished).get(timeout)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::shared_ptr&lt;HermesRuntime&gt; runtime</span><span class="s4">;</span>
+  <span class="s1">Inspector inspector</span><span class="s4">;</span>
+  <span class="s1">std::atomic&lt;</span><span class="s4">bool</span><span class="s1">&gt; stopFlag{}</span><span class="s4">;</span>
+  <span class="s1">folly::Future&lt;Unit&gt; finished</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">std::shared_ptr&lt;HermesDebugContext&gt; runScriptAsync(</span>
+    <span class="s1">InspectorObserver &amp;observer</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;script) {</span>
+  <span class="s4">auto </span><span class="s1">promise = std::make_shared&lt;folly::Promise&lt;Unit&gt;&gt;()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">future = promise-&gt;getFuture()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">context =</span>
+      <span class="s1">std::make_shared&lt;HermesDebugContext&gt;(observer</span><span class="s4">, </span><span class="s1">std::move(future))</span><span class="s4">;</span>
+
+  <span class="s1">std::thread t([=]() {</span>
+    <span class="s1">HermesRuntime::DebugFlags flags{}</span><span class="s4">;</span>
+    <span class="s1">context-&gt;runtime-&gt;debugJavaScript(script</span><span class="s4">, </span><span class="s3">&quot;url&quot;</span><span class="s4">, </span><span class="s1">flags)</span><span class="s4">;</span>
+    <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">t.detach()</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">context</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Tests 
+ */</span>
+
+<span class="s1">TEST(InspectorTests</span><span class="s4">, </span><span class="s1">testStepOver) {</span>
+  <span class="s1">std::string script = </span><span class="s4">R</span><span class="s3">&quot;</span><span class="s4">(</span>
+    <span class="s3">var a = 1 + 2; 
+    debugger; 
+    var b = a / 2; 
+    var c = a + b; 
+    var d = b - c; 
+    var e = c * d; 
+    var f = 10; 
+  </span><span class="s4">)</span><span class="s3">&quot;</span><span class="s4">;</span>
+
+  <span class="s0">// TODO: move this vector into lambdaInspectorObserver</span>
+  <span class="s1">std::vector&lt;folly::Future&lt;Unit&gt;&gt; futures</span><span class="s4">;</span>
+
+  <span class="s1">OnPauseFunction onPauseFunc = [&amp;futures](</span>
+                                    <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+                                    <span class="s4">const </span><span class="s1">debugger::ProgramState &amp;state</span><span class="s4">,</span>
+                                    <span class="s4">int </span><span class="s1">pauseCount) {</span>
+    <span class="s4">switch </span><span class="s1">(pauseCount) {</span>
+      <span class="s4">case </span><span class="s5">1</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(</span>
+            <span class="s1">state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::DebuggerStatement)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">3</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s1">futures.emplace_back(inspector.stepOver())</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">case </span><span class="s5">2</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::StepFinish)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s1">futures.emplace_back(inspector.stepOver())</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">case </span><span class="s5">3</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::StepFinish)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">5</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s1">futures.emplace_back(inspector.resume())</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">LambdaInspectorObserver observer(onPauseFunc)</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;HermesDebugContext&gt; context =</span>
+      <span class="s1">runScriptAsync(observer</span><span class="s4">, </span><span class="s1">script)</span><span class="s4">;</span>
+
+  <span class="s0">// TODO: temporarily do this to ensure i hit failure case</span>
+  <span class="s1">std::this_thread::sleep_for(</span><span class="s5">1000</span><span class="s1">ms)</span><span class="s4">;</span>
+
+  <span class="s1">futures.emplace_back(context-&gt;inspector.enable())</span><span class="s4">;</span>
+
+  <span class="s1">context-&gt;wait()</span><span class="s4">;</span>
+  <span class="s1">folly::collectAll(futures).get(kDefaultTimeout)</span><span class="s4">;</span>
+
+  <span class="s1">EXPECT_EQ(observer.getPauseCount()</span><span class="s4">, </span><span class="s5">3</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">TEST(InspectorTests</span><span class="s4">, </span><span class="s1">testSetBreakpoint) {</span>
+  <span class="s1">std::string script = </span><span class="s4">R</span><span class="s3">&quot;</span><span class="s4">(</span>
+    <span class="s3">var a = 1 + 2; 
+    debugger; 
+    var b = a / 2; 
+    var c = a + b; 
+    var d = b - c; 
+    var e = c * d; 
+    var f = 10; 
+  </span><span class="s4">)</span><span class="s3">&quot;</span><span class="s4">;</span>
+
+  <span class="s1">std::vector&lt;folly::Future&lt;Unit&gt;&gt; futures</span><span class="s4">;</span>
+
+  <span class="s1">OnPauseFunction onPauseFunc = [&amp;futures](</span>
+                                    <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+                                    <span class="s4">const </span><span class="s1">debugger::ProgramState &amp;state</span><span class="s4">,</span>
+                                    <span class="s4">int </span><span class="s1">pauseCount) {</span>
+    <span class="s4">switch </span><span class="s1">(pauseCount) {</span>
+      <span class="s4">case </span><span class="s5">1</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(</span>
+            <span class="s1">state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::DebuggerStatement)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">3</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">stepFuture = inspector.stepOver()</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(stepFuture))</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">case </span><span class="s5">2</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::StepFinish)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">breakpointFuture = inspector.setBreakpoint(locationForLine(</span><span class="s5">6</span><span class="s1">))</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(breakpointFuture)</span>
+                                 <span class="s1">.thenValue([](debugger::BreakpointInfo info) {</span>
+                                   <span class="s1">EXPECT_EQ(info.resolvedLocation.line</span><span class="s4">, </span><span class="s5">6</span><span class="s1">)</span><span class="s4">;</span>
+                                 <span class="s1">}))</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">resumeFuture = inspector.resume()</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(resumeFuture))</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">case </span><span class="s5">3</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::Breakpoint)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">6</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">resumeFuture = inspector.resume()</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(resumeFuture))</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">LambdaInspectorObserver observer(onPauseFunc)</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;HermesDebugContext&gt; context =</span>
+      <span class="s1">runScriptAsync(observer</span><span class="s4">, </span><span class="s1">script)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">enablePromise = context-&gt;inspector.enable()</span><span class="s4">;</span>
+  <span class="s1">futures.emplace_back(std::move(enablePromise))</span><span class="s4">;</span>
+
+  <span class="s1">context-&gt;wait()</span><span class="s4">;</span>
+  <span class="s1">folly::collectAll(futures).get(kDefaultTimeout)</span><span class="s4">;</span>
+
+  <span class="s1">EXPECT_EQ(observer.getPauseCount()</span><span class="s4">, </span><span class="s5">3</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">TEST(InspectorTests</span><span class="s4">, </span><span class="s1">testAsyncSetBreakpoint) {</span>
+  <span class="s1">std::string script = </span><span class="s4">R</span><span class="s3">&quot;</span><span class="s4">(</span>
+    <span class="s3">while (!shouldStop()) { 
+      var a = 1; 
+      var b = 2; 
+      var c = a + b; 
+      var d = 10; 
+    } 
+  </span><span class="s4">)</span><span class="s3">&quot;</span><span class="s4">;</span>
+
+  <span class="s1">std::vector&lt;folly::Future&lt;Unit&gt;&gt; futures</span><span class="s4">;</span>
+  <span class="s1">folly::Func stopFunc</span><span class="s4">;</span>
+
+  <span class="s1">OnPauseFunction onPauseFunc = [&amp;futures</span><span class="s4">, </span><span class="s1">&amp;stopFunc](</span>
+                                    <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+                                    <span class="s4">const </span><span class="s1">debugger::ProgramState &amp;state</span><span class="s4">,</span>
+                                    <span class="s4">int </span><span class="s1">pauseCount) {</span>
+    <span class="s4">switch </span><span class="s1">(pauseCount) {</span>
+      <span class="s4">case </span><span class="s5">1</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::Breakpoint)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">stepFuture = inspector.stepOver()</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(stepFuture))</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">case </span><span class="s5">2</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::StepFinish)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">5</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s1">stopFunc()</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">resumeFuture = inspector.resume()</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(resumeFuture))</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">LambdaInspectorObserver observer(onPauseFunc)</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;HermesDebugContext&gt; context =</span>
+      <span class="s1">runScriptAsync(observer</span><span class="s4">, </span><span class="s1">script)</span><span class="s4">;</span>
+
+  <span class="s1">stopFunc = [context]() { context-&gt;setStopFlag()</span><span class="s4">; </span><span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">context-&gt;inspector.enable()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">breakpointPromise = context-&gt;inspector.setBreakpoint(locationForLine(</span><span class="s5">4</span><span class="s1">))</span>
+                               <span class="s1">.thenValue([](debugger::BreakpointInfo info) {</span>
+                                 <span class="s1">EXPECT_EQ(info.resolvedLocation.line</span><span class="s4">, </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+                               <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">context-&gt;wait()</span><span class="s4">;</span>
+
+  <span class="s1">futures.emplace_back(std::move(breakpointPromise))</span><span class="s4">;</span>
+  <span class="s1">folly::collectAll(futures).get(kDefaultTimeout)</span><span class="s4">;</span>
+
+  <span class="s1">EXPECT_EQ(observer.getPauseCount()</span><span class="s4">, </span><span class="s5">2</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">TEST(InspectorTests</span><span class="s4">, </span><span class="s1">testDisable) {</span>
+  <span class="s1">std::string script = </span><span class="s4">R</span><span class="s3">&quot;</span><span class="s4">(</span>
+    <span class="s3">var a = 1 + 2; 
+    debugger; 
+    var b = a / 2; 
+    var c = a + b; 
+    var d = b - c; 
+    var e = c * d; 
+    var f = 10; 
+  </span><span class="s4">)</span><span class="s3">&quot;</span><span class="s4">;</span>
+
+  <span class="s1">std::vector&lt;folly::Future&lt;Unit&gt;&gt; futures</span><span class="s4">;</span>
+
+  <span class="s1">OnPauseFunction onPauseFunc = [&amp;futures](</span>
+                                    <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+                                    <span class="s4">const </span><span class="s1">debugger::ProgramState &amp;state</span><span class="s4">,</span>
+                                    <span class="s4">int </span><span class="s1">pauseCount) {</span>
+    <span class="s4">switch </span><span class="s1">(pauseCount) {</span>
+      <span class="s4">case </span><span class="s5">1</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(</span>
+            <span class="s1">state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::DebuggerStatement)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">3</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">stepFuture = inspector.stepOver()</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(stepFuture))</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">case </span><span class="s5">2</span><span class="s1">: {</span>
+        <span class="s1">EXPECT_EQ(state.getPauseReason()</span><span class="s4">, </span><span class="s1">debugger::PauseReason::StepFinish)</span><span class="s4">;</span>
+        <span class="s1">EXPECT_EQ(getCurrentLine(state)</span><span class="s4">, </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s1">futures.emplace_back(inspector.setBreakpoint(locationForLine(</span><span class="s5">6</span><span class="s1">))</span>
+                                 <span class="s1">.thenValue([](debugger::BreakpointInfo info) {</span>
+                                   <span class="s1">EXPECT_EQ(info.resolvedLocation.line</span><span class="s4">, </span><span class="s5">6</span><span class="s1">)</span><span class="s4">;</span>
+                                 <span class="s1">}))</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(inspector.setBreakpoint(locationForLine(</span><span class="s5">7</span><span class="s1">))</span>
+                                 <span class="s1">.thenValue([](debugger::BreakpointInfo info) {</span>
+                                   <span class="s1">EXPECT_EQ(info.resolvedLocation.line</span><span class="s4">, </span><span class="s5">7</span><span class="s1">)</span><span class="s4">;</span>
+                                 <span class="s1">}))</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">detachFuture = inspector.disable()</span><span class="s4">;</span>
+        <span class="s1">futures.emplace_back(std::move(detachFuture))</span><span class="s4">;</span>
+
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">LambdaInspectorObserver observer(onPauseFunc)</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;HermesDebugContext&gt; context =</span>
+      <span class="s1">runScriptAsync(observer</span><span class="s4">, </span><span class="s1">script)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">enablePromise = context-&gt;inspector.enable()</span><span class="s4">;</span>
+  <span class="s1">futures.emplace_back(std::move(enablePromise))</span><span class="s4">;</span>
+
+  <span class="s1">context-&gt;wait()</span><span class="s4">;</span>
+  <span class="s1">folly::collectAll(futures).get(kDefaultTimeout)</span><span class="s4">;</span>
+
+  <span class="s1">EXPECT_EQ(observer.getPauseCount()</span><span class="s4">, </span><span class="s5">2</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace inspector</span>
+<span class="s1">} </span><span class="s0">// namespace hermes</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

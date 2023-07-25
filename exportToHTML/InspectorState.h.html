@@ -1,0 +1,434 @@
+<html>
+<head>
+<title>InspectorState.h</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+InspectorState.h</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s0">// using include guards instead of #pragma once due to compile issues</span>
+<span class="s0">// with MSVC and BUCK</span>
+<span class="s2">#ifndef </span><span class="s1">HERMES_INSPECTOR_INSPECTOR_STATE_H</span>
+<span class="s2">#define </span><span class="s1">HERMES_INSPECTOR_INSPECTOR_STATE_H</span>
+
+<span class="s2">#include </span><span class="s3">&lt;condition_variable&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;iostream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;queue&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;utility&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;folly/Unit.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/Exceptions.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/Inspector.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">hermes {</span>
+<span class="s4">namespace </span><span class="s1">inspector {</span>
+
+<span class="s4">using </span><span class="s1">NextStatePtr = std::unique_ptr&lt;InspectorState&gt;</span><span class="s4">;</span>
+<span class="s4">using </span><span class="s1">CommandPtr = std::unique_ptr&lt;facebook::hermes::debugger::Command&gt;</span><span class="s4">;</span>
+<span class="s4">using </span><span class="s1">MonitorLock = std::unique_lock&lt;std::mutex&gt;</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * InspectorState encapsulates a single state in the Inspector FSM. Events in 
+ * the FSM are modeled as methods in InspectorState. 
+ * 
+ * Some events may cause state transitions. The next state is returned via a 
+ * pointer to the next InspectorState. 
+ * 
+ * We assume that the Inspector's mutex is held across all calls to 
+ * InspectorState methods. For more threading notes, see the Inspector 
+ * implementation. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorState {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">InspectorState(Inspector &amp;inspector) : inspector_(inspector) {}</span>
+  <span class="s4">virtual </span><span class="s1">~InspectorState() = </span><span class="s4">default;</span>
+  <span class="s0">/** 
+   * onEnter is called when entering the state. prevState may be null when 
+   * transitioning into an initial state. 
+   */</span>
+  <span class="s4">virtual void </span><span class="s1">onEnter(InspectorState *prevState) {}</span>
+
+  <span class="s0">/* 
+   * Events that may cause a state transition. 
+   */</span>
+
+  <span class="s0">/** 
+   * detach clears all debugger state and transitions to RunningDetached. 
+   */</span>
+  <span class="s4">virtual void </span><span class="s1">detach(std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) {</span>
+    <span class="s0">// As we're not attached we'd like for the operation to be idempotent</span>
+    <span class="s1">promise-&gt;setValue()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * didPause handles the didPause callback from the debugger. It takes the lock 
+   * associated with the Inspector's mutex by reference in case we need to 
+   * temporarily relinquish the lock (e.g. via condition_variable::wait). 
+   */</span>
+  <span class="s4">virtual </span><span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, </span><span class="s1">CommandPtr&gt; didPause(MonitorLock &amp;lock) = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * enable handles the enable event from the client. 
+   */</span>
+  <span class="s4">virtual </span><span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, bool</span><span class="s1">&gt; enable() {</span>
+    <span class="s4">return </span><span class="s1">std::make_pair&lt;NextStatePtr</span><span class="s4">, bool</span><span class="s1">&gt;(</span><span class="s4">nullptr, false</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* 
+   * Events that don't cause a state transition. 
+   */</span>
+
+  <span class="s0">/** 
+   * pushPendingFunc appends a function to run the next time the debugger 
+   * pauses, either explicitly while paused or implicitly while running. 
+   * Returns false if it's not possible to push a func in this state. 
+   */</span>
+  <span class="s4">virtual bool </span><span class="s1">pushPendingFunc(folly::Func func) {</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * pushPendingEval appends an eval request to run the next time the debugger 
+   * pauses, either explicitly while paused or implicitly while running. 
+   * resultTransformer function will be called with EvalResult before returning 
+   * result so that we can manipulate EvalResult while the VM is paused. 
+   */</span>
+  <span class="s4">virtual void </span><span class="s1">pushPendingEval(</span>
+      <span class="s1">uint32_t frameIndex</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;src</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;facebook::hermes::debugger::EvalResult&gt;&gt;</span>
+          <span class="s1">promise</span><span class="s4">,</span>
+      <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+          <span class="s1">resultTransformer) {</span>
+    <span class="s1">promise-&gt;setException(</span>
+        <span class="s1">InvalidStateException(</span><span class="s3">&quot;eval&quot;</span><span class="s4">, </span><span class="s1">description()</span><span class="s4">, </span><span class="s3">&quot;paused or running&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * setPendingCommand sets a command to break the debugger out of the didPause 
+   * run loop. If it's not possible to set a pending command in this state, the 
+   * promise fails with InvalidStateException. Otherwise, the promise resolves 
+   * to true when the command actually executes. 
+   */</span>
+  <span class="s4">virtual void </span><span class="s1">setPendingCommand(</span>
+      <span class="s1">debugger::Command command</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) {</span>
+    <span class="s1">promise-&gt;setException(</span>
+        <span class="s1">InvalidStateException(</span><span class="s3">&quot;cmd&quot;</span><span class="s4">, </span><span class="s1">description()</span><span class="s4">, </span><span class="s3">&quot;paused&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * pause requests an async pause from the VM. 
+   */</span>
+  <span class="s4">virtual bool </span><span class="s1">pause() {</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* 
+   * Convenience functions for determining the concrete type and description 
+   * for a state instance without RTTI. 
+   */</span>
+
+  <span class="s4">virtual bool </span><span class="s1">isRunningDetached() </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+  <span class="s4">virtual bool </span><span class="s1">isRunningWaitEnable() </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+  <span class="s4">virtual bool </span><span class="s1">isRunningWaitPause() </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+  <span class="s4">virtual bool </span><span class="s1">isPausedWaitEnable() </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+  <span class="s4">virtual bool </span><span class="s1">isRunning() </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+  <span class="s4">virtual bool </span><span class="s1">isPaused() </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return false;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">virtual const char </span><span class="s1">*description() </span><span class="s4">const </span><span class="s1">= </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">friend </span><span class="s1">std::ostream &amp;</span><span class="s4">operator</span><span class="s1">&lt;&lt;(</span>
+      <span class="s1">std::ostream &amp;os</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">InspectorState &amp;state)</span><span class="s4">;</span>
+
+  <span class="s4">class </span><span class="s1">RunningDetached</span><span class="s4">;</span>
+  <span class="s4">class </span><span class="s1">RunningWaitEnable</span><span class="s4">;</span>
+  <span class="s4">class </span><span class="s1">RunningWaitPause</span><span class="s4">;</span>
+  <span class="s4">class </span><span class="s1">PausedWaitEnable</span><span class="s4">;</span>
+  <span class="s4">class </span><span class="s1">Running</span><span class="s4">;</span>
+  <span class="s4">class </span><span class="s1">Paused</span><span class="s4">;</span>
+
+ <span class="s4">protected</span><span class="s1">:</span>
+  <span class="s1">debugger::PauseReason getPauseReason() {</span>
+    <span class="s4">return </span><span class="s1">inspector_.debugger_.getProgramState().getPauseReason()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">Inspector &amp;inspector_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">extern </span><span class="s1">std::ostream &amp;</span><span class="s4">operator</span><span class="s1">&lt;&lt;(std::ostream &amp;os</span><span class="s4">, const </span><span class="s1">InspectorState &amp;state)</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * RunningDetached is the initial state when we're associated with a VM that 
+ * initially has no breakpoints. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorState::RunningDetached : </span><span class="s4">public </span><span class="s1">InspectorState {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">static </span><span class="s1">std::unique_ptr&lt;InspectorState&gt; make(Inspector &amp;inspector) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;RunningDetached&gt;(inspector)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RunningDetached(Inspector &amp;inspector) : InspectorState(inspector) {}</span>
+  <span class="s1">~RunningDetached() override {}</span>
+
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, </span><span class="s1">CommandPtr&gt; didPause(MonitorLock &amp;lock) override</span><span class="s4">;</span>
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, bool</span><span class="s1">&gt; enable() override</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">onEnter(InspectorState *prevState) override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">isRunningDetached() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const char </span><span class="s1">*description() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return </span><span class="s3">&quot;RunningDetached&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * RunningWaitEnable is the initial state when we're associated with a VM that 
+ * has a breakpoint on the first statement. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorState::RunningWaitEnable : </span><span class="s4">public </span><span class="s1">InspectorState {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">static </span><span class="s1">std::unique_ptr&lt;InspectorState&gt; make(Inspector &amp;inspector) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;RunningWaitEnable&gt;(inspector)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RunningWaitEnable(Inspector &amp;inspector) : InspectorState(inspector) {}</span>
+  <span class="s1">~RunningWaitEnable() override {}</span>
+
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, </span><span class="s1">CommandPtr&gt; didPause(MonitorLock &amp;lock) override</span><span class="s4">;</span>
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, bool</span><span class="s1">&gt; enable() override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">isRunningWaitEnable() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const char </span><span class="s1">*description() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return </span><span class="s3">&quot;RunningWaitEnable&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * RunningWaitPause is the state when we've received enable call, but 
+ * waiting for didPause because we need to pause on the first statement. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorState::RunningWaitPause : </span><span class="s4">public </span><span class="s1">InspectorState {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">static </span><span class="s1">std::unique_ptr&lt;InspectorState&gt; make(Inspector &amp;inspector) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;RunningWaitPause&gt;(inspector)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, </span><span class="s1">CommandPtr&gt; didPause(MonitorLock &amp;lock) override</span><span class="s4">;</span>
+
+  <span class="s1">RunningWaitPause(Inspector &amp;inspector) : InspectorState(inspector) {}</span>
+  <span class="s1">~RunningWaitPause() {}</span>
+
+  <span class="s4">bool </span><span class="s1">isRunningWaitPause() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const char </span><span class="s1">*description() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return </span><span class="s3">&quot;RunningWaitPause&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * PausedWaitEnable is the state when we're in a didPause callback and we're 
+ * waiting for the client to call enable. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorState::PausedWaitEnable : </span><span class="s4">public </span><span class="s1">InspectorState {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">static </span><span class="s1">std::unique_ptr&lt;InspectorState&gt; make(Inspector &amp;inspector) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;PausedWaitEnable&gt;(inspector)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">PausedWaitEnable(Inspector &amp;inspector) : InspectorState(inspector) {}</span>
+  <span class="s1">~PausedWaitEnable() override {}</span>
+
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, </span><span class="s1">CommandPtr&gt; didPause(MonitorLock &amp;lock) override</span><span class="s4">;</span>
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, bool</span><span class="s1">&gt; enable() override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">isPausedWaitEnable() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const char </span><span class="s1">*description() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return </span><span class="s3">&quot;PausedWaitEnable&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s4">bool </span><span class="s1">enabled_ = </span><span class="s4">false;</span>
+  <span class="s1">std::condition_variable enabledCondition_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * PendingEval holds an eval command and a promise that is fulfilled with the 
+ * eval result. 
+ */</span>
+<span class="s4">struct </span><span class="s1">PendingEval {</span>
+  <span class="s1">debugger::Command command</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;folly::Promise&lt;facebook::hermes::debugger::EvalResult&gt;&gt;</span>
+      <span class="s1">promise</span><span class="s4">;</span>
+  <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+      <span class="s1">resultTransformer</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * Running is the state when we're enabled and not currently paused, e.g. when 
+ * we're actively executing JS. 
+ * 
+ * Note that we can be in the running state even if we're not actively running 
+ * JS. For instance, React Native could be blocked in a native message queue 
+ * waiting for the next message to process outside of the call in to Hermes. 
+ * That still counts as Running in this FSM. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorState::Running : </span><span class="s4">public </span><span class="s1">InspectorState {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">static </span><span class="s1">std::unique_ptr&lt;InspectorState&gt; make(Inspector &amp;inspector) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;Running&gt;(inspector)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">Running(Inspector &amp;inspector) : InspectorState(inspector) {}</span>
+  <span class="s1">~Running() override {}</span>
+
+  <span class="s4">void </span><span class="s1">onEnter(InspectorState *prevState) override</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">detach(std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) override</span><span class="s4">;</span>
+
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, </span><span class="s1">CommandPtr&gt; didPause(MonitorLock &amp;lock) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">pushPendingFunc(folly::Func func) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">pushPendingEval(</span>
+      <span class="s1">uint32_t frameIndex</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;src</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;facebook::hermes::debugger::EvalResult&gt;&gt;</span>
+          <span class="s1">promise</span><span class="s4">,</span>
+      <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+          <span class="s1">resultTransformer) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">pause() override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">isRunning() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const char </span><span class="s1">*description() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return </span><span class="s3">&quot;Running&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">std::vector&lt;folly::Func&gt; pendingFuncs_</span><span class="s4">;</span>
+  <span class="s1">std::queue&lt;PendingEval&gt; pendingEvals_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;folly::Promise&lt;facebook::hermes::debugger::EvalResult&gt;&gt;</span>
+      <span class="s1">pendingEvalPromise_</span><span class="s4">;</span>
+  <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+      <span class="s1">pendingEvalResultTransformer_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; pendingDetach_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * PendingCommand holds a resume or step command and a promise that is fulfilled 
+ * just before the debugger resumes or steps. 
+ */</span>
+<span class="s4">struct </span><span class="s1">PendingCommand {</span>
+  <span class="s1">PendingCommand(</span>
+      <span class="s1">debugger::Command command</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span>
+      <span class="s1">: command(std::move(command))</span><span class="s4">, </span><span class="s1">promise(promise) {}</span>
+
+  <span class="s1">debugger::Command command</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * Paused is the state when we're enabled and and currently in a didPause 
+ * callback. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorState::Paused : </span><span class="s4">public </span><span class="s1">InspectorState {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">static </span><span class="s1">std::unique_ptr&lt;InspectorState&gt; make(Inspector &amp;inspector) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;Paused&gt;(inspector)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">Paused(Inspector &amp;inspector) : InspectorState(inspector) {}</span>
+  <span class="s1">~Paused() override {}</span>
+
+  <span class="s4">void </span><span class="s1">onEnter(InspectorState *prevState) override</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">detach(std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) override</span><span class="s4">;</span>
+
+  <span class="s1">std::pair&lt;NextStatePtr</span><span class="s4">, </span><span class="s1">CommandPtr&gt; didPause(MonitorLock &amp;lock) override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">pushPendingFunc(folly::Func func) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">pushPendingEval(</span>
+      <span class="s1">uint32_t frameIndex</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;src</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;facebook::hermes::debugger::EvalResult&gt;&gt;</span>
+          <span class="s1">promise</span><span class="s4">,</span>
+      <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+          <span class="s1">resultTransformer) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">setPendingCommand(</span>
+      <span class="s1">debugger::Command command</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise) override</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">isPaused() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const char </span><span class="s1">*description() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return </span><span class="s3">&quot;Paused&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">std::condition_variable hasPendingWork_</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;folly::Func&gt; pendingFuncs_</span><span class="s4">;</span>
+  <span class="s1">std::queue&lt;PendingEval&gt; pendingEvals_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;folly::Promise&lt;facebook::hermes::debugger::EvalResult&gt;&gt;</span>
+      <span class="s1">pendingEvalPromise_</span><span class="s4">;</span>
+  <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+      <span class="s1">pendingEvalResultTransformer_</span><span class="s4">;</span>
+  <span class="s1">std::unique_ptr&lt;PendingCommand&gt; pendingCommand_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; pendingDetach_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">} </span><span class="s0">// namespace inspector</span>
+<span class="s1">} </span><span class="s0">// namespace hermes</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+
+<span class="s2">#endif </span><span class="s0">// HERMES_INSPECTOR_INSPECTOR_STATE_H</span>
+</pre>
+</body>
+</html>

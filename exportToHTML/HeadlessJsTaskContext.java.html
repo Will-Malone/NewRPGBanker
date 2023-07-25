@@ -1,0 +1,247 @@
+<html>
+<head>
+<title>HeadlessJsTaskContext.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #629755; font-weight: bold; font-style: italic;}
+.s5 { color: #77b767; font-style: italic;}
+.s6 { color: #6897bb;}
+.s7 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+HeadlessJsTaskContext.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.jstasks</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.os.Handler</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.util.SparseArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactSoftExceptionLogger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.UiThreadUtil</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.LifecycleState</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.modules.appregistry.AppRegistry</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.lang.ref.WeakReference</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Map</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Set</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.WeakHashMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.ConcurrentHashMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.CopyOnWriteArraySet</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.atomic.AtomicInteger</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* Helper class for dealing with JS tasks. Handles per-ReactContext active task tracking, starting /</span>
+ <span class="s3">* stopping tasks and notifying listeners.</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">HeadlessJsTaskContext {</span>
+
+  <span class="s2">private static final </span><span class="s1">WeakHashMap&lt;ReactContext</span><span class="s2">, </span><span class="s1">HeadlessJsTaskContext&gt; INSTANCES =</span>
+      <span class="s2">new </span><span class="s1">WeakHashMap&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Get the task helper instance for a particular {</span><span class="s4">@link </span><span class="s3">ReactContext}. There is only one instance</span>
+   <span class="s3">* per context.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s5">&lt;p&gt;&lt;strong&gt;</span><span class="s3">Note:</span><span class="s5">&lt;/strong&gt; </span><span class="s3">do not hold long-lived references to the object returned here, as</span>
+   <span class="s3">* that will cause memory leaks. Instead, just call this method on-demand.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public static </span><span class="s1">HeadlessJsTaskContext getInstance(ReactContext context) {</span>
+    <span class="s1">HeadlessJsTaskContext helper = INSTANCES.get(context)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(helper == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">helper = </span><span class="s2">new </span><span class="s1">HeadlessJsTaskContext(context)</span><span class="s2">;</span>
+      <span class="s1">INSTANCES.put(context</span><span class="s2">, </span><span class="s1">helper)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">helper</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final </span><span class="s1">WeakReference&lt;ReactContext&gt; mReactContext</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Set&lt;HeadlessJsTaskEventListener&gt; mHeadlessJsTaskEventListeners =</span>
+      <span class="s2">new </span><span class="s1">CopyOnWriteArraySet&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">AtomicInteger mLastTaskId = </span><span class="s2">new </span><span class="s1">AtomicInteger(</span><span class="s6">0</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Handler mHandler = </span><span class="s2">new </span><span class="s1">Handler()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Set&lt;Integer&gt; mActiveTasks = </span><span class="s2">new </span><span class="s1">CopyOnWriteArraySet&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Map&lt;Integer</span><span class="s2">, </span><span class="s1">HeadlessJsTaskConfig&gt; mActiveTaskConfigs = </span><span class="s2">new </span><span class="s1">ConcurrentHashMap&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">SparseArray&lt;Runnable&gt; mTaskTimeouts = </span><span class="s2">new </span><span class="s1">SparseArray&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">HeadlessJsTaskContext(ReactContext reactContext) {</span>
+    <span class="s1">mReactContext = </span><span class="s2">new </span><span class="s1">WeakReference&lt;ReactContext&gt;(reactContext)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Register a task lifecycle event listener. Synchronized in order to prevent race conditions with</span>
+   <span class="s3">* finishTask, as the listener will be invoked for already running tasks.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public synchronized void </span><span class="s1">addTaskEventListener(HeadlessJsTaskEventListener listener) {</span>
+    <span class="s1">mHeadlessJsTaskEventListeners.add(listener)</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(Integer activeTaskId : mActiveTasks) {</span>
+      <span class="s1">listener.onHeadlessJsTaskStart(activeTaskId)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Unregister a task lifecycle event listener. */</span>
+  <span class="s2">public void </span><span class="s1">removeTaskEventListener(HeadlessJsTaskEventListener listener) {</span>
+    <span class="s1">mHeadlessJsTaskEventListeners.remove(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Get whether there are any running JS tasks at the moment. */</span>
+  <span class="s2">public boolean </span><span class="s1">hasActiveTasks() {</span>
+    <span class="s2">return </span><span class="s1">mActiveTasks.size() &gt; </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Start a JS task. Handles invoking {</span><span class="s4">@link </span><span class="s3">AppRegistry#startHeadlessTask} and notifying</span>
+   <span class="s3">* listeners.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@return </span><span class="s3">a unique id representing this task instance.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public synchronized int </span><span class="s1">startTask(</span><span class="s2">final </span><span class="s1">HeadlessJsTaskConfig taskConfig) {</span>
+    <span class="s2">final int </span><span class="s1">taskId = mLastTaskId.incrementAndGet()</span><span class="s2">;</span>
+    <span class="s1">startTask(taskConfig</span><span class="s2">, </span><span class="s1">taskId)</span><span class="s2">;</span>
+    <span class="s2">return </span><span class="s1">taskId</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Start a JS task the provided task id. Handles invoking {</span><span class="s4">@link </span><span class="s3">AppRegistry#startHeadlessTask}</span>
+   <span class="s3">* and notifying listeners.</span>
+   <span class="s3">*/</span>
+  <span class="s2">private synchronized void </span><span class="s1">startTask(</span><span class="s2">final </span><span class="s1">HeadlessJsTaskConfig taskConfig</span><span class="s2">, int </span><span class="s1">taskId) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s1">ReactContext reactContext =</span>
+        <span class="s1">Assertions.assertNotNull(</span>
+            <span class="s1">mReactContext.get()</span><span class="s2">,</span>
+            <span class="s7">&quot;Tried to start a task on a react context that has already been destroyed&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(reactContext.getLifecycleState() == LifecycleState.RESUMED</span>
+        <span class="s1">&amp;&amp; !taskConfig.isAllowedInForeground()) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span>
+          <span class="s7">&quot;Tried to start task &quot;</span>
+              <span class="s1">+ taskConfig.getTaskKey()</span>
+              <span class="s1">+ </span><span class="s7">&quot; while in foreground, but this is not allowed.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mActiveTasks.add(taskId)</span><span class="s2">;</span>
+    <span class="s1">mActiveTaskConfigs.put(taskId</span><span class="s2">, new </span><span class="s1">HeadlessJsTaskConfig(taskConfig))</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(reactContext.hasActiveReactInstance()) {</span>
+      <span class="s1">reactContext</span>
+          <span class="s1">.getJSModule(AppRegistry.</span><span class="s2">class</span><span class="s1">)</span>
+          <span class="s1">.startHeadlessTask(taskId</span><span class="s2">, </span><span class="s1">taskConfig.getTaskKey()</span><span class="s2">, </span><span class="s1">taskConfig.getData())</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+          <span class="s7">&quot;HeadlessJsTaskContext&quot;</span><span class="s2">,</span>
+          <span class="s2">new </span><span class="s1">RuntimeException(</span><span class="s7">&quot;Cannot start headless task, CatalystInstance not available&quot;</span><span class="s1">))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(taskConfig.getTimeout() &gt; </span><span class="s6">0</span><span class="s1">) {</span>
+      <span class="s1">scheduleTaskTimeout(taskId</span><span class="s2">, </span><span class="s1">taskConfig.getTimeout())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">(HeadlessJsTaskEventListener listener : mHeadlessJsTaskEventListeners) {</span>
+      <span class="s1">listener.onHeadlessJsTaskStart(taskId)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Retry a running JS task with a delay. Invokes {</span><span class="s4">@link</span>
+   <span class="s3">* HeadlessJsTaskContext#startTask(HeadlessJsTaskConfig, int)} as long as the process does not get</span>
+   <span class="s3">* killed.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@return </span><span class="s3">true if a retry attempt has been posted.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public synchronized boolean </span><span class="s1">retryTask(</span><span class="s2">final int </span><span class="s1">taskId) {</span>
+    <span class="s2">final </span><span class="s1">HeadlessJsTaskConfig sourceTaskConfig = mActiveTaskConfigs.get(taskId)</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertCondition(</span>
+        <span class="s1">sourceTaskConfig != </span><span class="s2">null,</span>
+        <span class="s7">&quot;Tried to retrieve non-existent task config with id &quot; </span><span class="s1">+ taskId + </span><span class="s7">&quot;.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s2">final </span><span class="s1">HeadlessJsTaskRetryPolicy retryPolicy = sourceTaskConfig.getRetryPolicy()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(!retryPolicy.canRetry()) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">removeTimeout(taskId)</span><span class="s2">;</span>
+    <span class="s2">final </span><span class="s1">HeadlessJsTaskConfig taskConfig =</span>
+        <span class="s2">new </span><span class="s1">HeadlessJsTaskConfig(</span>
+            <span class="s1">sourceTaskConfig.getTaskKey()</span><span class="s2">,</span>
+            <span class="s1">sourceTaskConfig.getData()</span><span class="s2">,</span>
+            <span class="s1">sourceTaskConfig.getTimeout()</span><span class="s2">,</span>
+            <span class="s1">sourceTaskConfig.isAllowedInForeground()</span><span class="s2">,</span>
+            <span class="s1">retryPolicy.update())</span><span class="s2">;</span>
+
+    <span class="s2">final </span><span class="s1">Runnable retryAttempt =</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s1">startTask(taskConfig</span><span class="s2">, </span><span class="s1">taskId)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span><span class="s2">;</span>
+
+    <span class="s1">UiThreadUtil.runOnUiThread(retryAttempt</span><span class="s2">, </span><span class="s1">retryPolicy.getDelay())</span><span class="s2">;</span>
+    <span class="s2">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Finish a JS task. Doesn't actually stop the task on the JS side, only removes it from the list</span>
+   <span class="s3">* of active tasks and notifies listeners. A task can only be finished once.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">taskId the unique id returned by {</span><span class="s4">@link </span><span class="s3">#startTask}.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public synchronized void </span><span class="s1">finishTask(</span><span class="s2">final int </span><span class="s1">taskId) {</span>
+    <span class="s1">Assertions.assertCondition(</span>
+        <span class="s1">mActiveTasks.remove(taskId)</span><span class="s2">, </span><span class="s7">&quot;Tried to finish non-existent task with id &quot; </span><span class="s1">+ taskId + </span><span class="s7">&quot;.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertCondition(</span>
+        <span class="s1">mActiveTaskConfigs.remove(taskId) != </span><span class="s2">null,</span>
+        <span class="s7">&quot;Tried to remove non-existent task config with id &quot; </span><span class="s1">+ taskId + </span><span class="s7">&quot;.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">removeTimeout(taskId)</span><span class="s2">;</span>
+    <span class="s1">UiThreadUtil.runOnUiThread(</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s2">for </span><span class="s1">(HeadlessJsTaskEventListener listener : mHeadlessJsTaskEventListeners) {</span>
+              <span class="s1">listener.onHeadlessJsTaskFinish(taskId)</span><span class="s2">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">removeTimeout(</span><span class="s2">int </span><span class="s1">taskId) {</span>
+    <span class="s1">Runnable timeout = mTaskTimeouts.get(taskId)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(timeout != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mHandler.removeCallbacks(timeout)</span><span class="s2">;</span>
+      <span class="s1">mTaskTimeouts.remove(taskId)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Check if a given task is currently running. A task is stopped if either {</span><span class="s4">@link </span><span class="s3">#finishTask} is</span>
+   <span class="s3">* called or it times out.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public synchronized boolean </span><span class="s1">isTaskRunning(</span><span class="s2">final int </span><span class="s1">taskId) {</span>
+    <span class="s2">return </span><span class="s1">mActiveTasks.contains(taskId)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">scheduleTaskTimeout(</span><span class="s2">final int </span><span class="s1">taskId</span><span class="s2">, long </span><span class="s1">timeout) {</span>
+    <span class="s1">Runnable runnable =</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s1">finishTask(taskId)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span><span class="s2">;</span>
+    <span class="s1">mTaskTimeouts.append(taskId</span><span class="s2">, </span><span class="s1">runnable)</span><span class="s2">;</span>
+    <span class="s1">mHandler.postDelayed(runnable</span><span class="s2">, </span><span class="s1">timeout)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

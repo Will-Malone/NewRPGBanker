@@ -1,0 +1,340 @@
+<html>
+<head>
+<title>Runner.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #808080;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Runner.js</font>
+</center></td></tr></table>
+<pre>
+<span class="s1">/** 
+ * Copyright (c) Facebook, Inc. and its affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s0">;</span>
+
+<span class="s0">const child_process = require(</span><span class="s2">'child_process'</span><span class="s0">);</span>
+<span class="s0">const chalk = require(</span><span class="s2">'chalk'</span><span class="s0">);</span>
+<span class="s0">const fs = require(</span><span class="s2">'graceful-fs'</span><span class="s0">);</span>
+<span class="s0">const path = require(</span><span class="s2">'path'</span><span class="s0">);</span>
+<span class="s0">const http = require(</span><span class="s2">'http'</span><span class="s0">);</span>
+<span class="s0">const https = require(</span><span class="s2">'https'</span><span class="s0">);</span>
+<span class="s0">const temp = require(</span><span class="s2">'temp'</span><span class="s0">);</span>
+<span class="s0">const ignores = require(</span><span class="s2">'./ignoreFiles'</span><span class="s0">);</span>
+
+<span class="s0">const availableCpus = Math.max(require(</span><span class="s2">'os'</span><span class="s0">).cpus().length - </span><span class="s3">1</span><span class="s0">, </span><span class="s3">1</span><span class="s0">);</span>
+<span class="s0">const CHUNK_SIZE = </span><span class="s3">50</span><span class="s0">;</span>
+
+<span class="s4">function </span><span class="s0">lineBreak(str) {</span>
+  <span class="s4">return </span><span class="s0">/\n$/.test(str) ? str : str + </span><span class="s2">'</span><span class="s5">\n</span><span class="s2">'</span><span class="s0">;</span>
+<span class="s0">}</span>
+
+<span class="s0">const bufferedWrite = (</span><span class="s4">function</span><span class="s0">() {</span>
+  <span class="s0">const buffer = [];</span>
+  <span class="s0">let buffering = </span><span class="s4">false</span><span class="s0">;</span>
+
+  <span class="s0">process.stdout.on(</span><span class="s2">'drain'</span><span class="s0">, () =&gt; {</span>
+    <span class="s4">if </span><span class="s0">(!buffering) </span><span class="s4">return</span><span class="s0">;</span>
+    <span class="s4">while </span><span class="s0">(buffer.length &gt; </span><span class="s3">0 </span><span class="s0">&amp;&amp; process.stdout.write(buffer.shift()) !== </span><span class="s4">false</span><span class="s0">);</span>
+    <span class="s4">if </span><span class="s0">(buffer.length === </span><span class="s3">0</span><span class="s0">) {</span>
+      <span class="s0">buffering = </span><span class="s4">false</span><span class="s0">;</span>
+    <span class="s0">}</span>
+  <span class="s0">});</span>
+  <span class="s4">return function </span><span class="s0">write(msg) {</span>
+    <span class="s4">if </span><span class="s0">(buffering) {</span>
+      <span class="s0">buffer.push(msg);</span>
+    <span class="s0">}</span>
+    <span class="s4">if </span><span class="s0">(process.stdout.write(msg) === </span><span class="s4">false</span><span class="s0">) {</span>
+      <span class="s0">buffering = </span><span class="s4">true</span><span class="s0">;</span>
+    <span class="s0">}</span>
+  <span class="s0">};</span>
+<span class="s0">}());</span>
+
+<span class="s0">const log = {</span>
+  <span class="s0">ok(msg, verbose) {</span>
+    <span class="s0">verbose &gt;= </span><span class="s3">2 </span><span class="s0">&amp;&amp; bufferedWrite(chalk.white.bgGreen(</span><span class="s2">' OKK '</span><span class="s0">) + msg);</span>
+  <span class="s0">},</span>
+  <span class="s0">nochange(msg, verbose) {</span>
+    <span class="s0">verbose &gt;= </span><span class="s3">1 </span><span class="s0">&amp;&amp; bufferedWrite(chalk.white.bgYellow(</span><span class="s2">' NOC '</span><span class="s0">) + msg);</span>
+  <span class="s0">},</span>
+  <span class="s0">skip(msg, verbose) {</span>
+    <span class="s0">verbose &gt;= </span><span class="s3">1 </span><span class="s0">&amp;&amp; bufferedWrite(chalk.white.bgYellow(</span><span class="s2">' SKIP '</span><span class="s0">) + msg);</span>
+  <span class="s0">},</span>
+  <span class="s0">error(msg, verbose) {</span>
+    <span class="s0">verbose &gt;= </span><span class="s3">0 </span><span class="s0">&amp;&amp; bufferedWrite(chalk.white.bgRed(</span><span class="s2">' ERR '</span><span class="s0">) + msg);</span>
+  <span class="s0">},</span>
+<span class="s0">};</span>
+
+<span class="s4">function </span><span class="s0">report({file, msg}) {</span>
+  <span class="s0">bufferedWrite(lineBreak(`${chalk.white.bgBlue(</span><span class="s2">' REP '</span><span class="s0">)}${file} ${msg}`));</span>
+<span class="s0">}</span>
+
+<span class="s4">function </span><span class="s0">concatAll(arrays) {</span>
+  <span class="s0">const result = [];</span>
+  <span class="s4">for </span><span class="s0">(const array of arrays) {</span>
+    <span class="s4">for </span><span class="s0">(const element of array) {</span>
+      <span class="s0">result.push(element);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s4">return </span><span class="s0">result;</span>
+<span class="s0">}</span>
+
+<span class="s4">function </span><span class="s0">showFileStats(fileStats) {</span>
+  <span class="s0">process.stdout.write(</span>
+    <span class="s2">'Results: </span><span class="s5">\n</span><span class="s2">'</span><span class="s0">+</span>
+    <span class="s0">chalk.red(fileStats.error + </span><span class="s2">' errors</span><span class="s5">\n</span><span class="s2">'</span><span class="s0">)+</span>
+    <span class="s0">chalk.yellow(fileStats.nochange + </span><span class="s2">' unmodified</span><span class="s5">\n</span><span class="s2">'</span><span class="s0">)+</span>
+    <span class="s0">chalk.yellow(fileStats.skip + </span><span class="s2">' skipped</span><span class="s5">\n</span><span class="s2">'</span><span class="s0">)+</span>
+    <span class="s0">chalk.green(fileStats.ok + </span><span class="s2">' ok</span><span class="s5">\n</span><span class="s2">'</span><span class="s0">)</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s4">function </span><span class="s0">showStats(stats) {</span>
+  <span class="s0">const names = Object.keys(stats).sort();</span>
+  <span class="s4">if </span><span class="s0">(names.length) {</span>
+    <span class="s0">process.stdout.write(chalk.blue(</span><span class="s2">'Stats: </span><span class="s5">\n</span><span class="s2">'</span><span class="s0">));</span>
+  <span class="s0">}</span>
+  <span class="s0">names.forEach(name =&gt; process.stdout.write(name + </span><span class="s2">': ' </span><span class="s0">+ stats[name] + </span><span class="s2">'</span><span class="s5">\n</span><span class="s2">'</span><span class="s0">));</span>
+<span class="s0">}</span>
+
+<span class="s4">function </span><span class="s0">dirFiles (dir, callback, acc) {</span>
+  <span class="s1">// acc stores files found so far and counts remaining paths to be processed</span>
+  <span class="s0">acc = acc || { files: [], remaining: </span><span class="s3">1 </span><span class="s0">};</span>
+
+  <span class="s4">function </span><span class="s0">done() {</span>
+    <span class="s1">// decrement count and return if there are no more paths left to process</span>
+    <span class="s4">if </span><span class="s0">(!--acc.remaining) {</span>
+      <span class="s0">callback(acc.files);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">fs.readdir(dir, (err, files) =&gt; {</span>
+    <span class="s1">// if dir does not exist or is not a directory, bail</span>
+    <span class="s1">// (this should not happen as long as calls do the necessary checks)</span>
+    <span class="s4">if </span><span class="s0">(err) </span><span class="s4">throw </span><span class="s0">err;</span>
+
+    <span class="s0">acc.remaining += files.length;</span>
+    <span class="s0">files.forEach(file =&gt; {</span>
+      <span class="s0">let name = path.join(dir, file);</span>
+      <span class="s0">fs.stat(name, (err, stats) =&gt; {</span>
+        <span class="s4">if </span><span class="s0">(err) {</span>
+          <span class="s1">// probably a symlink issue</span>
+          <span class="s0">process.stdout.write(</span>
+            <span class="s2">'Skipping path &quot;' </span><span class="s0">+ name + </span><span class="s2">'&quot; which does not exist.</span><span class="s5">\n</span><span class="s2">'</span>
+          <span class="s0">);</span>
+          <span class="s0">done();</span>
+        <span class="s0">} </span><span class="s4">else if </span><span class="s0">(ignores.shouldIgnore(name)) {</span>
+          <span class="s1">// ignore the path</span>
+          <span class="s0">done();</span>
+        <span class="s0">} </span><span class="s4">else if </span><span class="s0">(stats.isDirectory()) {</span>
+          <span class="s0">dirFiles(name + </span><span class="s2">'/'</span><span class="s0">, callback, acc);</span>
+        <span class="s0">} </span><span class="s4">else </span><span class="s0">{</span>
+          <span class="s0">acc.files.push(name);</span>
+          <span class="s0">done();</span>
+        <span class="s0">}</span>
+      <span class="s0">});</span>
+    <span class="s0">});</span>
+    <span class="s0">done();</span>
+  <span class="s0">});</span>
+<span class="s0">}</span>
+
+<span class="s4">function </span><span class="s0">getAllFiles(paths, filter) {</span>
+  <span class="s4">return </span><span class="s0">Promise.all(</span>
+    <span class="s0">paths.map(file =&gt; </span><span class="s4">new </span><span class="s0">Promise(resolve =&gt; {</span>
+      <span class="s0">fs.lstat(file, (err, stat) =&gt; {</span>
+        <span class="s4">if </span><span class="s0">(err) {</span>
+          <span class="s0">process.stderr.write(</span><span class="s2">'Skipping path ' </span><span class="s0">+ file + </span><span class="s2">' which does not exist. </span><span class="s5">\n</span><span class="s2">'</span><span class="s0">);</span>
+          <span class="s0">resolve([]);</span>
+          <span class="s4">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+
+        <span class="s4">if </span><span class="s0">(stat.isDirectory()) {</span>
+          <span class="s0">dirFiles(</span>
+            <span class="s0">file,</span>
+            <span class="s0">list =&gt; resolve(list.filter(filter))</span>
+          <span class="s0">);</span>
+        <span class="s0">} </span><span class="s4">else if </span><span class="s0">(ignores.shouldIgnore(file)) {</span>
+          <span class="s1">// ignoring the file</span>
+          <span class="s0">resolve([]);</span>
+        <span class="s0">} </span><span class="s4">else </span><span class="s0">{</span>
+          <span class="s0">resolve([file]);</span>
+        <span class="s0">}</span>
+      <span class="s0">})</span>
+    <span class="s0">}))</span>
+  <span class="s0">).then(concatAll);</span>
+<span class="s0">}</span>
+
+<span class="s4">function </span><span class="s0">run(transformFile, paths, options) {</span>
+  <span class="s0">let usedRemoteScript = </span><span class="s4">false</span><span class="s0">;</span>
+  <span class="s0">const cpus = options.cpus ? Math.min(availableCpus, options.cpus) : availableCpus;</span>
+  <span class="s0">const extensions =</span>
+    <span class="s0">options.extensions &amp;&amp; options.extensions.split(</span><span class="s2">','</span><span class="s0">).map(ext =&gt; </span><span class="s2">'.' </span><span class="s0">+ ext);</span>
+  <span class="s0">const fileCounters = {error: </span><span class="s3">0</span><span class="s0">, ok: </span><span class="s3">0</span><span class="s0">, nochange: </span><span class="s3">0</span><span class="s0">, skip: </span><span class="s3">0</span><span class="s0">};</span>
+  <span class="s0">const statsCounter = {};</span>
+  <span class="s0">const startTime = process.hrtime();</span>
+
+  <span class="s0">ignores.add(options.ignorePattern);</span>
+  <span class="s0">ignores.addFromFile(options.ignoreConfig);</span>
+
+  <span class="s4">if </span><span class="s0">(/^http/.test(transformFile)) {</span>
+    <span class="s0">usedRemoteScript = </span><span class="s4">true</span><span class="s0">;</span>
+    <span class="s4">return new </span><span class="s0">Promise((resolve, reject) =&gt; {</span>
+      <span class="s1">// call the correct `http` or `https` implementation</span>
+      <span class="s0">(transformFile.indexOf(</span><span class="s2">'https'</span><span class="s0">) !== </span><span class="s3">0 </span><span class="s0">?  http : https).get(transformFile, (res) =&gt; {</span>
+        <span class="s0">let contents = </span><span class="s2">''</span><span class="s0">;</span>
+        <span class="s0">res</span>
+          <span class="s0">.on(</span><span class="s2">'data'</span><span class="s0">, (d) =&gt; {</span>
+            <span class="s0">contents += d.toString();</span>
+          <span class="s0">})</span>
+          <span class="s0">.on(</span><span class="s2">'end'</span><span class="s0">, () =&gt; {</span>
+            <span class="s0">const ext = path.extname(transformFile);</span>
+            <span class="s0">temp.open({ prefix: </span><span class="s2">'jscodeshift'</span><span class="s0">, suffix: ext }, (err, info) =&gt; {</span>
+              <span class="s4">if </span><span class="s0">(err) </span><span class="s4">return </span><span class="s0">reject(err);</span>
+              <span class="s0">fs.write(info.fd, contents, </span><span class="s4">function </span><span class="s0">(err) {</span>
+                <span class="s4">if </span><span class="s0">(err) </span><span class="s4">return </span><span class="s0">reject(err);</span>
+                <span class="s0">fs.close(info.fd, </span><span class="s4">function</span><span class="s0">(err) {</span>
+                  <span class="s4">if </span><span class="s0">(err) </span><span class="s4">return </span><span class="s0">reject(err);</span>
+                  <span class="s0">transform(info.path).then(resolve, reject);</span>
+                <span class="s0">});</span>
+              <span class="s0">});</span>
+            <span class="s0">});</span>
+        <span class="s0">})</span>
+      <span class="s0">})</span>
+      <span class="s0">.on(</span><span class="s2">'error'</span><span class="s0">, (e) =&gt; {</span>
+        <span class="s0">reject(e);</span>
+      <span class="s0">});</span>
+    <span class="s0">});</span>
+  <span class="s0">} </span><span class="s4">else if </span><span class="s0">(!fs.existsSync(transformFile)) {</span>
+    <span class="s0">process.stderr.write(</span>
+      <span class="s0">chalk.white.bgRed(</span><span class="s2">'ERROR'</span><span class="s0">) + </span><span class="s2">' Transform file ' </span><span class="s0">+ transformFile + </span><span class="s2">' does not exist </span><span class="s5">\n</span><span class="s2">'</span>
+    <span class="s0">);</span>
+    <span class="s4">return</span><span class="s0">;</span>
+  <span class="s0">} </span><span class="s4">else </span><span class="s0">{</span>
+    <span class="s4">return </span><span class="s0">transform(transformFile);</span>
+  <span class="s0">}</span>
+
+  <span class="s4">function </span><span class="s0">transform(transformFile) {</span>
+    <span class="s4">return </span><span class="s0">getAllFiles(</span>
+      <span class="s0">paths,</span>
+      <span class="s0">name =&gt; !extensions || extensions.indexOf(path.extname(name)) != -</span><span class="s3">1</span>
+    <span class="s0">).then(files =&gt; {</span>
+        <span class="s0">const numFiles = files.length;</span>
+
+        <span class="s4">if </span><span class="s0">(numFiles === </span><span class="s3">0</span><span class="s0">) {</span>
+          <span class="s0">process.stdout.write(</span><span class="s2">'No files selected, nothing to do. </span><span class="s5">\n</span><span class="s2">'</span><span class="s0">);</span>
+          <span class="s4">return </span><span class="s0">[];</span>
+        <span class="s0">}</span>
+
+        <span class="s0">const processes = options.runInBand ? </span><span class="s3">1 </span><span class="s0">: Math.min(numFiles, cpus);</span>
+        <span class="s0">const chunkSize = processes &gt; </span><span class="s3">1 </span><span class="s0">?</span>
+          <span class="s0">Math.min(Math.ceil(numFiles / processes), CHUNK_SIZE) :</span>
+          <span class="s0">numFiles;</span>
+
+        <span class="s0">let index = </span><span class="s3">0</span><span class="s0">;</span>
+        <span class="s1">// return the next chunk of work for a free worker</span>
+        <span class="s4">function </span><span class="s0">next() {</span>
+          <span class="s4">if </span><span class="s0">(!options.silent &amp;&amp; !options.runInBand &amp;&amp; index &lt; numFiles) {</span>
+            <span class="s0">process.stdout.write(</span>
+              <span class="s2">'Sending ' </span><span class="s0">+</span>
+              <span class="s0">Math.min(chunkSize, numFiles-index) +</span>
+              <span class="s2">' files to free worker...</span><span class="s5">\n</span><span class="s2">'</span>
+            <span class="s0">);</span>
+          <span class="s0">}</span>
+          <span class="s4">return </span><span class="s0">files.slice(index, index += chunkSize);</span>
+        <span class="s0">}</span>
+
+        <span class="s4">if </span><span class="s0">(!options.silent) {</span>
+          <span class="s0">process.stdout.write(</span><span class="s2">'Processing ' </span><span class="s0">+ files.length + </span><span class="s2">' files... </span><span class="s5">\n</span><span class="s2">'</span><span class="s0">);</span>
+          <span class="s4">if </span><span class="s0">(!options.runInBand) {</span>
+            <span class="s0">process.stdout.write(</span>
+              <span class="s2">'Spawning ' </span><span class="s0">+ processes +</span><span class="s2">' workers...</span><span class="s5">\n</span><span class="s2">'</span>
+            <span class="s0">);</span>
+          <span class="s0">}</span>
+          <span class="s4">if </span><span class="s0">(options.dry) {</span>
+            <span class="s0">process.stdout.write(</span>
+              <span class="s0">chalk.green(</span><span class="s2">'Running in dry mode, no files will be written! </span><span class="s5">\n</span><span class="s2">'</span><span class="s0">)</span>
+            <span class="s0">);</span>
+          <span class="s0">}</span>
+        <span class="s0">}</span>
+
+        <span class="s0">const args = [transformFile, options.babel ? </span><span class="s2">'babel' </span><span class="s0">: </span><span class="s2">'no-babel'</span><span class="s0">];</span>
+
+        <span class="s0">const workers = [];</span>
+        <span class="s4">for </span><span class="s0">(let i = </span><span class="s3">0</span><span class="s0">; i &lt; processes; i++) {</span>
+          <span class="s0">workers.push(options.runInBand ?</span>
+            <span class="s0">require(</span><span class="s2">'./Worker'</span><span class="s0">)(args) :</span>
+            <span class="s0">child_process.fork(require.resolve(</span><span class="s2">'./Worker'</span><span class="s0">), args)</span>
+          <span class="s0">);</span>
+        <span class="s0">}</span>
+
+        <span class="s4">return </span><span class="s0">workers.map(child =&gt; {</span>
+          <span class="s0">child.send({files: next(), options});</span>
+          <span class="s0">child.on(</span><span class="s2">'message'</span><span class="s0">, message =&gt; {</span>
+            <span class="s4">switch </span><span class="s0">(message.action) {</span>
+              <span class="s4">case </span><span class="s2">'status'</span><span class="s0">:</span>
+                <span class="s0">fileCounters[message.status] += </span><span class="s3">1</span><span class="s0">;</span>
+                <span class="s0">log[message.status](lineBreak(message.msg), options.verbose);</span>
+                <span class="s4">break</span><span class="s0">;</span>
+              <span class="s4">case </span><span class="s2">'update'</span><span class="s0">:</span>
+                <span class="s4">if </span><span class="s0">(!statsCounter[message.name]) {</span>
+                  <span class="s0">statsCounter[message.name] = </span><span class="s3">0</span><span class="s0">;</span>
+                <span class="s0">}</span>
+                <span class="s0">statsCounter[message.name] += message.quantity;</span>
+                <span class="s4">break</span><span class="s0">;</span>
+              <span class="s4">case </span><span class="s2">'free'</span><span class="s0">:</span>
+                <span class="s0">child.send({files: next(), options});</span>
+                <span class="s4">break</span><span class="s0">;</span>
+              <span class="s4">case </span><span class="s2">'report'</span><span class="s0">:</span>
+                <span class="s0">report(message);</span>
+                <span class="s4">break</span><span class="s0">;</span>
+            <span class="s0">}</span>
+          <span class="s0">});</span>
+          <span class="s4">return new </span><span class="s0">Promise(resolve =&gt; child.on(</span><span class="s2">'disconnect'</span><span class="s0">, resolve));</span>
+        <span class="s0">});</span>
+      <span class="s0">})</span>
+      <span class="s0">.then(pendingWorkers =&gt;</span>
+        <span class="s0">Promise.all(pendingWorkers).then(() =&gt; {</span>
+          <span class="s0">const endTime = process.hrtime(startTime);</span>
+          <span class="s0">const timeElapsed = (endTime[</span><span class="s3">0</span><span class="s0">] + endTime[</span><span class="s3">1</span><span class="s0">]/</span><span class="s3">1</span><span class="s0">e9).toFixed(</span><span class="s3">3</span><span class="s0">);</span>
+          <span class="s4">if </span><span class="s0">(!options.silent) {</span>
+            <span class="s0">process.stdout.write(</span><span class="s2">'All done. </span><span class="s5">\n</span><span class="s2">'</span><span class="s0">);</span>
+            <span class="s0">showFileStats(fileCounters);</span>
+            <span class="s0">showStats(statsCounter);</span>
+            <span class="s0">process.stdout.write(</span>
+              <span class="s2">'Time elapsed: ' </span><span class="s0">+ timeElapsed + </span><span class="s2">'seconds </span><span class="s5">\n</span><span class="s2">'</span>
+            <span class="s0">);</span>
+            
+            <span class="s4">if </span><span class="s0">(options.failOnError &amp;&amp; fileCounters.error &gt; </span><span class="s3">0</span><span class="s0">) {</span>
+              <span class="s0">process.exit(</span><span class="s3">1</span><span class="s0">);</span>
+            <span class="s0">}</span>
+          <span class="s0">}</span>
+          <span class="s4">if </span><span class="s0">(usedRemoteScript) {</span>
+            <span class="s0">temp.cleanupSync();</span>
+          <span class="s0">}</span>
+          <span class="s4">return </span><span class="s0">Object.assign({</span>
+            <span class="s0">stats: statsCounter,</span>
+            <span class="s0">timeElapsed: timeElapsed</span>
+          <span class="s0">}, fileCounters);</span>
+        <span class="s0">})</span>
+      <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">exports.run = run;</span>
+</pre>
+</body>
+</html>

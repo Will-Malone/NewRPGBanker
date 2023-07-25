@@ -1,0 +1,1144 @@
+<html>
+<head>
+<title>UIViewOperationQueue.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #629755; font-weight: bold; font-style: italic;}
+.s5 { color: #77b767; font-style: italic;}
+.s6 { color: #6897bb;}
+.s7 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+UIViewOperationQueue.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.uimanager</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.os.SystemClock</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.view.View</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.GuardedBy</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.UiThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.Callback</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.GuardedRunnable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactApplicationContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactNoCrashSoftException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactSoftExceptionLogger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.RetryableMountingLayerException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.SoftAssertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.UiThreadUtil</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.ReactConstants</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.modules.core.ReactChoreographer</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.debug.NotThreadSafeViewHierarchyUpdateDebugListener</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.systrace.Systrace</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.systrace.SystraceMessage</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayDeque</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.HashMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Map</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* This class acts as a buffer for command executed on {</span><span class="s4">@link </span><span class="s3">NativeViewHierarchyManager}. It expose</span>
+ <span class="s3">* similar methods as mentioned classes but instead of executing commands immediately it enqueues</span>
+ <span class="s3">* those operations in a queue that is then flushed from {</span><span class="s4">@link </span><span class="s3">UIManagerModule} once JS batch of ui</span>
+ <span class="s3">* operations is finished. This is to make sure that we execute all the JS operation coming from a</span>
+ <span class="s3">* single batch a single loop of the main (UI) android looper.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">TODO(7135923): Pooling of operation objects TODO(5694019): Consider a better data structure</span>
+ <span class="s3">* for operations queue to save on allocations</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">UIViewOperationQueue {</span>
+
+  <span class="s2">public static final int </span><span class="s1">DEFAULT_MIN_TIME_LEFT_IN_FRAME_FOR_NONBATCHED_OPERATION_MS = </span><span class="s6">8</span><span class="s2">;</span>
+  <span class="s2">private static final </span><span class="s1">String TAG = UIViewOperationQueue.</span><span class="s2">class</span><span class="s1">.getSimpleName()</span><span class="s2">;</span>
+
+  <span class="s2">private final int</span><span class="s1">[] mMeasureBuffer = </span><span class="s2">new int</span><span class="s1">[</span><span class="s6">4</span><span class="s1">]</span><span class="s2">;</span>
+
+  <span class="s3">/** A mutation or animation operation on the view hierarchy. */</span>
+  <span class="s2">public interface </span><span class="s1">UIOperation {</span>
+
+    <span class="s2">void </span><span class="s1">execute()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** A spec for an operation on the native View hierarchy. */</span>
+  <span class="s2">private abstract class </span><span class="s1">ViewOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+
+    <span class="s2">public int </span><span class="s1">mTag</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">ViewOperation(</span><span class="s2">int </span><span class="s1">tag) {</span>
+      <span class="s1">mTag = tag</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">RemoveRootViewOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">public </span><span class="s1">RemoveRootViewOperation(</span><span class="s2">int </span><span class="s1">tag) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.removeRootView(mTag)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">UpdatePropertiesOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">ReactStylesDiffMap mProps</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">UpdatePropertiesOperation(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">ReactStylesDiffMap props) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mProps = props</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.updateProperties(mTag</span><span class="s2">, </span><span class="s1">mProps)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">EmitOnLayoutEventOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mScreenX</span><span class="s2">;</span>
+    <span class="s2">private final int </span><span class="s1">mScreenY</span><span class="s2">;</span>
+    <span class="s2">private final int </span><span class="s1">mScreenWidth</span><span class="s2">;</span>
+    <span class="s2">private final int </span><span class="s1">mScreenHeight</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">EmitOnLayoutEventOperation(</span>
+        <span class="s2">int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">screenX</span><span class="s2">, int </span><span class="s1">screenY</span><span class="s2">, int </span><span class="s1">screenWidth</span><span class="s2">, int </span><span class="s1">screenHeight) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mScreenX = screenX</span><span class="s2">;</span>
+      <span class="s1">mScreenY = screenY</span><span class="s2">;</span>
+      <span class="s1">mScreenWidth = screenWidth</span><span class="s2">;</span>
+      <span class="s1">mScreenHeight = screenHeight</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">UIManagerModule uiManager = mReactApplicationContext.getNativeModule(UIManagerModule.</span><span class="s2">class</span><span class="s1">)</span><span class="s2">;</span>
+
+      <span class="s2">if </span><span class="s1">(uiManager != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">uiManager</span>
+            <span class="s1">.getEventDispatcher()</span>
+            <span class="s1">.dispatchEvent(</span>
+                <span class="s1">OnLayoutEvent.obtain(</span>
+                    <span class="s1">-</span><span class="s6">1 </span><span class="s0">/* SurfaceId not used in classic renderer */</span><span class="s2">,</span>
+                    <span class="s1">mTag</span><span class="s2">,</span>
+                    <span class="s1">mScreenX</span><span class="s2">,</span>
+                    <span class="s1">mScreenY</span><span class="s2">,</span>
+                    <span class="s1">mScreenWidth</span><span class="s2">,</span>
+                    <span class="s1">mScreenHeight))</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">UpdateInstanceHandleOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final long </span><span class="s1">mInstanceHandle</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">UpdateInstanceHandleOperation(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, long </span><span class="s1">instanceHandle) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mInstanceHandle = instanceHandle</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.updateInstanceHandle(mTag</span><span class="s2">, </span><span class="s1">mInstanceHandle)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Operation for updating native view's position and size. The operation is not created directly</span>
+   <span class="s3">* by a {</span><span class="s4">@link </span><span class="s3">UIManagerModule} call from JS. Instead it gets inflated using computed position and</span>
+   <span class="s3">* size values by CSSNodeDEPRECATED hierarchy.</span>
+   <span class="s3">*/</span>
+  <span class="s2">private final class </span><span class="s1">UpdateLayoutOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mParentTag</span><span class="s2">, </span><span class="s1">mX</span><span class="s2">, </span><span class="s1">mY</span><span class="s2">, </span><span class="s1">mWidth</span><span class="s2">, </span><span class="s1">mHeight</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">UpdateLayoutOperation(</span><span class="s2">int </span><span class="s1">parentTag</span><span class="s2">, int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">x</span><span class="s2">, int </span><span class="s1">y</span><span class="s2">, int </span><span class="s1">width</span><span class="s2">, int </span><span class="s1">height) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mParentTag = parentTag</span><span class="s2">;</span>
+      <span class="s1">mX = x</span><span class="s2">;</span>
+      <span class="s1">mY = y</span><span class="s2">;</span>
+      <span class="s1">mWidth = width</span><span class="s2">;</span>
+      <span class="s1">mHeight = height</span><span class="s2">;</span>
+      <span class="s1">Systrace.startAsyncFlow(Systrace.TRACE_TAG_REACT_VIEW</span><span class="s2">, </span><span class="s7">&quot;updateLayout&quot;</span><span class="s2">, </span><span class="s1">mTag)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">Systrace.endAsyncFlow(Systrace.TRACE_TAG_REACT_VIEW</span><span class="s2">, </span><span class="s7">&quot;updateLayout&quot;</span><span class="s2">, </span><span class="s1">mTag)</span><span class="s2">;</span>
+      <span class="s1">mNativeViewHierarchyManager.updateLayout(mParentTag</span><span class="s2">, </span><span class="s1">mTag</span><span class="s2">, </span><span class="s1">mX</span><span class="s2">, </span><span class="s1">mY</span><span class="s2">, </span><span class="s1">mWidth</span><span class="s2">, </span><span class="s1">mHeight)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">CreateViewOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">ThemedReactContext mThemedContext</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">String mClassName</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">@Nullable ReactStylesDiffMap mInitialProps</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">CreateViewOperation(</span>
+        <span class="s1">ThemedReactContext themedContext</span><span class="s2">,</span>
+        <span class="s2">int </span><span class="s1">tag</span><span class="s2">,</span>
+        <span class="s1">String className</span><span class="s2">,</span>
+        <span class="s1">@Nullable ReactStylesDiffMap initialProps) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mThemedContext = themedContext</span><span class="s2">;</span>
+      <span class="s1">mClassName = className</span><span class="s2">;</span>
+      <span class="s1">mInitialProps = initialProps</span><span class="s2">;</span>
+      <span class="s1">Systrace.startAsyncFlow(Systrace.TRACE_TAG_REACT_VIEW</span><span class="s2">, </span><span class="s7">&quot;createView&quot;</span><span class="s2">, </span><span class="s1">mTag)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">Systrace.endAsyncFlow(Systrace.TRACE_TAG_REACT_VIEW</span><span class="s2">, </span><span class="s7">&quot;createView&quot;</span><span class="s2">, </span><span class="s1">mTag)</span><span class="s2">;</span>
+      <span class="s1">mNativeViewHierarchyManager.createView(mThemedContext</span><span class="s2">, </span><span class="s1">mTag</span><span class="s2">, </span><span class="s1">mClassName</span><span class="s2">, </span><span class="s1">mInitialProps)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">ManageChildrenOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">@Nullable </span><span class="s2">int</span><span class="s1">[] mIndicesToRemove</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">@Nullable ViewAtIndex[] mViewsToAdd</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">@Nullable </span><span class="s2">int</span><span class="s1">[] mTagsToDelete</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">ManageChildrenOperation(</span>
+        <span class="s2">int </span><span class="s1">tag</span><span class="s2">,</span>
+        <span class="s1">@Nullable </span><span class="s2">int</span><span class="s1">[] indicesToRemove</span><span class="s2">,</span>
+        <span class="s1">@Nullable ViewAtIndex[] viewsToAdd</span><span class="s2">,</span>
+        <span class="s1">@Nullable </span><span class="s2">int</span><span class="s1">[] tagsToDelete) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mIndicesToRemove = indicesToRemove</span><span class="s2">;</span>
+      <span class="s1">mViewsToAdd = viewsToAdd</span><span class="s2">;</span>
+      <span class="s1">mTagsToDelete = tagsToDelete</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.manageChildren(</span>
+          <span class="s1">mTag</span><span class="s2">, </span><span class="s1">mIndicesToRemove</span><span class="s2">, </span><span class="s1">mViewsToAdd</span><span class="s2">, </span><span class="s1">mTagsToDelete)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">SetChildrenOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">ReadableArray mChildrenTags</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">SetChildrenOperation(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">ReadableArray childrenTags) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mChildrenTags = childrenTags</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.setChildren(mTag</span><span class="s2">, </span><span class="s1">mChildrenTags)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">UpdateViewExtraData </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">Object mExtraData</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">UpdateViewExtraData(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">Object extraData) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mExtraData = extraData</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.updateViewExtraData(mTag</span><span class="s2">, </span><span class="s1">mExtraData)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">ChangeJSResponderOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mInitialTag</span><span class="s2">;</span>
+    <span class="s2">private final boolean </span><span class="s1">mBlockNativeResponder</span><span class="s2">;</span>
+    <span class="s2">private final boolean </span><span class="s1">mClearResponder</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">ChangeJSResponderOperation(</span>
+        <span class="s2">int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">initialTag</span><span class="s2">, boolean </span><span class="s1">clearResponder</span><span class="s2">, boolean </span><span class="s1">blockNativeResponder) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mInitialTag = initialTag</span><span class="s2">;</span>
+      <span class="s1">mClearResponder = clearResponder</span><span class="s2">;</span>
+      <span class="s1">mBlockNativeResponder = blockNativeResponder</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s2">if </span><span class="s1">(!mClearResponder) {</span>
+        <span class="s1">mNativeViewHierarchyManager.setJSResponder(mTag</span><span class="s2">, </span><span class="s1">mInitialTag</span><span class="s2">, </span><span class="s1">mBlockNativeResponder)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">mNativeViewHierarchyManager.clearJSResponder()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* This is a common interface for View Command operations. Once we delete the deprecated {</span><span class="s4">@link</span>
+   <span class="s3">* DispatchCommandOperation}, we can delete this interface too. It provides a set of common</span>
+   <span class="s3">* operations to simplify generic operations on all types of ViewCommands.</span>
+   <span class="s3">*/</span>
+  <span class="s2">private interface </span><span class="s1">DispatchCommandViewOperation {</span>
+
+    <span class="s3">/**</span>
+     <span class="s3">* Like the execute function, but throws real exceptions instead of logging soft errors and</span>
+     <span class="s3">* returning silently.</span>
+     <span class="s3">*/</span>
+    <span class="s2">void </span><span class="s1">executeWithExceptions()</span><span class="s2">;</span>
+
+    <span class="s3">/** Increment retry counter. */</span>
+    <span class="s2">void </span><span class="s1">incrementRetries()</span><span class="s2">;</span>
+
+    <span class="s3">/** Get retry counter. */</span>
+    <span class="s2">int </span><span class="s1">getRetries()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Deprecated</span>
+  <span class="s2">private final class </span><span class="s1">DispatchCommandOperation </span><span class="s2">extends </span><span class="s1">ViewOperation</span>
+      <span class="s2">implements </span><span class="s1">DispatchCommandViewOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mCommand</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">@Nullable ReadableArray mArgs</span><span class="s2">;</span>
+
+    <span class="s2">private int </span><span class="s1">numRetries = </span><span class="s6">0</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">DispatchCommandOperation(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">command</span><span class="s2">, </span><span class="s1">@Nullable ReadableArray args) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mCommand = command</span><span class="s2">;</span>
+      <span class="s1">mArgs = args</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mNativeViewHierarchyManager.dispatchCommand(mTag</span><span class="s2">, </span><span class="s1">mCommand</span><span class="s2">, </span><span class="s1">mArgs)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Throwable e) {</span>
+        <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+            <span class="s1">TAG</span><span class="s2">, new </span><span class="s1">RuntimeException(</span><span class="s7">&quot;Error dispatching View Command&quot;</span><span class="s2">, </span><span class="s1">e))</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">executeWithExceptions() {</span>
+      <span class="s1">mNativeViewHierarchyManager.dispatchCommand(mTag</span><span class="s2">, </span><span class="s1">mCommand</span><span class="s2">, </span><span class="s1">mArgs)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s1">@UiThread</span>
+    <span class="s2">public void </span><span class="s1">incrementRetries() {</span>
+      <span class="s1">numRetries++</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s1">@UiThread</span>
+    <span class="s2">public int </span><span class="s1">getRetries() {</span>
+      <span class="s2">return </span><span class="s1">numRetries</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">DispatchStringCommandOperation </span><span class="s2">extends </span><span class="s1">ViewOperation</span>
+      <span class="s2">implements </span><span class="s1">DispatchCommandViewOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">String mCommand</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">@Nullable ReadableArray mArgs</span><span class="s2">;</span>
+    <span class="s2">private int </span><span class="s1">numRetries = </span><span class="s6">0</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">DispatchStringCommandOperation(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">String command</span><span class="s2">, </span><span class="s1">@Nullable ReadableArray args) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mCommand = command</span><span class="s2">;</span>
+      <span class="s1">mArgs = args</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mNativeViewHierarchyManager.dispatchCommand(mTag</span><span class="s2">, </span><span class="s1">mCommand</span><span class="s2">, </span><span class="s1">mArgs)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Throwable e) {</span>
+        <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+            <span class="s1">TAG</span><span class="s2">, new </span><span class="s1">RuntimeException(</span><span class="s7">&quot;Error dispatching View Command&quot;</span><span class="s2">, </span><span class="s1">e))</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s1">@UiThread</span>
+    <span class="s2">public void </span><span class="s1">executeWithExceptions() {</span>
+      <span class="s1">mNativeViewHierarchyManager.dispatchCommand(mTag</span><span class="s2">, </span><span class="s1">mCommand</span><span class="s2">, </span><span class="s1">mArgs)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s1">@UiThread</span>
+    <span class="s2">public void </span><span class="s1">incrementRetries() {</span>
+      <span class="s1">numRetries++</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public int </span><span class="s1">getRetries() {</span>
+      <span class="s2">return </span><span class="s1">numRetries</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">ShowPopupMenuOperation </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">ReadableArray mItems</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">Callback mError</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">Callback mSuccess</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">ShowPopupMenuOperation(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">ReadableArray items</span><span class="s2">, </span><span class="s1">Callback error</span><span class="s2">, </span><span class="s1">Callback success) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mItems = items</span><span class="s2">;</span>
+      <span class="s1">mError = error</span><span class="s2">;</span>
+      <span class="s1">mSuccess = success</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.showPopupMenu(mTag</span><span class="s2">, </span><span class="s1">mItems</span><span class="s2">, </span><span class="s1">mSuccess</span><span class="s2">, </span><span class="s1">mError)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">DismissPopupMenuOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.dismissPopupMenu()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** A spec for animation operations (add/remove) */</span>
+  <span class="s2">private abstract static class </span><span class="s1">AnimationOperation </span><span class="s2">implements </span><span class="s1">UIViewOperationQueue.UIOperation {</span>
+
+    <span class="s2">protected final int </span><span class="s1">mAnimationID</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">AnimationOperation(</span><span class="s2">int </span><span class="s1">animationID) {</span>
+      <span class="s1">mAnimationID = animationID</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">SetLayoutAnimationEnabledOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+    <span class="s2">private final boolean </span><span class="s1">mEnabled</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">SetLayoutAnimationEnabledOperation(</span><span class="s2">final boolean </span><span class="s1">enabled) {</span>
+      <span class="s1">mEnabled = enabled</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.setLayoutAnimationEnabled(mEnabled)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">ConfigureLayoutAnimationOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+    <span class="s2">private final </span><span class="s1">ReadableMap mConfig</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">Callback mAnimationComplete</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">ConfigureLayoutAnimationOperation(</span>
+        <span class="s2">final </span><span class="s1">ReadableMap config</span><span class="s2">, final </span><span class="s1">Callback animationComplete) {</span>
+      <span class="s1">mConfig = config</span><span class="s2">;</span>
+      <span class="s1">mAnimationComplete = animationComplete</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.configureLayoutAnimation(mConfig</span><span class="s2">, </span><span class="s1">mAnimationComplete)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">MeasureOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mReactTag</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">Callback mCallback</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">MeasureOperation(</span><span class="s2">final int </span><span class="s1">reactTag</span><span class="s2">, final </span><span class="s1">Callback callback) {</span>
+      <span class="s2">super</span><span class="s1">()</span><span class="s2">;</span>
+      <span class="s1">mReactTag = reactTag</span><span class="s2">;</span>
+      <span class="s1">mCallback = callback</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mNativeViewHierarchyManager.measure(mReactTag</span><span class="s2">, </span><span class="s1">mMeasureBuffer)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(NoSuchNativeViewException e) {</span>
+        <span class="s0">// Invoke with no args to signal failure and to allow JS to clean up the callback</span>
+        <span class="s0">// handle.</span>
+        <span class="s1">mCallback.invoke()</span><span class="s2">;</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">float </span><span class="s1">x = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">0</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">y = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">1</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">width = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">2</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">height = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">3</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s1">mCallback.invoke(</span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">MeasureInWindowOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mReactTag</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">Callback mCallback</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">MeasureInWindowOperation(</span><span class="s2">final int </span><span class="s1">reactTag</span><span class="s2">, final </span><span class="s1">Callback callback) {</span>
+      <span class="s2">super</span><span class="s1">()</span><span class="s2">;</span>
+      <span class="s1">mReactTag = reactTag</span><span class="s2">;</span>
+      <span class="s1">mCallback = callback</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mNativeViewHierarchyManager.measureInWindow(mReactTag</span><span class="s2">, </span><span class="s1">mMeasureBuffer)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(NoSuchNativeViewException e) {</span>
+        <span class="s0">// Invoke with no args to signal failure and to allow JS to clean up the callback</span>
+        <span class="s0">// handle.</span>
+        <span class="s1">mCallback.invoke()</span><span class="s2">;</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">float </span><span class="s1">x = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">0</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">y = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">1</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">width = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">2</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">height = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">3</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s1">mCallback.invoke(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">FindTargetForTouchOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mReactTag</span><span class="s2">;</span>
+    <span class="s2">private final float </span><span class="s1">mTargetX</span><span class="s2">;</span>
+    <span class="s2">private final float </span><span class="s1">mTargetY</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">Callback mCallback</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">FindTargetForTouchOperation(</span>
+        <span class="s2">final int </span><span class="s1">reactTag</span><span class="s2">, final float </span><span class="s1">targetX</span><span class="s2">, final float </span><span class="s1">targetY</span><span class="s2">, final </span><span class="s1">Callback callback) {</span>
+      <span class="s2">super</span><span class="s1">()</span><span class="s2">;</span>
+      <span class="s1">mReactTag = reactTag</span><span class="s2">;</span>
+      <span class="s1">mTargetX = targetX</span><span class="s2">;</span>
+      <span class="s1">mTargetY = targetY</span><span class="s2">;</span>
+      <span class="s1">mCallback = callback</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mNativeViewHierarchyManager.measure(mReactTag</span><span class="s2">, </span><span class="s1">mMeasureBuffer)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(IllegalViewOperationException e) {</span>
+        <span class="s1">mCallback.invoke()</span><span class="s2">;</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Because React coordinates are relative to root container, and measure() operates</span>
+      <span class="s0">// on screen coordinates, we need to offset values using root container location.</span>
+      <span class="s2">final float </span><span class="s1">containerX = (</span><span class="s2">float</span><span class="s1">) mMeasureBuffer[</span><span class="s6">0</span><span class="s1">]</span><span class="s2">;</span>
+      <span class="s2">final float </span><span class="s1">containerY = (</span><span class="s2">float</span><span class="s1">) mMeasureBuffer[</span><span class="s6">1</span><span class="s1">]</span><span class="s2">;</span>
+
+      <span class="s2">final int </span><span class="s1">touchTargetReactTag =</span>
+          <span class="s1">mNativeViewHierarchyManager.findTargetTagForTouch(mReactTag</span><span class="s2">, </span><span class="s1">mTargetX</span><span class="s2">, </span><span class="s1">mTargetY)</span><span class="s2">;</span>
+
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mNativeViewHierarchyManager.measure(touchTargetReactTag</span><span class="s2">, </span><span class="s1">mMeasureBuffer)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(IllegalViewOperationException e) {</span>
+        <span class="s1">mCallback.invoke()</span><span class="s2">;</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">float </span><span class="s1">x = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">0</span><span class="s1">] - containerX)</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">y = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">1</span><span class="s1">] - containerY)</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">width = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">2</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s2">float </span><span class="s1">height = PixelUtil.toDIPFromPixel(mMeasureBuffer[</span><span class="s6">3</span><span class="s1">])</span><span class="s2">;</span>
+      <span class="s1">mCallback.invoke(touchTargetReactTag</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">LayoutUpdateFinishedOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+
+    <span class="s2">private final </span><span class="s1">ReactShadowNode mNode</span><span class="s2">;</span>
+    <span class="s2">private final </span><span class="s1">UIImplementation.LayoutUpdateListener mListener</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">LayoutUpdateFinishedOperation(</span>
+        <span class="s1">ReactShadowNode node</span><span class="s2">, </span><span class="s1">UIImplementation.LayoutUpdateListener listener) {</span>
+      <span class="s1">mNode = node</span><span class="s2">;</span>
+      <span class="s1">mListener = listener</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mListener.onLayoutUpdated(mNode)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">UIBlockOperation </span><span class="s2">implements </span><span class="s1">UIOperation {</span>
+    <span class="s2">private final </span><span class="s1">UIBlock mBlock</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">UIBlockOperation(UIBlock block) {</span>
+      <span class="s1">mBlock = block</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mBlock.execute(mNativeViewHierarchyManager)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final class </span><span class="s1">SendAccessibilityEvent </span><span class="s2">extends </span><span class="s1">ViewOperation {</span>
+
+    <span class="s2">private final int </span><span class="s1">mEventType</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">SendAccessibilityEvent(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">eventType) {</span>
+      <span class="s2">super</span><span class="s1">(tag)</span><span class="s2">;</span>
+      <span class="s1">mEventType = eventType</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">execute() {</span>
+      <span class="s1">mNativeViewHierarchyManager.sendAccessibilityEvent(mTag</span><span class="s2">, </span><span class="s1">mEventType)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final </span><span class="s1">NativeViewHierarchyManager mNativeViewHierarchyManager</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Object mDispatchRunnablesLock = </span><span class="s2">new </span><span class="s1">Object()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Object mNonBatchedOperationsLock = </span><span class="s2">new </span><span class="s1">Object()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">DispatchUIFrameCallback mDispatchUIFrameCallback</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ReactApplicationContext mReactApplicationContext</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">ArrayList&lt;DispatchCommandViewOperation&gt; mViewCommandOperations = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s0">// Only called from the UIManager queue?</span>
+  <span class="s2">private </span><span class="s1">ArrayList&lt;UIOperation&gt; mOperations = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s1">@GuardedBy(</span><span class="s7">&quot;mDispatchRunnablesLock&quot;</span><span class="s1">)</span>
+  <span class="s2">private </span><span class="s1">ArrayList&lt;Runnable&gt; mDispatchUIRunnables = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s1">@GuardedBy(</span><span class="s7">&quot;mNonBatchedOperationsLock&quot;</span><span class="s1">)</span>
+  <span class="s2">private </span><span class="s1">ArrayDeque&lt;UIOperation&gt; mNonBatchedOperations = </span><span class="s2">new </span><span class="s1">ArrayDeque&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">@Nullable NotThreadSafeViewHierarchyUpdateDebugListener mViewHierarchyUpdateDebugListener</span><span class="s2">;</span>
+  <span class="s2">private boolean </span><span class="s1">mIsDispatchUIFrameCallbackEnqueued = </span><span class="s2">false;</span>
+  <span class="s2">private boolean </span><span class="s1">mIsInIllegalUIState = </span><span class="s2">false;</span>
+  <span class="s2">private boolean </span><span class="s1">mIsProfilingNextBatch = </span><span class="s2">false;</span>
+  <span class="s2">private long </span><span class="s1">mNonBatchedExecutionTotalTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchCommitStartTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchCommitEndTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchLayoutTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchDispatchViewUpdatesTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchRunStartTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchRunEndTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchBatchedExecutionTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mProfiledBatchNonBatchedExecutionTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mThreadCpuTime</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mCreateViewCount</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mUpdatePropertiesOperationCount</span><span class="s2">;</span>
+
+  <span class="s2">public </span><span class="s1">UIViewOperationQueue(</span>
+      <span class="s1">ReactApplicationContext reactContext</span><span class="s2">,</span>
+      <span class="s1">NativeViewHierarchyManager nativeViewHierarchyManager</span><span class="s2">,</span>
+      <span class="s2">int </span><span class="s1">minTimeLeftInFrameForNonBatchedOperationMs) {</span>
+    <span class="s1">mNativeViewHierarchyManager = nativeViewHierarchyManager</span><span class="s2">;</span>
+    <span class="s1">mDispatchUIFrameCallback =</span>
+        <span class="s2">new </span><span class="s1">DispatchUIFrameCallback(</span>
+            <span class="s1">reactContext</span><span class="s2">,</span>
+            <span class="s1">minTimeLeftInFrameForNonBatchedOperationMs == -</span><span class="s6">1</span>
+                <span class="s1">? DEFAULT_MIN_TIME_LEFT_IN_FRAME_FOR_NONBATCHED_OPERATION_MS</span>
+                <span class="s1">: minTimeLeftInFrameForNonBatchedOperationMs)</span><span class="s2">;</span>
+    <span class="s1">mReactApplicationContext = reactContext</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/*package*/ </span><span class="s1">NativeViewHierarchyManager getNativeViewHierarchyManager() {</span>
+    <span class="s2">return </span><span class="s1">mNativeViewHierarchyManager</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">setViewHierarchyUpdateDebugListener(</span>
+      <span class="s1">@Nullable NotThreadSafeViewHierarchyUpdateDebugListener listener) {</span>
+    <span class="s1">mViewHierarchyUpdateDebugListener = listener</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">profileNextBatch() {</span>
+    <span class="s1">mIsProfilingNextBatch = </span><span class="s2">true;</span>
+    <span class="s1">mProfiledBatchCommitStartTime = </span><span class="s6">0</span><span class="s2">;</span>
+    <span class="s1">mCreateViewCount = </span><span class="s6">0</span><span class="s2">;</span>
+    <span class="s1">mUpdatePropertiesOperationCount = </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">Map&lt;String</span><span class="s2">, </span><span class="s1">Long&gt; getProfiledBatchPerfCounters() {</span>
+    <span class="s1">Map&lt;String</span><span class="s2">, </span><span class="s1">Long&gt; perfMap = </span><span class="s2">new </span><span class="s1">HashMap&lt;&gt;()</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;CommitStartTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchCommitStartTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;CommitEndTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchCommitEndTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;LayoutTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchLayoutTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;DispatchViewUpdatesTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchDispatchViewUpdatesTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;RunStartTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchRunStartTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;RunEndTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchRunEndTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;BatchedExecutionTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchBatchedExecutionTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;NonBatchedExecutionTime&quot;</span><span class="s2">, </span><span class="s1">mProfiledBatchNonBatchedExecutionTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;NativeModulesThreadCpuTime&quot;</span><span class="s2">, </span><span class="s1">mThreadCpuTime)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;CreateViewCount&quot;</span><span class="s2">, </span><span class="s1">mCreateViewCount)</span><span class="s2">;</span>
+    <span class="s1">perfMap.put(</span><span class="s7">&quot;UpdatePropsCount&quot;</span><span class="s2">, </span><span class="s1">mUpdatePropertiesOperationCount)</span><span class="s2">;</span>
+    <span class="s2">return </span><span class="s1">perfMap</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">isEmpty() {</span>
+    <span class="s2">return </span><span class="s1">mOperations.isEmpty() &amp;&amp; mViewCommandOperations.isEmpty()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addRootView(</span><span class="s2">final int </span><span class="s1">tag</span><span class="s2">, final </span><span class="s1">View rootView) {</span>
+    <span class="s1">mNativeViewHierarchyManager.addRootView(tag</span><span class="s2">, </span><span class="s1">rootView)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Enqueues a UIOperation to be executed in UI thread. This method should only be used by a</span>
+   <span class="s3">* subclass to support UIOperations not provided by UIViewOperationQueue.</span>
+   <span class="s3">*/</span>
+  <span class="s2">protected void </span><span class="s1">enqueueUIOperation(UIOperation operation) {</span>
+    <span class="s1">SoftAssertions.assertNotNull(operation)</span><span class="s2">;</span>
+    <span class="s1">mOperations.add(operation)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueRemoveRootView(</span><span class="s2">int </span><span class="s1">rootViewTag) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">RemoveRootViewOperation(rootViewTag))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueSetJSResponder(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">initialTag</span><span class="s2">, boolean </span><span class="s1">blockNativeResponder) {</span>
+    <span class="s1">mOperations.add(</span>
+        <span class="s2">new </span><span class="s1">ChangeJSResponderOperation(</span>
+            <span class="s1">tag</span><span class="s2">, </span><span class="s1">initialTag</span><span class="s2">, false </span><span class="s0">/*clearResponder*/</span><span class="s2">, </span><span class="s1">blockNativeResponder))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueClearJSResponder() {</span>
+    <span class="s0">// Tag is 0 because JSResponderHandler doesn't need one in order to clear the responder.</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">ChangeJSResponderOperation(</span><span class="s6">0</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, true </span><span class="s0">/*clearResponder*/</span><span class="s2">, false</span><span class="s1">))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Deprecated</span>
+  <span class="s2">public void </span><span class="s1">enqueueDispatchCommand(</span>
+      <span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, int </span><span class="s1">commandId</span><span class="s2">, </span><span class="s1">@Nullable ReadableArray commandArgs) {</span>
+    <span class="s2">final </span><span class="s1">DispatchCommandOperation command =</span>
+        <span class="s2">new </span><span class="s1">DispatchCommandOperation(reactTag</span><span class="s2">, </span><span class="s1">commandId</span><span class="s2">, </span><span class="s1">commandArgs)</span><span class="s2">;</span>
+    <span class="s1">mViewCommandOperations.add(command)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueDispatchCommand(</span>
+      <span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">String commandId</span><span class="s2">, </span><span class="s1">@Nullable ReadableArray commandArgs) {</span>
+    <span class="s2">final </span><span class="s1">DispatchStringCommandOperation command =</span>
+        <span class="s2">new </span><span class="s1">DispatchStringCommandOperation(reactTag</span><span class="s2">, </span><span class="s1">commandId</span><span class="s2">, </span><span class="s1">commandArgs)</span><span class="s2">;</span>
+    <span class="s1">mViewCommandOperations.add(command)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueUpdateExtraData(</span><span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">Object extraData) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">UpdateViewExtraData(reactTag</span><span class="s2">, </span><span class="s1">extraData))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueShowPopupMenu(</span>
+      <span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">ReadableArray items</span><span class="s2">, </span><span class="s1">Callback error</span><span class="s2">, </span><span class="s1">Callback success) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">ShowPopupMenuOperation(reactTag</span><span class="s2">, </span><span class="s1">items</span><span class="s2">, </span><span class="s1">error</span><span class="s2">, </span><span class="s1">success))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueDismissPopupMenu() {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">DismissPopupMenuOperation())</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueCreateView(</span>
+      <span class="s1">ThemedReactContext themedContext</span><span class="s2">,</span>
+      <span class="s2">int </span><span class="s1">viewReactTag</span><span class="s2">,</span>
+      <span class="s1">String viewClassName</span><span class="s2">,</span>
+      <span class="s1">@Nullable ReactStylesDiffMap initialProps) {</span>
+    <span class="s2">synchronized </span><span class="s1">(mNonBatchedOperationsLock) {</span>
+      <span class="s1">mCreateViewCount++</span><span class="s2">;</span>
+      <span class="s1">mNonBatchedOperations.addLast(</span>
+          <span class="s2">new </span><span class="s1">CreateViewOperation(themedContext</span><span class="s2">, </span><span class="s1">viewReactTag</span><span class="s2">, </span><span class="s1">viewClassName</span><span class="s2">, </span><span class="s1">initialProps))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueUpdateInstanceHandle(</span><span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, long </span><span class="s1">instanceHandle) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">UpdateInstanceHandleOperation(reactTag</span><span class="s2">, </span><span class="s1">instanceHandle))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueUpdateProperties(</span><span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">String className</span><span class="s2">, </span><span class="s1">ReactStylesDiffMap props) {</span>
+    <span class="s1">mUpdatePropertiesOperationCount++</span><span class="s2">;</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">UpdatePropertiesOperation(reactTag</span><span class="s2">, </span><span class="s1">props))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueOnLayoutEvent(</span>
+      <span class="s2">int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">screenX</span><span class="s2">, int </span><span class="s1">screenY</span><span class="s2">, int </span><span class="s1">screenWidth</span><span class="s2">, int </span><span class="s1">screenHeight) {</span>
+    <span class="s1">mOperations.add(</span>
+        <span class="s2">new </span><span class="s1">EmitOnLayoutEventOperation(tag</span><span class="s2">, </span><span class="s1">screenX</span><span class="s2">, </span><span class="s1">screenY</span><span class="s2">, </span><span class="s1">screenWidth</span><span class="s2">, </span><span class="s1">screenHeight))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueUpdateLayout(</span>
+      <span class="s2">int </span><span class="s1">parentTag</span><span class="s2">, int </span><span class="s1">reactTag</span><span class="s2">, int </span><span class="s1">x</span><span class="s2">, int </span><span class="s1">y</span><span class="s2">, int </span><span class="s1">width</span><span class="s2">, int </span><span class="s1">height) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">UpdateLayoutOperation(parentTag</span><span class="s2">, </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">width</span><span class="s2">, </span><span class="s1">height))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueManageChildren(</span>
+      <span class="s2">int </span><span class="s1">reactTag</span><span class="s2">,</span>
+      <span class="s1">@Nullable </span><span class="s2">int</span><span class="s1">[] indicesToRemove</span><span class="s2">,</span>
+      <span class="s1">@Nullable ViewAtIndex[] viewsToAdd</span><span class="s2">,</span>
+      <span class="s1">@Nullable </span><span class="s2">int</span><span class="s1">[] tagsToDelete) {</span>
+    <span class="s1">mOperations.add(</span>
+        <span class="s2">new </span><span class="s1">ManageChildrenOperation(reactTag</span><span class="s2">, </span><span class="s1">indicesToRemove</span><span class="s2">, </span><span class="s1">viewsToAdd</span><span class="s2">, </span><span class="s1">tagsToDelete))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueSetChildren(</span><span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">ReadableArray childrenTags) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">SetChildrenOperation(reactTag</span><span class="s2">, </span><span class="s1">childrenTags))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueSetLayoutAnimationEnabled(</span><span class="s2">final boolean </span><span class="s1">enabled) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">SetLayoutAnimationEnabledOperation(enabled))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueConfigureLayoutAnimation(</span>
+      <span class="s2">final </span><span class="s1">ReadableMap config</span><span class="s2">, final </span><span class="s1">Callback onAnimationComplete) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">ConfigureLayoutAnimationOperation(config</span><span class="s2">, </span><span class="s1">onAnimationComplete))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueMeasure(</span><span class="s2">final int </span><span class="s1">reactTag</span><span class="s2">, final </span><span class="s1">Callback callback) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">MeasureOperation(reactTag</span><span class="s2">, </span><span class="s1">callback))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueMeasureInWindow(</span><span class="s2">final int </span><span class="s1">reactTag</span><span class="s2">, final </span><span class="s1">Callback callback) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">MeasureInWindowOperation(reactTag</span><span class="s2">, </span><span class="s1">callback))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueFindTargetForTouch(</span>
+      <span class="s2">final int </span><span class="s1">reactTag</span><span class="s2">, final float </span><span class="s1">targetX</span><span class="s2">, final float </span><span class="s1">targetY</span><span class="s2">, final </span><span class="s1">Callback callback) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">FindTargetForTouchOperation(reactTag</span><span class="s2">, </span><span class="s1">targetX</span><span class="s2">, </span><span class="s1">targetY</span><span class="s2">, </span><span class="s1">callback))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueSendAccessibilityEvent(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, int </span><span class="s1">eventType) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">SendAccessibilityEvent(tag</span><span class="s2">, </span><span class="s1">eventType))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueLayoutUpdateFinished(</span>
+      <span class="s1">ReactShadowNode node</span><span class="s2">, </span><span class="s1">UIImplementation.LayoutUpdateListener listener) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">LayoutUpdateFinishedOperation(node</span><span class="s2">, </span><span class="s1">listener))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueueUIBlock(UIBlock block) {</span>
+    <span class="s1">mOperations.add(</span><span class="s2">new </span><span class="s1">UIBlockOperation(block))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">prependUIBlock(UIBlock block) {</span>
+    <span class="s1">mOperations.add(</span><span class="s6">0</span><span class="s2">, new </span><span class="s1">UIBlockOperation(block))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">dispatchViewUpdates(</span>
+      <span class="s2">final int </span><span class="s1">batchId</span><span class="s2">, final long </span><span class="s1">commitStartTime</span><span class="s2">, final long </span><span class="s1">layoutTime) {</span>
+    <span class="s1">SystraceMessage.beginSection(</span>
+            <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;UIViewOperationQueue.dispatchViewUpdates&quot;</span><span class="s1">)</span>
+        <span class="s1">.arg(</span><span class="s7">&quot;batchId&quot;</span><span class="s2">, </span><span class="s1">batchId)</span>
+        <span class="s1">.flush()</span><span class="s2">;</span>
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s2">final long </span><span class="s1">dispatchViewUpdatesTime = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+      <span class="s2">final long </span><span class="s1">nativeModulesThreadCpuTime = SystemClock.currentThreadTimeMillis()</span><span class="s2">;</span>
+
+      <span class="s0">// Store the current operation queues to dispatch and create new empty ones to continue</span>
+      <span class="s0">// receiving new operations</span>
+      <span class="s2">final </span><span class="s1">ArrayList&lt;DispatchCommandViewOperation&gt; viewCommandOperations</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(!mViewCommandOperations.isEmpty()) {</span>
+        <span class="s1">viewCommandOperations = mViewCommandOperations</span><span class="s2">;</span>
+        <span class="s1">mViewCommandOperations = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">viewCommandOperations = </span><span class="s2">null;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">final </span><span class="s1">ArrayList&lt;UIOperation&gt; batchedOperations</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(!mOperations.isEmpty()) {</span>
+        <span class="s1">batchedOperations = mOperations</span><span class="s2">;</span>
+        <span class="s1">mOperations = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">batchedOperations = </span><span class="s2">null;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">final </span><span class="s1">ArrayDeque&lt;UIOperation&gt; nonBatchedOperations</span><span class="s2">;</span>
+      <span class="s2">synchronized </span><span class="s1">(mNonBatchedOperationsLock) {</span>
+        <span class="s2">if </span><span class="s1">(!mNonBatchedOperations.isEmpty()) {</span>
+          <span class="s1">nonBatchedOperations = mNonBatchedOperations</span><span class="s2">;</span>
+          <span class="s1">mNonBatchedOperations = </span><span class="s2">new </span><span class="s1">ArrayDeque&lt;&gt;()</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+          <span class="s1">nonBatchedOperations = </span><span class="s2">null;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s2">if </span><span class="s1">(mViewHierarchyUpdateDebugListener != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">mViewHierarchyUpdateDebugListener.onViewHierarchyUpdateEnqueued()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">Runnable runOperations =</span>
+          <span class="s2">new </span><span class="s1">Runnable() {</span>
+            <span class="s1">@Override</span>
+            <span class="s2">public void </span><span class="s1">run() {</span>
+              <span class="s1">SystraceMessage.beginSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;DispatchUI&quot;</span><span class="s1">)</span>
+                  <span class="s1">.arg(</span><span class="s7">&quot;BatchId&quot;</span><span class="s2">, </span><span class="s1">batchId)</span>
+                  <span class="s1">.flush()</span><span class="s2">;</span>
+              <span class="s2">try </span><span class="s1">{</span>
+                <span class="s2">long </span><span class="s1">runStartTime = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+
+                <span class="s0">// All ViewCommands should be executed first as a perf optimization.</span>
+                <span class="s0">// This entire block is only executed if there's at least one ViewCommand queued.</span>
+                <span class="s2">if </span><span class="s1">(viewCommandOperations != </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">for </span><span class="s1">(DispatchCommandViewOperation op : viewCommandOperations) {</span>
+                    <span class="s2">try </span><span class="s1">{</span>
+                      <span class="s1">op.executeWithExceptions()</span><span class="s2">;</span>
+                    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RetryableMountingLayerException e) {</span>
+                      <span class="s0">// Catch errors in DispatchCommands. We allow all commands to be retried</span>
+                      <span class="s0">// exactly once, after the current batch of other mountitems. If the second</span>
+                      <span class="s0">// attempt fails, then  we log a soft error. This will still crash only in</span>
+                      <span class="s0">// debug. We do this because it is a ~relatively common pattern to dispatch a</span>
+                      <span class="s0">// command during render, for example, to scroll to the bottom of a ScrollView</span>
+                      <span class="s0">// in render. This dispatches the command before that View is even mounted. By</span>
+                      <span class="s0">// retrying once, we can still dispatch the vast majority of commands faster,</span>
+                      <span class="s0">// avoid errors, and still operate correctly for most commands even when</span>
+                      <span class="s0">// they're executed too soon.</span>
+                      <span class="s2">if </span><span class="s1">(op.getRetries() == </span><span class="s6">0</span><span class="s1">) {</span>
+                        <span class="s1">op.incrementRetries()</span><span class="s2">;</span>
+                        <span class="s1">mViewCommandOperations.add(op)</span><span class="s2">;</span>
+                      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                        <span class="s0">// Retryable exceptions should be logged, but never crash in debug.</span>
+                        <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+                            <span class="s1">TAG</span><span class="s2">, new </span><span class="s1">ReactNoCrashSoftException(e))</span><span class="s2">;</span>
+                      <span class="s1">}</span>
+                    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Throwable e) {</span>
+                      <span class="s0">// Non-retryable exceptions should be logged in prod, and crash in Debug.</span>
+                      <span class="s1">ReactSoftExceptionLogger.logSoftException(TAG</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+                    <span class="s1">}</span>
+                  <span class="s1">}</span>
+                <span class="s1">}</span>
+
+                <span class="s0">// All nonBatchedOperations should be executed before regular operations as</span>
+                <span class="s0">// regular operations may depend on them</span>
+                <span class="s2">if </span><span class="s1">(nonBatchedOperations != </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">for </span><span class="s1">(UIOperation op : nonBatchedOperations) {</span>
+                    <span class="s1">op.execute()</span><span class="s2">;</span>
+                  <span class="s1">}</span>
+                <span class="s1">}</span>
+
+                <span class="s2">if </span><span class="s1">(batchedOperations != </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">for </span><span class="s1">(UIOperation op : batchedOperations) {</span>
+                    <span class="s1">op.execute()</span><span class="s2">;</span>
+                  <span class="s1">}</span>
+                <span class="s1">}</span>
+
+                <span class="s2">if </span><span class="s1">(mIsProfilingNextBatch &amp;&amp; mProfiledBatchCommitStartTime == </span><span class="s6">0</span><span class="s1">) {</span>
+                  <span class="s1">mProfiledBatchCommitStartTime = commitStartTime</span><span class="s2">;</span>
+                  <span class="s1">mProfiledBatchCommitEndTime = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+                  <span class="s1">mProfiledBatchLayoutTime = layoutTime</span><span class="s2">;</span>
+                  <span class="s1">mProfiledBatchDispatchViewUpdatesTime = dispatchViewUpdatesTime</span><span class="s2">;</span>
+                  <span class="s1">mProfiledBatchRunStartTime = runStartTime</span><span class="s2">;</span>
+                  <span class="s1">mProfiledBatchRunEndTime = mProfiledBatchCommitEndTime</span><span class="s2">;</span>
+                  <span class="s1">mThreadCpuTime = nativeModulesThreadCpuTime</span><span class="s2">;</span>
+
+                  <span class="s1">Systrace.beginAsyncSection(</span>
+                      <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+                      <span class="s7">&quot;delayBeforeDispatchViewUpdates&quot;</span><span class="s2">,</span>
+                      <span class="s6">0</span><span class="s2">,</span>
+                      <span class="s1">mProfiledBatchCommitStartTime * </span><span class="s6">1000000</span><span class="s1">)</span><span class="s2">;</span>
+                  <span class="s1">Systrace.endAsyncSection(</span>
+                      <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+                      <span class="s7">&quot;delayBeforeDispatchViewUpdates&quot;</span><span class="s2">,</span>
+                      <span class="s6">0</span><span class="s2">,</span>
+                      <span class="s1">mProfiledBatchDispatchViewUpdatesTime * </span><span class="s6">1000000</span><span class="s1">)</span><span class="s2">;</span>
+                  <span class="s1">Systrace.beginAsyncSection(</span>
+                      <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+                      <span class="s7">&quot;delayBeforeBatchRunStart&quot;</span><span class="s2">,</span>
+                      <span class="s6">0</span><span class="s2">,</span>
+                      <span class="s1">mProfiledBatchDispatchViewUpdatesTime * </span><span class="s6">1000000</span><span class="s1">)</span><span class="s2">;</span>
+                  <span class="s1">Systrace.endAsyncSection(</span>
+                      <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+                      <span class="s7">&quot;delayBeforeBatchRunStart&quot;</span><span class="s2">,</span>
+                      <span class="s6">0</span><span class="s2">,</span>
+                      <span class="s1">mProfiledBatchRunStartTime * </span><span class="s6">1000000</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+
+                <span class="s0">// Clear layout animation, as animation only apply to current UI operations batch.</span>
+                <span class="s1">mNativeViewHierarchyManager.clearLayoutAnimation()</span><span class="s2">;</span>
+
+                <span class="s2">if </span><span class="s1">(mViewHierarchyUpdateDebugListener != </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s1">mViewHierarchyUpdateDebugListener.onViewHierarchyUpdateFinished()</span><span class="s2">;</span>
+                <span class="s1">}</span>
+              <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+                <span class="s1">mIsInIllegalUIState = </span><span class="s2">true;</span>
+                <span class="s2">throw </span><span class="s1">e</span><span class="s2">;</span>
+              <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+                <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span><span class="s2">;</span>
+
+      <span class="s1">SystraceMessage.beginSection(</span>
+              <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;acquiring mDispatchRunnablesLock&quot;</span><span class="s1">)</span>
+          <span class="s1">.arg(</span><span class="s7">&quot;batchId&quot;</span><span class="s2">, </span><span class="s1">batchId)</span>
+          <span class="s1">.flush()</span><span class="s2">;</span>
+      <span class="s2">synchronized </span><span class="s1">(mDispatchRunnablesLock) {</span>
+        <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+        <span class="s1">mDispatchUIRunnables.add(runOperations)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// In the case where the frame callback isn't enqueued, the UI isn't being displayed or is</span>
+      <span class="s0">// being</span>
+      <span class="s0">// destroyed. In this case it's no longer important to align to frames, but it is important to</span>
+      <span class="s0">// make</span>
+      <span class="s0">// sure any late-arriving UI commands are executed.</span>
+      <span class="s2">if </span><span class="s1">(!mIsDispatchUIFrameCallbackEnqueued) {</span>
+        <span class="s1">UiThreadUtil.runOnUiThread(</span>
+            <span class="s2">new </span><span class="s1">GuardedRunnable(mReactApplicationContext) {</span>
+              <span class="s1">@Override</span>
+              <span class="s2">public void </span><span class="s1">runGuarded() {</span>
+                <span class="s1">flushPendingBatches()</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">})</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+      <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* package */ </span><span class="s2">void </span><span class="s1">resumeFrameCallback() {</span>
+    <span class="s1">mIsDispatchUIFrameCallbackEnqueued = </span><span class="s2">true;</span>
+    <span class="s1">ReactChoreographer.getInstance()</span>
+        <span class="s1">.postFrameCallback(ReactChoreographer.CallbackType.DISPATCH_UI</span><span class="s2">, </span><span class="s1">mDispatchUIFrameCallback)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* package */ </span><span class="s2">void </span><span class="s1">pauseFrameCallback() {</span>
+    <span class="s1">mIsDispatchUIFrameCallbackEnqueued = </span><span class="s2">false;</span>
+    <span class="s1">ReactChoreographer.getInstance()</span>
+        <span class="s1">.removeFrameCallback(ReactChoreographer.CallbackType.DISPATCH_UI</span><span class="s2">, </span><span class="s1">mDispatchUIFrameCallback)</span><span class="s2">;</span>
+    <span class="s1">flushPendingBatches()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">flushPendingBatches() {</span>
+    <span class="s2">if </span><span class="s1">(mIsInIllegalUIState) {</span>
+      <span class="s1">FLog.w(</span>
+          <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+          <span class="s7">&quot;Not flushing pending UI operations because of previously thrown Exception&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">final </span><span class="s1">ArrayList&lt;Runnable&gt; runnables</span><span class="s2">;</span>
+    <span class="s2">synchronized </span><span class="s1">(mDispatchRunnablesLock) {</span>
+      <span class="s2">if </span><span class="s1">(!mDispatchUIRunnables.isEmpty()) {</span>
+        <span class="s1">runnables = mDispatchUIRunnables</span><span class="s2">;</span>
+        <span class="s1">mDispatchUIRunnables = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">final long </span><span class="s1">batchedExecutionStartTime = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(Runnable runnable : runnables) {</span>
+      <span class="s1">runnable.run()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(mIsProfilingNextBatch) {</span>
+      <span class="s1">mProfiledBatchBatchedExecutionTime = SystemClock.uptimeMillis() - batchedExecutionStartTime</span><span class="s2">;</span>
+      <span class="s1">mProfiledBatchNonBatchedExecutionTime = mNonBatchedExecutionTotalTime</span><span class="s2">;</span>
+      <span class="s1">mIsProfilingNextBatch = </span><span class="s2">false;</span>
+
+      <span class="s1">Systrace.beginAsyncSection(</span>
+          <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+          <span class="s7">&quot;batchedExecutionTime&quot;</span><span class="s2">,</span>
+          <span class="s6">0</span><span class="s2">,</span>
+          <span class="s1">batchedExecutionStartTime * </span><span class="s6">1000000</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">Systrace.endAsyncSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;batchedExecutionTime&quot;</span><span class="s2">, </span><span class="s6">0</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mNonBatchedExecutionTotalTime = </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Choreographer FrameCallback responsible for actually dispatching view updates on the UI thread</span>
+   <span class="s3">* that were enqueued via {</span><span class="s4">@link </span><span class="s3">#dispatchViewUpdates(int)}. The reason we don't just enqueue</span>
+   <span class="s3">* directly to the UI thread from that method is to make sure our Runnables actually run before</span>
+   <span class="s3">* the next traversals happen:</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">ViewRootImpl#scheduleTraversals (which is called from invalidate, requestLayout, etc) calls</span>
+   <span class="s3">* Looper#postSyncBarrier which keeps any UI thread looper messages from being processed until</span>
+   <span class="s3">* that barrier is removed during the next traversal. That means, depending on when we get updates</span>
+   <span class="s3">* from JS and what else is happening on the UI thread, we can sometimes try to post this runnable</span>
+   <span class="s3">* after ViewRootImpl has posted a barrier.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">Using a Choreographer callback (which runs immediately before traversals), we guarantee we</span>
+   <span class="s3">* run before the next traversal.</span>
+   <span class="s3">*/</span>
+  <span class="s2">private class </span><span class="s1">DispatchUIFrameCallback </span><span class="s2">extends </span><span class="s1">GuardedFrameCallback {</span>
+
+    <span class="s2">private static final int </span><span class="s1">FRAME_TIME_MS = </span><span class="s6">16</span><span class="s2">;</span>
+    <span class="s2">private final int </span><span class="s1">mMinTimeLeftInFrameForNonBatchedOperationMs</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">DispatchUIFrameCallback(</span>
+        <span class="s1">ReactContext reactContext</span><span class="s2">, int </span><span class="s1">minTimeLeftInFrameForNonBatchedOperationMs) {</span>
+      <span class="s2">super</span><span class="s1">(reactContext)</span><span class="s2">;</span>
+      <span class="s1">mMinTimeLeftInFrameForNonBatchedOperationMs = minTimeLeftInFrameForNonBatchedOperationMs</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">doFrameGuarded(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+      <span class="s2">if </span><span class="s1">(mIsInIllegalUIState) {</span>
+        <span class="s1">FLog.w(</span>
+            <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+            <span class="s7">&quot;Not flushing pending UI operations because of previously thrown Exception&quot;</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">Systrace.beginSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;dispatchNonBatchedUIOperations&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">dispatchPendingNonBatchedOperations(frameTimeNanos)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+        <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">flushPendingBatches()</span><span class="s2">;</span>
+
+      <span class="s1">ReactChoreographer.getInstance()</span>
+          <span class="s1">.postFrameCallback(ReactChoreographer.CallbackType.DISPATCH_UI</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">private void </span><span class="s1">dispatchPendingNonBatchedOperations(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+      <span class="s2">while </span><span class="s1">(</span><span class="s2">true</span><span class="s1">) {</span>
+        <span class="s2">long </span><span class="s1">timeLeftInFrame = FRAME_TIME_MS - ((System.nanoTime() - frameTimeNanos) / </span><span class="s6">1000000</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(timeLeftInFrame &lt; mMinTimeLeftInFrameForNonBatchedOperationMs) {</span>
+          <span class="s2">break;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">UIOperation nextOperation</span><span class="s2">;</span>
+        <span class="s2">synchronized </span><span class="s1">(mNonBatchedOperationsLock) {</span>
+          <span class="s2">if </span><span class="s1">(mNonBatchedOperations.isEmpty()) {</span>
+            <span class="s2">break;</span>
+          <span class="s1">}</span>
+
+          <span class="s1">nextOperation = mNonBatchedOperations.pollFirst()</span><span class="s2">;</span>
+        <span class="s1">}</span>
+
+        <span class="s2">try </span><span class="s1">{</span>
+          <span class="s2">long </span><span class="s1">nonBatchedExecutionStartTime = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+          <span class="s1">nextOperation.execute()</span><span class="s2">;</span>
+          <span class="s1">mNonBatchedExecutionTotalTime +=</span>
+              <span class="s1">SystemClock.uptimeMillis() - nonBatchedExecutionStartTime</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+          <span class="s1">mIsInIllegalUIState = </span><span class="s2">true;</span>
+          <span class="s2">throw </span><span class="s1">e</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

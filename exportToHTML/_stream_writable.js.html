@@ -1,0 +1,661 @@
+<html>
+<head>
+<title>_stream_writable.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_stream_writable.js</font>
+</center></td></tr></table>
+<pre><span class="s0">// Copyright Joyent, Inc. and other Node contributors.</span>
+<span class="s0">//</span>
+<span class="s0">// Permission is hereby granted, free of charge, to any person obtaining a</span>
+<span class="s0">// copy of this software and associated documentation files (the</span>
+<span class="s0">// &quot;Software&quot;), to deal in the Software without restriction, including</span>
+<span class="s0">// without limitation the rights to use, copy, modify, merge, publish,</span>
+<span class="s0">// distribute, sublicense, and/or sell copies of the Software, and to permit</span>
+<span class="s0">// persons to whom the Software is furnished to do so, subject to the</span>
+<span class="s0">// following conditions:</span>
+<span class="s0">//</span>
+<span class="s0">// The above copyright notice and this permission notice shall be included</span>
+<span class="s0">// in all copies or substantial portions of the Software.</span>
+<span class="s0">//</span>
+<span class="s0">// THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS</span>
+<span class="s0">// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF</span>
+<span class="s0">// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN</span>
+<span class="s0">// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,</span>
+<span class="s0">// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR</span>
+<span class="s0">// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE</span>
+<span class="s0">// USE OR OTHER DEALINGS IN THE SOFTWARE.</span>
+
+<span class="s0">// A bit simpler than readable streams.</span>
+<span class="s0">// Implement an async ._write(chunk, encoding, cb), and it'll handle all</span>
+<span class="s0">// the drain event emission and buffering.</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">module.exports = Writable;</span>
+
+<span class="s0">/* &lt;replacement&gt; */</span>
+<span class="s3">function </span><span class="s1">WriteReq(chunk, encoding, cb) {</span>
+  <span class="s3">this</span><span class="s1">.chunk = chunk;</span>
+  <span class="s3">this</span><span class="s1">.encoding = encoding;</span>
+  <span class="s3">this</span><span class="s1">.callback = cb;</span>
+  <span class="s3">this</span><span class="s1">.next = </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// It seems a linked list but it is not</span>
+<span class="s0">// there will be only 2 of these for each stream</span>
+<span class="s3">function </span><span class="s1">CorkedRequest(state) {</span>
+  <span class="s3">var </span><span class="s1">_this = </span><span class="s3">this</span><span class="s1">;</span>
+  <span class="s3">this</span><span class="s1">.next = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s3">this</span><span class="s1">.entry = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s3">this</span><span class="s1">.finish = </span><span class="s3">function </span><span class="s1">() {</span>
+    <span class="s1">onCorkedFinish(_this, state);</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+<span class="s0">/* &lt;/replacement&gt; */</span>
+
+<span class="s0">/*&lt;replacement&gt;*/</span>
+<span class="s3">var </span><span class="s1">Duplex;</span>
+<span class="s0">/*&lt;/replacement&gt;*/</span>
+
+<span class="s1">Writable.WritableState = WritableState;</span>
+
+<span class="s0">/*&lt;replacement&gt;*/</span>
+<span class="s3">var </span><span class="s1">internalUtil = {</span>
+  <span class="s1">deprecate: require(</span><span class="s2">'util-deprecate'</span><span class="s1">)</span>
+<span class="s1">};</span>
+<span class="s0">/*&lt;/replacement&gt;*/</span>
+
+<span class="s0">/*&lt;replacement&gt;*/</span>
+<span class="s3">var </span><span class="s1">Stream = require(</span><span class="s2">'./internal/streams/stream'</span><span class="s1">);</span>
+<span class="s0">/*&lt;/replacement&gt;*/</span>
+
+<span class="s3">var </span><span class="s1">Buffer = require(</span><span class="s2">'buffer'</span><span class="s1">).Buffer;</span>
+<span class="s3">var </span><span class="s1">OurUint8Array = (</span><span class="s3">typeof </span><span class="s1">global !== </span><span class="s2">'undefined' </span><span class="s1">? global : </span><span class="s3">typeof </span><span class="s1">window !== </span><span class="s2">'undefined' </span><span class="s1">? window : </span><span class="s3">typeof </span><span class="s1">self !== </span><span class="s2">'undefined' </span><span class="s1">? self : {}).Uint8Array || </span><span class="s3">function </span><span class="s1">() {};</span>
+<span class="s3">function </span><span class="s1">_uint8ArrayToBuffer(chunk) {</span>
+  <span class="s3">return </span><span class="s1">Buffer.from(chunk);</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">_isUint8Array(obj) {</span>
+  <span class="s3">return </span><span class="s1">Buffer.isBuffer(obj) || obj </span><span class="s3">instanceof </span><span class="s1">OurUint8Array;</span>
+<span class="s1">}</span>
+<span class="s3">var </span><span class="s1">destroyImpl = require(</span><span class="s2">'./internal/streams/destroy'</span><span class="s1">);</span>
+<span class="s3">var </span><span class="s1">_require = require(</span><span class="s2">'./internal/streams/state'</span><span class="s1">),</span>
+  <span class="s1">getHighWaterMark = _require.getHighWaterMark;</span>
+<span class="s3">var </span><span class="s1">_require$codes = require(</span><span class="s2">'../errors'</span><span class="s1">).codes,</span>
+  <span class="s1">ERR_INVALID_ARG_TYPE = _require$codes.ERR_INVALID_ARG_TYPE,</span>
+  <span class="s1">ERR_METHOD_NOT_IMPLEMENTED = _require$codes.ERR_METHOD_NOT_IMPLEMENTED,</span>
+  <span class="s1">ERR_MULTIPLE_CALLBACK = _require$codes.ERR_MULTIPLE_CALLBACK,</span>
+  <span class="s1">ERR_STREAM_CANNOT_PIPE = _require$codes.ERR_STREAM_CANNOT_PIPE,</span>
+  <span class="s1">ERR_STREAM_DESTROYED = _require$codes.ERR_STREAM_DESTROYED,</span>
+  <span class="s1">ERR_STREAM_NULL_VALUES = _require$codes.ERR_STREAM_NULL_VALUES,</span>
+  <span class="s1">ERR_STREAM_WRITE_AFTER_END = _require$codes.ERR_STREAM_WRITE_AFTER_END,</span>
+  <span class="s1">ERR_UNKNOWN_ENCODING = _require$codes.ERR_UNKNOWN_ENCODING;</span>
+<span class="s3">var </span><span class="s1">errorOrDestroy = destroyImpl.errorOrDestroy;</span>
+<span class="s1">require(</span><span class="s2">'inherits'</span><span class="s1">)(Writable, Stream);</span>
+<span class="s3">function </span><span class="s1">nop() {}</span>
+<span class="s3">function </span><span class="s1">WritableState(options, stream, isDuplex) {</span>
+  <span class="s1">Duplex = Duplex || require(</span><span class="s2">'./_stream_duplex'</span><span class="s1">);</span>
+  <span class="s1">options = options || {};</span>
+
+  <span class="s0">// Duplex streams are both readable and writable, but share</span>
+  <span class="s0">// the same options object.</span>
+  <span class="s0">// However, some cases require setting options to different</span>
+  <span class="s0">// values for the readable and the writable sides of the duplex stream,</span>
+  <span class="s0">// e.g. options.readableObjectMode vs. options.writableObjectMode, etc.</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">isDuplex !== </span><span class="s2">'boolean'</span><span class="s1">) isDuplex = stream </span><span class="s3">instanceof </span><span class="s1">Duplex;</span>
+
+  <span class="s0">// object stream flag to indicate whether or not this stream</span>
+  <span class="s0">// contains buffers or objects.</span>
+  <span class="s3">this</span><span class="s1">.objectMode = !!options.objectMode;</span>
+  <span class="s3">if </span><span class="s1">(isDuplex) </span><span class="s3">this</span><span class="s1">.objectMode = </span><span class="s3">this</span><span class="s1">.objectMode || !!options.writableObjectMode;</span>
+
+  <span class="s0">// the point at which write() starts returning false</span>
+  <span class="s0">// Note: 0 is a valid value, means that we always return false if</span>
+  <span class="s0">// the entire buffer is not flushed immediately on write()</span>
+  <span class="s3">this</span><span class="s1">.highWaterMark = getHighWaterMark(</span><span class="s3">this</span><span class="s1">, options, </span><span class="s2">'writableHighWaterMark'</span><span class="s1">, isDuplex);</span>
+
+  <span class="s0">// if _final has been called</span>
+  <span class="s3">this</span><span class="s1">.finalCalled = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// drain event flag.</span>
+  <span class="s3">this</span><span class="s1">.needDrain = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s0">// at the start of calling end()</span>
+  <span class="s3">this</span><span class="s1">.ending = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s0">// when end() has been called, and returned</span>
+  <span class="s3">this</span><span class="s1">.ended = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s0">// when 'finish' is emitted</span>
+  <span class="s3">this</span><span class="s1">.finished = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// has it been destroyed</span>
+  <span class="s3">this</span><span class="s1">.destroyed = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// should we decode strings into buffers before passing to _write?</span>
+  <span class="s0">// this is here so that some node-core streams can optimize string</span>
+  <span class="s0">// handling at a lower level.</span>
+  <span class="s3">var </span><span class="s1">noDecode = options.decodeStrings === </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s3">this</span><span class="s1">.decodeStrings = !noDecode;</span>
+
+  <span class="s0">// Crypto is kind of old and crusty.  Historically, its default string</span>
+  <span class="s0">// encoding is 'binary' so we have to make this configurable.</span>
+  <span class="s0">// Everything else in the universe uses 'utf8', though.</span>
+  <span class="s3">this</span><span class="s1">.defaultEncoding = options.defaultEncoding || </span><span class="s2">'utf8'</span><span class="s1">;</span>
+
+  <span class="s0">// not an actual buffer we keep track of, but a measurement</span>
+  <span class="s0">// of how much we're waiting to get pushed to some underlying</span>
+  <span class="s0">// socket or file.</span>
+  <span class="s3">this</span><span class="s1">.length = </span><span class="s4">0</span><span class="s1">;</span>
+
+  <span class="s0">// a flag to see when we're in the middle of a write.</span>
+  <span class="s3">this</span><span class="s1">.writing = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// when true all writes will be buffered until .uncork() call</span>
+  <span class="s3">this</span><span class="s1">.corked = </span><span class="s4">0</span><span class="s1">;</span>
+
+  <span class="s0">// a flag to be able to tell if the onwrite cb is called immediately,</span>
+  <span class="s0">// or on a later tick.  We set this to true at first, because any</span>
+  <span class="s0">// actions that shouldn't happen until &quot;later&quot; should generally also</span>
+  <span class="s0">// not happen before the first write call.</span>
+  <span class="s3">this</span><span class="s1">.sync = </span><span class="s3">true</span><span class="s1">;</span>
+
+  <span class="s0">// a flag to know if we're processing previously buffered items, which</span>
+  <span class="s0">// may call the _write() callback in the same tick, so that we don't</span>
+  <span class="s0">// end up in an overlapped onwrite situation.</span>
+  <span class="s3">this</span><span class="s1">.bufferProcessing = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// the callback that's passed to _write(chunk,cb)</span>
+  <span class="s3">this</span><span class="s1">.onwrite = </span><span class="s3">function </span><span class="s1">(er) {</span>
+    <span class="s1">onwrite(stream, er);</span>
+  <span class="s1">};</span>
+
+  <span class="s0">// the callback that the user supplies to write(chunk,encoding,cb)</span>
+  <span class="s3">this</span><span class="s1">.writecb = </span><span class="s3">null</span><span class="s1">;</span>
+
+  <span class="s0">// the amount that is being written when _write is called.</span>
+  <span class="s3">this</span><span class="s1">.writelen = </span><span class="s4">0</span><span class="s1">;</span>
+  <span class="s3">this</span><span class="s1">.bufferedRequest = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s3">this</span><span class="s1">.lastBufferedRequest = </span><span class="s3">null</span><span class="s1">;</span>
+
+  <span class="s0">// number of pending user-supplied write callbacks</span>
+  <span class="s0">// this must be 0 before 'finish' can be emitted</span>
+  <span class="s3">this</span><span class="s1">.pendingcb = </span><span class="s4">0</span><span class="s1">;</span>
+
+  <span class="s0">// emit prefinish if the only thing we're waiting for is _write cbs</span>
+  <span class="s0">// This is relevant for synchronous Transform streams</span>
+  <span class="s3">this</span><span class="s1">.prefinished = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// True if the error was already emitted and should not be thrown again</span>
+  <span class="s3">this</span><span class="s1">.errorEmitted = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// Should close be emitted on destroy. Defaults to true.</span>
+  <span class="s3">this</span><span class="s1">.emitClose = options.emitClose !== </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s0">// Should .destroy() be called after 'finish' (and potentially 'end')</span>
+  <span class="s3">this</span><span class="s1">.autoDestroy = !!options.autoDestroy;</span>
+
+  <span class="s0">// count buffered requests</span>
+  <span class="s3">this</span><span class="s1">.bufferedRequestCount = </span><span class="s4">0</span><span class="s1">;</span>
+
+  <span class="s0">// allocate the first CorkedRequest, there is always</span>
+  <span class="s0">// one allocated and free to use, and we maintain at most two</span>
+  <span class="s3">this</span><span class="s1">.corkedRequestsFree = </span><span class="s3">new </span><span class="s1">CorkedRequest(</span><span class="s3">this</span><span class="s1">);</span>
+<span class="s1">}</span>
+<span class="s1">WritableState.prototype.getBuffer = </span><span class="s3">function </span><span class="s1">getBuffer() {</span>
+  <span class="s3">var </span><span class="s1">current = </span><span class="s3">this</span><span class="s1">.bufferedRequest;</span>
+  <span class="s3">var </span><span class="s1">out = [];</span>
+  <span class="s3">while </span><span class="s1">(current) {</span>
+    <span class="s1">out.push(current);</span>
+    <span class="s1">current = current.next;</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">out;</span>
+<span class="s1">};</span>
+<span class="s1">(</span><span class="s3">function </span><span class="s1">() {</span>
+  <span class="s3">try </span><span class="s1">{</span>
+    <span class="s1">Object.defineProperty(WritableState.prototype, </span><span class="s2">'buffer'</span><span class="s1">, {</span>
+      <span class="s1">get: internalUtil.deprecate(</span><span class="s3">function </span><span class="s1">writableStateBufferGetter() {</span>
+        <span class="s3">return this</span><span class="s1">.getBuffer();</span>
+      <span class="s1">}, </span><span class="s2">'_writableState.buffer is deprecated. Use _writableState.getBuffer ' </span><span class="s1">+ </span><span class="s2">'instead.'</span><span class="s1">, </span><span class="s2">'DEP0003'</span><span class="s1">)</span>
+    <span class="s1">});</span>
+  <span class="s1">} </span><span class="s3">catch </span><span class="s1">(_) {}</span>
+<span class="s1">})();</span>
+
+<span class="s0">// Test _writableState for inheritance to account for Duplex streams,</span>
+<span class="s0">// whose prototype chain only points to Readable.</span>
+<span class="s3">var </span><span class="s1">realHasInstance;</span>
+<span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">Symbol === </span><span class="s2">'function' </span><span class="s1">&amp;&amp; Symbol.hasInstance &amp;&amp; </span><span class="s3">typeof </span><span class="s1">Function.prototype[Symbol.hasInstance] === </span><span class="s2">'function'</span><span class="s1">) {</span>
+  <span class="s1">realHasInstance = Function.prototype[Symbol.hasInstance];</span>
+  <span class="s1">Object.defineProperty(Writable, Symbol.hasInstance, {</span>
+    <span class="s1">value: </span><span class="s3">function </span><span class="s1">value(object) {</span>
+      <span class="s3">if </span><span class="s1">(realHasInstance.call(</span><span class="s3">this</span><span class="s1">, object)) </span><span class="s3">return true</span><span class="s1">;</span>
+      <span class="s3">if </span><span class="s1">(</span><span class="s3">this </span><span class="s1">!== Writable) </span><span class="s3">return false</span><span class="s1">;</span>
+      <span class="s3">return </span><span class="s1">object &amp;&amp; object._writableState </span><span class="s3">instanceof </span><span class="s1">WritableState;</span>
+    <span class="s1">}</span>
+  <span class="s1">});</span>
+<span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+  <span class="s1">realHasInstance = </span><span class="s3">function </span><span class="s1">realHasInstance(object) {</span>
+    <span class="s3">return </span><span class="s1">object </span><span class="s3">instanceof this</span><span class="s1">;</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">Writable(options) {</span>
+  <span class="s1">Duplex = Duplex || require(</span><span class="s2">'./_stream_duplex'</span><span class="s1">);</span>
+
+  <span class="s0">// Writable ctor is applied to Duplexes, too.</span>
+  <span class="s0">// `realHasInstance` is necessary because using plain `instanceof`</span>
+  <span class="s0">// would return false, as no `_writableState` property is attached.</span>
+
+  <span class="s0">// Trying to use the custom `instanceof` for Writable here will also break the</span>
+  <span class="s0">// Node.js LazyTransform implementation, which has a non-trivial getter for</span>
+  <span class="s0">// `_writableState` that would lead to infinite recursion.</span>
+
+  <span class="s0">// Checking for a Stream.Duplex instance is faster here instead of inside</span>
+  <span class="s0">// the WritableState constructor, at least with V8 6.5</span>
+  <span class="s3">var </span><span class="s1">isDuplex = </span><span class="s3">this instanceof </span><span class="s1">Duplex;</span>
+  <span class="s3">if </span><span class="s1">(!isDuplex &amp;&amp; !realHasInstance.call(Writable, </span><span class="s3">this</span><span class="s1">)) </span><span class="s3">return new </span><span class="s1">Writable(options);</span>
+  <span class="s3">this</span><span class="s1">._writableState = </span><span class="s3">new </span><span class="s1">WritableState(options, </span><span class="s3">this</span><span class="s1">, isDuplex);</span>
+
+  <span class="s0">// legacy.</span>
+  <span class="s3">this</span><span class="s1">.writable = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s3">if </span><span class="s1">(options) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">options.write === </span><span class="s2">'function'</span><span class="s1">) </span><span class="s3">this</span><span class="s1">._write = options.write;</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">options.writev === </span><span class="s2">'function'</span><span class="s1">) </span><span class="s3">this</span><span class="s1">._writev = options.writev;</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">options.destroy === </span><span class="s2">'function'</span><span class="s1">) </span><span class="s3">this</span><span class="s1">._destroy = options.destroy;</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">options.final === </span><span class="s2">'function'</span><span class="s1">) </span><span class="s3">this</span><span class="s1">._final = options.final;</span>
+  <span class="s1">}</span>
+  <span class="s1">Stream.call(</span><span class="s3">this</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">// Otherwise people can pipe Writable streams, which is just wrong.</span>
+<span class="s1">Writable.prototype.pipe = </span><span class="s3">function </span><span class="s1">() {</span>
+  <span class="s1">errorOrDestroy(</span><span class="s3">this</span><span class="s1">, </span><span class="s3">new </span><span class="s1">ERR_STREAM_CANNOT_PIPE());</span>
+<span class="s1">};</span>
+<span class="s3">function </span><span class="s1">writeAfterEnd(stream, cb) {</span>
+  <span class="s3">var </span><span class="s1">er = </span><span class="s3">new </span><span class="s1">ERR_STREAM_WRITE_AFTER_END();</span>
+  <span class="s0">// TODO: defer error events consistently everywhere, not just the cb</span>
+  <span class="s1">errorOrDestroy(stream, er);</span>
+  <span class="s1">process.nextTick(cb, er);</span>
+<span class="s1">}</span>
+
+<span class="s0">// Checks that a user-supplied chunk is valid, especially for the particular</span>
+<span class="s0">// mode the stream is in. Currently this means that `null` is never accepted</span>
+<span class="s0">// and undefined/non-string values are only allowed in object mode.</span>
+<span class="s3">function </span><span class="s1">validChunk(stream, state, chunk, cb) {</span>
+  <span class="s3">var </span><span class="s1">er;</span>
+  <span class="s3">if </span><span class="s1">(chunk === </span><span class="s3">null</span><span class="s1">) {</span>
+    <span class="s1">er = </span><span class="s3">new </span><span class="s1">ERR_STREAM_NULL_VALUES();</span>
+  <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">chunk !== </span><span class="s2">'string' </span><span class="s1">&amp;&amp; !state.objectMode) {</span>
+    <span class="s1">er = </span><span class="s3">new </span><span class="s1">ERR_INVALID_ARG_TYPE(</span><span class="s2">'chunk'</span><span class="s1">, [</span><span class="s2">'string'</span><span class="s1">, </span><span class="s2">'Buffer'</span><span class="s1">], chunk);</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(er) {</span>
+    <span class="s1">errorOrDestroy(stream, er);</span>
+    <span class="s1">process.nextTick(cb, er);</span>
+    <span class="s3">return false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s3">return true</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s1">Writable.prototype.write = </span><span class="s3">function </span><span class="s1">(chunk, encoding, cb) {</span>
+  <span class="s3">var </span><span class="s1">state = </span><span class="s3">this</span><span class="s1">._writableState;</span>
+  <span class="s3">var </span><span class="s1">ret = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s3">var </span><span class="s1">isBuf = !state.objectMode &amp;&amp; _isUint8Array(chunk);</span>
+  <span class="s3">if </span><span class="s1">(isBuf &amp;&amp; !Buffer.isBuffer(chunk)) {</span>
+    <span class="s1">chunk = _uint8ArrayToBuffer(chunk);</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">encoding === </span><span class="s2">'function'</span><span class="s1">) {</span>
+    <span class="s1">cb = encoding;</span>
+    <span class="s1">encoding = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(isBuf) encoding = </span><span class="s2">'buffer'</span><span class="s1">;</span><span class="s3">else if </span><span class="s1">(!encoding) encoding = state.defaultEncoding;</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">cb !== </span><span class="s2">'function'</span><span class="s1">) cb = nop;</span>
+  <span class="s3">if </span><span class="s1">(state.ending) writeAfterEnd(</span><span class="s3">this</span><span class="s1">, cb);</span><span class="s3">else if </span><span class="s1">(isBuf || validChunk(</span><span class="s3">this</span><span class="s1">, state, chunk, cb)) {</span>
+    <span class="s1">state.pendingcb++;</span>
+    <span class="s1">ret = writeOrBuffer(</span><span class="s3">this</span><span class="s1">, state, isBuf, chunk, encoding, cb);</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">ret;</span>
+<span class="s1">};</span>
+<span class="s1">Writable.prototype.cork = </span><span class="s3">function </span><span class="s1">() {</span>
+  <span class="s3">this</span><span class="s1">._writableState.corked++;</span>
+<span class="s1">};</span>
+<span class="s1">Writable.prototype.uncork = </span><span class="s3">function </span><span class="s1">() {</span>
+  <span class="s3">var </span><span class="s1">state = </span><span class="s3">this</span><span class="s1">._writableState;</span>
+  <span class="s3">if </span><span class="s1">(state.corked) {</span>
+    <span class="s1">state.corked--;</span>
+    <span class="s3">if </span><span class="s1">(!state.writing &amp;&amp; !state.corked &amp;&amp; !state.bufferProcessing &amp;&amp; state.bufferedRequest) clearBuffer(</span><span class="s3">this</span><span class="s1">, state);</span>
+  <span class="s1">}</span>
+<span class="s1">};</span>
+<span class="s1">Writable.prototype.setDefaultEncoding = </span><span class="s3">function </span><span class="s1">setDefaultEncoding(encoding) {</span>
+  <span class="s0">// node::ParseEncoding() requires lower case.</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">encoding === </span><span class="s2">'string'</span><span class="s1">) encoding = encoding.toLowerCase();</span>
+  <span class="s3">if </span><span class="s1">(!([</span><span class="s2">'hex'</span><span class="s1">, </span><span class="s2">'utf8'</span><span class="s1">, </span><span class="s2">'utf-8'</span><span class="s1">, </span><span class="s2">'ascii'</span><span class="s1">, </span><span class="s2">'binary'</span><span class="s1">, </span><span class="s2">'base64'</span><span class="s1">, </span><span class="s2">'ucs2'</span><span class="s1">, </span><span class="s2">'ucs-2'</span><span class="s1">, </span><span class="s2">'utf16le'</span><span class="s1">, </span><span class="s2">'utf-16le'</span><span class="s1">, </span><span class="s2">'raw'</span><span class="s1">].indexOf((encoding + </span><span class="s2">''</span><span class="s1">).toLowerCase()) &gt; -</span><span class="s4">1</span><span class="s1">)) </span><span class="s3">throw new </span><span class="s1">ERR_UNKNOWN_ENCODING(encoding);</span>
+  <span class="s3">this</span><span class="s1">._writableState.defaultEncoding = encoding;</span>
+  <span class="s3">return this</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s1">Object.defineProperty(Writable.prototype, </span><span class="s2">'writableBuffer'</span><span class="s1">, {</span>
+  <span class="s0">// making it explicit this property is not enumerable</span>
+  <span class="s0">// because otherwise some prototype manipulation in</span>
+  <span class="s0">// userland will fail</span>
+  <span class="s1">enumerable: </span><span class="s3">false</span><span class="s1">,</span>
+  <span class="s1">get: </span><span class="s3">function </span><span class="s1">get() {</span>
+    <span class="s3">return this</span><span class="s1">._writableState &amp;&amp; </span><span class="s3">this</span><span class="s1">._writableState.getBuffer();</span>
+  <span class="s1">}</span>
+<span class="s1">});</span>
+<span class="s3">function </span><span class="s1">decodeChunk(state, chunk, encoding) {</span>
+  <span class="s3">if </span><span class="s1">(!state.objectMode &amp;&amp; state.decodeStrings !== </span><span class="s3">false </span><span class="s1">&amp;&amp; </span><span class="s3">typeof </span><span class="s1">chunk === </span><span class="s2">'string'</span><span class="s1">) {</span>
+    <span class="s1">chunk = Buffer.from(chunk, encoding);</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">chunk;</span>
+<span class="s1">}</span>
+<span class="s1">Object.defineProperty(Writable.prototype, </span><span class="s2">'writableHighWaterMark'</span><span class="s1">, {</span>
+  <span class="s0">// making it explicit this property is not enumerable</span>
+  <span class="s0">// because otherwise some prototype manipulation in</span>
+  <span class="s0">// userland will fail</span>
+  <span class="s1">enumerable: </span><span class="s3">false</span><span class="s1">,</span>
+  <span class="s1">get: </span><span class="s3">function </span><span class="s1">get() {</span>
+    <span class="s3">return this</span><span class="s1">._writableState.highWaterMark;</span>
+  <span class="s1">}</span>
+<span class="s1">});</span>
+
+<span class="s0">// if we're already writing something, then just put this</span>
+<span class="s0">// in the queue, and wait our turn.  Otherwise, call _write</span>
+<span class="s0">// If we return false, then we need a drain event, so set that flag.</span>
+<span class="s3">function </span><span class="s1">writeOrBuffer(stream, state, isBuf, chunk, encoding, cb) {</span>
+  <span class="s3">if </span><span class="s1">(!isBuf) {</span>
+    <span class="s3">var </span><span class="s1">newChunk = decodeChunk(state, chunk, encoding);</span>
+    <span class="s3">if </span><span class="s1">(chunk !== newChunk) {</span>
+      <span class="s1">isBuf = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">encoding = </span><span class="s2">'buffer'</span><span class="s1">;</span>
+      <span class="s1">chunk = newChunk;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s3">var </span><span class="s1">len = state.objectMode ? </span><span class="s4">1 </span><span class="s1">: chunk.length;</span>
+  <span class="s1">state.length += len;</span>
+  <span class="s3">var </span><span class="s1">ret = state.length &lt; state.highWaterMark;</span>
+  <span class="s0">// we must ensure that previous needDrain will not be reset to false.</span>
+  <span class="s3">if </span><span class="s1">(!ret) state.needDrain = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s3">if </span><span class="s1">(state.writing || state.corked) {</span>
+    <span class="s3">var </span><span class="s1">last = state.lastBufferedRequest;</span>
+    <span class="s1">state.lastBufferedRequest = {</span>
+      <span class="s1">chunk: chunk,</span>
+      <span class="s1">encoding: encoding,</span>
+      <span class="s1">isBuf: isBuf,</span>
+      <span class="s1">callback: cb,</span>
+      <span class="s1">next: </span><span class="s3">null</span>
+    <span class="s1">};</span>
+    <span class="s3">if </span><span class="s1">(last) {</span>
+      <span class="s1">last.next = state.lastBufferedRequest;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">state.bufferedRequest = state.lastBufferedRequest;</span>
+    <span class="s1">}</span>
+    <span class="s1">state.bufferedRequestCount += </span><span class="s4">1</span><span class="s1">;</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s1">doWrite(stream, state, </span><span class="s3">false</span><span class="s1">, len, chunk, encoding, cb);</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">ret;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">doWrite(stream, state, writev, len, chunk, encoding, cb) {</span>
+  <span class="s1">state.writelen = len;</span>
+  <span class="s1">state.writecb = cb;</span>
+  <span class="s1">state.writing = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s1">state.sync = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s3">if </span><span class="s1">(state.destroyed) state.onwrite(</span><span class="s3">new </span><span class="s1">ERR_STREAM_DESTROYED(</span><span class="s2">'write'</span><span class="s1">));</span><span class="s3">else if </span><span class="s1">(writev) stream._writev(chunk, state.onwrite);</span><span class="s3">else </span><span class="s1">stream._write(chunk, encoding, state.onwrite);</span>
+  <span class="s1">state.sync = </span><span class="s3">false</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">onwriteError(stream, state, sync, er, cb) {</span>
+  <span class="s1">--state.pendingcb;</span>
+  <span class="s3">if </span><span class="s1">(sync) {</span>
+    <span class="s0">// defer the callback if we are being called synchronously</span>
+    <span class="s0">// to avoid piling up things on the stack</span>
+    <span class="s1">process.nextTick(cb, er);</span>
+    <span class="s0">// this can emit finish, and it will always happen</span>
+    <span class="s0">// after error</span>
+    <span class="s1">process.nextTick(finishMaybe, stream, state);</span>
+    <span class="s1">stream._writableState.errorEmitted = </span><span class="s3">true</span><span class="s1">;</span>
+    <span class="s1">errorOrDestroy(stream, er);</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s0">// the caller expect this to happen before if</span>
+    <span class="s0">// it is async</span>
+    <span class="s1">cb(er);</span>
+    <span class="s1">stream._writableState.errorEmitted = </span><span class="s3">true</span><span class="s1">;</span>
+    <span class="s1">errorOrDestroy(stream, er);</span>
+    <span class="s0">// this can emit finish, but finish must</span>
+    <span class="s0">// always follow error</span>
+    <span class="s1">finishMaybe(stream, state);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">onwriteStateUpdate(state) {</span>
+  <span class="s1">state.writing = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s1">state.writecb = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">state.length -= state.writelen;</span>
+  <span class="s1">state.writelen = </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">onwrite(stream, er) {</span>
+  <span class="s3">var </span><span class="s1">state = stream._writableState;</span>
+  <span class="s3">var </span><span class="s1">sync = state.sync;</span>
+  <span class="s3">var </span><span class="s1">cb = state.writecb;</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">cb !== </span><span class="s2">'function'</span><span class="s1">) </span><span class="s3">throw new </span><span class="s1">ERR_MULTIPLE_CALLBACK();</span>
+  <span class="s1">onwriteStateUpdate(state);</span>
+  <span class="s3">if </span><span class="s1">(er) onwriteError(stream, state, sync, er, cb);</span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s0">// Check if we're actually ready to finish, but don't emit yet</span>
+    <span class="s3">var </span><span class="s1">finished = needFinish(state) || stream.destroyed;</span>
+    <span class="s3">if </span><span class="s1">(!finished &amp;&amp; !state.corked &amp;&amp; !state.bufferProcessing &amp;&amp; state.bufferedRequest) {</span>
+      <span class="s1">clearBuffer(stream, state);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(sync) {</span>
+      <span class="s1">process.nextTick(afterWrite, stream, state, finished, cb);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">afterWrite(stream, state, finished, cb);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">afterWrite(stream, state, finished, cb) {</span>
+  <span class="s3">if </span><span class="s1">(!finished) onwriteDrain(stream, state);</span>
+  <span class="s1">state.pendingcb--;</span>
+  <span class="s1">cb();</span>
+  <span class="s1">finishMaybe(stream, state);</span>
+<span class="s1">}</span>
+
+<span class="s0">// Must force callback to be called on nextTick, so that we don't</span>
+<span class="s0">// emit 'drain' before the write() consumer gets the 'false' return</span>
+<span class="s0">// value, and has a chance to attach a 'drain' listener.</span>
+<span class="s3">function </span><span class="s1">onwriteDrain(stream, state) {</span>
+  <span class="s3">if </span><span class="s1">(state.length === </span><span class="s4">0 </span><span class="s1">&amp;&amp; state.needDrain) {</span>
+    <span class="s1">state.needDrain = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s1">stream.emit(</span><span class="s2">'drain'</span><span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// if there's something in the buffer waiting, then process it</span>
+<span class="s3">function </span><span class="s1">clearBuffer(stream, state) {</span>
+  <span class="s1">state.bufferProcessing = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s3">var </span><span class="s1">entry = state.bufferedRequest;</span>
+  <span class="s3">if </span><span class="s1">(stream._writev &amp;&amp; entry &amp;&amp; entry.next) {</span>
+    <span class="s0">// Fast case, write everything using _writev()</span>
+    <span class="s3">var </span><span class="s1">l = state.bufferedRequestCount;</span>
+    <span class="s3">var </span><span class="s1">buffer = </span><span class="s3">new </span><span class="s1">Array(l);</span>
+    <span class="s3">var </span><span class="s1">holder = state.corkedRequestsFree;</span>
+    <span class="s1">holder.entry = entry;</span>
+    <span class="s3">var </span><span class="s1">count = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s3">var </span><span class="s1">allBuffers = </span><span class="s3">true</span><span class="s1">;</span>
+    <span class="s3">while </span><span class="s1">(entry) {</span>
+      <span class="s1">buffer[count] = entry;</span>
+      <span class="s3">if </span><span class="s1">(!entry.isBuf) allBuffers = </span><span class="s3">false</span><span class="s1">;</span>
+      <span class="s1">entry = entry.next;</span>
+      <span class="s1">count += </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">buffer.allBuffers = allBuffers;</span>
+    <span class="s1">doWrite(stream, state, </span><span class="s3">true</span><span class="s1">, state.length, buffer, </span><span class="s2">''</span><span class="s1">, holder.finish);</span>
+
+    <span class="s0">// doWrite is almost always async, defer these to save a bit of time</span>
+    <span class="s0">// as the hot path ends with doWrite</span>
+    <span class="s1">state.pendingcb++;</span>
+    <span class="s1">state.lastBufferedRequest = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s3">if </span><span class="s1">(holder.next) {</span>
+      <span class="s1">state.corkedRequestsFree = holder.next;</span>
+      <span class="s1">holder.next = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">state.corkedRequestsFree = </span><span class="s3">new </span><span class="s1">CorkedRequest(state);</span>
+    <span class="s1">}</span>
+    <span class="s1">state.bufferedRequestCount = </span><span class="s4">0</span><span class="s1">;</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s0">// Slow case, write chunks one-by-one</span>
+    <span class="s3">while </span><span class="s1">(entry) {</span>
+      <span class="s3">var </span><span class="s1">chunk = entry.chunk;</span>
+      <span class="s3">var </span><span class="s1">encoding = entry.encoding;</span>
+      <span class="s3">var </span><span class="s1">cb = entry.callback;</span>
+      <span class="s3">var </span><span class="s1">len = state.objectMode ? </span><span class="s4">1 </span><span class="s1">: chunk.length;</span>
+      <span class="s1">doWrite(stream, state, </span><span class="s3">false</span><span class="s1">, len, chunk, encoding, cb);</span>
+      <span class="s1">entry = entry.next;</span>
+      <span class="s1">state.bufferedRequestCount--;</span>
+      <span class="s0">// if we didn't call the onwrite immediately, then</span>
+      <span class="s0">// it means that we need to wait until it does.</span>
+      <span class="s0">// also, that means that the chunk and cb are currently</span>
+      <span class="s0">// being processed, so move the buffer counter past them.</span>
+      <span class="s3">if </span><span class="s1">(state.writing) {</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(entry === </span><span class="s3">null</span><span class="s1">) state.lastBufferedRequest = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">state.bufferedRequest = entry;</span>
+  <span class="s1">state.bufferProcessing = </span><span class="s3">false</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s1">Writable.prototype._write = </span><span class="s3">function </span><span class="s1">(chunk, encoding, cb) {</span>
+  <span class="s1">cb(</span><span class="s3">new </span><span class="s1">ERR_METHOD_NOT_IMPLEMENTED(</span><span class="s2">'_write()'</span><span class="s1">));</span>
+<span class="s1">};</span>
+<span class="s1">Writable.prototype._writev = </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">Writable.prototype.end = </span><span class="s3">function </span><span class="s1">(chunk, encoding, cb) {</span>
+  <span class="s3">var </span><span class="s1">state = </span><span class="s3">this</span><span class="s1">._writableState;</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">chunk === </span><span class="s2">'function'</span><span class="s1">) {</span>
+    <span class="s1">cb = chunk;</span>
+    <span class="s1">chunk = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">encoding = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">encoding === </span><span class="s2">'function'</span><span class="s1">) {</span>
+    <span class="s1">cb = encoding;</span>
+    <span class="s1">encoding = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(chunk !== </span><span class="s3">null </span><span class="s1">&amp;&amp; chunk !== undefined) </span><span class="s3">this</span><span class="s1">.write(chunk, encoding);</span>
+
+  <span class="s0">// .end() fully uncorks</span>
+  <span class="s3">if </span><span class="s1">(state.corked) {</span>
+    <span class="s1">state.corked = </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s3">this</span><span class="s1">.uncork();</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// ignore unnecessary end() calls.</span>
+  <span class="s3">if </span><span class="s1">(!state.ending) endWritable(</span><span class="s3">this</span><span class="s1">, state, cb);</span>
+  <span class="s3">return this</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s1">Object.defineProperty(Writable.prototype, </span><span class="s2">'writableLength'</span><span class="s1">, {</span>
+  <span class="s0">// making it explicit this property is not enumerable</span>
+  <span class="s0">// because otherwise some prototype manipulation in</span>
+  <span class="s0">// userland will fail</span>
+  <span class="s1">enumerable: </span><span class="s3">false</span><span class="s1">,</span>
+  <span class="s1">get: </span><span class="s3">function </span><span class="s1">get() {</span>
+    <span class="s3">return this</span><span class="s1">._writableState.length;</span>
+  <span class="s1">}</span>
+<span class="s1">});</span>
+<span class="s3">function </span><span class="s1">needFinish(state) {</span>
+  <span class="s3">return </span><span class="s1">state.ending &amp;&amp; state.length === </span><span class="s4">0 </span><span class="s1">&amp;&amp; state.bufferedRequest === </span><span class="s3">null </span><span class="s1">&amp;&amp; !state.finished &amp;&amp; !state.writing;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">callFinal(stream, state) {</span>
+  <span class="s1">stream._final(</span><span class="s3">function </span><span class="s1">(err) {</span>
+    <span class="s1">state.pendingcb--;</span>
+    <span class="s3">if </span><span class="s1">(err) {</span>
+      <span class="s1">errorOrDestroy(stream, err);</span>
+    <span class="s1">}</span>
+    <span class="s1">state.prefinished = </span><span class="s3">true</span><span class="s1">;</span>
+    <span class="s1">stream.emit(</span><span class="s2">'prefinish'</span><span class="s1">);</span>
+    <span class="s1">finishMaybe(stream, state);</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">prefinish(stream, state) {</span>
+  <span class="s3">if </span><span class="s1">(!state.prefinished &amp;&amp; !state.finalCalled) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">stream._final === </span><span class="s2">'function' </span><span class="s1">&amp;&amp; !state.destroyed) {</span>
+      <span class="s1">state.pendingcb++;</span>
+      <span class="s1">state.finalCalled = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">process.nextTick(callFinal, stream, state);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">state.prefinished = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">stream.emit(</span><span class="s2">'prefinish'</span><span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">finishMaybe(stream, state) {</span>
+  <span class="s3">var </span><span class="s1">need = needFinish(state);</span>
+  <span class="s3">if </span><span class="s1">(need) {</span>
+    <span class="s1">prefinish(stream, state);</span>
+    <span class="s3">if </span><span class="s1">(state.pendingcb === </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">state.finished = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">stream.emit(</span><span class="s2">'finish'</span><span class="s1">);</span>
+      <span class="s3">if </span><span class="s1">(state.autoDestroy) {</span>
+        <span class="s0">// In case of duplex streams we need a way to detect</span>
+        <span class="s0">// if the readable side is ready for autoDestroy as well</span>
+        <span class="s3">var </span><span class="s1">rState = stream._readableState;</span>
+        <span class="s3">if </span><span class="s1">(!rState || rState.autoDestroy &amp;&amp; rState.endEmitted) {</span>
+          <span class="s1">stream.destroy();</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">need;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">endWritable(stream, state, cb) {</span>
+  <span class="s1">state.ending = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s1">finishMaybe(stream, state);</span>
+  <span class="s3">if </span><span class="s1">(cb) {</span>
+    <span class="s3">if </span><span class="s1">(state.finished) process.nextTick(cb);</span><span class="s3">else </span><span class="s1">stream.once(</span><span class="s2">'finish'</span><span class="s1">, cb);</span>
+  <span class="s1">}</span>
+  <span class="s1">state.ended = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s1">stream.writable = </span><span class="s3">false</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">onCorkedFinish(corkReq, state, err) {</span>
+  <span class="s3">var </span><span class="s1">entry = corkReq.entry;</span>
+  <span class="s1">corkReq.entry = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s3">while </span><span class="s1">(entry) {</span>
+    <span class="s3">var </span><span class="s1">cb = entry.callback;</span>
+    <span class="s1">state.pendingcb--;</span>
+    <span class="s1">cb(err);</span>
+    <span class="s1">entry = entry.next;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// reuse the free corkReq.</span>
+  <span class="s1">state.corkedRequestsFree.next = corkReq;</span>
+<span class="s1">}</span>
+<span class="s1">Object.defineProperty(Writable.prototype, </span><span class="s2">'destroyed'</span><span class="s1">, {</span>
+  <span class="s0">// making it explicit this property is not enumerable</span>
+  <span class="s0">// because otherwise some prototype manipulation in</span>
+  <span class="s0">// userland will fail</span>
+  <span class="s1">enumerable: </span><span class="s3">false</span><span class="s1">,</span>
+  <span class="s1">get: </span><span class="s3">function </span><span class="s1">get() {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._writableState === undefined) {</span>
+      <span class="s3">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">return this</span><span class="s1">._writableState.destroyed;</span>
+  <span class="s1">},</span>
+  <span class="s1">set: </span><span class="s3">function </span><span class="s1">set(value) {</span>
+    <span class="s0">// we ignore the value if the stream</span>
+    <span class="s0">// has not been initialized yet</span>
+    <span class="s3">if </span><span class="s1">(!</span><span class="s3">this</span><span class="s1">._writableState) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// backward compatibility, the user is explicitly</span>
+    <span class="s0">// managing destroyed</span>
+    <span class="s3">this</span><span class="s1">._writableState.destroyed = value;</span>
+  <span class="s1">}</span>
+<span class="s1">});</span>
+<span class="s1">Writable.prototype.destroy = destroyImpl.destroy;</span>
+<span class="s1">Writable.prototype._undestroy = destroyImpl.undestroy;</span>
+<span class="s1">Writable.prototype._destroy = </span><span class="s3">function </span><span class="s1">(err, cb) {</span>
+  <span class="s1">cb(err);</span>
+<span class="s1">};</span></pre>
+</body>
+</html>

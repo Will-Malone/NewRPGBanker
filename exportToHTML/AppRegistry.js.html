@@ -1,0 +1,377 @@
+<html>
+<head>
+<title>AppRegistry.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+AppRegistry.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow 
+ * @format 
+ */</span>
+
+<span class="s1">import type {RootTag} from </span><span class="s2">'../Types/RootTagTypes'</span><span class="s1">;</span>
+<span class="s1">import type {IPerformanceLogger} from </span><span class="s2">'../Utilities/createPerformanceLogger'</span><span class="s1">;</span>
+
+<span class="s1">import BatchedBridge from </span><span class="s2">'../BatchedBridge/BatchedBridge'</span><span class="s1">;</span>
+<span class="s1">import BugReporting from </span><span class="s2">'../BugReporting/BugReporting'</span><span class="s1">;</span>
+<span class="s1">import createPerformanceLogger from </span><span class="s2">'../Utilities/createPerformanceLogger'</span><span class="s1">;</span>
+<span class="s1">import infoLog from </span><span class="s2">'../Utilities/infoLog'</span><span class="s1">;</span>
+<span class="s1">import SceneTracker from </span><span class="s2">'../Utilities/SceneTracker'</span><span class="s1">;</span>
+<span class="s1">import {coerceDisplayMode} from </span><span class="s2">'./DisplayMode'</span><span class="s1">;</span>
+<span class="s1">import HeadlessJsTaskError from </span><span class="s2">'./HeadlessJsTaskError'</span><span class="s1">;</span>
+<span class="s1">import NativeHeadlessJsTaskSupport from </span><span class="s2">'./NativeHeadlessJsTaskSupport'</span><span class="s1">;</span>
+<span class="s1">import renderApplication from </span><span class="s2">'./renderApplication'</span><span class="s1">;</span>
+<span class="s1">import {unmountComponentAtNodeAndRemoveContainer} from </span><span class="s2">'./RendererProxy'</span><span class="s1">;</span>
+<span class="s1">import invariant from </span><span class="s2">'invariant'</span><span class="s1">;</span>
+
+<span class="s1">type Task = (taskData: any) =&gt; Promise&lt;</span><span class="s3">void</span><span class="s1">&gt;;</span>
+<span class="s1">export type TaskProvider = () =&gt; Task;</span>
+<span class="s1">type TaskCanceller = () =&gt; </span><span class="s3">void</span><span class="s1">;</span>
+<span class="s1">type TaskCancelProvider = () =&gt; TaskCanceller;</span>
+
+<span class="s1">export type ComponentProvider = () =&gt; React$ComponentType&lt;any&gt;;</span>
+<span class="s1">export type ComponentProviderInstrumentationHook = (</span>
+  <span class="s1">component: ComponentProvider,</span>
+  <span class="s1">scopedPerformanceLogger: IPerformanceLogger,</span>
+<span class="s1">) =&gt; React$ComponentType&lt;any&gt;;</span>
+<span class="s1">export type AppConfig = {</span>
+  <span class="s1">appKey: string,</span>
+  <span class="s1">component?: ComponentProvider,</span>
+  <span class="s1">run?: Function,</span>
+  <span class="s1">section?: boolean,</span>
+  <span class="s1">...</span>
+<span class="s1">};</span>
+<span class="s1">export type Runnable = {</span>
+  <span class="s1">component?: ComponentProvider,</span>
+  <span class="s1">run: Function,</span>
+  <span class="s1">...</span>
+<span class="s1">};</span>
+<span class="s1">export type Runnables = {[appKey: string]: Runnable, ...};</span>
+<span class="s1">export type Registry = {</span>
+  <span class="s1">sections: Array&lt;string&gt;,</span>
+  <span class="s1">runnables: Runnables,</span>
+  <span class="s1">...</span>
+<span class="s1">};</span>
+<span class="s1">export type WrapperComponentProvider = (</span>
+  <span class="s1">appParameters: any,</span>
+<span class="s1">) =&gt; React$ComponentType&lt;any&gt;;</span>
+
+<span class="s1">const runnables: Runnables = {};</span>
+<span class="s1">let runCount = </span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">const sections: Runnables = {};</span>
+<span class="s1">const taskProviders: Map&lt;string, TaskProvider&gt; = </span><span class="s3">new </span><span class="s1">Map();</span>
+<span class="s1">const taskCancelProviders: Map&lt;string, TaskCancelProvider&gt; = </span><span class="s3">new </span><span class="s1">Map();</span>
+<span class="s1">let componentProviderInstrumentationHook: ComponentProviderInstrumentationHook =</span>
+  <span class="s1">(component: ComponentProvider) =&gt; component();</span>
+
+<span class="s1">let wrapperComponentProvider: ?WrapperComponentProvider;</span>
+<span class="s1">let showArchitectureIndicator = </span><span class="s3">false</span><span class="s1">;</span>
+
+<span class="s0">/** 
+ * `AppRegistry` is the JavaScript entry point to running all React Native apps. 
+ * 
+ * See https://reactnative.dev/docs/appregistry 
+ */</span>
+<span class="s1">const AppRegistry = {</span>
+  <span class="s1">setWrapperComponentProvider(provider: WrapperComponentProvider) {</span>
+    <span class="s1">wrapperComponentProvider = provider;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">enableArchitectureIndicator(enabled: boolean): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">showArchitectureIndicator = enabled;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">registerConfig(config: Array&lt;AppConfig&gt;): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">config.forEach(appConfig =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(appConfig.run) {</span>
+        <span class="s1">AppRegistry.registerRunnable(appConfig.appKey, appConfig.run);</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">invariant(</span>
+          <span class="s1">appConfig.component != </span><span class="s3">null</span><span class="s1">,</span>
+          <span class="s2">'AppRegistry.registerConfig(...): Every config is expected to set ' </span><span class="s1">+</span>
+            <span class="s2">'either `run` or `component`, but `%s` has neither.'</span><span class="s1">,</span>
+          <span class="s1">appConfig.appKey,</span>
+        <span class="s1">);</span>
+        <span class="s1">AppRegistry.registerComponent(</span>
+          <span class="s1">appConfig.appKey,</span>
+          <span class="s1">appConfig.component,</span>
+          <span class="s1">appConfig.section,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Registers an app's root component. 
+   * 
+   * See https://reactnative.dev/docs/appregistry#registercomponent 
+   */</span>
+  <span class="s1">registerComponent(</span>
+    <span class="s1">appKey: string,</span>
+    <span class="s1">componentProvider: ComponentProvider,</span>
+    <span class="s1">section?: boolean,</span>
+  <span class="s1">): string {</span>
+    <span class="s1">let scopedPerformanceLogger = createPerformanceLogger();</span>
+    <span class="s1">runnables[appKey] = {</span>
+      <span class="s1">componentProvider,</span>
+      <span class="s1">run: (appParameters, displayMode) =&gt; {</span>
+        <span class="s1">const concurrentRootEnabled =</span>
+          <span class="s1">appParameters.initialProps?.concurrentRoot ||</span>
+          <span class="s1">appParameters.concurrentRoot;</span>
+        <span class="s1">renderApplication(</span>
+          <span class="s1">componentProviderInstrumentationHook(</span>
+            <span class="s1">componentProvider,</span>
+            <span class="s1">scopedPerformanceLogger,</span>
+          <span class="s1">),</span>
+          <span class="s1">appParameters.initialProps,</span>
+          <span class="s1">appParameters.rootTag,</span>
+          <span class="s1">wrapperComponentProvider &amp;&amp; wrapperComponentProvider(appParameters),</span>
+          <span class="s1">appParameters.fabric,</span>
+          <span class="s1">showArchitectureIndicator,</span>
+          <span class="s1">scopedPerformanceLogger,</span>
+          <span class="s1">appKey === </span><span class="s2">'LogBox'</span><span class="s1">,</span>
+          <span class="s1">appKey,</span>
+          <span class="s1">coerceDisplayMode(displayMode),</span>
+          <span class="s1">concurrentRootEnabled,</span>
+        <span class="s1">);</span>
+      <span class="s1">},</span>
+    <span class="s1">};</span>
+    <span class="s3">if </span><span class="s1">(section) {</span>
+      <span class="s1">sections[appKey] = runnables[appKey];</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">appKey;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">registerRunnable(appKey: string, run: Function): string {</span>
+    <span class="s1">runnables[appKey] = {run};</span>
+    <span class="s3">return </span><span class="s1">appKey;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">registerSection(appKey: string, component: ComponentProvider): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">AppRegistry.registerComponent(appKey, component, </span><span class="s3">true</span><span class="s1">);</span>
+  <span class="s1">},</span>
+
+  <span class="s1">getAppKeys(): Array&lt;string&gt; {</span>
+    <span class="s3">return </span><span class="s1">Object.keys(runnables);</span>
+  <span class="s1">},</span>
+
+  <span class="s1">getSectionKeys(): Array&lt;string&gt; {</span>
+    <span class="s3">return </span><span class="s1">Object.keys(sections);</span>
+  <span class="s1">},</span>
+
+  <span class="s1">getSections(): Runnables {</span>
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s1">...sections,</span>
+    <span class="s1">};</span>
+  <span class="s1">},</span>
+
+  <span class="s1">getRunnable(appKey: string): ?Runnable {</span>
+    <span class="s3">return </span><span class="s1">runnables[appKey];</span>
+  <span class="s1">},</span>
+
+  <span class="s1">getRegistry(): Registry {</span>
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s1">sections: AppRegistry.getSectionKeys(),</span>
+      <span class="s1">runnables: {...runnables},</span>
+    <span class="s1">};</span>
+  <span class="s1">},</span>
+
+  <span class="s1">setComponentProviderInstrumentationHook(</span>
+    <span class="s1">hook: ComponentProviderInstrumentationHook,</span>
+  <span class="s1">) {</span>
+    <span class="s1">componentProviderInstrumentationHook = hook;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Loads the JavaScript bundle and runs the app. 
+   * 
+   * See https://reactnative.dev/docs/appregistry#runapplication 
+   */</span>
+  <span class="s1">runApplication(</span>
+    <span class="s1">appKey: string,</span>
+    <span class="s1">appParameters: any,</span>
+    <span class="s1">displayMode?: number,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">if </span><span class="s1">(appKey !== </span><span class="s2">'LogBox'</span><span class="s1">) {</span>
+      <span class="s1">const logParams = __DEV__</span>
+        <span class="s1">? </span><span class="s2">'&quot; with ' </span><span class="s1">+ JSON.stringify(appParameters)</span>
+        <span class="s1">: </span><span class="s2">''</span><span class="s1">;</span>
+      <span class="s1">const msg = </span><span class="s2">'Running &quot;' </span><span class="s1">+ appKey + logParams;</span>
+      <span class="s1">infoLog(msg);</span>
+      <span class="s1">BugReporting.addSource(</span>
+        <span class="s2">'AppRegistry.runApplication' </span><span class="s1">+ runCount++,</span>
+        <span class="s1">() =&gt; msg,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">runnables[appKey] &amp;&amp; runnables[appKey].run,</span>
+      <span class="s1">`</span><span class="s2">&quot;${appKey}&quot; </span><span class="s1">has not been registered. This can happen </span><span class="s3">if</span><span class="s1">:\n` +</span>
+        <span class="s2">'* Metro (the local dev server) is run from the wrong folder. ' </span><span class="s1">+</span>
+        <span class="s2">'Check if Metro is running, stop it and restart it in the current project.</span><span class="s5">\n</span><span class="s2">' </span><span class="s1">+</span>
+        <span class="s2">&quot;* A module failed to load due to an error and `AppRegistry.registerComponent` wasn't called.&quot;</span><span class="s1">,</span>
+    <span class="s1">);</span>
+
+    <span class="s1">SceneTracker.setActiveScene({name: appKey});</span>
+    <span class="s1">runnables[appKey].run(appParameters, displayMode);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Update initial props for a surface that's already rendered 
+   */</span>
+  <span class="s1">setSurfaceProps(</span>
+    <span class="s1">appKey: string,</span>
+    <span class="s1">appParameters: any,</span>
+    <span class="s1">displayMode?: number,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">if </span><span class="s1">(appKey !== </span><span class="s2">'LogBox'</span><span class="s1">) {</span>
+      <span class="s1">const msg =</span>
+        <span class="s2">'Updating props for Surface &quot;' </span><span class="s1">+</span>
+        <span class="s1">appKey +</span>
+        <span class="s2">'&quot; with ' </span><span class="s1">+</span>
+        <span class="s1">JSON.stringify(appParameters);</span>
+      <span class="s1">infoLog(msg);</span>
+      <span class="s1">BugReporting.addSource(</span>
+        <span class="s2">'AppRegistry.setSurfaceProps' </span><span class="s1">+ runCount++,</span>
+        <span class="s1">() =&gt; msg,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">runnables[appKey] &amp;&amp; runnables[appKey].run,</span>
+      <span class="s1">`</span><span class="s2">&quot;${appKey}&quot; </span><span class="s1">has not been registered. This can happen </span><span class="s3">if</span><span class="s1">:\n` +</span>
+        <span class="s2">'* Metro (the local dev server) is run from the wrong folder. ' </span><span class="s1">+</span>
+        <span class="s2">'Check if Metro is running, stop it and restart it in the current project.</span><span class="s5">\n</span><span class="s2">' </span><span class="s1">+</span>
+        <span class="s2">&quot;* A module failed to load due to an error and `AppRegistry.registerComponent` wasn't called.&quot;</span><span class="s1">,</span>
+    <span class="s1">);</span>
+
+    <span class="s1">runnables[appKey].run(appParameters, displayMode);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Stops an application when a view should be destroyed. 
+   * 
+   * See https://reactnative.dev/docs/appregistry#unmountapplicationcomponentatroottag 
+   */</span>
+  <span class="s1">unmountApplicationComponentAtRootTag(rootTag: RootTag): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">unmountComponentAtNodeAndRemoveContainer(rootTag);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Register a headless task. A headless task is a bit of code that runs without a UI. 
+   * 
+   * See https://reactnative.dev/docs/appregistry#registerheadlesstask 
+   */</span>
+  <span class="s1">registerHeadlessTask(taskKey: string, taskProvider: TaskProvider): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s0">// $FlowFixMe[object-this-reference]</span>
+    <span class="s3">this</span><span class="s1">.registerCancellableHeadlessTask(taskKey, taskProvider, () =&gt; () =&gt; {</span>
+      <span class="s0">/* Cancel is no-op */</span>
+    <span class="s1">});</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Register a cancellable headless task. A headless task is a bit of code that runs without a UI. 
+   * 
+   * See https://reactnative.dev/docs/appregistry#registercancellableheadlesstask 
+   */</span>
+  <span class="s1">registerCancellableHeadlessTask(</span>
+    <span class="s1">taskKey: string,</span>
+    <span class="s1">taskProvider: TaskProvider,</span>
+    <span class="s1">taskCancelProvider: TaskCancelProvider,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">if </span><span class="s1">(taskProviders.has(taskKey)) {</span>
+      <span class="s1">console.warn(</span>
+        <span class="s1">`registerHeadlessTask or registerCancellableHeadlessTask called multiple times </span><span class="s3">for </span><span class="s1">same key </span><span class="s2">'${taskKey}'</span><span class="s1">`,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">taskProviders.set(taskKey, taskProvider);</span>
+    <span class="s1">taskCancelProviders.set(taskKey, taskCancelProvider);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Only called from native code. Starts a headless task. 
+   * 
+   * See https://reactnative.dev/docs/appregistry#startheadlesstask 
+   */</span>
+  <span class="s1">startHeadlessTask(taskId: number, taskKey: string, data: any): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">const taskProvider = taskProviders.get(taskKey);</span>
+    <span class="s3">if </span><span class="s1">(!taskProvider) {</span>
+      <span class="s1">console.warn(`No task registered </span><span class="s3">for </span><span class="s1">key ${taskKey}`);</span>
+      <span class="s3">if </span><span class="s1">(NativeHeadlessJsTaskSupport) {</span>
+        <span class="s1">NativeHeadlessJsTaskSupport.notifyTaskFinished(taskId);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">taskProvider()(data)</span>
+      <span class="s1">.then(() =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(NativeHeadlessJsTaskSupport) {</span>
+          <span class="s1">NativeHeadlessJsTaskSupport.notifyTaskFinished(taskId);</span>
+        <span class="s1">}</span>
+      <span class="s1">})</span>
+      <span class="s1">.</span><span class="s3">catch</span><span class="s1">(reason =&gt; {</span>
+        <span class="s1">console.error(reason);</span>
+
+        <span class="s3">if </span><span class="s1">(</span>
+          <span class="s1">NativeHeadlessJsTaskSupport &amp;&amp;</span>
+          <span class="s1">reason </span><span class="s3">instanceof </span><span class="s1">HeadlessJsTaskError</span>
+        <span class="s1">) {</span>
+          <span class="s0">// $FlowFixMe[unused-promise]</span>
+          <span class="s1">NativeHeadlessJsTaskSupport.notifyTaskRetry(taskId).then(</span>
+            <span class="s1">retryPosted =&gt; {</span>
+              <span class="s3">if </span><span class="s1">(!retryPosted) {</span>
+                <span class="s1">NativeHeadlessJsTaskSupport.notifyTaskFinished(taskId);</span>
+              <span class="s1">}</span>
+            <span class="s1">},</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">});</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Only called from native code. Cancels a headless task. 
+   * 
+   * See https://reactnative.dev/docs/appregistry#cancelheadlesstask 
+   */</span>
+  <span class="s1">cancelHeadlessTask(taskId: number, taskKey: string): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">const taskCancelProvider = taskCancelProviders.get(taskKey);</span>
+    <span class="s3">if </span><span class="s1">(!taskCancelProvider) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(`No task canceller registered </span><span class="s3">for </span><span class="s1">key </span><span class="s2">'${taskKey}'</span><span class="s1">`);</span>
+    <span class="s1">}</span>
+    <span class="s1">taskCancelProvider()();</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+
+<span class="s3">if </span><span class="s1">(!(global.RN$Bridgeless === </span><span class="s3">true</span><span class="s1">)) {</span>
+  <span class="s1">BatchedBridge.registerCallableModule(</span><span class="s2">'AppRegistry'</span><span class="s1">, AppRegistry);</span>
+
+  <span class="s1">AppRegistry.registerComponent(</span><span class="s2">'LogBox'</span><span class="s1">, () =&gt; {</span>
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s3">return </span><span class="s1">require(</span><span class="s2">'../LogBox/LogBoxInspectorContainer'</span><span class="s1">).</span><span class="s3">default</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s3">return function </span><span class="s1">NoOp() {</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+      <span class="s1">};</span>
+    <span class="s1">}</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = AppRegistry;</span>
+</pre>
+</body>
+</html>

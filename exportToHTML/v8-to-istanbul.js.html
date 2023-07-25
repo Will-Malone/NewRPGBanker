@@ -1,0 +1,336 @@
+<html>
+<head>
+<title>v8-to-istanbul.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #6a8759;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+v8-to-istanbul.js</font>
+</center></td></tr></table>
+<pre><span class="s0">const assert = require(</span><span class="s1">'assert'</span><span class="s0">)</span>
+<span class="s0">const convertSourceMap = require(</span><span class="s1">'convert-source-map'</span><span class="s0">)</span>
+<span class="s0">const util = require(</span><span class="s1">'util'</span><span class="s0">)</span>
+<span class="s0">const debuglog = util.debuglog(</span><span class="s1">'c8'</span><span class="s0">)</span>
+<span class="s0">const { dirname, isAbsolute, join, resolve } = require(</span><span class="s1">'path'</span><span class="s0">)</span>
+<span class="s0">const { fileURLToPath } = require(</span><span class="s1">'url'</span><span class="s0">)</span>
+<span class="s0">const CovBranch = require(</span><span class="s1">'./branch'</span><span class="s0">)</span>
+<span class="s0">const CovFunction = require(</span><span class="s1">'./function'</span><span class="s0">)</span>
+<span class="s0">const CovSource = require(</span><span class="s1">'./source'</span><span class="s0">)</span>
+<span class="s0">const { sliceRange } = require(</span><span class="s1">'./range'</span><span class="s0">)</span>
+<span class="s0">const compatError = Error(`requires Node.js ${require(</span><span class="s1">'../package.json'</span><span class="s0">).engines.node}`)</span>
+<span class="s0">let readFile = () =&gt; { </span><span class="s2">throw </span><span class="s0">compatError }</span>
+<span class="s2">try </span><span class="s0">{</span>
+  <span class="s0">readFile = require(</span><span class="s1">'fs'</span><span class="s0">).promises.readFile</span>
+<span class="s0">} </span><span class="s2">catch </span><span class="s0">(_err) {</span>
+  <span class="s3">// most likely we're on an older version of Node.js.</span>
+<span class="s0">}</span>
+<span class="s0">const { TraceMap } = require(</span><span class="s1">'@jridgewell/trace-mapping'</span><span class="s0">)</span>
+<span class="s0">const isOlderNode10 = /^v10\.(([</span><span class="s4">0</span><span class="s0">-</span><span class="s4">9</span><span class="s0">]\.)|(</span><span class="s4">1</span><span class="s0">[</span><span class="s4">0</span><span class="s0">-</span><span class="s4">5</span><span class="s0">]\.))/u.test(process.version)</span>
+<span class="s0">const isNode8 = /^v8\./.test(process.version)</span>
+
+<span class="s3">// Injected when Node.js is loading script into isolate pre Node 10.16.x.</span>
+<span class="s3">// see: https://github.com/nodejs/node/pull/21573.</span>
+<span class="s0">const cjsWrapperLength = isOlderNode10 ? require(</span><span class="s1">'module'</span><span class="s0">).wrapper[</span><span class="s4">0</span><span class="s0">].length : </span><span class="s4">0</span>
+
+<span class="s0">module.exports = class V8ToIstanbul {</span>
+  <span class="s0">constructor (scriptPath, wrapperLength, sources, excludePath) {</span>
+    <span class="s0">assert(</span><span class="s2">typeof </span><span class="s0">scriptPath === </span><span class="s1">'string'</span><span class="s0">, </span><span class="s1">'scriptPath must be a string'</span><span class="s0">)</span>
+    <span class="s0">assert(!isNode8, </span><span class="s1">'This module does not support node 8 or lower, please upgrade to node 10'</span><span class="s0">)</span>
+    <span class="s2">this</span><span class="s0">.path = parsePath(scriptPath)</span>
+    <span class="s2">this</span><span class="s0">.wrapperLength = wrapperLength === undefined ? cjsWrapperLength : wrapperLength</span>
+    <span class="s2">this</span><span class="s0">.excludePath = excludePath || (() =&gt; </span><span class="s2">false</span><span class="s0">)</span>
+    <span class="s2">this</span><span class="s0">.sources = sources || {}</span>
+    <span class="s2">this</span><span class="s0">.generatedLines = []</span>
+    <span class="s2">this</span><span class="s0">.branches = {}</span>
+    <span class="s2">this</span><span class="s0">.functions = {}</span>
+    <span class="s2">this</span><span class="s0">.covSources = []</span>
+    <span class="s2">this</span><span class="s0">.rawSourceMap = undefined</span>
+    <span class="s2">this</span><span class="s0">.sourceMap = undefined</span>
+    <span class="s2">this</span><span class="s0">.sourceTranspiled = undefined</span>
+    <span class="s3">// Indicate that this report was generated with placeholder data from</span>
+    <span class="s3">// running --all:</span>
+    <span class="s2">this</span><span class="s0">.all = </span><span class="s2">false</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async load () {</span>
+    <span class="s0">const rawSource = </span><span class="s2">this</span><span class="s0">.sources.source || await readFile(</span><span class="s2">this</span><span class="s0">.path, </span><span class="s1">'utf8'</span><span class="s0">)</span>
+    <span class="s2">this</span><span class="s0">.rawSourceMap = </span><span class="s2">this</span><span class="s0">.sources.sourceMap ||</span>
+      <span class="s3">// if we find a source-map (either inline, or a .map file) we load</span>
+      <span class="s3">// both the transpiled and original source, both of which are used during</span>
+      <span class="s3">// the backflips we perform to remap absolute to relative positions.</span>
+      <span class="s0">convertSourceMap.fromSource(rawSource) || convertSourceMap.fromMapFileSource(rawSource, dirname(</span><span class="s2">this</span><span class="s0">.path))</span>
+
+    <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.rawSourceMap) {</span>
+      <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.rawSourceMap.sourcemap.sources.length &gt; </span><span class="s4">1</span><span class="s0">) {</span>
+        <span class="s2">this</span><span class="s0">.sourceMap = </span><span class="s2">new </span><span class="s0">TraceMap(</span><span class="s2">this</span><span class="s0">.rawSourceMap.sourcemap)</span>
+        <span class="s2">if </span><span class="s0">(!</span><span class="s2">this</span><span class="s0">.sourceMap.sourcesContent) {</span>
+          <span class="s2">this</span><span class="s0">.sourceMap.sourcesContent = await </span><span class="s2">this</span><span class="s0">.sourcesContentFromSources()</span>
+        <span class="s0">}</span>
+        <span class="s2">this</span><span class="s0">.covSources = </span><span class="s2">this</span><span class="s0">.sourceMap.sourcesContent.map((rawSource, i) =&gt; ({ source: </span><span class="s2">new </span><span class="s0">CovSource(rawSource, </span><span class="s2">this</span><span class="s0">.wrapperLength), path: </span><span class="s2">this</span><span class="s0">.sourceMap.sources[i] }))</span>
+        <span class="s2">this</span><span class="s0">.sourceTranspiled = </span><span class="s2">new </span><span class="s0">CovSource(rawSource, </span><span class="s2">this</span><span class="s0">.wrapperLength)</span>
+      <span class="s0">} </span><span class="s2">else </span><span class="s0">{</span>
+        <span class="s0">const candidatePath = </span><span class="s2">this</span><span class="s0">.rawSourceMap.sourcemap.sources.length &gt;= </span><span class="s4">1 </span><span class="s0">? </span><span class="s2">this</span><span class="s0">.rawSourceMap.sourcemap.sources[</span><span class="s4">0</span><span class="s0">] : </span><span class="s2">this</span><span class="s0">.rawSourceMap.sourcemap.file</span>
+        <span class="s2">this</span><span class="s0">.path = </span><span class="s2">this</span><span class="s0">._resolveSource(</span><span class="s2">this</span><span class="s0">.rawSourceMap, candidatePath || </span><span class="s2">this</span><span class="s0">.path)</span>
+        <span class="s2">this</span><span class="s0">.sourceMap = </span><span class="s2">new </span><span class="s0">TraceMap(</span><span class="s2">this</span><span class="s0">.rawSourceMap.sourcemap)</span>
+
+        <span class="s0">let originalRawSource</span>
+        <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.sources.sourceMap &amp;&amp; </span><span class="s2">this</span><span class="s0">.sources.sourceMap.sourcemap &amp;&amp; </span><span class="s2">this</span><span class="s0">.sources.sourceMap.sourcemap.sourcesContent &amp;&amp; </span><span class="s2">this</span><span class="s0">.sources.sourceMap.sourcemap.sourcesContent.length === </span><span class="s4">1</span><span class="s0">) {</span>
+          <span class="s3">// If the sourcesContent field has been provided, return it rather than attempting</span>
+          <span class="s3">// to load the original source from disk.</span>
+          <span class="s3">// TODO: investigate whether there's ever a case where we hit this logic with 1:many sources.</span>
+          <span class="s0">originalRawSource = </span><span class="s2">this</span><span class="s0">.sources.sourceMap.sourcemap.sourcesContent[</span><span class="s4">0</span><span class="s0">]</span>
+        <span class="s0">} </span><span class="s2">else if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.sources.originalSource) {</span>
+          <span class="s3">// Original source may be populated on the sources object.</span>
+          <span class="s0">originalRawSource = </span><span class="s2">this</span><span class="s0">.sources.originalSource</span>
+        <span class="s0">} </span><span class="s2">else if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.sourceMap.sourcesContent &amp;&amp; </span><span class="s2">this</span><span class="s0">.sourceMap.sourcesContent[</span><span class="s4">0</span><span class="s0">]) {</span>
+          <span class="s3">// perhaps we loaded sourcesContent was populated by an inline source map, or .map file?</span>
+          <span class="s3">// TODO: investigate whether there's ever a case where we hit this logic with 1:many sources.</span>
+          <span class="s0">originalRawSource = </span><span class="s2">this</span><span class="s0">.sourceMap.sourcesContent[</span><span class="s4">0</span><span class="s0">]</span>
+        <span class="s0">} </span><span class="s2">else </span><span class="s0">{</span>
+          <span class="s3">// We fallback to reading the original source from disk.</span>
+          <span class="s0">originalRawSource = await readFile(</span><span class="s2">this</span><span class="s0">.path, </span><span class="s1">'utf8'</span><span class="s0">)</span>
+        <span class="s0">}</span>
+        <span class="s2">this</span><span class="s0">.covSources = [{ source: </span><span class="s2">new </span><span class="s0">CovSource(originalRawSource, </span><span class="s2">this</span><span class="s0">.wrapperLength), path: </span><span class="s2">this</span><span class="s0">.path }]</span>
+        <span class="s2">this</span><span class="s0">.sourceTranspiled = </span><span class="s2">new </span><span class="s0">CovSource(rawSource, </span><span class="s2">this</span><span class="s0">.wrapperLength)</span>
+      <span class="s0">}</span>
+    <span class="s0">} </span><span class="s2">else </span><span class="s0">{</span>
+      <span class="s2">this</span><span class="s0">.covSources = [{ source: </span><span class="s2">new </span><span class="s0">CovSource(rawSource, </span><span class="s2">this</span><span class="s0">.wrapperLength), path: </span><span class="s2">this</span><span class="s0">.path }]</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async sourcesContentFromSources () {</span>
+    <span class="s0">const fileList = </span><span class="s2">this</span><span class="s0">.sourceMap.sources.map(relativePath =&gt; {</span>
+      <span class="s0">const realPath = </span><span class="s2">this</span><span class="s0">._resolveSource(</span><span class="s2">this</span><span class="s0">.rawSourceMap, relativePath)</span>
+      <span class="s2">return </span><span class="s0">readFile(realPath, </span><span class="s1">'utf-8'</span><span class="s0">)</span>
+        <span class="s0">.then(result =&gt; result)</span>
+        <span class="s0">.</span><span class="s2">catch</span><span class="s0">(err =&gt; {</span>
+          <span class="s0">debuglog(`failed to load ${realPath}: ${err.message}`)</span>
+        <span class="s0">})</span>
+    <span class="s0">})</span>
+    <span class="s2">return </span><span class="s0">await Promise.all(fileList)</span>
+  <span class="s0">}</span>
+
+  <span class="s0">destroy () {</span>
+    <span class="s3">// no longer necessary, but preserved for backwards compatibility.</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_resolveSource (rawSourceMap, sourcePath) {</span>
+    <span class="s2">if </span><span class="s0">(sourcePath.startsWith(</span><span class="s1">'file://'</span><span class="s0">)) {</span>
+      <span class="s2">return </span><span class="s0">fileURLToPath(sourcePath)</span>
+    <span class="s0">}</span>
+    <span class="s0">sourcePath = sourcePath.replace(/^webpack:\/\</span><span class="s3">//, '')</span>
+    <span class="s0">const sourceRoot = rawSourceMap.sourcemap.sourceRoot ? rawSourceMap.sourcemap.sourceRoot.replace(</span><span class="s1">'file://'</span><span class="s0">, </span><span class="s1">''</span><span class="s0">) : </span><span class="s1">''</span>
+    <span class="s0">const candidatePath = join(sourceRoot, sourcePath)</span>
+
+    <span class="s2">if </span><span class="s0">(isAbsolute(candidatePath)) {</span>
+      <span class="s2">return </span><span class="s0">candidatePath</span>
+    <span class="s0">} </span><span class="s2">else </span><span class="s0">{</span>
+      <span class="s2">return </span><span class="s0">resolve(dirname(</span><span class="s2">this</span><span class="s0">.path), candidatePath)</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">applyCoverage (blocks) {</span>
+    <span class="s0">blocks.forEach(block =&gt; {</span>
+      <span class="s0">block.ranges.forEach((range, i) =&gt; {</span>
+        <span class="s0">const { startCol, endCol, path, covSource } = </span><span class="s2">this</span><span class="s0">._maybeRemapStartColEndCol(range)</span>
+        <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.excludePath(path)) {</span>
+          <span class="s2">return</span>
+        <span class="s0">}</span>
+        <span class="s0">let lines</span>
+        <span class="s2">if </span><span class="s0">(block.functionName === </span><span class="s1">'(empty-report)'</span><span class="s0">) {</span>
+          <span class="s3">// (empty-report), this will result in a report that has all lines zeroed out.</span>
+          <span class="s0">lines = covSource.lines.filter((line) =&gt; {</span>
+            <span class="s0">line.count = </span><span class="s4">0</span>
+            <span class="s2">return true</span>
+          <span class="s0">})</span>
+          <span class="s2">this</span><span class="s0">.all = lines.length &gt; </span><span class="s4">0</span>
+        <span class="s0">} </span><span class="s2">else </span><span class="s0">{</span>
+          <span class="s0">lines = sliceRange(covSource.lines, startCol, endCol)</span>
+        <span class="s0">}</span>
+        <span class="s2">if </span><span class="s0">(!lines.length) {</span>
+          <span class="s2">return</span>
+        <span class="s0">}</span>
+
+        <span class="s0">const startLineInstance = lines[</span><span class="s4">0</span><span class="s0">]</span>
+        <span class="s0">const endLineInstance = lines[lines.length - </span><span class="s4">1</span><span class="s0">]</span>
+
+        <span class="s2">if </span><span class="s0">(block.isBlockCoverage) {</span>
+          <span class="s2">this</span><span class="s0">.branches[path] = </span><span class="s2">this</span><span class="s0">.branches[path] || []</span>
+          <span class="s3">// record branches.</span>
+          <span class="s2">this</span><span class="s0">.branches[path].push(</span><span class="s2">new </span><span class="s0">CovBranch(</span>
+            <span class="s0">startLineInstance.line,</span>
+            <span class="s0">startCol - startLineInstance.startCol,</span>
+            <span class="s0">endLineInstance.line,</span>
+            <span class="s0">endCol - endLineInstance.startCol,</span>
+            <span class="s0">range.count</span>
+          <span class="s0">))</span>
+
+          <span class="s3">// if block-level granularity is enabled, we still create a single</span>
+          <span class="s3">// CovFunction tracking object for each set of ranges.</span>
+          <span class="s2">if </span><span class="s0">(block.functionName &amp;&amp; i === </span><span class="s4">0</span><span class="s0">) {</span>
+            <span class="s2">this</span><span class="s0">.functions[path] = </span><span class="s2">this</span><span class="s0">.functions[path] || []</span>
+            <span class="s2">this</span><span class="s0">.functions[path].push(</span><span class="s2">new </span><span class="s0">CovFunction(</span>
+              <span class="s0">block.functionName,</span>
+              <span class="s0">startLineInstance.line,</span>
+              <span class="s0">startCol - startLineInstance.startCol,</span>
+              <span class="s0">endLineInstance.line,</span>
+              <span class="s0">endCol - endLineInstance.startCol,</span>
+              <span class="s0">range.count</span>
+            <span class="s0">))</span>
+          <span class="s0">}</span>
+        <span class="s0">} </span><span class="s2">else if </span><span class="s0">(block.functionName) {</span>
+          <span class="s2">this</span><span class="s0">.functions[path] = </span><span class="s2">this</span><span class="s0">.functions[path] || []</span>
+          <span class="s3">// record functions.</span>
+          <span class="s2">this</span><span class="s0">.functions[path].push(</span><span class="s2">new </span><span class="s0">CovFunction(</span>
+            <span class="s0">block.functionName,</span>
+            <span class="s0">startLineInstance.line,</span>
+            <span class="s0">startCol - startLineInstance.startCol,</span>
+            <span class="s0">endLineInstance.line,</span>
+            <span class="s0">endCol - endLineInstance.startCol,</span>
+            <span class="s0">range.count</span>
+          <span class="s0">))</span>
+        <span class="s0">}</span>
+
+        <span class="s3">// record the lines (we record these as statements, such that we're</span>
+        <span class="s3">// compatible with Istanbul 2.0).</span>
+        <span class="s0">lines.forEach(line =&gt; {</span>
+          <span class="s3">// make sure branch spans entire line; don't record 'goodbye'</span>
+          <span class="s3">// branch in `const foo = true ? 'hello' : 'goodbye'` as a</span>
+          <span class="s3">// 0 for line coverage.</span>
+          <span class="s3">//</span>
+          <span class="s3">// All lines start out with coverage of 1, and are later set to 0</span>
+          <span class="s3">// if they are not invoked; line.ignore prevents a line from being</span>
+          <span class="s3">// set to 0, and is set if the special comment /* c8 ignore next */</span>
+          <span class="s3">// is used.</span>
+
+          <span class="s2">if </span><span class="s0">(startCol &lt;= line.startCol &amp;&amp; endCol &gt;= line.endCol &amp;&amp; !line.ignore) {</span>
+            <span class="s0">line.count = range.count</span>
+          <span class="s0">}</span>
+        <span class="s0">})</span>
+      <span class="s0">})</span>
+    <span class="s0">})</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_maybeRemapStartColEndCol (range) {</span>
+    <span class="s0">let covSource = </span><span class="s2">this</span><span class="s0">.covSources[</span><span class="s4">0</span><span class="s0">].source</span>
+    <span class="s0">let startCol = Math.max(</span><span class="s4">0</span><span class="s0">, range.startOffset - covSource.wrapperLength)</span>
+    <span class="s0">let endCol = Math.min(covSource.eof, range.endOffset - covSource.wrapperLength)</span>
+    <span class="s0">let path = </span><span class="s2">this</span><span class="s0">.path</span>
+
+    <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.sourceMap) {</span>
+      <span class="s0">startCol = Math.max(</span><span class="s4">0</span><span class="s0">, range.startOffset - </span><span class="s2">this</span><span class="s0">.sourceTranspiled.wrapperLength)</span>
+      <span class="s0">endCol = Math.min(</span><span class="s2">this</span><span class="s0">.sourceTranspiled.eof, range.endOffset - </span><span class="s2">this</span><span class="s0">.sourceTranspiled.wrapperLength)</span>
+
+      <span class="s0">const { startLine, relStartCol, endLine, relEndCol, source } = </span><span class="s2">this</span><span class="s0">.sourceTranspiled.offsetToOriginalRelative(</span>
+        <span class="s2">this</span><span class="s0">.sourceMap,</span>
+        <span class="s0">startCol,</span>
+        <span class="s0">endCol</span>
+      <span class="s0">)</span>
+
+      <span class="s0">const matchingSource = </span><span class="s2">this</span><span class="s0">.covSources.find(covSource =&gt; covSource.path === source)</span>
+      <span class="s0">covSource = matchingSource ? matchingSource.source : </span><span class="s2">this</span><span class="s0">.covSources[</span><span class="s4">0</span><span class="s0">].source</span>
+      <span class="s0">path = matchingSource ? matchingSource.path : </span><span class="s2">this</span><span class="s0">.covSources[</span><span class="s4">0</span><span class="s0">].path</span>
+
+      <span class="s3">// next we convert these relative positions back to absolute positions</span>
+      <span class="s3">// in the original source (which is the format expected in the next step).</span>
+      <span class="s0">startCol = covSource.relativeToOffset(startLine, relStartCol)</span>
+      <span class="s0">endCol = covSource.relativeToOffset(endLine, relEndCol)</span>
+    <span class="s0">}</span>
+
+    <span class="s2">return </span><span class="s0">{</span>
+      <span class="s0">path,</span>
+      <span class="s0">covSource,</span>
+      <span class="s0">startCol,</span>
+      <span class="s0">endCol</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getInnerIstanbul (source, path) {</span>
+    <span class="s3">// We apply the &quot;Resolving Sources&quot; logic (as defined in</span>
+    <span class="s3">// sourcemaps.info/spec.html) as a final step for 1:many source maps.</span>
+    <span class="s3">// for 1:1 source maps, the resolve logic is applied while loading.</span>
+    <span class="s3">//</span>
+    <span class="s3">// TODO: could we move the resolving logic for 1:1 source maps to the final</span>
+    <span class="s3">// step as well? currently this breaks some tests in c8.</span>
+    <span class="s0">let resolvedPath = path</span>
+    <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.rawSourceMap &amp;&amp; </span><span class="s2">this</span><span class="s0">.rawSourceMap.sourcemap.sources.length &gt; </span><span class="s4">1</span><span class="s0">) {</span>
+      <span class="s0">resolvedPath = </span><span class="s2">this</span><span class="s0">._resolveSource(</span><span class="s2">this</span><span class="s0">.rawSourceMap, path)</span>
+    <span class="s0">}</span>
+
+    <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.excludePath(resolvedPath)) {</span>
+      <span class="s2">return</span>
+    <span class="s0">}</span>
+
+    <span class="s2">return </span><span class="s0">{</span>
+      <span class="s0">[resolvedPath]: {</span>
+        <span class="s0">path: resolvedPath,</span>
+        <span class="s0">all: </span><span class="s2">this</span><span class="s0">.all,</span>
+        <span class="s0">...</span><span class="s2">this</span><span class="s0">._statementsToIstanbul(source, path),</span>
+        <span class="s0">...</span><span class="s2">this</span><span class="s0">._branchesToIstanbul(source, path),</span>
+        <span class="s0">...</span><span class="s2">this</span><span class="s0">._functionsToIstanbul(source, path)</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">toIstanbul () {</span>
+    <span class="s2">return this</span><span class="s0">.covSources.reduce((istanbulOuter, { source, path }) =&gt; Object.assign(istanbulOuter, </span><span class="s2">this</span><span class="s0">.getInnerIstanbul(source, path)), {})</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_statementsToIstanbul (source, path) {</span>
+    <span class="s0">const statements = {</span>
+      <span class="s0">statementMap: {},</span>
+      <span class="s0">s: {}</span>
+    <span class="s0">}</span>
+    <span class="s0">source.lines.forEach((line, index) =&gt; {</span>
+      <span class="s0">statements.statementMap[`${index}`] = line.toIstanbul()</span>
+      <span class="s0">statements.s[`${index}`] = line.count</span>
+    <span class="s0">})</span>
+    <span class="s2">return </span><span class="s0">statements</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_branchesToIstanbul (source, path) {</span>
+    <span class="s0">const branches = {</span>
+      <span class="s0">branchMap: {},</span>
+      <span class="s0">b: {}</span>
+    <span class="s0">}</span>
+    <span class="s2">this</span><span class="s0">.branches[path] = </span><span class="s2">this</span><span class="s0">.branches[path] || []</span>
+    <span class="s2">this</span><span class="s0">.branches[path].forEach((branch, index) =&gt; {</span>
+      <span class="s0">const srcLine = source.lines[branch.startLine - </span><span class="s4">1</span><span class="s0">]</span>
+      <span class="s0">const ignore = srcLine === undefined ? </span><span class="s2">true </span><span class="s0">: srcLine.ignore</span>
+      <span class="s0">branches.branchMap[`${index}`] = branch.toIstanbul()</span>
+      <span class="s0">branches.b[`${index}`] = [ignore ? </span><span class="s4">1 </span><span class="s0">: branch.count]</span>
+    <span class="s0">})</span>
+    <span class="s2">return </span><span class="s0">branches</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_functionsToIstanbul (source, path) {</span>
+    <span class="s0">const functions = {</span>
+      <span class="s0">fnMap: {},</span>
+      <span class="s0">f: {}</span>
+    <span class="s0">}</span>
+    <span class="s2">this</span><span class="s0">.functions[path] = </span><span class="s2">this</span><span class="s0">.functions[path] || []</span>
+    <span class="s2">this</span><span class="s0">.functions[path].forEach((fn, index) =&gt; {</span>
+      <span class="s0">const srcLine = source.lines[fn.startLine - </span><span class="s4">1</span><span class="s0">]</span>
+      <span class="s0">const ignore = srcLine === undefined ? </span><span class="s2">true </span><span class="s0">: srcLine.ignore</span>
+      <span class="s0">functions.fnMap[`${index}`] = fn.toIstanbul()</span>
+      <span class="s0">functions.f[`${index}`] = ignore ? </span><span class="s4">1 </span><span class="s0">: fn.count</span>
+    <span class="s0">})</span>
+    <span class="s2">return </span><span class="s0">functions</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s2">function </span><span class="s0">parsePath (scriptPath) {</span>
+  <span class="s2">return </span><span class="s0">scriptPath.startsWith(</span><span class="s1">'file://'</span><span class="s0">) ? fileURLToPath(scriptPath) : scriptPath</span>
+<span class="s0">}</span>
+</pre>
+</body>
+</html>

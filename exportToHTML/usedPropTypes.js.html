@@ -1,0 +1,590 @@
+<html>
+<head>
+<title>usedPropTypes.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+usedPropTypes.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Common used propTypes detection functionality. 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const values = require(</span><span class="s2">'object.values'</span><span class="s1">);</span>
+
+<span class="s1">const astUtil = require(</span><span class="s2">'./ast'</span><span class="s1">);</span>
+<span class="s1">const componentUtil = require(</span><span class="s2">'./componentUtil'</span><span class="s1">);</span>
+<span class="s1">const testReactVersion = require(</span><span class="s2">'./version'</span><span class="s1">).testReactVersion;</span>
+<span class="s1">const ast = require(</span><span class="s2">'./ast'</span><span class="s1">);</span>
+
+<span class="s0">// ------------------------------------------------------------------------------</span>
+<span class="s0">// Constants</span>
+<span class="s0">// ------------------------------------------------------------------------------</span>
+
+<span class="s1">const LIFE_CYCLE_METHODS = [</span><span class="s2">'componentWillReceiveProps'</span><span class="s1">, </span><span class="s2">'shouldComponentUpdate'</span><span class="s1">, </span><span class="s2">'componentWillUpdate'</span><span class="s1">, </span><span class="s2">'componentDidUpdate'</span><span class="s1">];</span>
+<span class="s1">const ASYNC_SAFE_LIFE_CYCLE_METHODS = [</span><span class="s2">'getDerivedStateFromProps'</span><span class="s1">, </span><span class="s2">'getSnapshotBeforeUpdate'</span><span class="s1">, </span><span class="s2">'UNSAFE_componentWillReceiveProps'</span><span class="s1">, </span><span class="s2">'UNSAFE_componentWillUpdate'</span><span class="s1">];</span>
+
+<span class="s3">function </span><span class="s1">createPropVariables() {</span>
+  <span class="s0">/** @type {Map&lt;string, string[]&gt;} Maps the variable to its definition. `props.a.b` is stored as `['a', 'b']` */</span>
+  <span class="s1">let propVariables = </span><span class="s3">new </span><span class="s1">Map();</span>
+  <span class="s1">let hasBeenWritten = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s1">const stack = [{ propVariables, hasBeenWritten }];</span>
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">pushScope() {</span>
+      <span class="s0">// popVariables is not copied until first write.</span>
+      <span class="s1">stack.push({ propVariables, hasBeenWritten: </span><span class="s3">false </span><span class="s1">});</span>
+    <span class="s1">},</span>
+    <span class="s1">popScope() {</span>
+      <span class="s1">stack.pop();</span>
+      <span class="s1">propVariables = stack[stack.length - </span><span class="s4">1</span><span class="s1">].propVariables;</span>
+      <span class="s1">hasBeenWritten = stack[stack.length - </span><span class="s4">1</span><span class="s1">].hasBeenWritten;</span>
+    <span class="s1">},</span>
+    <span class="s0">/** 
+     * Add a variable name to the current scope 
+     * @param {string} name 
+     * @param {string[]} allNames Example: `props.a.b` should be formatted as `['a', 'b']` 
+     * @returns {Map&lt;string, string[]&gt;} 
+     */</span>
+    <span class="s1">set(name, allNames) {</span>
+      <span class="s3">if </span><span class="s1">(!hasBeenWritten) {</span>
+        <span class="s0">// copy on write</span>
+        <span class="s1">propVariables = </span><span class="s3">new </span><span class="s1">Map(propVariables);</span>
+        <span class="s1">Object.assign(stack[stack.length - </span><span class="s4">1</span><span class="s1">], { propVariables, hasBeenWritten: </span><span class="s3">true </span><span class="s1">});</span>
+        <span class="s1">stack[stack.length - </span><span class="s4">1</span><span class="s1">].hasBeenWritten = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">return </span><span class="s1">propVariables.set(name, allNames);</span>
+    <span class="s1">},</span>
+    <span class="s0">/** 
+     * Get the definition of a variable. 
+     * @param {string} name 
+     * @returns {string[]} Example: `props.a.b` is represented by `['a', 'b']` 
+     */</span>
+    <span class="s1">get(name) {</span>
+      <span class="s3">return </span><span class="s1">propVariables.get(name);</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if the string is one of `props`, `nextProps`, or `prevProps` 
+ * @param {string} name The AST node being checked. 
+ * @returns {Boolean} True if the prop name matches 
+ */</span>
+<span class="s3">function </span><span class="s1">isCommonVariableNameForProps(name) {</span>
+  <span class="s3">return </span><span class="s1">name === </span><span class="s2">'props' </span><span class="s1">|| name === </span><span class="s2">'nextProps' </span><span class="s1">|| name === </span><span class="s2">'prevProps'</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if the component must be validated 
+ * @param {Object} component The component to process 
+ * @returns {Boolean} True if the component must be validated, false if not. 
+ */</span>
+<span class="s3">function </span><span class="s1">mustBeValidated(component) {</span>
+  <span class="s3">return </span><span class="s1">!!(component &amp;&amp; !component.ignorePropsValidation);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Check if we are in a lifecycle method 
+ * @param {object} context 
+ * @param {boolean} checkAsyncSafeLifeCycles 
+ * @return {boolean} true if we are in a class constructor, false if not 
+ */</span>
+<span class="s3">function </span><span class="s1">inLifeCycleMethod(context, checkAsyncSafeLifeCycles) {</span>
+  <span class="s1">let scope = context.getScope();</span>
+  <span class="s3">while </span><span class="s1">(scope) {</span>
+    <span class="s3">if </span><span class="s1">(scope.block &amp;&amp; scope.block.parent &amp;&amp; scope.block.parent.key) {</span>
+      <span class="s1">const name = scope.block.parent.key.name;</span>
+
+      <span class="s3">if </span><span class="s1">(LIFE_CYCLE_METHODS.indexOf(name) &gt;= </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s3">return true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">(checkAsyncSafeLifeCycles &amp;&amp; ASYNC_SAFE_LIFE_CYCLE_METHODS.indexOf(name) &gt;= </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s3">return true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">scope = scope.upper;</span>
+  <span class="s1">}</span>
+  <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Returns true if the given node is a React Component lifecycle method 
+ * @param {ASTNode} node The AST node being checked. 
+ * @param {boolean} checkAsyncSafeLifeCycles 
+ * @return {Boolean} True if the node is a lifecycle method 
+ */</span>
+<span class="s3">function </span><span class="s1">isNodeALifeCycleMethod(node, checkAsyncSafeLifeCycles) {</span>
+  <span class="s1">const nodeKeyName = (node.key || </span><span class="s0">/** @type {ASTNode} */ </span><span class="s1">({})).name;</span>
+
+  <span class="s3">if </span><span class="s1">(node.kind === </span><span class="s2">'constructor'</span><span class="s1">) {</span>
+    <span class="s3">return true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(LIFE_CYCLE_METHODS.indexOf(nodeKeyName) &gt;= </span><span class="s4">0</span><span class="s1">) {</span>
+    <span class="s3">return true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(checkAsyncSafeLifeCycles &amp;&amp; ASYNC_SAFE_LIFE_CYCLE_METHODS.indexOf(nodeKeyName) &gt;= </span><span class="s4">0</span><span class="s1">) {</span>
+    <span class="s3">return true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Returns true if the given node is inside a React Component lifecycle 
+ * method. 
+ * @param {ASTNode} node The AST node being checked. 
+ * @param {boolean} checkAsyncSafeLifeCycles 
+ * @return {Boolean} True if the node is inside a lifecycle method 
+ */</span>
+<span class="s3">function </span><span class="s1">isInLifeCycleMethod(node, checkAsyncSafeLifeCycles) {</span>
+  <span class="s3">if </span><span class="s1">((node.type === </span><span class="s2">'MethodDefinition' </span><span class="s1">|| node.type === </span><span class="s2">'Property'</span><span class="s1">) &amp;&amp; isNodeALifeCycleMethod(node, checkAsyncSafeLifeCycles)) {</span>
+    <span class="s3">return true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">if </span><span class="s1">(node.parent) {</span>
+    <span class="s3">return </span><span class="s1">isInLifeCycleMethod(node.parent, checkAsyncSafeLifeCycles);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Check if a function node is a setState updater 
+ * @param {ASTNode} node a function node 
+ * @return {boolean} 
+ */</span>
+<span class="s3">function </span><span class="s1">isSetStateUpdater(node) {</span>
+  <span class="s1">const unwrappedParentCalleeNode = node.parent &amp;&amp; node.parent.type === </span><span class="s2">'CallExpression'</span>
+    <span class="s1">&amp;&amp; ast.unwrapTSAsExpression(node.parent.callee);</span>
+
+  <span class="s3">return </span><span class="s1">unwrappedParentCalleeNode</span>
+    <span class="s1">&amp;&amp; unwrappedParentCalleeNode.property</span>
+    <span class="s1">&amp;&amp; unwrappedParentCalleeNode.property.name === </span><span class="s2">'setState'</span>
+    <span class="s0">// Make sure we are in the updater not the callback</span>
+    <span class="s1">&amp;&amp; node.parent.arguments[</span><span class="s4">0</span><span class="s1">] === node;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">isPropArgumentInSetStateUpdater(context, name) {</span>
+  <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">name !== </span><span class="s2">'string'</span><span class="s1">) {</span>
+    <span class="s3">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">let scope = context.getScope();</span>
+  <span class="s3">while </span><span class="s1">(scope) {</span>
+    <span class="s1">const unwrappedParentCalleeNode = scope.block</span>
+      <span class="s1">&amp;&amp; scope.block.parent</span>
+      <span class="s1">&amp;&amp; scope.block.parent.type === </span><span class="s2">'CallExpression'</span>
+      <span class="s1">&amp;&amp; ast.unwrapTSAsExpression(scope.block.parent.callee);</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">unwrappedParentCalleeNode</span>
+      <span class="s1">&amp;&amp; unwrappedParentCalleeNode.property</span>
+      <span class="s1">&amp;&amp; unwrappedParentCalleeNode.property.name === </span><span class="s2">'setState'</span>
+      <span class="s0">// Make sure we are in the updater not the callback</span>
+      <span class="s1">&amp;&amp; scope.block.parent.arguments[</span><span class="s4">0</span><span class="s1">].range[</span><span class="s4">0</span><span class="s1">] === scope.block.range[</span><span class="s4">0</span><span class="s1">]</span>
+      <span class="s1">&amp;&amp; scope.block.parent.arguments[</span><span class="s4">0</span><span class="s1">].params</span>
+      <span class="s1">&amp;&amp; scope.block.parent.arguments[</span><span class="s4">0</span><span class="s1">].params.length &gt; </span><span class="s4">1</span>
+    <span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">scope.block.parent.arguments[</span><span class="s4">0</span><span class="s1">].params[</span><span class="s4">1</span><span class="s1">].name === name;</span>
+    <span class="s1">}</span>
+    <span class="s1">scope = scope.upper;</span>
+  <span class="s1">}</span>
+  <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * @param {Context} context 
+ * @returns {boolean} 
+ */</span>
+<span class="s3">function </span><span class="s1">isInClassComponent(context) {</span>
+  <span class="s3">return </span><span class="s1">!!(componentUtil.getParentES6Component(context) || componentUtil.getParentES5Component(context));</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if the node is `this.props` 
+ * @param {ASTNode|undefined} node 
+ * @returns {boolean} 
+ */</span>
+<span class="s3">function </span><span class="s1">isThisDotProps(node) {</span>
+  <span class="s3">return </span><span class="s1">!!node</span>
+    <span class="s1">&amp;&amp; node.type === </span><span class="s2">'MemberExpression'</span>
+    <span class="s1">&amp;&amp; ast.unwrapTSAsExpression(node.object).type === </span><span class="s2">'ThisExpression'</span>
+    <span class="s1">&amp;&amp; node.property.name === </span><span class="s2">'props'</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if the prop has spread operator. 
+ * @param {object} context 
+ * @param {ASTNode} node The AST node being marked. 
+ * @returns {Boolean} True if the prop has spread operator, false if not. 
+ */</span>
+<span class="s3">function </span><span class="s1">hasSpreadOperator(context, node) {</span>
+  <span class="s1">const tokens = context.getSourceCode().getTokens(node);</span>
+  <span class="s3">return </span><span class="s1">tokens.length &amp;&amp; tokens[</span><span class="s4">0</span><span class="s1">].value === </span><span class="s2">'...'</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if the node is a propTypes usage of the form `this.props.*`, `props.*`, `prevProps.*`, or `nextProps.*`. 
+ * @param {ASTNode} node 
+ * @param {Context} context 
+ * @param {Object} utils 
+ * @param {boolean} checkAsyncSafeLifeCycles 
+ * @returns {boolean} 
+ */</span>
+<span class="s3">function </span><span class="s1">isPropTypesUsageByMemberExpression(node, context, utils, checkAsyncSafeLifeCycles) {</span>
+  <span class="s1">const unwrappedObjectNode = ast.unwrapTSAsExpression(node.object);</span>
+
+  <span class="s3">if </span><span class="s1">(isInClassComponent(context)) {</span>
+    <span class="s0">// this.props.*</span>
+    <span class="s3">if </span><span class="s1">(isThisDotProps(unwrappedObjectNode)) {</span>
+      <span class="s3">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s0">// props.* or prevProps.* or nextProps.*</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">isCommonVariableNameForProps(unwrappedObjectNode.name)</span>
+      <span class="s1">&amp;&amp; (inLifeCycleMethod(context, checkAsyncSafeLifeCycles) || astUtil.inConstructor(context))</span>
+    <span class="s1">) {</span>
+      <span class="s3">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s0">// this.setState((_, props) =&gt; props.*))</span>
+    <span class="s3">if </span><span class="s1">(isPropArgumentInSetStateUpdater(context, unwrappedObjectNode.name)) {</span>
+      <span class="s3">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">return false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s0">// props.* in function component</span>
+  <span class="s3">return </span><span class="s1">unwrappedObjectNode.name === </span><span class="s2">'props' </span><span class="s1">&amp;&amp; !ast.isAssignmentLHS(node);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Retrieve the name of a property node 
+ * @param {ASTNode} node The AST node with the property. 
+ * @param {Context} context 
+ * @param {Object} utils 
+ * @param {boolean} checkAsyncSafeLifeCycles 
+ * @return {string|undefined} the name of the property or undefined if not found 
+ */</span>
+<span class="s3">function </span><span class="s1">getPropertyName(node, context, utils, checkAsyncSafeLifeCycles) {</span>
+  <span class="s1">const property = node.property;</span>
+  <span class="s3">if </span><span class="s1">(property) {</span>
+    <span class="s3">switch </span><span class="s1">(property.type) {</span>
+      <span class="s3">case </span><span class="s2">'Identifier'</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">(node.computed) {</span>
+          <span class="s3">return </span><span class="s2">'__COMPUTED_PROP__'</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">return </span><span class="s1">property.name;</span>
+      <span class="s3">case </span><span class="s2">'MemberExpression'</span><span class="s1">:</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">'Literal'</span><span class="s1">:</span>
+        <span class="s0">// Accept computed properties that are literal strings</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">property.value === </span><span class="s2">'string'</span><span class="s1">) {</span>
+          <span class="s3">return </span><span class="s1">property.value;</span>
+        <span class="s1">}</span>
+        <span class="s0">// Accept number as well but only accept props[123]</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">property.value === </span><span class="s2">'number'</span><span class="s1">) {</span>
+          <span class="s3">if </span><span class="s1">(isPropTypesUsageByMemberExpression(node, context, utils, checkAsyncSafeLifeCycles)) {</span>
+            <span class="s3">return </span><span class="s1">property.raw;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s0">// falls through</span>
+      <span class="s3">default</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">(node.computed) {</span>
+          <span class="s3">return </span><span class="s2">'__COMPUTED_PROP__'</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = </span><span class="s3">function </span><span class="s1">usedPropTypesInstructions(context, components, utils) {</span>
+  <span class="s1">const checkAsyncSafeLifeCycles = testReactVersion(context, </span><span class="s2">'&gt;= 16.3.0'</span><span class="s1">);</span>
+
+  <span class="s1">const propVariables = createPropVariables();</span>
+  <span class="s1">const pushScope = propVariables.pushScope;</span>
+  <span class="s1">const popScope = propVariables.popScope;</span>
+
+  <span class="s0">/** 
+   * Mark a prop type as used 
+   * @param {ASTNode} node The AST node being marked. 
+   * @param {string[]} [parentNames] 
+   */</span>
+  <span class="s3">function </span><span class="s1">markPropTypesAsUsed(node, parentNames) {</span>
+    <span class="s1">parentNames = parentNames || [];</span>
+    <span class="s1">let type;</span>
+    <span class="s1">let name;</span>
+    <span class="s1">let allNames;</span>
+    <span class="s1">let properties;</span>
+    <span class="s3">switch </span><span class="s1">(node.type) {</span>
+      <span class="s3">case </span><span class="s2">'OptionalMemberExpression'</span><span class="s1">:</span>
+      <span class="s3">case </span><span class="s2">'MemberExpression'</span><span class="s1">:</span>
+        <span class="s1">name = getPropertyName(node, context, utils, checkAsyncSafeLifeCycles);</span>
+        <span class="s3">if </span><span class="s1">(name) {</span>
+          <span class="s1">allNames = parentNames.concat(name);</span>
+          <span class="s3">if </span><span class="s1">(</span>
+            <span class="s0">// Match props.foo.bar, don't match bar[props.foo]</span>
+            <span class="s1">node.parent.type === </span><span class="s2">'MemberExpression'</span>
+            <span class="s1">&amp;&amp; node.parent.object === node</span>
+          <span class="s1">) {</span>
+            <span class="s1">markPropTypesAsUsed(node.parent, allNames);</span>
+          <span class="s1">}</span>
+          <span class="s0">// Handle the destructuring part of `const {foo} = props.a.b`</span>
+          <span class="s3">if </span><span class="s1">(</span>
+            <span class="s1">node.parent.type === </span><span class="s2">'VariableDeclarator'</span>
+            <span class="s1">&amp;&amp; node.parent.id.type === </span><span class="s2">'ObjectPattern'</span>
+          <span class="s1">) {</span>
+            <span class="s1">node.parent.id.parent = node.parent; </span><span class="s0">// patch for bug in eslint@4 in which ObjectPattern has no parent</span>
+            <span class="s1">markPropTypesAsUsed(node.parent.id, allNames);</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// const a = props.a</span>
+          <span class="s3">if </span><span class="s1">(</span>
+            <span class="s1">node.parent.type === </span><span class="s2">'VariableDeclarator'</span>
+            <span class="s1">&amp;&amp; node.parent.id.type === </span><span class="s2">'Identifier'</span>
+          <span class="s1">) {</span>
+            <span class="s1">propVariables.set(node.parent.id.name, allNames);</span>
+          <span class="s1">}</span>
+          <span class="s0">// Do not mark computed props as used.</span>
+          <span class="s1">type = name !== </span><span class="s2">'__COMPUTED_PROP__' </span><span class="s1">? </span><span class="s2">'direct' </span><span class="s1">: </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">'ArrowFunctionExpression'</span><span class="s1">:</span>
+      <span class="s3">case </span><span class="s2">'FunctionDeclaration'</span><span class="s1">:</span>
+      <span class="s3">case </span><span class="s2">'FunctionExpression'</span><span class="s1">: {</span>
+        <span class="s3">if </span><span class="s1">(node.params.length === </span><span class="s4">0</span><span class="s1">) {</span>
+          <span class="s3">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">type = </span><span class="s2">'destructuring'</span><span class="s1">;</span>
+        <span class="s1">const propParam = isSetStateUpdater(node) ? node.params[</span><span class="s4">1</span><span class="s1">] : node.params[</span><span class="s4">0</span><span class="s1">];</span>
+        <span class="s1">properties = propParam.type === </span><span class="s2">'AssignmentPattern'</span>
+          <span class="s1">? propParam.left.properties</span>
+          <span class="s1">: propParam.properties;</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">case </span><span class="s2">'ObjectPattern'</span><span class="s1">:</span>
+        <span class="s1">type = </span><span class="s2">'destructuring'</span><span class="s1">;</span>
+        <span class="s1">properties = node.properties;</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">'TSEmptyBodyFunctionExpression'</span><span class="s1">:</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">default</span><span class="s1">:</span>
+        <span class="s3">throw new </span><span class="s1">Error(`${node.type} ASTNodes are not handled by markPropTypesAsUsed`);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const component = components.get(utils.getParentComponent());</span>
+    <span class="s1">const usedPropTypes = (component &amp;&amp; component.usedPropTypes) || [];</span>
+    <span class="s1">let ignoreUnusedPropTypesValidation = (component &amp;&amp; component.ignoreUnusedPropTypesValidation) || </span><span class="s3">false</span><span class="s1">;</span>
+
+    <span class="s3">switch </span><span class="s1">(type) {</span>
+      <span class="s3">case </span><span class="s2">'direct'</span><span class="s1">: {</span>
+        <span class="s0">// Ignore Object methods</span>
+        <span class="s3">if </span><span class="s1">(name </span><span class="s3">in </span><span class="s1">Object.prototype) {</span>
+          <span class="s3">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const reportedNode = node.property;</span>
+        <span class="s1">usedPropTypes.push({</span>
+          <span class="s1">name,</span>
+          <span class="s1">allNames,</span>
+          <span class="s1">node: reportedNode,</span>
+        <span class="s1">});</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">case </span><span class="s2">'destructuring'</span><span class="s1">: {</span>
+        <span class="s3">for </span><span class="s1">(let k = </span><span class="s4">0</span><span class="s1">, l = (properties || []).length; k &lt; l; k++) {</span>
+          <span class="s3">if </span><span class="s1">(hasSpreadOperator(context, properties[k]) || properties[k].computed) {</span>
+            <span class="s1">ignoreUnusedPropTypesValidation = </span><span class="s3">true</span><span class="s1">;</span>
+            <span class="s3">break</span><span class="s1">;</span>
+          <span class="s1">}</span>
+          <span class="s1">const propName = ast.getKeyValue(context, properties[k]);</span>
+
+          <span class="s3">if </span><span class="s1">(!propName || properties[k].type !== </span><span class="s2">'Property'</span><span class="s1">) {</span>
+            <span class="s3">break</span><span class="s1">;</span>
+          <span class="s1">}</span>
+
+          <span class="s1">usedPropTypes.push({</span>
+            <span class="s1">allNames: parentNames.concat([propName]),</span>
+            <span class="s1">name: propName,</span>
+            <span class="s1">node: properties[k],</span>
+          <span class="s1">});</span>
+
+          <span class="s3">if </span><span class="s1">(properties[k].value.type === </span><span class="s2">'ObjectPattern'</span><span class="s1">) {</span>
+            <span class="s1">markPropTypesAsUsed(properties[k].value, parentNames.concat([propName]));</span>
+          <span class="s1">} </span><span class="s3">else if </span><span class="s1">(properties[k].value.type === </span><span class="s2">'Identifier'</span><span class="s1">) {</span>
+            <span class="s1">propVariables.set(properties[k].value.name, parentNames.concat(propName));</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">default</span><span class="s1">:</span>
+        <span class="s3">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">components.set(component ? component.node : node, {</span>
+      <span class="s1">usedPropTypes,</span>
+      <span class="s1">ignoreUnusedPropTypesValidation,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * @param {ASTNode} node We expect either an ArrowFunctionExpression, 
+   *   FunctionDeclaration, or FunctionExpression 
+   */</span>
+  <span class="s3">function </span><span class="s1">markDestructuredFunctionArgumentsAsUsed(node) {</span>
+    <span class="s1">const param = node.params &amp;&amp; isSetStateUpdater(node) ? node.params[</span><span class="s4">1</span><span class="s1">] : node.params[</span><span class="s4">0</span><span class="s1">];</span>
+
+    <span class="s1">const destructuring = param &amp;&amp; (</span>
+      <span class="s1">param.type === </span><span class="s2">'ObjectPattern'</span>
+      <span class="s1">|| ((param.type === </span><span class="s2">'AssignmentPattern'</span><span class="s1">) &amp;&amp; (param.left.type === </span><span class="s2">'ObjectPattern'</span><span class="s1">))</span>
+    <span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(destructuring &amp;&amp; (components.get(node) || components.get(node.parent))) {</span>
+      <span class="s1">markPropTypesAsUsed(node);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">function </span><span class="s1">handleSetStateUpdater(node) {</span>
+    <span class="s3">if </span><span class="s1">(!node.params || node.params.length &lt; </span><span class="s4">2 </span><span class="s1">|| !isSetStateUpdater(node)) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">markPropTypesAsUsed(node);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Handle both stateless functions and setState updater functions. 
+   * @param {ASTNode} node We expect either an ArrowFunctionExpression, 
+   *   FunctionDeclaration, or FunctionExpression 
+   */</span>
+  <span class="s3">function </span><span class="s1">handleFunctionLikeExpressions(node) {</span>
+    <span class="s1">pushScope();</span>
+    <span class="s1">handleSetStateUpdater(node);</span>
+    <span class="s1">markDestructuredFunctionArgumentsAsUsed(node);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">function </span><span class="s1">handleCustomValidators(component) {</span>
+    <span class="s1">const propTypes = component.declaredPropTypes;</span>
+    <span class="s3">if </span><span class="s1">(!propTypes) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Object.keys(propTypes).forEach((key) =&gt; {</span>
+      <span class="s1">const node = propTypes[key].node;</span>
+
+      <span class="s3">if </span><span class="s1">(node &amp;&amp; node.value &amp;&amp; astUtil.isFunctionLikeExpression(node.value)) {</span>
+        <span class="s1">markPropTypesAsUsed(node.value);</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">VariableDeclarator(node) {</span>
+      <span class="s1">const unwrappedInitNode = ast.unwrapTSAsExpression(node.init);</span>
+
+      <span class="s0">// let props = this.props</span>
+      <span class="s3">if </span><span class="s1">(isThisDotProps(unwrappedInitNode) &amp;&amp; isInClassComponent(context) &amp;&amp; node.id.type === </span><span class="s2">'Identifier'</span><span class="s1">) {</span>
+        <span class="s1">propVariables.set(node.id.name, []);</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Only handles destructuring</span>
+      <span class="s3">if </span><span class="s1">(node.id.type !== </span><span class="s2">'ObjectPattern' </span><span class="s1">|| !unwrappedInitNode) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// let {props: {firstname}} = this</span>
+      <span class="s1">const propsProperty = node.id.properties.find((property) =&gt; (</span>
+        <span class="s1">property.key</span>
+        <span class="s1">&amp;&amp; (property.key.name === </span><span class="s2">'props' </span><span class="s1">|| property.key.value === </span><span class="s2">'props'</span><span class="s1">)</span>
+      <span class="s1">));</span>
+
+      <span class="s3">if </span><span class="s1">(unwrappedInitNode.type === </span><span class="s2">'ThisExpression' </span><span class="s1">&amp;&amp; propsProperty &amp;&amp; propsProperty.value.type === </span><span class="s2">'ObjectPattern'</span><span class="s1">) {</span>
+        <span class="s1">markPropTypesAsUsed(propsProperty.value);</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// let {props} = this</span>
+      <span class="s3">if </span><span class="s1">(unwrappedInitNode.type === </span><span class="s2">'ThisExpression' </span><span class="s1">&amp;&amp; propsProperty &amp;&amp; propsProperty.value.name === </span><span class="s2">'props'</span><span class="s1">) {</span>
+        <span class="s1">propVariables.set(</span><span class="s2">'props'</span><span class="s1">, []);</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// let {firstname} = props</span>
+      <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">isCommonVariableNameForProps(unwrappedInitNode.name)</span>
+        <span class="s1">&amp;&amp; (utils.getParentStatelessComponent() || isInLifeCycleMethod(node, checkAsyncSafeLifeCycles))</span>
+      <span class="s1">) {</span>
+        <span class="s1">markPropTypesAsUsed(node.id);</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// let {firstname} = this.props</span>
+      <span class="s3">if </span><span class="s1">(isThisDotProps(unwrappedInitNode) &amp;&amp; isInClassComponent(context)) {</span>
+        <span class="s1">markPropTypesAsUsed(node.id);</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// let {firstname} = thing, where thing is defined by const thing = this.props.**.*</span>
+      <span class="s3">if </span><span class="s1">(propVariables.get(unwrappedInitNode.name)) {</span>
+        <span class="s1">markPropTypesAsUsed(node.id, propVariables.get(unwrappedInitNode.name));</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">FunctionDeclaration: handleFunctionLikeExpressions,</span>
+
+    <span class="s1">ArrowFunctionExpression: handleFunctionLikeExpressions,</span>
+
+    <span class="s1">FunctionExpression: handleFunctionLikeExpressions,</span>
+
+    <span class="s2">'FunctionDeclaration:exit'</span><span class="s1">: popScope,</span>
+
+    <span class="s2">'ArrowFunctionExpression:exit'</span><span class="s1">: popScope,</span>
+
+    <span class="s2">'FunctionExpression:exit'</span><span class="s1">: popScope,</span>
+
+    <span class="s1">JSXSpreadAttribute(node) {</span>
+      <span class="s1">const component = components.get(utils.getParentComponent());</span>
+      <span class="s1">components.set(component ? component.node : node, {</span>
+        <span class="s1">ignoreUnusedPropTypesValidation: node.argument.type !== </span><span class="s2">'ObjectExpression'</span><span class="s1">,</span>
+      <span class="s1">});</span>
+    <span class="s1">},</span>
+
+    <span class="s2">'MemberExpression, OptionalMemberExpression'</span><span class="s1">(node) {</span>
+      <span class="s3">if </span><span class="s1">(isPropTypesUsageByMemberExpression(node, context, utils, checkAsyncSafeLifeCycles)) {</span>
+        <span class="s1">markPropTypesAsUsed(node);</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const propVariable = propVariables.get(ast.unwrapTSAsExpression(node.object).name);</span>
+      <span class="s3">if </span><span class="s1">(propVariable) {</span>
+        <span class="s1">markPropTypesAsUsed(node, propVariable);</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">ObjectPattern(node) {</span>
+      <span class="s0">// If the object pattern is a destructured props object in a lifecycle</span>
+      <span class="s0">// method -- mark it for used props.</span>
+      <span class="s3">if </span><span class="s1">(isNodeALifeCycleMethod(node.parent.parent, checkAsyncSafeLifeCycles) &amp;&amp; node.properties.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">markPropTypesAsUsed(node.parent);</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s2">'Program:exit'</span><span class="s1">() {</span>
+      <span class="s1">values(components.list())</span>
+        <span class="s1">.filter((component) =&gt; mustBeValidated(component))</span>
+        <span class="s1">.forEach((component) =&gt; {</span>
+          <span class="s1">handleCustomValidators(component);</span>
+        <span class="s1">});</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

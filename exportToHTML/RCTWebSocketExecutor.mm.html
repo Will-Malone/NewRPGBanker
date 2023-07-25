@@ -1,0 +1,320 @@
+<html>
+<head>
+<title>RCTWebSocketExecutor.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTWebSocketExecutor.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTWebSocketExecutor.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTAssert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBridge.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConvert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTDefines.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTLog.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;ReactCommon/RCTTurboModule.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;SocketRocket/SRWebSocket.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;CoreModulesPlugins.h&quot;</span>
+
+<span class="s2">#if </span><span class="s1">RCT_DEV </span><span class="s0">// Debug executors are only supported in dev mode</span>
+
+<span class="s4">typedef void </span><span class="s1">(^RCTWSMessageCallback)(NSError *error</span><span class="s4">, </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *reply)</span><span class="s4">;</span>
+
+<span class="s4">@interface </span><span class="s1">RCTWebSocketExecutor () &lt;SRWebSocketDelegate</span><span class="s4">, </span><span class="s1">RCTTurboModule&gt;</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTWebSocketExecutor {</span>
+  <span class="s1">SRWebSocket *_socket</span><span class="s4">;</span>
+  <span class="s1">dispatch_queue_t _jsQueue</span><span class="s4">;</span>
+  <span class="s1">NSMutableDictionary&lt;NSNumber *</span><span class="s4">, </span><span class="s1">RCTWSMessageCallback&gt; *_callbacks</span><span class="s4">;</span>
+  <span class="s1">dispatch_semaphore_t _socketOpenSemaphore</span><span class="s4">;</span>
+  <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">NSString *&gt; *_injectedObjects</span><span class="s4">;</span>
+  <span class="s1">NSURL *_url</span><span class="s4">;</span>
+  <span class="s1">NSError *_setupError</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_MODULE()</span>
+
+<span class="s4">@synthesize </span><span class="s1">bridge = _bridge</span><span class="s4">;</span>
+
+<span class="s1">- (instancetype)initWithURL:(NSURL *)URL</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertParam(URL)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">((self = [self init])) {</span>
+    <span class="s1">_url = URL</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setUp</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_url) {</span>
+    <span class="s1">NSInteger port = [[[_bridge bundleURL] port] integerValue] ?: RCT_METRO_PORT</span><span class="s4">;</span>
+    <span class="s1">NSString *host = [[_bridge bundleURL] host] ?: </span><span class="s4">@</span><span class="s3">&quot;localhost&quot;</span><span class="s4">;</span>
+    <span class="s1">NSString *URLString =</span>
+        <span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;http://%@:%lld/debugger-proxy?role=client&quot;</span><span class="s4">, </span><span class="s1">host</span><span class="s4">, </span><span class="s1">(</span><span class="s4">long long</span><span class="s1">)port]</span><span class="s4">;</span>
+    <span class="s1">_url = [RCTConvert NSURL:URLString]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_jsQueue = dispatch_queue_create(</span><span class="s3">&quot;com.facebook.react.WebSocketExecutor&quot;</span><span class="s4">, </span><span class="s1">DISPATCH_QUEUE_SERIAL)</span><span class="s4">;</span>
+  <span class="s1">_socket = [[SRWebSocket alloc] initWithURL:_url]</span><span class="s4">;</span>
+  <span class="s1">_socket.delegate = self</span><span class="s4">;</span>
+  <span class="s1">_callbacks = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_injectedObjects = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">[_socket setDelegateDispatchQueue:_jsQueue]</span><span class="s4">;</span>
+
+  <span class="s1">NSURL *startDevToolsURL = [NSURL URLWithString:</span><span class="s4">@</span><span class="s3">&quot;/launch-js-devtools&quot; </span><span class="s1">relativeToURL:_url]</span><span class="s4">;</span>
+
+  <span class="s1">NSURLSession *session = [NSURLSession sharedSession]</span><span class="s4">;</span>
+  <span class="s1">NSURLSessionDataTask *dataTask =</span>
+      <span class="s1">[session dataTaskWithRequest:[NSURLRequest requestWithURL:startDevToolsURL]</span>
+                 <span class="s1">completionHandler:^(NSData *data</span><span class="s4">, </span><span class="s1">NSURLResponse *response</span><span class="s4">, </span><span class="s1">NSError *error){</span>
+                 <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">[dataTask resume]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(![self connectToProxy]) {</span>
+    <span class="s1">[self invalidate]</span><span class="s4">;</span>
+    <span class="s1">NSString *error = [NSString stringWithFormat:</span>
+                                    <span class="s4">@</span><span class="s3">&quot;Connection to %@ timed out. Are you &quot;</span>
+                                     <span class="s3">&quot;running node proxy? If you are running on the device, check if &quot;</span>
+                                     <span class="s3">&quot;you have the right IP address in `RCTWebSocketExecutor.m`.&quot;</span><span class="s4">,</span>
+                                    <span class="s1">_url]</span><span class="s4">;</span>
+    <span class="s1">_setupError = RCTErrorWithMessage(error)</span><span class="s4">;</span>
+    <span class="s1">RCTFatal(_setupError)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSInteger retries = </span><span class="s5">3</span><span class="s4">;</span>
+  <span class="s1">BOOL runtimeIsReady = [self prepareJSRuntime]</span><span class="s4">;</span>
+  <span class="s4">while </span><span class="s1">(!runtimeIsReady &amp;&amp; retries &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">runtimeIsReady = [self prepareJSRuntime]</span><span class="s4">;</span>
+    <span class="s1">retries--</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!runtimeIsReady) {</span>
+    <span class="s1">[self invalidate]</span><span class="s4">;</span>
+    <span class="s1">NSString *error =</span>
+        <span class="s4">@</span><span class="s3">&quot;Runtime is not ready for debugging.</span><span class="s4">\n </span><span class="s3">&quot;</span>
+         <span class="s3">&quot;- Make sure Metro is running.</span><span class="s4">\n</span><span class="s3">&quot;</span>
+         <span class="s3">&quot;- Make sure the JavaScript Debugger is running and not paused on a &quot;</span>
+         <span class="s3">&quot;breakpoint or exception and try reloading again.&quot;</span><span class="s4">;</span>
+    <span class="s1">_setupError = RCTErrorWithMessage(error)</span><span class="s4">;</span>
+    <span class="s1">RCTFatal(_setupError)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)connectToProxy</span>
+<span class="s1">{</span>
+  <span class="s1">_socketOpenSemaphore = dispatch_semaphore_create(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">[_socket open]</span><span class="s4">;</span>
+  <span class="s4">long </span><span class="s1">connected = dispatch_semaphore_wait(_socketOpenSemaphore</span><span class="s4">, </span><span class="s1">dispatch_time(DISPATCH_TIME_NOW</span><span class="s4">, </span><span class="s1">NSEC_PER_SEC * </span><span class="s5">15</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">connected == </span><span class="s5">0 </span><span class="s1">&amp;&amp; _socket.readyState == SR_OPEN</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)prepareJSRuntime</span>
+<span class="s1">{</span>
+  <span class="s1">__block NSError *initError</span><span class="s4">;</span>
+  <span class="s1">dispatch_semaphore_t s = dispatch_semaphore_create(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">[self sendMessage:</span><span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;method&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;prepareJSRuntime&quot;</span><span class="s1">}</span>
+            <span class="s1">onReply:^(NSError *error</span><span class="s4">, </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *reply) {</span>
+              <span class="s1">initError = error</span><span class="s4">;</span>
+              <span class="s1">dispatch_semaphore_signal(s)</span><span class="s4">;</span>
+            <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s4">long </span><span class="s1">runtimeIsReady = dispatch_semaphore_wait(s</span><span class="s4">, </span><span class="s1">dispatch_time(DISPATCH_TIME_NOW</span><span class="s4">, </span><span class="s1">NSEC_PER_SEC * </span><span class="s5">10</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(initError) {</span>
+    <span class="s1">RCTLogInfo(</span><span class="s4">@</span><span class="s3">&quot;Websocket runtime setup failed: %@&quot;</span><span class="s4">, </span><span class="s1">initError)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">runtimeIsReady == </span><span class="s5">0 </span><span class="s1">&amp;&amp; initError == nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)webSocket:(SRWebSocket *)webSocket didReceiveMessage:(id)message</span>
+<span class="s1">{</span>
+  <span class="s1">NSError *error = nil</span><span class="s4">;</span>
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *reply = RCTJSONParse(message</span><span class="s4">, </span><span class="s1">&amp;error)</span><span class="s4">;</span>
+  <span class="s1">NSNumber *messageID = reply[</span><span class="s4">@</span><span class="s3">&quot;replyID&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">RCTWSMessageCallback callback = _callbacks[messageID]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(callback) {</span>
+    <span class="s1">callback(error</span><span class="s4">, </span><span class="s1">reply)</span><span class="s4">;</span>
+    <span class="s1">[_callbacks removeObjectForKey:messageID]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)webSocketDidOpen:(SRWebSocket *)webSocket</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_semaphore_signal(_socketOpenSemaphore)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)webSocket:(SRWebSocket *)webSocket didFailWithError:(NSError *)error</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_semaphore_signal(_socketOpenSemaphore)</span><span class="s4">;</span>
+  <span class="s1">RCTLogInfo(</span><span class="s4">@</span><span class="s3">&quot;WebSocket connection failed with error %@&quot;</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendMessage:(NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)message onReply:(RCTWSMessageCallback)callback</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSUInteger lastID = </span><span class="s5">10000</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(_setupError) {</span>
+    <span class="s1">callback(_setupError</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">dispatch_async(_jsQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s4">if </span><span class="s1">(!self.valid) {</span>
+      <span class="s1">callback(RCTErrorWithMessage(</span><span class="s4">@</span><span class="s3">&quot;Runtime is not ready for debugging. Make sure Metro is running.&quot;</span><span class="s1">)</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">NSNumber *expectedID = </span><span class="s4">@</span><span class="s1">(lastID++)</span><span class="s4">;</span>
+    <span class="s1">self-&gt;_callbacks[expectedID] = [callback copy]</span><span class="s4">;</span>
+    <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *messageWithID = [message mutableCopy]</span><span class="s4">;</span>
+    <span class="s1">messageWithID[</span><span class="s4">@</span><span class="s3">&quot;id&quot;</span><span class="s1">] = expectedID</span><span class="s4">;</span>
+    <span class="s1">[self-&gt;_socket sendString:RCTJSONStringify(messageWithID</span><span class="s4">, </span><span class="s1">NULL) error:nil]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)executeApplicationScript:(NSData *)script</span>
+                       <span class="s1">sourceURL:(NSURL *)URL</span>
+                      <span class="s1">onComplete:(RCTJavaScriptCompleteBlock)onComplete</span>
+<span class="s1">{</span>
+  <span class="s0">// Hack: the bridge transitions out of loading state as soon as this method returns, which prevents us</span>
+  <span class="s0">// from completely invalidating the bridge and preventing an endless barage of RCTLog.logIfNoNativeHook</span>
+  <span class="s0">// calls if the JS execution environment is broken. We therefore block this thread until this message has returned.</span>
+  <span class="s1">dispatch_semaphore_t scriptSem = dispatch_semaphore_create(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *message = </span><span class="s4">@</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;method&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;executeApplicationScript&quot;</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;url&quot; </span><span class="s1">: RCTNullIfNil(URL.absoluteString)</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;inject&quot; </span><span class="s1">: _injectedObjects</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">[self sendMessage:message</span>
+            <span class="s1">onReply:^(NSError *socketError</span><span class="s4">, </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *reply) {</span>
+              <span class="s4">if </span><span class="s1">(socketError) {</span>
+                <span class="s1">onComplete(socketError)</span><span class="s4">;</span>
+              <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+                <span class="s1">NSString *error = reply[</span><span class="s4">@</span><span class="s3">&quot;error&quot;</span><span class="s1">]</span><span class="s4">;</span>
+                <span class="s1">onComplete(error ? RCTErrorWithMessage(error) : nil)</span><span class="s4">;</span>
+              <span class="s1">}</span>
+              <span class="s1">dispatch_semaphore_signal(scriptSem)</span><span class="s4">;</span>
+            <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_semaphore_wait(scriptSem</span><span class="s4">, </span><span class="s1">DISPATCH_TIME_FOREVER)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)flushedQueue:(RCTJavaScriptCallback)onComplete</span>
+<span class="s1">{</span>
+  <span class="s1">[self _executeJSCall:</span><span class="s4">@</span><span class="s3">&quot;flushedQueue&quot; </span><span class="s1">arguments:</span><span class="s4">@</span><span class="s1">[] callback:onComplete]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)callFunctionOnModule:(NSString *)module</span>
+                      <span class="s1">method:(NSString *)method</span>
+                   <span class="s1">arguments:(NSArray *)args</span>
+                    <span class="s1">callback:(RCTJavaScriptCallback)onComplete</span>
+<span class="s1">{</span>
+  <span class="s1">[self _executeJSCall:</span><span class="s4">@</span><span class="s3">&quot;callFunctionReturnFlushedQueue&quot; </span><span class="s1">arguments:</span><span class="s4">@</span><span class="s1">[ module</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">args ] callback:onComplete]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)invokeCallbackID:(NSNumber *)cbID arguments:(NSArray *)args callback:(RCTJavaScriptCallback)onComplete</span>
+<span class="s1">{</span>
+  <span class="s1">[self _executeJSCall:</span><span class="s4">@</span><span class="s3">&quot;invokeCallbackAndReturnFlushedQueue&quot; </span><span class="s1">arguments:</span><span class="s4">@</span><span class="s1">[ cbID</span><span class="s4">, </span><span class="s1">args ] callback:onComplete]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_executeJSCall:(NSString *)method arguments:(NSArray *)arguments callback:(RCTJavaScriptCallback)onComplete</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssert(onComplete != nil</span><span class="s4">, @</span><span class="s3">&quot;callback was missing for exec JS call&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *message = </span><span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;method&quot; </span><span class="s1">: method</span><span class="s4">, @</span><span class="s3">&quot;arguments&quot; </span><span class="s1">: arguments}</span><span class="s4">;</span>
+  <span class="s1">[self sendMessage:message</span>
+            <span class="s1">onReply:^(NSError *socketError</span><span class="s4">, </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *reply) {</span>
+              <span class="s4">if </span><span class="s1">(socketError) {</span>
+                <span class="s1">onComplete(nil</span><span class="s4">, </span><span class="s1">socketError)</span><span class="s4">;</span>
+                <span class="s4">return;</span>
+              <span class="s1">}</span>
+
+              <span class="s1">NSError *jsonError</span><span class="s4">;</span>
+              <span class="s1">id result = RCTJSONParse(reply[</span><span class="s4">@</span><span class="s3">&quot;result&quot;</span><span class="s1">]</span><span class="s4">, </span><span class="s1">&amp;jsonError)</span><span class="s4">;</span>
+              <span class="s1">NSString *error = reply[</span><span class="s4">@</span><span class="s3">&quot;error&quot;</span><span class="s1">]</span><span class="s4">;</span>
+              <span class="s1">onComplete(result</span><span class="s4">, </span><span class="s1">error ? RCTErrorWithMessage(error) : jsonError)</span><span class="s4">;</span>
+            <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)injectJSONText:(NSString *)script</span>
+    <span class="s1">asGlobalObjectNamed:(NSString *)objectName</span>
+               <span class="s1">callback:(RCTJavaScriptCompleteBlock)onComplete</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_async(_jsQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">self-&gt;_injectedObjects[objectName] = script</span><span class="s4">;</span>
+    <span class="s1">onComplete(nil)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)executeBlockOnJavaScriptQueue:(dispatch_block_t)block</span>
+<span class="s1">{</span>
+  <span class="s1">RCTExecuteOnMainQueue(block)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)executeAsyncBlockOnJavaScriptQueue:(dispatch_block_t)block</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_async(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">block)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)invalidate</span>
+<span class="s1">{</span>
+  <span class="s1">_socket.delegate = nil</span><span class="s4">;</span>
+  <span class="s1">[_socket closeWithCode:</span><span class="s5">1000 </span><span class="s1">reason:</span><span class="s4">@</span><span class="s3">&quot;Invalidated&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_socket = nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)isValid</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_socket != nil &amp;&amp; _socket.readyState == SR_OPEN</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dealloc</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssert(!self.valid</span><span class="s4">, @</span><span class="s3">&quot;-invalidate must be called before -dealloc&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (std::shared_ptr&lt;facebook::react::TurboModule&gt;)getTurboModule:</span>
+    <span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::react::ObjCTurboModule::InitParams &amp;)params</span>
+<span class="s1">{</span>
+  <span class="s4">return nullptr;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s2">#endif</span>
+
+<span class="s1">Class RCTWebSocketExecutorCls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+<span class="s2">#if </span><span class="s1">RCT_DEV</span>
+  <span class="s4">return </span><span class="s1">RCTWebSocketExecutor.</span><span class="s4">class;</span>
+<span class="s2">#else</span>
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

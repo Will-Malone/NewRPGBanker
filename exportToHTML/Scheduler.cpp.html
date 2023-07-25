@@ -1,0 +1,423 @@
+<html>
+<head>
+<title>Scheduler.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Scheduler.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;Scheduler.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/componentregistry/ComponentDescriptorRegistry.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/EventQueueProcessor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/LayoutContext.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/MountingOverrideDelegate.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/ShadowViewMutation.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/runtimescheduler/RuntimeScheduler.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/templateprocessor/UITemplateProcessor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/uimanager/UIManager.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/uimanager/UIManagerBinding.h&gt;</span>
+
+<span class="s2">#ifdef </span><span class="s1">RN_SHADOW_TREE_INTROSPECTION</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/stubs.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;iostream&gt;</span>
+<span class="s2">#endif</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s1">Scheduler::Scheduler(</span>
+    <span class="s1">SchedulerToolbox </span><span class="s4">const </span><span class="s1">&amp;schedulerToolbox</span><span class="s4">,</span>
+    <span class="s1">UIManagerAnimationDelegate *animationDelegate</span><span class="s4">,</span>
+    <span class="s1">SchedulerDelegate *delegate) {</span>
+  <span class="s1">runtimeExecutor_ = schedulerToolbox.runtimeExecutor</span><span class="s4">;</span>
+  <span class="s1">contextContainer_ = schedulerToolbox.contextContainer</span><span class="s4">;</span>
+
+  <span class="s1">reactNativeConfig_ =</span>
+      <span class="s1">contextContainer_-&gt;at&lt;std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">ReactNativeConfig&gt;&gt;(</span>
+          <span class="s3">&quot;ReactNativeConfig&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// Creating a container for future `EventDispatcher` instance.</span>
+  <span class="s1">eventDispatcher_ = std::make_shared&lt;std::optional&lt;EventDispatcher </span><span class="s4">const</span><span class="s1">&gt;&gt;()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">uiManager = std::make_shared&lt;UIManager&gt;(</span>
+      <span class="s1">runtimeExecutor_</span><span class="s4">, </span><span class="s1">schedulerToolbox.backgroundExecutor</span><span class="s4">, </span><span class="s1">contextContainer_)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">eventOwnerBox = std::make_shared&lt;EventBeat::OwnerBox&gt;()</span><span class="s4">;</span>
+  <span class="s1">eventOwnerBox-&gt;owner = eventDispatcher_</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">weakRuntimeScheduler =</span>
+      <span class="s1">contextContainer_-&gt;find&lt;std::weak_ptr&lt;RuntimeScheduler&gt;&gt;(</span>
+          <span class="s3">&quot;RuntimeScheduler&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">runtimeScheduler = weakRuntimeScheduler.has_value()</span>
+      <span class="s1">? weakRuntimeScheduler.value().lock()</span>
+      <span class="s1">: </span><span class="s4">nullptr;</span>
+
+  <span class="s4">auto </span><span class="s1">eventPipe = [uiManager</span><span class="s4">, </span><span class="s1">runtimeScheduler = runtimeScheduler.get()](</span>
+                       <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+                       <span class="s4">const </span><span class="s1">EventTarget *eventTarget</span><span class="s4">,</span>
+                       <span class="s4">const </span><span class="s1">std::string &amp;type</span><span class="s4">,</span>
+                       <span class="s1">ReactEventPriority priority</span><span class="s4">,</span>
+                       <span class="s4">const </span><span class="s1">ValueFactory &amp;payloadFactory) {</span>
+    <span class="s1">uiManager-&gt;visitBinding(</span>
+        <span class="s1">[&amp;](UIManagerBinding </span><span class="s4">const </span><span class="s1">&amp;uiManagerBinding) {</span>
+          <span class="s1">uiManagerBinding.dispatchEvent(</span>
+              <span class="s1">runtime</span><span class="s4">, </span><span class="s1">eventTarget</span><span class="s4">, </span><span class="s1">type</span><span class="s4">, </span><span class="s1">priority</span><span class="s4">, </span><span class="s1">payloadFactory)</span><span class="s4">;</span>
+        <span class="s1">}</span><span class="s4">,</span>
+        <span class="s1">runtime)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(runtimeScheduler != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s1">runtimeScheduler-&gt;callExpiredTasks(runtime)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">statePipe = [uiManager](StateUpdate </span><span class="s4">const </span><span class="s1">&amp;stateUpdate) {</span>
+    <span class="s1">uiManager-&gt;updateState(stateUpdate)</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s0">// Creating an `EventDispatcher` instance inside the already allocated</span>
+  <span class="s0">// container (inside the optional).</span>
+  <span class="s1">eventDispatcher_-&gt;emplace(</span>
+      <span class="s1">EventQueueProcessor(eventPipe</span><span class="s4">, </span><span class="s1">statePipe)</span><span class="s4">,</span>
+      <span class="s1">schedulerToolbox.synchronousEventBeatFactory</span><span class="s4">,</span>
+      <span class="s1">schedulerToolbox.asynchronousEventBeatFactory</span><span class="s4">,</span>
+      <span class="s1">eventOwnerBox)</span><span class="s4">;</span>
+
+  <span class="s0">// Casting to `std::shared_ptr&lt;EventDispatcher const&gt;`.</span>
+  <span class="s4">auto </span><span class="s1">eventDispatcher =</span>
+      <span class="s1">EventDispatcher::Shared{eventDispatcher_</span><span class="s4">, </span><span class="s1">&amp;eventDispatcher_-&gt;value()}</span><span class="s4">;</span>
+
+  <span class="s1">componentDescriptorRegistry_ = schedulerToolbox.componentRegistryFactory(</span>
+      <span class="s1">eventDispatcher</span><span class="s4">, </span><span class="s1">contextContainer_)</span><span class="s4">;</span>
+
+  <span class="s1">uiManager-&gt;setDelegate(</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">uiManager-&gt;setComponentDescriptorRegistry(componentDescriptorRegistry_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">bindingsExecutor =</span>
+      <span class="s1">schedulerToolbox.bridgelessBindingsExecutor.has_value()</span>
+      <span class="s1">? schedulerToolbox.bridgelessBindingsExecutor.value()</span>
+      <span class="s1">: runtimeExecutor_</span><span class="s4">;</span>
+  <span class="s1">bindingsExecutor([uiManager](jsi::Runtime &amp;runtime) {</span>
+    <span class="s1">UIManagerBinding::createAndInstallIfNeeded(runtime</span><span class="s4">, </span><span class="s1">uiManager)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">componentDescriptorRegistryKey =</span>
+      <span class="s3">&quot;ComponentDescriptorRegistry_DO_NOT_USE_PRETTY_PLEASE&quot;</span><span class="s4">;</span>
+  <span class="s1">contextContainer_-&gt;erase(componentDescriptorRegistryKey)</span><span class="s4">;</span>
+  <span class="s1">contextContainer_-&gt;insert(</span>
+      <span class="s1">componentDescriptorRegistryKey</span><span class="s4">,</span>
+      <span class="s1">std::weak_ptr&lt;ComponentDescriptorRegistry </span><span class="s4">const</span><span class="s1">&gt;(</span>
+          <span class="s1">componentDescriptorRegistry_))</span><span class="s4">;</span>
+
+  <span class="s1">delegate_ = delegate</span><span class="s4">;</span>
+  <span class="s1">commitHooks_ = schedulerToolbox.commitHooks</span><span class="s4">;</span>
+  <span class="s1">uiManager_ = uiManager</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;commitHook : commitHooks_) {</span>
+    <span class="s1">uiManager-&gt;registerCommitHook(*commitHook)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+<span class="s2">#ifdef </span><span class="s1">ANDROID</span>
+  <span class="s1">removeOutstandingSurfacesOnDestruction_ = </span><span class="s4">true;</span>
+  <span class="s1">reduceDeleteCreateMutationLayoutAnimation_ = reactNativeConfig_-&gt;getBool(</span>
+      <span class="s3">&quot;react_fabric:reduce_delete_create_mutation_layout_animation_android&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s1">removeOutstandingSurfacesOnDestruction_ = reactNativeConfig_-&gt;getBool(</span>
+      <span class="s3">&quot;react_fabric:remove_outstanding_surfaces_on_destruction_ios&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">reduceDeleteCreateMutationLayoutAnimation_ = </span><span class="s4">true;</span>
+<span class="s2">#endif</span>
+
+  <span class="s1">CoreFeatures::blockPaintForUseLayoutEffect = reactNativeConfig_-&gt;getBool(</span>
+      <span class="s3">&quot;react_fabric:block_paint_for_use_layout_effect&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(animationDelegate != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">animationDelegate-&gt;setComponentDescriptorRegistry(</span>
+        <span class="s1">componentDescriptorRegistry_)</span><span class="s4">;</span>
+    <span class="s1">animationDelegate-&gt;setReduceDeleteCreateMutation(</span>
+        <span class="s1">reduceDeleteCreateMutationLayoutAnimation_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">uiManager_-&gt;setAnimationDelegate(animationDelegate)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">Scheduler::~Scheduler() {</span>
+  <span class="s1">LOG(WARNING) &lt;&lt; </span><span class="s3">&quot;Scheduler::~Scheduler() was called (address: &quot; </span><span class="s1">&lt;&lt; </span><span class="s4">this</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot;).&quot;</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;commitHook : commitHooks_) {</span>
+    <span class="s1">uiManager_-&gt;unregisterCommitHook(*commitHook)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// All Surfaces must be explicitly stopped before destroying `Scheduler`.</span>
+  <span class="s0">// The idea is that `UIManager` is allowed to call `Scheduler` only if the</span>
+  <span class="s0">// corresponding `ShadowTree` instance exists.</span>
+
+  <span class="s0">// The thread-safety of this operation is guaranteed by this requirement.</span>
+  <span class="s1">uiManager_-&gt;setDelegate(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">uiManager_-&gt;setAnimationDelegate(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// Then, let's verify that the requirement was satisfied.</span>
+  <span class="s4">auto </span><span class="s1">surfaceIds = std::vector&lt;SurfaceId&gt;{}</span><span class="s4">;</span>
+  <span class="s1">uiManager_-&gt;getShadowTreeRegistry().enumerate(</span>
+      <span class="s1">[&amp;surfaceIds](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree</span><span class="s4">, bool </span><span class="s1">&amp;) {</span>
+        <span class="s1">surfaceIds.push_back(shadowTree.getSurfaceId())</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s0">// TODO(T88046056): Fix Android memory leak before uncommenting changes</span>
+  <span class="s0">//  react_native_assert(</span>
+  <span class="s0">//      surfaceIds.empty() &amp;&amp;</span>
+  <span class="s0">//      &quot;Scheduler was destroyed with outstanding Surfaces.&quot;);</span>
+
+  <span class="s4">if </span><span class="s1">(surfaceIds.empty()) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Scheduler was destroyed with outstanding Surfaces.&quot;</span><span class="s4">;</span>
+
+  <span class="s0">// If we are here, that means assert didn't fire which indicates that we in</span>
+  <span class="s0">// production.</span>
+
+  <span class="s0">// Now we have still-running surfaces, which is no good, no good.</span>
+  <span class="s0">// That's indeed a sign of a severe issue on the application layer.</span>
+  <span class="s0">// At this point, we don't have much to lose, so we are trying to unmount all</span>
+  <span class="s0">// outstanding `ShadowTree`s to prevent all stored JSI entities from</span>
+  <span class="s0">// overliving the `Scheduler`. (Unmounting `ShadowNode`s disables</span>
+  <span class="s0">// `EventEmitter`s which destroys JSI objects.)</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">surfaceId : surfaceIds) {</span>
+    <span class="s1">uiManager_-&gt;getShadowTreeRegistry().visit(</span>
+        <span class="s1">surfaceId</span><span class="s4">,</span>
+        <span class="s1">[](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree) { shadowTree.commitEmptyTree()</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+    <span class="s0">// Removing surfaces is gated because it acquires mutex waiting for commits</span>
+    <span class="s0">// in flight; in theory, it can deadlock.</span>
+    <span class="s4">if </span><span class="s1">(removeOutstandingSurfacesOnDestruction_) {</span>
+      <span class="s1">uiManager_-&gt;getShadowTreeRegistry().remove(surfaceId)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::registerSurface(</span>
+    <span class="s1">SurfaceHandler </span><span class="s4">const </span><span class="s1">&amp;surfaceHandler) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">surfaceHandler.setContextContainer(getContextContainer())</span><span class="s4">;</span>
+  <span class="s1">surfaceHandler.setUIManager(uiManager_.get())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">InspectorData Scheduler::getInspectorDataForInstance(</span>
+    <span class="s1">EventEmitter </span><span class="s4">const </span><span class="s1">&amp;eventEmitter) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">executeSynchronouslyOnSameThread_CAN_DEADLOCK&lt;InspectorData&gt;(</span>
+      <span class="s1">runtimeExecutor_</span><span class="s4">, </span><span class="s1">[=](jsi::Runtime &amp;runtime) -&gt; InspectorData {</span>
+        <span class="s4">auto </span><span class="s1">uiManagerBinding = UIManagerBinding::getBinding(runtime)</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">value = uiManagerBinding-&gt;getInspectorDataForInstance(</span>
+            <span class="s1">runtime</span><span class="s4">, </span><span class="s1">eventEmitter)</span><span class="s4">;</span>
+
+        <span class="s0">// TODO T97216348: avoid transforming jsi into folly::dynamic</span>
+        <span class="s4">auto </span><span class="s1">dynamic = jsi::dynamicFromValue(runtime</span><span class="s4">, </span><span class="s1">value)</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">source = dynamic[</span><span class="s3">&quot;source&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+        <span class="s1">InspectorData result = {}</span><span class="s4">;</span>
+        <span class="s1">result.fileName =</span>
+            <span class="s1">source[</span><span class="s3">&quot;fileName&quot;</span><span class="s1">].isNull() ? </span><span class="s3">&quot;&quot; </span><span class="s1">: source[</span><span class="s3">&quot;fileName&quot;</span><span class="s1">].c_str()</span><span class="s4">;</span>
+        <span class="s1">result.lineNumber = (</span><span class="s4">int</span><span class="s1">)source[</span><span class="s3">&quot;lineNumber&quot;</span><span class="s1">].getDouble()</span><span class="s4">;</span>
+        <span class="s1">result.columnNumber = (</span><span class="s4">int</span><span class="s1">)source[</span><span class="s3">&quot;columnNumber&quot;</span><span class="s1">].getDouble()</span><span class="s4">;</span>
+        <span class="s1">result.selectedIndex = (</span><span class="s4">int</span><span class="s1">)dynamic[</span><span class="s3">&quot;selectedIndex&quot;</span><span class="s1">].getDouble()</span><span class="s4">;</span>
+        <span class="s0">// TODO T97216348: remove folly::dynamic from InspectorData struct</span>
+        <span class="s1">result.props = dynamic[</span><span class="s3">&quot;props&quot;</span><span class="s1">]</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">hierarchy = dynamic[</span><span class="s3">&quot;hierarchy&quot;</span><span class="s1">]</span><span class="s4">;</span>
+        <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;i : hierarchy) {</span>
+          <span class="s4">auto </span><span class="s1">viewHierarchyValue = i[</span><span class="s3">&quot;name&quot;</span><span class="s1">]</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">(!viewHierarchyValue.isNull()) {</span>
+            <span class="s1">result.hierarchy.emplace_back(viewHierarchyValue.c_str())</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::unregisterSurface(</span>
+    <span class="s1">SurfaceHandler </span><span class="s4">const </span><span class="s1">&amp;surfaceHandler) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">surfaceHandler.setUIManager(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::renderTemplateToSurface(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;uiTemplate) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Scheduler::renderTemplateToSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s4">if </span><span class="s1">(uiTemplate.empty()) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">NativeModuleRegistry nMR</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">tree = UITemplateProcessor::buildShadowTree(</span>
+        <span class="s1">uiTemplate</span><span class="s4">,</span>
+        <span class="s1">surfaceId</span><span class="s4">,</span>
+        <span class="s1">folly::dynamic::object()</span><span class="s4">,</span>
+        <span class="s1">*componentDescriptorRegistry_</span><span class="s4">,</span>
+        <span class="s1">nMR</span><span class="s4">,</span>
+        <span class="s1">reactNativeConfig_)</span><span class="s4">;</span>
+
+    <span class="s1">uiManager_-&gt;getShadowTreeRegistry().visit(</span>
+        <span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">[=](</span><span class="s4">const </span><span class="s1">ShadowTree &amp;shadowTree) {</span>
+          <span class="s4">return </span><span class="s1">shadowTree.tryCommit(</span>
+              <span class="s1">[&amp;](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode) {</span>
+                <span class="s4">return </span><span class="s1">std::make_shared&lt;RootShadowNode&gt;(</span>
+                    <span class="s1">oldRootShadowNode</span><span class="s4">,</span>
+                    <span class="s1">ShadowNodeFragment{</span>
+                        <span class="s0">/* .props = */ </span><span class="s1">ShadowNodeFragment::propsPlaceholder()</span><span class="s4">,</span>
+                        <span class="s0">/* .children = */</span>
+                        <span class="s1">std::make_shared&lt;ShadowNode::ListOfShared&gt;(</span>
+                            <span class="s1">ShadowNode::ListOfShared{tree})</span><span class="s4">,</span>
+                    <span class="s1">})</span><span class="s4">;</span>
+              <span class="s1">}</span><span class="s4">,</span>
+              <span class="s1">{</span><span class="s0">/* default commit options */</span><span class="s1">})</span><span class="s4">;</span>
+        <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::exception &amp;e) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;    &gt;&gt;&gt;&gt; EXCEPTION &lt;&lt;&lt;  rendering uiTemplate in &quot;</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot;Scheduler::renderTemplateToSurface: &quot; </span><span class="s1">&lt;&lt; e.what()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">ComponentDescriptor </span><span class="s4">const </span><span class="s1">*</span>
+<span class="s1">Scheduler::findComponentDescriptorByHandle_DO_NOT_USE_THIS_IS_BROKEN(</span>
+    <span class="s1">ComponentHandle handle) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">componentDescriptorRegistry_</span>
+      <span class="s1">-&gt;findComponentDescriptorByHandle_DO_NOT_USE_THIS_IS_BROKEN(handle)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Delegate</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::setDelegate(SchedulerDelegate *delegate) {</span>
+  <span class="s1">delegate_ = delegate</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SchedulerDelegate *Scheduler::getDelegate() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">delegate_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - UIManagerAnimationDelegate</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::animationTick() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">uiManager_-&gt;animationTick()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - UIManagerDelegate</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::uiManagerDidFinishTransaction(</span>
+    <span class="s1">MountingCoordinator::Shared mountingCoordinator</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">mountSynchronously) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Scheduler::uiManagerDidFinishTransaction&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">if </span><span class="s1">(CoreFeatures::blockPaintForUseLayoutEffect) {</span>
+      <span class="s4">auto </span><span class="s1">weakRuntimeScheduler =</span>
+          <span class="s1">contextContainer_-&gt;find&lt;std::weak_ptr&lt;RuntimeScheduler&gt;&gt;(</span>
+              <span class="s3">&quot;RuntimeScheduler&quot;</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">runtimeScheduler = weakRuntimeScheduler.has_value()</span>
+          <span class="s1">? weakRuntimeScheduler.value().lock()</span>
+          <span class="s1">: </span><span class="s4">nullptr;</span>
+      <span class="s4">if </span><span class="s1">(runtimeScheduler &amp;&amp; !mountSynchronously) {</span>
+        <span class="s1">runtimeScheduler-&gt;scheduleTask(</span>
+            <span class="s1">SchedulerPriority::UserBlockingPriority</span><span class="s4">,</span>
+            <span class="s1">[delegate = delegate_</span><span class="s4">,</span>
+             <span class="s1">mountingCoordinator =</span>
+                 <span class="s1">std::move(mountingCoordinator)](jsi::Runtime &amp;) {</span>
+              <span class="s1">delegate-&gt;schedulerDidFinishTransaction(</span>
+                  <span class="s1">std::move(mountingCoordinator))</span><span class="s4">;</span>
+            <span class="s1">})</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">delegate_-&gt;schedulerDidFinishTransaction(</span>
+            <span class="s1">std::move(mountingCoordinator))</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">delegate_-&gt;schedulerDidFinishTransaction(std::move(mountingCoordinator))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s4">void </span><span class="s1">Scheduler::uiManagerDidCreateShadowNode(</span><span class="s4">const </span><span class="s1">ShadowNode &amp;shadowNode) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Scheduler::uiManagerDidCreateShadowNode&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">delegate_-&gt;schedulerDidRequestPreliminaryViewAllocation(</span>
+        <span class="s1">shadowNode.getSurfaceId()</span><span class="s4">, </span><span class="s1">shadowNode)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::uiManagerDidDispatchCommand(</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::Shared &amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;commandName</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;args) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Scheduler::uiManagerDispatchCommand&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">auto </span><span class="s1">shadowView = ShadowView(*shadowNode)</span><span class="s4">;</span>
+    <span class="s1">delegate_-&gt;schedulerDidDispatchCommand(shadowView</span><span class="s4">, </span><span class="s1">commandName</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::uiManagerDidSendAccessibilityEvent(</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::Shared &amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;eventType) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Scheduler::uiManagerDidSendAccessibilityEvent&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">auto </span><span class="s1">shadowView = ShadowView(*shadowNode)</span><span class="s4">;</span>
+    <span class="s1">delegate_-&gt;schedulerDidSendAccessibilityEvent(shadowView</span><span class="s4">, </span><span class="s1">eventType)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Set JS responder for a view. 
+ */</span>
+<span class="s4">void </span><span class="s1">Scheduler::uiManagerDidSetIsJSResponder(</span>
+    <span class="s1">ShadowNode::Shared </span><span class="s4">const </span><span class="s1">&amp;shadowNode</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">isJSResponder</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">blockNativeResponder) {</span>
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">delegate_-&gt;schedulerDidSetIsJSResponder(</span>
+        <span class="s1">ShadowView(*shadowNode)</span><span class="s4">, </span><span class="s1">isJSResponder</span><span class="s4">, </span><span class="s1">blockNativeResponder)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">ContextContainer::Shared Scheduler::getContextContainer() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">contextContainer_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;UIManager&gt; Scheduler::getUIManager() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">uiManager_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::addEventListener(</span>
+    <span class="s4">const </span><span class="s1">std::shared_ptr&lt;EventListener </span><span class="s4">const</span><span class="s1">&gt; &amp;listener) {</span>
+  <span class="s4">if </span><span class="s1">(eventDispatcher_-&gt;has_value()) {</span>
+    <span class="s1">eventDispatcher_-&gt;value().addListener(listener)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">Scheduler::removeEventListener(</span>
+    <span class="s4">const </span><span class="s1">std::shared_ptr&lt;EventListener </span><span class="s4">const</span><span class="s1">&gt; &amp;listener) {</span>
+  <span class="s4">if </span><span class="s1">(eventDispatcher_-&gt;has_value()) {</span>
+    <span class="s1">eventDispatcher_-&gt;value().removeListener(listener)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

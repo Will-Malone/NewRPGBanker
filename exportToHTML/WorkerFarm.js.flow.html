@@ -1,0 +1,196 @@
+<html>
+<head>
+<title>WorkerFarm.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+WorkerFarm.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {TransformResult} from '../DeltaBundler';</span>
+<span class="s0">import type {TransformerConfig, TransformOptions, Worker} from './Worker';</span>
+<span class="s0">import type {ConfigT} from 'metro-config/src/configTypes.flow';</span>
+<span class="s0">import type {Readable} from 'stream';</span>
+
+<span class="s0">const {Worker: JestWorker} = require('jest-worker');</span>
+<span class="s0">const {Logger} = require('metro-core');</span>
+
+<span class="s0">type WorkerInterface = {</span>
+  <span class="s0">getStdout(): Readable,</span>
+  <span class="s0">getStderr(): Readable,</span>
+  <span class="s0">end(): void,</span>
+  <span class="s0">...Worker,</span>
+<span class="s0">};</span>
+
+<span class="s0">type TransformerResult = $ReadOnly&lt;{</span>
+  <span class="s0">result: TransformResult&lt;&gt;,</span>
+  <span class="s0">sha1: string,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">class WorkerFarm {</span>
+  <span class="s0">_config: ConfigT;</span>
+  <span class="s0">_transformerConfig: TransformerConfig;</span>
+  <span class="s0">_worker: WorkerInterface | Worker;</span>
+
+  <span class="s0">constructor(config: ConfigT, transformerConfig: TransformerConfig) {</span>
+    <span class="s0">this._config = config;</span>
+    <span class="s0">this._transformerConfig = transformerConfig;</span>
+
+    <span class="s0">if (this._config.maxWorkers &gt; 1) {</span>
+      <span class="s0">const worker = this._makeFarm(</span>
+        <span class="s0">this._config.transformer.workerPath,</span>
+        <span class="s0">['transform'],</span>
+        <span class="s0">this._config.maxWorkers,</span>
+      <span class="s0">);</span>
+
+      <span class="s0">worker.getStdout().on('data', chunk =&gt; {</span>
+        <span class="s0">this._config.reporter.update({</span>
+          <span class="s0">type: 'worker_stdout_chunk',</span>
+          <span class="s0">chunk: chunk.toString('utf8'),</span>
+        <span class="s0">});</span>
+      <span class="s0">});</span>
+      <span class="s0">worker.getStderr().on('data', chunk =&gt; {</span>
+        <span class="s0">this._config.reporter.update({</span>
+          <span class="s0">type: 'worker_stderr_chunk',</span>
+          <span class="s0">chunk: chunk.toString('utf8'),</span>
+        <span class="s0">});</span>
+      <span class="s0">});</span>
+
+      <span class="s0">this._worker = worker;</span>
+    <span class="s0">} else {</span>
+      <span class="s0">// eslint-disable-next-line no-useless-call</span>
+      <span class="s0">this._worker = (require.call(</span>
+        <span class="s0">null,</span>
+        <span class="s0">this._config.transformer.workerPath,</span>
+      <span class="s0">): Worker);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async kill(): Promise&lt;void&gt; {</span>
+    <span class="s0">if (this._worker &amp;&amp; typeof this._worker.end === 'function') {</span>
+      <span class="s0">await this._worker.end();</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async transform(</span>
+    <span class="s0">filename: string,</span>
+    <span class="s0">options: TransformOptions,</span>
+    <span class="s0">fileBuffer?: Buffer,</span>
+  <span class="s0">): Promise&lt;TransformerResult&gt; {</span>
+    <span class="s0">try {</span>
+      <span class="s0">const data = await this._worker.transform(</span>
+        <span class="s0">filename,</span>
+        <span class="s0">options,</span>
+        <span class="s0">this._config.projectRoot,</span>
+        <span class="s0">this._transformerConfig,</span>
+        <span class="s0">fileBuffer,</span>
+      <span class="s0">);</span>
+
+      <span class="s0">Logger.log(data.transformFileStartLogEntry);</span>
+      <span class="s0">Logger.log(data.transformFileEndLogEntry);</span>
+
+      <span class="s0">return {</span>
+        <span class="s0">result: data.result,</span>
+        <span class="s0">sha1: data.sha1,</span>
+      <span class="s0">};</span>
+    <span class="s0">} catch (err) {</span>
+      <span class="s0">if (err.loc) {</span>
+        <span class="s0">throw this._formatBabelError(err, filename);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">throw this._formatGenericError(err, filename);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_makeFarm(</span>
+    <span class="s0">workerPath: string,</span>
+    <span class="s0">exposedMethods: $ReadOnlyArray&lt;string&gt;,</span>
+    <span class="s0">numWorkers: number,</span>
+  <span class="s0">): any {</span>
+    <span class="s0">const env = {</span>
+      <span class="s0">...process.env,</span>
+      <span class="s0">// Force color to print syntax highlighted code frames.</span>
+      <span class="s0">FORCE_COLOR: 1,</span>
+    <span class="s0">};</span>
+
+    <span class="s0">return new JestWorker(workerPath, {</span>
+      <span class="s0">computeWorkerKey: this._config.stickyWorkers</span>
+        <span class="s0">? // $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+          <span class="s0">// $FlowFixMe[incompatible-call]</span>
+          <span class="s0">this._computeWorkerKey</span>
+        <span class="s0">: undefined,</span>
+      <span class="s0">exposedMethods,</span>
+      <span class="s0">forkOptions: {env},</span>
+      <span class="s0">numWorkers,</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_computeWorkerKey(method: string, filename: string): ?string {</span>
+    <span class="s0">// Only when transforming a file we want to stick to the same worker; and</span>
+    <span class="s0">// we'll shard by file path. If not; we return null, which tells the worker</span>
+    <span class="s0">// to pick the first available one.</span>
+    <span class="s0">if (method === 'transform') {</span>
+      <span class="s0">return filename;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_formatGenericError(err: any, filename: string): TransformError {</span>
+    <span class="s0">const error = new TransformError(`${filename}: ${err.message}`);</span>
+
+    <span class="s0">return Object.assign(error, {</span>
+      <span class="s0">stack: (err.stack || '').split('\n').slice(0, -1).join('\n'),</span>
+      <span class="s0">lineNumber: 0,</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_formatBabelError(err: any, filename: string): TransformError {</span>
+    <span class="s0">const error = new TransformError(</span>
+      <span class="s0">`${err.type || 'Error'}${</span>
+        <span class="s0">err.message.includes(filename) ? '' : ' in ' + filename</span>
+      <span class="s0">}: ${err.message}`,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">// $FlowExpectedError: TODO(t67543470): Change this to properly extend the error.</span>
+    <span class="s0">return Object.assign(error, {</span>
+      <span class="s0">stack: err.stack,</span>
+      <span class="s0">snippet: err.codeFrame,</span>
+      <span class="s0">lineNumber: err.loc.line,</span>
+      <span class="s0">column: err.loc.column,</span>
+      <span class="s0">filename,</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">class TransformError extends SyntaxError {</span>
+  <span class="s0">type: string = 'TransformError';</span>
+
+  <span class="s0">constructor(message: string) {</span>
+    <span class="s0">super(message);</span>
+    <span class="s0">Error.captureStackTrace &amp;&amp; Error.captureStackTrace(this, TransformError);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = WorkerFarm;</span>
+</pre>
+</body>
+</html>

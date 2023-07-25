@@ -1,0 +1,336 @@
+<html>
+<head>
+<title>DependencyGraph.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #6a8759;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+DependencyGraph.js</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s2">var </span><span class="s1">_metroFileMap = require(</span><span class="s0">&quot;metro-file-map&quot;</span><span class="s1">);</span>
+<span class="s3">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s1">const canonicalize = require(</span><span class="s0">&quot;metro-core/src/canonicalize&quot;</span><span class="s1">);</span>
+<span class="s1">const createHasteMap = require(</span><span class="s0">&quot;./DependencyGraph/createHasteMap&quot;</span><span class="s1">);</span>
+<span class="s1">const { ModuleResolver } = require(</span><span class="s0">&quot;./DependencyGraph/ModuleResolution&quot;</span><span class="s1">);</span>
+<span class="s1">const ModuleCache = require(</span><span class="s0">&quot;./ModuleCache&quot;</span><span class="s1">);</span>
+<span class="s1">const { EventEmitter } = require(</span><span class="s0">&quot;events&quot;</span><span class="s1">);</span>
+<span class="s1">const fs = require(</span><span class="s0">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const {</span>
+  <span class="s1">AmbiguousModuleResolutionError,</span>
+  <span class="s1">Logger: { createActionStartEntry, createActionEndEntry, log },</span>
+  <span class="s1">PackageResolutionError,</span>
+<span class="s1">} = require(</span><span class="s0">&quot;metro-core&quot;</span><span class="s1">);</span>
+<span class="s1">const { InvalidPackageError } = require(</span><span class="s0">&quot;metro-resolver&quot;</span><span class="s1">);</span>
+<span class="s1">const nullthrows = require(</span><span class="s0">&quot;nullthrows&quot;</span><span class="s1">);</span>
+<span class="s1">const path = require(</span><span class="s0">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s1">const NULL_PLATFORM = Symbol();</span>
+<span class="s2">function </span><span class="s1">getOrCreateMap(map, field) {</span>
+  <span class="s1">let subMap = map.get(field);</span>
+  <span class="s2">if </span><span class="s1">(!subMap) {</span>
+    <span class="s1">subMap = </span><span class="s2">new </span><span class="s1">Map();</span>
+    <span class="s1">map.set(field, subMap);</span>
+  <span class="s1">}</span>
+  <span class="s2">return </span><span class="s1">subMap;</span>
+<span class="s1">}</span>
+<span class="s1">class DependencyGraph extends EventEmitter {</span>
+  <span class="s1">constructor(config, options) {</span>
+    <span class="s1">super();</span>
+    <span class="s2">this</span><span class="s1">._config = config;</span>
+    <span class="s1">const { hasReducedPerformance, watch } = options ?? {};</span>
+    <span class="s1">const initializingMetroLogEntry = log(</span>
+      <span class="s1">createActionStartEntry(</span><span class="s0">&quot;Initializing Metro&quot;</span><span class="s1">)</span>
+    <span class="s1">);</span>
+    <span class="s1">config.reporter.update({</span>
+      <span class="s1">type: </span><span class="s0">&quot;dep_graph_loading&quot;</span><span class="s1">,</span>
+      <span class="s1">hasReducedPerformance: !!hasReducedPerformance,</span>
+    <span class="s1">});</span>
+    <span class="s1">const haste = createHasteMap(config, {</span>
+      <span class="s1">watch,</span>
+    <span class="s1">});</span>
+
+    <span class="s3">// We can have a lot of graphs listening to Haste for changes.</span>
+    <span class="s3">// Bump this up to silence the max listeners EventEmitter warning.</span>
+    <span class="s1">haste.setMaxListeners(</span><span class="s4">1000</span><span class="s1">);</span>
+    <span class="s2">this</span><span class="s1">._haste = haste;</span>
+    <span class="s2">this</span><span class="s1">._haste.on(</span><span class="s0">&quot;status&quot;</span><span class="s1">, (status) =&gt; </span><span class="s2">this</span><span class="s1">._onWatcherStatus(status));</span>
+    <span class="s2">this</span><span class="s1">._readyPromise = haste</span>
+      <span class="s1">.build()</span>
+      <span class="s1">.then(({ fileSystem, hasteModuleMap }) =&gt; {</span>
+        <span class="s1">log(createActionEndEntry(initializingMetroLogEntry));</span>
+        <span class="s1">config.reporter.update({</span>
+          <span class="s1">type: </span><span class="s0">&quot;dep_graph_loaded&quot;</span><span class="s1">,</span>
+        <span class="s1">});</span>
+        <span class="s2">this</span><span class="s1">._fileSystem = fileSystem;</span>
+        <span class="s2">this</span><span class="s1">._hasteModuleMap = hasteModuleMap;</span>
+        <span class="s2">this</span><span class="s1">._haste.on(</span><span class="s0">&quot;change&quot;</span><span class="s1">, (changeEvent) =&gt;</span>
+          <span class="s2">this</span><span class="s1">._onHasteChange(changeEvent)</span>
+        <span class="s1">);</span>
+        <span class="s2">this</span><span class="s1">._haste.on(</span><span class="s0">&quot;healthCheck&quot;</span><span class="s1">, (result) =&gt;</span>
+          <span class="s2">this</span><span class="s1">._onWatcherHealthCheck(result)</span>
+        <span class="s1">);</span>
+        <span class="s2">this</span><span class="s1">._resolutionCache = </span><span class="s2">new </span><span class="s1">Map();</span>
+        <span class="s2">this</span><span class="s1">._moduleCache = </span><span class="s2">this</span><span class="s1">._createModuleCache();</span>
+        <span class="s2">this</span><span class="s1">._createModuleResolver();</span>
+      <span class="s1">});</span>
+  <span class="s1">}</span>
+  <span class="s1">_onWatcherHealthCheck(result) {</span>
+    <span class="s2">this</span><span class="s1">._config.reporter.update({</span>
+      <span class="s1">type: </span><span class="s0">&quot;watcher_health_check_result&quot;</span><span class="s1">,</span>
+      <span class="s1">result,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+  <span class="s1">_onWatcherStatus(status) {</span>
+    <span class="s2">this</span><span class="s1">._config.reporter.update({</span>
+      <span class="s1">type: </span><span class="s0">&quot;watcher_status&quot;</span><span class="s1">,</span>
+      <span class="s1">status,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Waits for the dependency graph to become ready after initialisation.</span>
+  <span class="s3">// Don't read anything from the graph until this resolves.</span>
+  <span class="s1">async ready() {</span>
+    <span class="s1">await </span><span class="s2">this</span><span class="s1">._readyPromise;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">// Creates the dependency graph and waits for it to become ready.</span>
+  <span class="s3">// @deprecated Use the constructor + ready() directly.</span>
+  <span class="s1">static async load(config, options) {</span>
+    <span class="s1">const self = </span><span class="s2">new </span><span class="s1">DependencyGraph(config, options);</span>
+    <span class="s1">await self.ready();</span>
+    <span class="s2">return </span><span class="s1">self;</span>
+  <span class="s1">}</span>
+  <span class="s1">_getClosestPackage(filePath) {</span>
+    <span class="s1">const parsedPath = path.parse(filePath);</span>
+    <span class="s1">const root = parsedPath.root;</span>
+    <span class="s1">let dir = path.join(parsedPath.dir, parsedPath.base);</span>
+    <span class="s2">do </span><span class="s1">{</span>
+      <span class="s3">// If we've hit a node_modules directory, the closest package was not</span>
+      <span class="s3">// found (`filePath` was likely nonexistent).</span>
+      <span class="s2">if </span><span class="s1">(path.basename(dir) === </span><span class="s0">&quot;node_modules&quot;</span><span class="s1">) {</span>
+        <span class="s2">return null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">const candidate = path.join(dir, </span><span class="s0">&quot;package.json&quot;</span><span class="s1">);</span>
+      <span class="s2">if </span><span class="s1">(</span><span class="s2">this</span><span class="s1">._fileSystem.exists(candidate)) {</span>
+        <span class="s2">return </span><span class="s1">candidate;</span>
+      <span class="s1">}</span>
+      <span class="s1">dir = path.dirname(dir);</span>
+    <span class="s1">} </span><span class="s2">while </span><span class="s1">(dir !== </span><span class="s0">&quot;.&quot; </span><span class="s1">&amp;&amp; dir !== root);</span>
+    <span class="s2">return null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">_onHasteChange({ eventsQueue }) {</span>
+    <span class="s2">this</span><span class="s1">._resolutionCache = </span><span class="s2">new </span><span class="s1">Map();</span>
+    <span class="s1">eventsQueue.forEach(({ filePath }) =&gt;</span>
+      <span class="s2">this</span><span class="s1">._moduleCache.invalidate(filePath)</span>
+    <span class="s1">);</span>
+    <span class="s2">this</span><span class="s1">._createModuleResolver();</span>
+    <span class="s2">this</span><span class="s1">.emit(</span><span class="s0">&quot;change&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">_createModuleResolver() {</span>
+    <span class="s2">this</span><span class="s1">._moduleResolver = </span><span class="s2">new </span><span class="s1">ModuleResolver({</span>
+      <span class="s1">assetExts: </span><span class="s2">new </span><span class="s1">Set(</span><span class="s2">this</span><span class="s1">._config.resolver.assetExts),</span>
+      <span class="s1">dirExists: (filePath) =&gt; {</span>
+        <span class="s2">try </span><span class="s1">{</span>
+          <span class="s2">return </span><span class="s1">fs.lstatSync(filePath).isDirectory();</span>
+        <span class="s1">} </span><span class="s2">catch </span><span class="s1">(e) {}</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+      <span class="s1">},</span>
+      <span class="s1">disableHierarchicalLookup:</span>
+        <span class="s2">this</span><span class="s1">._config.resolver.disableHierarchicalLookup,</span>
+      <span class="s1">doesFileExist: </span><span class="s2">this</span><span class="s1">._doesFileExist,</span>
+      <span class="s1">emptyModulePath: </span><span class="s2">this</span><span class="s1">._config.resolver.emptyModulePath,</span>
+      <span class="s1">extraNodeModules: </span><span class="s2">this</span><span class="s1">._config.resolver.extraNodeModules,</span>
+      <span class="s1">getHasteModulePath: (name, platform) =&gt;</span>
+        <span class="s2">this</span><span class="s1">._hasteModuleMap.getModule(name, platform, </span><span class="s2">true</span><span class="s1">),</span>
+      <span class="s1">getHastePackagePath: (name, platform) =&gt;</span>
+        <span class="s2">this</span><span class="s1">._hasteModuleMap.getPackage(name, platform, </span><span class="s2">true</span><span class="s1">),</span>
+      <span class="s1">mainFields: </span><span class="s2">this</span><span class="s1">._config.resolver.resolverMainFields,</span>
+      <span class="s1">moduleCache: </span><span class="s2">this</span><span class="s1">._moduleCache,</span>
+      <span class="s1">nodeModulesPaths: </span><span class="s2">this</span><span class="s1">._config.resolver.nodeModulesPaths,</span>
+      <span class="s1">preferNativePlatform: </span><span class="s2">true</span><span class="s1">,</span>
+      <span class="s1">projectRoot: </span><span class="s2">this</span><span class="s1">._config.projectRoot,</span>
+      <span class="s1">reporter: </span><span class="s2">this</span><span class="s1">._config.reporter,</span>
+      <span class="s1">resolveAsset: (dirPath, assetName, extension) =&gt; {</span>
+        <span class="s1">const basePath = dirPath + path.sep + assetName;</span>
+        <span class="s1">let assets = [</span>
+          <span class="s1">basePath + extension,</span>
+          <span class="s1">...</span><span class="s2">this</span><span class="s1">._config.resolver.assetResolutions.map(</span>
+            <span class="s1">(resolution) =&gt; basePath + </span><span class="s0">&quot;@&quot; </span><span class="s1">+ resolution + </span><span class="s0">&quot;x&quot; </span><span class="s1">+ extension</span>
+          <span class="s1">),</span>
+        <span class="s1">];</span>
+        <span class="s2">if </span><span class="s1">(</span><span class="s2">this</span><span class="s1">._config.resolver.unstable_enableSymlinks) {</span>
+          <span class="s1">assets = assets</span>
+            <span class="s1">.map((candidate) =&gt; </span><span class="s2">this</span><span class="s1">._fileSystem.getRealPath(candidate))</span>
+            <span class="s1">.filter(Boolean);</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+          <span class="s1">assets = assets.filter((candidate) =&gt;</span>
+            <span class="s2">this</span><span class="s1">._fileSystem.exists(candidate)</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">assets.length ? assets : </span><span class="s2">null</span><span class="s1">;</span>
+      <span class="s1">},</span>
+      <span class="s1">resolveRequest: </span><span class="s2">this</span><span class="s1">._config.resolver.resolveRequest,</span>
+      <span class="s1">sourceExts: </span><span class="s2">this</span><span class="s1">._config.resolver.sourceExts,</span>
+      <span class="s1">unstable_conditionNames: </span><span class="s2">this</span><span class="s1">._config.resolver.unstable_conditionNames,</span>
+      <span class="s1">unstable_conditionsByPlatform:</span>
+        <span class="s2">this</span><span class="s1">._config.resolver.unstable_conditionsByPlatform,</span>
+      <span class="s1">unstable_enablePackageExports:</span>
+        <span class="s2">this</span><span class="s1">._config.resolver.unstable_enablePackageExports,</span>
+      <span class="s1">unstable_getRealPath: </span><span class="s2">this</span><span class="s1">._config.resolver.unstable_enableSymlinks</span>
+        <span class="s1">? (path) =&gt; </span><span class="s2">this</span><span class="s1">._fileSystem.getRealPath(path)</span>
+        <span class="s1">: </span><span class="s2">null</span><span class="s1">,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+  <span class="s1">_createModuleCache() {</span>
+    <span class="s2">return new </span><span class="s1">ModuleCache({</span>
+      <span class="s1">getClosestPackage: (filePath) =&gt; </span><span class="s2">this</span><span class="s1">._getClosestPackage(filePath),</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+  <span class="s1">getAllFiles() {</span>
+    <span class="s2">return </span><span class="s1">nullthrows(</span><span class="s2">this</span><span class="s1">._fileSystem).getAllFiles();</span>
+  <span class="s1">}</span>
+  <span class="s1">getSha1(filename) {</span>
+    <span class="s3">// TODO If it looks like we're trying to get the sha1 from a file located</span>
+    <span class="s3">// within a Zip archive, then we instead compute the sha1 for what looks</span>
+    <span class="s3">// like the Zip archive itself.</span>
+
+    <span class="s1">const splitIndex = filename.indexOf(</span><span class="s0">&quot;.zip/&quot;</span><span class="s1">);</span>
+    <span class="s1">const containerName =</span>
+      <span class="s1">splitIndex !== -</span><span class="s4">1 </span><span class="s1">? filename.slice(</span><span class="s4">0</span><span class="s1">, splitIndex + </span><span class="s4">4</span><span class="s1">) : filename;</span>
+
+    <span class="s3">// Prior to unstable_enableSymlinks:</span>
+    <span class="s3">// Calling realpath allows us to get a hash for a given path even when</span>
+    <span class="s3">// it's a symlink to a file, which prevents Metro from crashing in such a</span>
+    <span class="s3">// case. However, it doesn't allow Metro to track changes to the target file</span>
+    <span class="s3">// of the symlink. We should fix this by implementing a symlink map into</span>
+    <span class="s3">// Metro (or maybe by implementing those &quot;extra transformation sources&quot; we've</span>
+    <span class="s3">// been talking about for stuff like CSS or WASM).</span>
+    <span class="s3">//</span>
+    <span class="s3">// This is unnecessary with a symlink-aware fileSystem implementation.</span>
+    <span class="s1">const resolvedPath = </span><span class="s2">this</span><span class="s1">._config.resolver.unstable_enableSymlinks</span>
+      <span class="s1">? containerName</span>
+      <span class="s1">: fs.realpathSync(containerName);</span>
+    <span class="s1">const sha1 = </span><span class="s2">this</span><span class="s1">._fileSystem.getSha1(resolvedPath);</span>
+    <span class="s2">if </span><span class="s1">(!sha1) {</span>
+      <span class="s2">throw new </span><span class="s1">ReferenceError(`SHA-1 </span><span class="s2">for </span><span class="s1">file ${filename} (${resolvedPath}) is not computed.</span>
+         <span class="s1">Potential causes:</span>
+           <span class="s4">1</span><span class="s1">) You have symlinks </span><span class="s2">in </span><span class="s1">your project - watchman does not follow symlinks.</span>
+           <span class="s4">2</span><span class="s1">) Check \`blockList\` </span><span class="s2">in </span><span class="s1">your metro.config.js and make sure it isn</span><span class="s0">'t excluding the file path.`);</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">sha1;</span>
+  <span class="s1">}</span>
+  <span class="s1">getWatcher() {</span>
+    <span class="s2">return this</span><span class="s1">._haste;</span>
+  <span class="s1">}</span>
+  <span class="s1">end() {</span>
+    <span class="s3">// $FlowFixMe[unused-promise]</span>
+    <span class="s2">this</span><span class="s1">._haste.end();</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Given a search context, return a list of file paths matching the query. */</span>
+  <span class="s1">matchFilesWithContext(from, context) {</span>
+    <span class="s2">return this</span><span class="s1">._fileSystem.matchFilesWithContext(from, context);</span>
+  <span class="s1">}</span>
+  <span class="s1">resolveDependency(</span>
+    <span class="s1">from,</span>
+    <span class="s1">to,</span>
+    <span class="s1">platform,</span>
+    <span class="s1">resolverOptions,</span>
+    <span class="s3">// TODO: Fold assumeFlatNodeModules into resolverOptions and add to graphId</span>
+    <span class="s1">{ assumeFlatNodeModules } = {</span>
+      <span class="s1">assumeFlatNodeModules: </span><span class="s2">false</span><span class="s1">,</span>
+    <span class="s1">}</span>
+  <span class="s1">) {</span>
+    <span class="s1">const isSensitiveToOriginFolder =</span>
+      <span class="s3">// Resolution is always relative to the origin folder unless we assume a flat node_modules</span>
+      <span class="s1">!assumeFlatNodeModules ||</span>
+      <span class="s3">// Path requests are resolved relative to the origin folder</span>
+      <span class="s1">to.includes(</span><span class="s0">&quot;/&quot;</span><span class="s1">) ||</span>
+      <span class="s1">to === </span><span class="s0">&quot;.&quot; </span><span class="s1">||</span>
+      <span class="s1">to === </span><span class="s0">&quot;..&quot; </span><span class="s1">||</span>
+      <span class="s3">// Preserve standard assumptions under node_modules</span>
+      <span class="s1">from.includes(path.sep + </span><span class="s0">&quot;node_modules&quot; </span><span class="s1">+ path.sep);</span>
+
+    <span class="s3">// Compound key for the resolver cache</span>
+    <span class="s1">const resolverOptionsKey =</span>
+      <span class="s1">JSON.stringify(</span>
+        <span class="s1">resolverOptions.customResolverOptions ?? {},</span>
+        <span class="s1">canonicalize</span>
+      <span class="s1">) ?? </span><span class="s0">&quot;&quot;</span><span class="s1">;</span>
+    <span class="s1">const originKey = isSensitiveToOriginFolder ? path.dirname(from) : </span><span class="s0">&quot;&quot;</span><span class="s1">;</span>
+    <span class="s1">const targetKey = to;</span>
+    <span class="s1">const platformKey = platform ?? NULL_PLATFORM;</span>
+
+    <span class="s3">// Traverse the resolver cache, which is a tree of maps</span>
+    <span class="s1">const mapByResolverOptions = </span><span class="s2">this</span><span class="s1">._resolutionCache;</span>
+    <span class="s1">const mapByOrigin = getOrCreateMap(</span>
+      <span class="s1">mapByResolverOptions,</span>
+      <span class="s1">resolverOptionsKey</span>
+    <span class="s1">);</span>
+    <span class="s1">const mapByTarget = getOrCreateMap(mapByOrigin, originKey);</span>
+    <span class="s1">const mapByPlatform = getOrCreateMap(mapByTarget, targetKey);</span>
+    <span class="s1">let resolution = mapByPlatform.get(platformKey);</span>
+    <span class="s2">if </span><span class="s1">(!resolution) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">resolution = </span><span class="s2">this</span><span class="s1">._moduleResolver.resolveDependency(</span>
+          <span class="s2">this</span><span class="s1">._moduleCache.getModule(from),</span>
+          <span class="s1">to,</span>
+          <span class="s2">true</span><span class="s1">,</span>
+          <span class="s1">platform,</span>
+          <span class="s1">resolverOptions</span>
+        <span class="s1">);</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(error) {</span>
+        <span class="s2">if </span><span class="s1">(error </span><span class="s2">instanceof </span><span class="s1">_metroFileMap.DuplicateHasteCandidatesError) {</span>
+          <span class="s2">throw new </span><span class="s1">AmbiguousModuleResolutionError(from, error);</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(error </span><span class="s2">instanceof </span><span class="s1">InvalidPackageError) {</span>
+          <span class="s2">throw new </span><span class="s1">PackageResolutionError({</span>
+            <span class="s1">packageError: error,</span>
+            <span class="s1">originModulePath: from,</span>
+            <span class="s1">targetModuleName: to,</span>
+          <span class="s1">});</span>
+        <span class="s1">}</span>
+        <span class="s2">throw </span><span class="s1">error;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">mapByPlatform.set(platformKey, resolution);</span>
+    <span class="s2">return </span><span class="s1">resolution;</span>
+  <span class="s1">}</span>
+  <span class="s1">_doesFileExist = (filePath) =&gt; {</span>
+    <span class="s2">return this</span><span class="s1">._fileSystem.exists(filePath);</span>
+  <span class="s1">};</span>
+  <span class="s1">getHasteName(filePath) {</span>
+    <span class="s1">const hasteName = </span><span class="s2">this</span><span class="s1">._fileSystem.getModuleName(filePath);</span>
+    <span class="s2">if </span><span class="s1">(hasteName) {</span>
+      <span class="s2">return </span><span class="s1">hasteName;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">path.relative(</span><span class="s2">this</span><span class="s1">._config.projectRoot, filePath);</span>
+  <span class="s1">}</span>
+  <span class="s1">getDependencies(filePath) {</span>
+    <span class="s2">return </span><span class="s1">nullthrows(</span><span class="s2">this</span><span class="s1">._fileSystem.getDependencies(filePath));</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = DependencyGraph;</span>
+</pre>
+</body>
+</html>

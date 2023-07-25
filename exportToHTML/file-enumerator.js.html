@@ -1,0 +1,569 @@
+<html>
+<head>
+<title>file-enumerator.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+file-enumerator.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview `FileEnumerator` class. 
+ * 
+ * `FileEnumerator` class has two responsibilities: 
+ * 
+ * 1. Find target files by processing glob patterns. 
+ * 2. Tie each target file and appropriate configuration. 
+ * 
+ * It provides a method: 
+ * 
+ * - `iterateFiles(patterns)` 
+ *     Iterate files which are matched by given patterns together with the 
+ *     corresponded configuration. This is for `CLIEngine#executeOnFiles()`. 
+ *     While iterating files, it loads the configuration file of each directory 
+ *     before iterate files on the directory, so we can use the configuration 
+ *     files to determine target files. 
+ * 
+ * @example 
+ * const enumerator = new FileEnumerator(); 
+ * const linter = new Linter(); 
+ * 
+ * for (const { config, filePath } of enumerator.iterateFiles([&quot;*.js&quot;])) { 
+ *     const code = fs.readFileSync(filePath, &quot;utf8&quot;); 
+ *     const messages = linter.verify(code, config, filePath); 
+ * 
+ *     console.log(messages); 
+ * } 
+ * 
+ * @author Toru Nagashima &lt;https://github.com/mysticatea&gt; 
+ */</span>
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const fs = require(</span><span class="s2">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const path = require(</span><span class="s2">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s1">const getGlobParent = require(</span><span class="s2">&quot;glob-parent&quot;</span><span class="s1">);</span>
+<span class="s1">const isGlob = require(</span><span class="s2">&quot;is-glob&quot;</span><span class="s1">);</span>
+<span class="s1">const escapeRegExp = require(</span><span class="s2">&quot;escape-string-regexp&quot;</span><span class="s1">);</span>
+<span class="s1">const { Minimatch } = require(</span><span class="s2">&quot;minimatch&quot;</span><span class="s1">);</span>
+
+<span class="s1">const {</span>
+    <span class="s1">Legacy: {</span>
+        <span class="s1">IgnorePattern,</span>
+        <span class="s1">CascadingConfigArrayFactory</span>
+    <span class="s1">}</span>
+<span class="s1">} = require(</span><span class="s2">&quot;@eslint/eslintrc&quot;</span><span class="s1">);</span>
+<span class="s1">const debug = require(</span><span class="s2">&quot;debug&quot;</span><span class="s1">)(</span><span class="s2">&quot;eslint:file-enumerator&quot;</span><span class="s1">);</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const minimatchOpts = { dot: </span><span class="s3">true</span><span class="s1">, matchBase: </span><span class="s3">true </span><span class="s1">};</span>
+<span class="s1">const dotfilesPattern = /(?:(?:^\.)|(?:[/\\]\.))[^/\\.].*/u;</span>
+<span class="s1">const NONE = </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">const IGNORED_SILENTLY = </span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">const IGNORED = </span><span class="s4">2</span><span class="s1">;</span>
+
+<span class="s0">// For VSCode intellisense</span>
+<span class="s0">/** @typedef {ReturnType&lt;CascadingConfigArrayFactory.getConfigArrayForFile&gt;} ConfigArray */</span>
+
+<span class="s0">/** 
+ * @typedef {Object} FileEnumeratorOptions 
+ * @property {CascadingConfigArrayFactory} [configArrayFactory] The factory for config arrays. 
+ * @property {string} [cwd] The base directory to start lookup. 
+ * @property {string[]} [extensions] The extensions to match files for directory patterns. 
+ * @property {boolean} [globInputPaths] Set to false to skip glob resolution of input file paths to lint (default: true). If false, each input file paths is assumed to be a non-glob path to an existing file. 
+ * @property {boolean} [ignore] The flag to check ignored files. 
+ * @property {string[]} [rulePaths] The value of `--rulesdir` option. 
+ */</span>
+
+<span class="s0">/** 
+ * @typedef {Object} FileAndConfig 
+ * @property {string} filePath The path to a target file. 
+ * @property {ConfigArray} config The config entries of that file. 
+ * @property {boolean} ignored If `true` then this file should be ignored and warned because it was directly specified. 
+ */</span>
+
+<span class="s0">/** 
+ * @typedef {Object} FileEntry 
+ * @property {string} filePath The path to a target file. 
+ * @property {ConfigArray} config The config entries of that file. 
+ * @property {NONE|IGNORED_SILENTLY|IGNORED} flag The flag. 
+ * - `NONE` means the file is a target file. 
+ * - `IGNORED_SILENTLY` means the file should be ignored silently. 
+ * - `IGNORED` means the file should be ignored and warned because it was directly specified. 
+ */</span>
+
+<span class="s0">/** 
+ * @typedef {Object} FileEnumeratorInternalSlots 
+ * @property {CascadingConfigArrayFactory} configArrayFactory The factory for config arrays. 
+ * @property {string} cwd The base directory to start lookup. 
+ * @property {RegExp|null} extensionRegExp The RegExp to test if a string ends with specific file extensions. 
+ * @property {boolean} globInputPaths Set to false to skip glob resolution of input file paths to lint (default: true). If false, each input file paths is assumed to be a non-glob path to an existing file. 
+ * @property {boolean} ignoreFlag The flag to check ignored files. 
+ * @property {(filePath:string, dot:boolean) =&gt; boolean} defaultIgnores The default predicate function to ignore files. 
+ */</span>
+
+<span class="s0">/** @type {WeakMap&lt;FileEnumerator, FileEnumeratorInternalSlots&gt;} */</span>
+<span class="s1">const internalSlotsMap = </span><span class="s3">new </span><span class="s1">WeakMap();</span>
+
+<span class="s0">/** 
+ * Check if a string is a glob pattern or not. 
+ * @param {string} pattern A glob pattern. 
+ * @returns {boolean} `true` if the string is a glob pattern. 
+ */</span>
+<span class="s3">function </span><span class="s1">isGlobPattern(pattern) {</span>
+    <span class="s3">return </span><span class="s1">isGlob(path.sep === </span><span class="s2">&quot;</span><span class="s5">\\</span><span class="s2">&quot; </span><span class="s1">? pattern.replace(/\\/gu, </span><span class="s2">&quot;/&quot;</span><span class="s1">) : pattern);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Get stats of a given path. 
+ * @param {string} filePath The path to target file. 
+ * @throws {Error} As may be thrown by `fs.statSync`. 
+ * @returns {fs.Stats|null} The stats. 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">statSafeSync(filePath) {</span>
+    <span class="s3">try </span><span class="s1">{</span>
+        <span class="s3">return </span><span class="s1">fs.statSync(filePath);</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+
+        <span class="s0">/* c8 ignore next */</span>
+        <span class="s3">if </span><span class="s1">(error.code !== </span><span class="s2">&quot;ENOENT&quot;</span><span class="s1">) {</span>
+            <span class="s3">throw </span><span class="s1">error;</span>
+        <span class="s1">}</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Get filenames in a given path to a directory. 
+ * @param {string} directoryPath The path to target directory. 
+ * @throws {Error} As may be thrown by `fs.readdirSync`. 
+ * @returns {import(&quot;fs&quot;).Dirent[]} The filenames. 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">readdirSafeSync(directoryPath) {</span>
+    <span class="s3">try </span><span class="s1">{</span>
+        <span class="s3">return </span><span class="s1">fs.readdirSync(directoryPath, { withFileTypes: </span><span class="s3">true </span><span class="s1">});</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+
+        <span class="s0">/* c8 ignore next */</span>
+        <span class="s3">if </span><span class="s1">(error.code !== </span><span class="s2">&quot;ENOENT&quot;</span><span class="s1">) {</span>
+            <span class="s3">throw </span><span class="s1">error;</span>
+        <span class="s1">}</span>
+        <span class="s3">return </span><span class="s1">[];</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Create a `RegExp` object to detect extensions. 
+ * @param {string[] | null} extensions The extensions to create. 
+ * @returns {RegExp | null} The created `RegExp` object or null. 
+ */</span>
+<span class="s3">function </span><span class="s1">createExtensionRegExp(extensions) {</span>
+    <span class="s3">if </span><span class="s1">(extensions) {</span>
+        <span class="s1">const normalizedExts = extensions.map(ext =&gt; escapeRegExp(</span>
+            <span class="s1">ext.startsWith(</span><span class="s2">&quot;.&quot;</span><span class="s1">)</span>
+                <span class="s1">? ext.slice(</span><span class="s4">1</span><span class="s1">)</span>
+                <span class="s1">: ext</span>
+        <span class="s1">));</span>
+
+        <span class="s3">return new </span><span class="s1">RegExp(</span>
+            <span class="s1">`.\\.(?:${normalizedExts.join(</span><span class="s2">&quot;|&quot;</span><span class="s1">)})$`,</span>
+            <span class="s2">&quot;u&quot;</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">return null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * The error type when no files match a glob. 
+ */</span>
+<span class="s1">class NoFilesFoundError extends Error {</span>
+
+    <span class="s0">/** 
+     * @param {string} pattern The glob pattern which was not found. 
+     * @param {boolean} globDisabled If `true` then the pattern was a glob pattern, but glob was disabled. 
+     */</span>
+    <span class="s1">constructor(pattern, globDisabled) {</span>
+        <span class="s1">super(`No files matching </span><span class="s2">'${pattern}' </span><span class="s1">were found${globDisabled ? </span><span class="s2">&quot; (glob was disabled)&quot; </span><span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s1">}.`);</span>
+        <span class="s3">this</span><span class="s1">.messageTemplate = </span><span class="s2">&quot;file-not-found&quot;</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.messageData = { pattern, globDisabled };</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * The error type when there are files matched by a glob, but all of them have been ignored. 
+ */</span>
+<span class="s1">class AllFilesIgnoredError extends Error {</span>
+
+    <span class="s0">/** 
+     * @param {string} pattern The glob pattern which was not found. 
+     */</span>
+    <span class="s1">constructor(pattern) {</span>
+        <span class="s1">super(`All files matched by </span><span class="s2">'${pattern}' </span><span class="s1">are ignored.`);</span>
+        <span class="s3">this</span><span class="s1">.messageTemplate = </span><span class="s2">&quot;all-files-ignored&quot;</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.messageData = { pattern };</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * This class provides the functionality that enumerates every file which is 
+ * matched by given glob patterns and that configuration. 
+ */</span>
+<span class="s1">class FileEnumerator {</span>
+
+    <span class="s0">/** 
+     * Initialize this enumerator. 
+     * @param {FileEnumeratorOptions} options The options. 
+     */</span>
+    <span class="s1">constructor({</span>
+        <span class="s1">cwd = process.cwd(),</span>
+        <span class="s1">configArrayFactory = </span><span class="s3">new </span><span class="s1">CascadingConfigArrayFactory({</span>
+            <span class="s1">cwd,</span>
+            <span class="s1">getEslintRecommendedConfig: () =&gt; require(</span><span class="s2">&quot;@eslint/js&quot;</span><span class="s1">).configs.recommended,</span>
+            <span class="s1">getEslintAllConfig: () =&gt; require(</span><span class="s2">&quot;@eslint/js&quot;</span><span class="s1">).configs.all</span>
+        <span class="s1">}),</span>
+        <span class="s1">extensions = </span><span class="s3">null</span><span class="s1">,</span>
+        <span class="s1">globInputPaths = </span><span class="s3">true</span><span class="s1">,</span>
+        <span class="s1">errorOnUnmatchedPattern = </span><span class="s3">true</span><span class="s1">,</span>
+        <span class="s1">ignore = </span><span class="s3">true</span>
+    <span class="s1">} = {}) {</span>
+        <span class="s1">internalSlotsMap.set(</span><span class="s3">this</span><span class="s1">, {</span>
+            <span class="s1">configArrayFactory,</span>
+            <span class="s1">cwd,</span>
+            <span class="s1">defaultIgnores: IgnorePattern.createDefaultIgnore(cwd),</span>
+            <span class="s1">extensionRegExp: createExtensionRegExp(extensions),</span>
+            <span class="s1">globInputPaths,</span>
+            <span class="s1">errorOnUnmatchedPattern,</span>
+            <span class="s1">ignoreFlag: ignore</span>
+        <span class="s1">});</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Check if a given file is target or not. 
+     * @param {string} filePath The path to a candidate file. 
+     * @param {ConfigArray} [providedConfig] Optional. The configuration for the file. 
+     * @returns {boolean} `true` if the file is a target. 
+     */</span>
+    <span class="s1">isTargetPath(filePath, providedConfig) {</span>
+        <span class="s1">const {</span>
+            <span class="s1">configArrayFactory,</span>
+            <span class="s1">extensionRegExp</span>
+        <span class="s1">} = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+
+        <span class="s0">// If `--ext` option is present, use it.</span>
+        <span class="s3">if </span><span class="s1">(extensionRegExp) {</span>
+            <span class="s3">return </span><span class="s1">extensionRegExp.test(filePath);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// `.js` file is target by default.</span>
+        <span class="s3">if </span><span class="s1">(filePath.endsWith(</span><span class="s2">&quot;.js&quot;</span><span class="s1">)) {</span>
+            <span class="s3">return true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// use `overrides[].files` to check additional targets.</span>
+        <span class="s1">const config =</span>
+            <span class="s1">providedConfig ||</span>
+            <span class="s1">configArrayFactory.getConfigArrayForFile(</span>
+                <span class="s1">filePath,</span>
+                <span class="s1">{ ignoreNotFoundError: </span><span class="s3">true </span><span class="s1">}</span>
+            <span class="s1">);</span>
+
+        <span class="s3">return </span><span class="s1">config.isAdditionalTargetPath(filePath);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Iterate files which are matched by given glob patterns. 
+     * @param {string|string[]} patternOrPatterns The glob patterns to iterate files. 
+     * @throws {NoFilesFoundError|AllFilesIgnoredError} On an unmatched pattern. 
+     * @returns {IterableIterator&lt;FileAndConfig&gt;} The found files. 
+     */</span>
+    <span class="s1">*iterateFiles(patternOrPatterns) {</span>
+        <span class="s1">const { globInputPaths, errorOnUnmatchedPattern } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const patterns = Array.isArray(patternOrPatterns)</span>
+            <span class="s1">? patternOrPatterns</span>
+            <span class="s1">: [patternOrPatterns];</span>
+
+        <span class="s1">debug(</span><span class="s2">&quot;Start to iterate files: %o&quot;</span><span class="s1">, patterns);</span>
+
+        <span class="s0">// The set of paths to remove duplicate.</span>
+        <span class="s1">const set = </span><span class="s3">new </span><span class="s1">Set();</span>
+
+        <span class="s3">for </span><span class="s1">(const pattern of patterns) {</span>
+            <span class="s1">let foundRegardlessOfIgnored = </span><span class="s3">false</span><span class="s1">;</span>
+            <span class="s1">let found = </span><span class="s3">false</span><span class="s1">;</span>
+
+            <span class="s0">// Skip empty string.</span>
+            <span class="s3">if </span><span class="s1">(!pattern) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Iterate files of this pattern.</span>
+            <span class="s3">for </span><span class="s1">(const { config, filePath, flag } of </span><span class="s3">this</span><span class="s1">._iterateFiles(pattern)) {</span>
+                <span class="s1">foundRegardlessOfIgnored = </span><span class="s3">true</span><span class="s1">;</span>
+                <span class="s3">if </span><span class="s1">(flag === IGNORED_SILENTLY) {</span>
+                    <span class="s3">continue</span><span class="s1">;</span>
+                <span class="s1">}</span>
+                <span class="s1">found = </span><span class="s3">true</span><span class="s1">;</span>
+
+                <span class="s0">// Remove duplicate paths while yielding paths.</span>
+                <span class="s3">if </span><span class="s1">(!set.has(filePath)) {</span>
+                    <span class="s1">set.add(filePath);</span>
+                    <span class="s1">yield {</span>
+                        <span class="s1">config,</span>
+                        <span class="s1">filePath,</span>
+                        <span class="s1">ignored: flag === IGNORED</span>
+                    <span class="s1">};</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Raise an error if any files were not found.</span>
+            <span class="s3">if </span><span class="s1">(errorOnUnmatchedPattern) {</span>
+                <span class="s3">if </span><span class="s1">(!foundRegardlessOfIgnored) {</span>
+                    <span class="s3">throw new </span><span class="s1">NoFilesFoundError(</span>
+                        <span class="s1">pattern,</span>
+                        <span class="s1">!globInputPaths &amp;&amp; isGlob(pattern)</span>
+                    <span class="s1">);</span>
+                <span class="s1">}</span>
+                <span class="s3">if </span><span class="s1">(!found) {</span>
+                    <span class="s3">throw new </span><span class="s1">AllFilesIgnoredError(pattern);</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s1">debug(`Complete iterating files: ${JSON.stringify(patterns)}`);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Iterate files which are matched by a given glob pattern. 
+     * @param {string} pattern The glob pattern to iterate files. 
+     * @returns {IterableIterator&lt;FileEntry&gt;} The found files. 
+     */</span>
+    <span class="s1">_iterateFiles(pattern) {</span>
+        <span class="s1">const { cwd, globInputPaths } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const absolutePath = path.resolve(cwd, pattern);</span>
+        <span class="s1">const isDot = dotfilesPattern.test(pattern);</span>
+        <span class="s1">const stat = statSafeSync(absolutePath);</span>
+
+        <span class="s3">if </span><span class="s1">(stat &amp;&amp; stat.isDirectory()) {</span>
+            <span class="s3">return this</span><span class="s1">._iterateFilesWithDirectory(absolutePath, isDot);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(stat &amp;&amp; stat.isFile()) {</span>
+            <span class="s3">return this</span><span class="s1">._iterateFilesWithFile(absolutePath);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(globInputPaths &amp;&amp; isGlobPattern(pattern)) {</span>
+            <span class="s3">return this</span><span class="s1">._iterateFilesWithGlob(pattern, isDot);</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">[];</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Iterate a file which is matched by a given path. 
+     * @param {string} filePath The path to the target file. 
+     * @returns {IterableIterator&lt;FileEntry&gt;} The found files. 
+     * @private 
+     */</span>
+    <span class="s1">_iterateFilesWithFile(filePath) {</span>
+        <span class="s1">debug(`File: ${filePath}`);</span>
+
+        <span class="s1">const { configArrayFactory } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const config = configArrayFactory.getConfigArrayForFile(filePath);</span>
+        <span class="s1">const ignored = </span><span class="s3">this</span><span class="s1">._isIgnoredFile(filePath, { config, direct: </span><span class="s3">true </span><span class="s1">});</span>
+        <span class="s1">const flag = ignored ? IGNORED : NONE;</span>
+
+        <span class="s3">return </span><span class="s1">[{ config, filePath, flag }];</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Iterate files in a given path. 
+     * @param {string} directoryPath The path to the target directory. 
+     * @param {boolean} dotfiles If `true` then it doesn't skip dot files by default. 
+     * @returns {IterableIterator&lt;FileEntry&gt;} The found files. 
+     * @private 
+     */</span>
+    <span class="s1">_iterateFilesWithDirectory(directoryPath, dotfiles) {</span>
+        <span class="s1">debug(`Directory: ${directoryPath}`);</span>
+
+        <span class="s3">return this</span><span class="s1">._iterateFilesRecursive(</span>
+            <span class="s1">directoryPath,</span>
+            <span class="s1">{ dotfiles, recursive: </span><span class="s3">true</span><span class="s1">, selector: </span><span class="s3">null </span><span class="s1">}</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Iterate files which are matched by a given glob pattern. 
+     * @param {string} pattern The glob pattern to iterate files. 
+     * @param {boolean} dotfiles If `true` then it doesn't skip dot files by default. 
+     * @returns {IterableIterator&lt;FileEntry&gt;} The found files. 
+     * @private 
+     */</span>
+    <span class="s1">_iterateFilesWithGlob(pattern, dotfiles) {</span>
+        <span class="s1">debug(`Glob: ${pattern}`);</span>
+
+        <span class="s1">const { cwd } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const directoryPath = path.resolve(cwd, getGlobParent(pattern));</span>
+        <span class="s1">const absolutePath = path.resolve(cwd, pattern);</span>
+        <span class="s1">const globPart = absolutePath.slice(directoryPath.length + </span><span class="s4">1</span><span class="s1">);</span>
+
+        <span class="s0">/* 
+         * recursive if there are `**` or path separators in the glob part. 
+         * Otherwise, patterns such as `src/*.js`, it doesn't need recursive. 
+         */</span>
+        <span class="s1">const recursive = /\*\*|\/|\\/u.test(globPart);</span>
+        <span class="s1">const selector = </span><span class="s3">new </span><span class="s1">Minimatch(absolutePath, minimatchOpts);</span>
+
+        <span class="s1">debug(`recursive? ${recursive}`);</span>
+
+        <span class="s3">return this</span><span class="s1">._iterateFilesRecursive(</span>
+            <span class="s1">directoryPath,</span>
+            <span class="s1">{ dotfiles, recursive, selector }</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Iterate files in a given path. 
+     * @param {string} directoryPath The path to the target directory. 
+     * @param {Object} options The options to iterate files. 
+     * @param {boolean} [options.dotfiles] If `true` then it doesn't skip dot files by default. 
+     * @param {boolean} [options.recursive] If `true` then it dives into sub directories. 
+     * @param {InstanceType&lt;Minimatch&gt;} [options.selector] The matcher to choose files. 
+     * @returns {IterableIterator&lt;FileEntry&gt;} The found files. 
+     * @private 
+     */</span>
+    <span class="s1">*_iterateFilesRecursive(directoryPath, options) {</span>
+        <span class="s1">debug(`Enter the directory: ${directoryPath}`);</span>
+        <span class="s1">const { configArrayFactory } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+
+        <span class="s0">/** @type {ConfigArray|null} */</span>
+        <span class="s1">let config = </span><span class="s3">null</span><span class="s1">;</span>
+
+        <span class="s0">// Enumerate the files of this directory.</span>
+        <span class="s3">for </span><span class="s1">(const entry of readdirSafeSync(directoryPath)) {</span>
+            <span class="s1">const filePath = path.join(directoryPath, entry.name);</span>
+            <span class="s1">const fileInfo = entry.isSymbolicLink() ? statSafeSync(filePath) : entry;</span>
+
+            <span class="s3">if </span><span class="s1">(!fileInfo) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Check if the file is matched.</span>
+            <span class="s3">if </span><span class="s1">(fileInfo.isFile()) {</span>
+                <span class="s3">if </span><span class="s1">(!config) {</span>
+                    <span class="s1">config = configArrayFactory.getConfigArrayForFile(</span>
+                        <span class="s1">filePath,</span>
+
+                        <span class="s0">/* 
+                         * We must ignore `ConfigurationNotFoundError` at this 
+                         * point because we don't know if target files exist in 
+                         * this directory. 
+                         */</span>
+                        <span class="s1">{ ignoreNotFoundError: </span><span class="s3">true </span><span class="s1">}</span>
+                    <span class="s1">);</span>
+                <span class="s1">}</span>
+                <span class="s1">const matched = options.selector</span>
+
+                    <span class="s0">// Started with a glob pattern; choose by the pattern.</span>
+                    <span class="s1">? options.selector.match(filePath)</span>
+
+                    <span class="s0">// Started with a directory path; choose by file extensions.</span>
+                    <span class="s1">: </span><span class="s3">this</span><span class="s1">.isTargetPath(filePath, config);</span>
+
+                <span class="s3">if </span><span class="s1">(matched) {</span>
+                    <span class="s1">const ignored = </span><span class="s3">this</span><span class="s1">._isIgnoredFile(filePath, { ...options, config });</span>
+                    <span class="s1">const flag = ignored ? IGNORED_SILENTLY : NONE;</span>
+
+                    <span class="s1">debug(`Yield: ${entry.name}${ignored ? </span><span class="s2">&quot; but ignored&quot; </span><span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s1">}`);</span>
+                    <span class="s1">yield {</span>
+                        <span class="s1">config: configArrayFactory.getConfigArrayForFile(filePath),</span>
+                        <span class="s1">filePath,</span>
+                        <span class="s1">flag</span>
+                    <span class="s1">};</span>
+                <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                    <span class="s1">debug(`Didn</span><span class="s2">'t match: ${entry.name}`);</span>
+                <span class="s1">}</span>
+
+            <span class="s0">// Dive into the sub directory.</span>
+            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(options.recursive &amp;&amp; fileInfo.isDirectory()) {</span>
+                <span class="s3">if </span><span class="s1">(!config) {</span>
+                    <span class="s1">config = configArrayFactory.getConfigArrayForFile(</span>
+                        <span class="s1">filePath,</span>
+                        <span class="s1">{ ignoreNotFoundError: </span><span class="s3">true </span><span class="s1">}</span>
+                    <span class="s1">);</span>
+                <span class="s1">}</span>
+                <span class="s1">const ignored = </span><span class="s3">this</span><span class="s1">._isIgnoredFile(</span>
+                    <span class="s1">filePath + path.sep,</span>
+                    <span class="s1">{ ...options, config }</span>
+                <span class="s1">);</span>
+
+                <span class="s3">if </span><span class="s1">(!ignored) {</span>
+                    <span class="s1">yield* </span><span class="s3">this</span><span class="s1">._iterateFilesRecursive(filePath, options);</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s1">debug(`Leave the directory: ${directoryPath}`);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Check if a given file should be ignored. 
+     * @param {string} filePath The path to a file to check. 
+     * @param {Object} options Options 
+     * @param {ConfigArray} [options.config] The config for this file. 
+     * @param {boolean} [options.dotfiles] If `true` then this is not ignore dot files by default. 
+     * @param {boolean} [options.direct] If `true` then this is a direct specified file. 
+     * @returns {boolean} `true` if the file should be ignored. 
+     * @private 
+     */</span>
+    <span class="s1">_isIgnoredFile(filePath, {</span>
+        <span class="s1">config: providedConfig,</span>
+        <span class="s1">dotfiles = </span><span class="s3">false</span><span class="s1">,</span>
+        <span class="s1">direct = </span><span class="s3">false</span>
+    <span class="s1">}) {</span>
+        <span class="s1">const {</span>
+            <span class="s1">configArrayFactory,</span>
+            <span class="s1">defaultIgnores,</span>
+            <span class="s1">ignoreFlag</span>
+        <span class="s1">} = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+
+        <span class="s3">if </span><span class="s1">(ignoreFlag) {</span>
+            <span class="s1">const config =</span>
+                <span class="s1">providedConfig ||</span>
+                <span class="s1">configArrayFactory.getConfigArrayForFile(</span>
+                    <span class="s1">filePath,</span>
+                    <span class="s1">{ ignoreNotFoundError: </span><span class="s3">true </span><span class="s1">}</span>
+                <span class="s1">);</span>
+            <span class="s1">const ignores =</span>
+                <span class="s1">config.extractConfig(filePath).ignores || defaultIgnores;</span>
+
+            <span class="s3">return </span><span class="s1">ignores(filePath, dotfiles);</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">!direct &amp;&amp; defaultIgnores(filePath, dotfiles);</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Public Interface</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">module.exports = { FileEnumerator };</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<html>
+<head>
+<title>JSIExecutor.h</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JSIExecutor.h</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#pragma </span><span class="s1">once</span>
+
+<span class="s2">#include </span><span class="s3">&quot;JSINativeModules.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSBigString.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSExecutor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/RAMBundleRegistry.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;functional&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;optional&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s0">// A JSIScopedTimeoutInvoker is a trampoline-type function for introducing</span>
+<span class="s0">// timeouts. Call the TimeoutInvoker with a function to execute, the invokee.</span>
+<span class="s0">// The TimeoutInvoker will immediately invoke it, synchronously on the same</span>
+<span class="s0">// thread. If the invokee fails to return after some timeout (private to the</span>
+<span class="s0">// TimeoutInvoker), a soft error may be reported.</span>
+<span class="s0">//</span>
+<span class="s0">// If a soft error is reported, the second parameter errorMessageProducer will</span>
+<span class="s0">// be invoked to produce an error message, which will be included in the soft</span>
+<span class="s0">// error report. Note that the errorMessageProducer will be invoked</span>
+<span class="s0">// asynchronously on a different thread.</span>
+<span class="s0">//</span>
+<span class="s0">// The timeout behavior does NOT cause the invokee to aborted. If the invokee</span>
+<span class="s0">// blocks forever, so will the ScopedTimeoutInvoker (but the soft error may</span>
+<span class="s0">// still be reported).</span>
+<span class="s0">//</span>
+<span class="s0">// The invokee is passed by const ref because it is executed synchronously, but</span>
+<span class="s0">// the errorMessageProducer is passed by value because it must be copied or</span>
+<span class="s0">// moved for async execution.</span>
+<span class="s0">//</span>
+<span class="s0">// Example usage:</span>
+<span class="s0">//</span>
+<span class="s0">//   int param = ...;</span>
+<span class="s0">//   timeoutInvoker(</span>
+<span class="s0">//       [&amp;]{ someBigWork(param); },</span>
+<span class="s0">//       [=] -&gt; std::string {</span>
+<span class="s0">//           return &quot;someBigWork, param &quot; + std::to_string(param);</span>
+<span class="s0">//       })</span>
+<span class="s0">//</span>
+<span class="s4">using </span><span class="s1">JSIScopedTimeoutInvoker = std::function&lt;</span><span class="s4">void</span><span class="s1">(</span>
+    <span class="s4">const </span><span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;invokee</span><span class="s4">,</span>
+    <span class="s1">std::function&lt;std::string()&gt; errorMessageProducer)&gt;</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">BigStringBuffer : </span><span class="s4">public </span><span class="s1">jsi::Buffer {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">BigStringBuffer(std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; script)</span>
+      <span class="s1">: script_(std::move(script)) {}</span>
+
+  <span class="s1">size_t size() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return </span><span class="s1">script_-&gt;size()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const </span><span class="s1">uint8_t *data() </span><span class="s4">const </span><span class="s1">override {</span>
+    <span class="s4">return reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">uint8_t *&gt;(script_-&gt;c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; script_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">JSIExecutor : </span><span class="s4">public </span><span class="s1">JSExecutor {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">using </span><span class="s1">RuntimeInstaller = std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp;runtime)&gt;</span><span class="s4">;</span>
+
+  <span class="s1">JSIExecutor(</span>
+      <span class="s1">std::shared_ptr&lt;jsi::Runtime&gt; runtime</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; delegate</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">JSIScopedTimeoutInvoker &amp;timeoutInvoker</span><span class="s4">,</span>
+      <span class="s1">RuntimeInstaller runtimeInstaller)</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">initializeRuntime() override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">loadBundle(</span>
+      <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; script</span><span class="s4">,</span>
+      <span class="s1">std::string sourceURL) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">setBundleRegistry(std::unique_ptr&lt;RAMBundleRegistry&gt;) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">registerBundle(uint32_t bundleId</span><span class="s4">, const </span><span class="s1">std::string &amp;bundlePath)</span>
+      <span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">callFunction(</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;moduleId</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;methodId</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">folly::dynamic &amp;arguments) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">invokeCallback(</span><span class="s4">const double </span><span class="s1">callbackId</span><span class="s4">, const </span><span class="s1">folly::dynamic &amp;arguments)</span>
+      <span class="s1">override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">setGlobalVariable(</span>
+      <span class="s1">std::string propName</span><span class="s4">,</span>
+      <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; jsonValue) override</span><span class="s4">;</span>
+  <span class="s1">std::string getDescription() override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">*getJavaScriptContext() override</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">isInspectable() override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">handleMemoryPressure(</span><span class="s4">int </span><span class="s1">pressureLevel) override</span><span class="s4">;</span>
+
+  <span class="s0">// An implementation of JSIScopedTimeoutInvoker that simply runs the</span>
+  <span class="s0">// invokee, with no timeout.</span>
+  <span class="s4">static void </span><span class="s1">defaultTimeoutInvoker(</span>
+      <span class="s4">const </span><span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;invokee</span><span class="s4">,</span>
+      <span class="s1">std::function&lt;std::string()&gt; errorMessageProducer) {</span>
+    <span class="s1">(</span><span class="s4">void</span><span class="s1">)errorMessageProducer</span><span class="s4">;</span>
+    <span class="s1">invokee()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">flush() override</span><span class="s4">;</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s4">class </span><span class="s1">NativeModuleProxy</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">bindBridge()</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">callNativeModules(</span><span class="s4">const </span><span class="s1">jsi::Value &amp;queue</span><span class="s4">, bool </span><span class="s1">isEndOfBatch)</span><span class="s4">;</span>
+  <span class="s1">jsi::Value nativeCallSyncHook(</span><span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">, </span><span class="s1">size_t count)</span><span class="s4">;</span>
+  <span class="s1">jsi::Value nativeRequire(</span><span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">, </span><span class="s1">size_t count)</span><span class="s4">;</span>
+  <span class="s1">jsi::Value globalEvalWithSourceUrl(</span><span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">, </span><span class="s1">size_t count)</span><span class="s4">;</span>
+
+  <span class="s1">std::shared_ptr&lt;jsi::Runtime&gt; runtime_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; delegate_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;JSINativeModules&gt; nativeModules_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;ModuleRegistry&gt; moduleRegistry_</span><span class="s4">;</span>
+  <span class="s1">std::once_flag bindFlag_</span><span class="s4">;</span>
+  <span class="s1">std::unique_ptr&lt;RAMBundleRegistry&gt; bundleRegistry_</span><span class="s4">;</span>
+  <span class="s1">JSIScopedTimeoutInvoker scopedTimeoutInvoker_</span><span class="s4">;</span>
+  <span class="s1">RuntimeInstaller runtimeInstaller_</span><span class="s4">;</span>
+
+  <span class="s1">std::optional&lt;jsi::Function&gt; callFunctionReturnFlushedQueue_</span><span class="s4">;</span>
+  <span class="s1">std::optional&lt;jsi::Function&gt; invokeCallbackAndReturnFlushedQueue_</span><span class="s4">;</span>
+  <span class="s1">std::optional&lt;jsi::Function&gt; flushedQueue_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">using </span><span class="s1">Logger =</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::string &amp;message</span><span class="s4">, unsigned int </span><span class="s1">logLevel)&gt;</span><span class="s4">;</span>
+<span class="s4">void </span><span class="s1">bindNativeLogger(jsi::Runtime &amp;runtime</span><span class="s4">, </span><span class="s1">Logger logger)</span><span class="s4">;</span>
+
+<span class="s4">void </span><span class="s1">bindNativePerformanceNow(jsi::Runtime &amp;runtime)</span><span class="s4">;</span>
+
+<span class="s4">double </span><span class="s1">performanceNow()</span><span class="s4">;</span>
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

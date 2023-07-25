@@ -1,0 +1,1100 @@
+<html>
+<head>
+<title>cli-engine.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cli-engine.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Main CLI object. 
+ * @author Nicholas C. Zakas 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">/* 
+ * The CLI object should *not* call process.exit() directly. It should only return 
+ * exit codes. This allows other programs to use the CLI object and still control 
+ * when the program exits. 
+ */</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const fs = require(</span><span class="s2">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const path = require(</span><span class="s2">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s1">const defaultOptions = require(</span><span class="s2">&quot;../../conf/default-cli-options&quot;</span><span class="s1">);</span>
+<span class="s1">const pkg = require(</span><span class="s2">&quot;../../package.json&quot;</span><span class="s1">);</span>
+
+
+<span class="s1">const {</span>
+    <span class="s1">Legacy: {</span>
+        <span class="s1">ConfigOps,</span>
+        <span class="s1">naming,</span>
+        <span class="s1">CascadingConfigArrayFactory,</span>
+        <span class="s1">IgnorePattern,</span>
+        <span class="s1">getUsedExtractedConfigs,</span>
+        <span class="s1">ModuleResolver</span>
+    <span class="s1">}</span>
+<span class="s1">} = require(</span><span class="s2">&quot;@eslint/eslintrc&quot;</span><span class="s1">);</span>
+
+<span class="s1">const { FileEnumerator } = require(</span><span class="s2">&quot;./file-enumerator&quot;</span><span class="s1">);</span>
+
+<span class="s1">const { Linter } = require(</span><span class="s2">&quot;../linter&quot;</span><span class="s1">);</span>
+<span class="s1">const builtInRules = require(</span><span class="s2">&quot;../rules&quot;</span><span class="s1">);</span>
+<span class="s1">const loadRules = require(</span><span class="s2">&quot;./load-rules&quot;</span><span class="s1">);</span>
+<span class="s1">const hash = require(</span><span class="s2">&quot;./hash&quot;</span><span class="s1">);</span>
+<span class="s1">const LintResultCache = require(</span><span class="s2">&quot;./lint-result-cache&quot;</span><span class="s1">);</span>
+
+<span class="s1">const debug = require(</span><span class="s2">&quot;debug&quot;</span><span class="s1">)(</span><span class="s2">&quot;eslint:cli-engine&quot;</span><span class="s1">);</span>
+<span class="s1">const validFixTypes = </span><span class="s3">new </span><span class="s1">Set([</span><span class="s2">&quot;directive&quot;</span><span class="s1">, </span><span class="s2">&quot;problem&quot;</span><span class="s1">, </span><span class="s2">&quot;suggestion&quot;</span><span class="s1">, </span><span class="s2">&quot;layout&quot;</span><span class="s1">]);</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Typedefs</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">// For VSCode IntelliSense</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).ConfigData} ConfigData */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).DeprecatedRuleInfo} DeprecatedRuleInfo */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).LintMessage} LintMessage */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).SuppressedLintMessage} SuppressedLintMessage */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).ParserOptions} ParserOptions */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).Plugin} Plugin */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).RuleConf} RuleConf */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).Rule} Rule */</span>
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).FormatterFunction} FormatterFunction */</span>
+<span class="s0">/** @typedef {ReturnType&lt;CascadingConfigArrayFactory.getConfigArrayForFile&gt;} ConfigArray */</span>
+<span class="s0">/** @typedef {ReturnType&lt;ConfigArray.extractConfig&gt;} ExtractedConfig */</span>
+
+<span class="s0">/** 
+ * The options to configure a CLI engine with. 
+ * @typedef {Object} CLIEngineOptions 
+ * @property {boolean} [allowInlineConfig] Enable or disable inline configuration comments. 
+ * @property {ConfigData} [baseConfig] Base config object, extended by all configs used with this CLIEngine instance 
+ * @property {boolean} [cache] Enable result caching. 
+ * @property {string} [cacheLocation] The cache file to use instead of .eslintcache. 
+ * @property {string} [configFile] The configuration file to use. 
+ * @property {string} [cwd] The value to use for the current working directory. 
+ * @property {string[]} [envs] An array of environments to load. 
+ * @property {string[]|null} [extensions] An array of file extensions to check. 
+ * @property {boolean|Function} [fix] Execute in autofix mode. If a function, should return a boolean. 
+ * @property {string[]} [fixTypes] Array of rule types to apply fixes for. 
+ * @property {string[]} [globals] An array of global variables to declare. 
+ * @property {boolean} [ignore] False disables use of .eslintignore. 
+ * @property {string} [ignorePath] The ignore file to use instead of .eslintignore. 
+ * @property {string|string[]} [ignorePattern] One or more glob patterns to ignore. 
+ * @property {boolean} [useEslintrc] False disables looking for .eslintrc 
+ * @property {string} [parser] The name of the parser to use. 
+ * @property {ParserOptions} [parserOptions] An object of parserOption settings to use. 
+ * @property {string[]} [plugins] An array of plugins to load. 
+ * @property {Record&lt;string,RuleConf&gt;} [rules] An object of rules to use. 
+ * @property {string[]} [rulePaths] An array of directories to load custom rules from. 
+ * @property {boolean} [reportUnusedDisableDirectives] `true` adds reports for unused eslint-disable directives 
+ * @property {boolean} [globInputPaths] Set to false to skip glob resolution of input file paths to lint (default: true). If false, each input file paths is assumed to be a non-glob path to an existing file. 
+ * @property {string} [resolvePluginsRelativeTo] The folder where plugins should be resolved from, defaulting to the CWD 
+ */</span>
+
+<span class="s0">/** 
+ * A linting result. 
+ * @typedef {Object} LintResult 
+ * @property {string} filePath The path to the file that was linted. 
+ * @property {LintMessage[]} messages All of the messages for the result. 
+ * @property {SuppressedLintMessage[]} suppressedMessages All of the suppressed messages for the result. 
+ * @property {number} errorCount Number of errors for the result. 
+ * @property {number} fatalErrorCount Number of fatal errors for the result. 
+ * @property {number} warningCount Number of warnings for the result. 
+ * @property {number} fixableErrorCount Number of fixable errors for the result. 
+ * @property {number} fixableWarningCount Number of fixable warnings for the result. 
+ * @property {string} [source] The source code of the file that was linted. 
+ * @property {string} [output] The source code of the file that was linted, with as many fixes applied as possible. 
+ */</span>
+
+<span class="s0">/** 
+ * Linting results. 
+ * @typedef {Object} LintReport 
+ * @property {LintResult[]} results All of the result. 
+ * @property {number} errorCount Number of errors for the result. 
+ * @property {number} fatalErrorCount Number of fatal errors for the result. 
+ * @property {number} warningCount Number of warnings for the result. 
+ * @property {number} fixableErrorCount Number of fixable errors for the result. 
+ * @property {number} fixableWarningCount Number of fixable warnings for the result. 
+ * @property {DeprecatedRuleInfo[]} usedDeprecatedRules The list of used deprecated rules. 
+ */</span>
+
+<span class="s0">/** 
+ * Private data for CLIEngine. 
+ * @typedef {Object} CLIEngineInternalSlots 
+ * @property {Map&lt;string, Plugin&gt;} additionalPluginPool The map for additional plugins. 
+ * @property {string} cacheFilePath The path to the cache of lint results. 
+ * @property {CascadingConfigArrayFactory} configArrayFactory The factory of configs. 
+ * @property {(filePath: string) =&gt; boolean} defaultIgnores The default predicate function to check if a file ignored or not. 
+ * @property {FileEnumerator} fileEnumerator The file enumerator. 
+ * @property {ConfigArray[]} lastConfigArrays The list of config arrays that the last `executeOnFiles` or `executeOnText` used. 
+ * @property {LintResultCache|null} lintResultCache The cache of lint results. 
+ * @property {Linter} linter The linter instance which has loaded rules. 
+ * @property {CLIEngineOptions} options The normalized options of this instance. 
+ */</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** @type {WeakMap&lt;CLIEngine, CLIEngineInternalSlots&gt;} */</span>
+<span class="s1">const internalSlotsMap = </span><span class="s3">new </span><span class="s1">WeakMap();</span>
+
+<span class="s0">/** 
+ * Determines if each fix type in an array is supported by ESLint and throws 
+ * an error if not. 
+ * @param {string[]} fixTypes An array of fix types to check. 
+ * @returns {void} 
+ * @throws {Error} If an invalid fix type is found. 
+ */</span>
+<span class="s3">function </span><span class="s1">validateFixTypes(fixTypes) {</span>
+    <span class="s3">for </span><span class="s1">(const fixType of fixTypes) {</span>
+        <span class="s3">if </span><span class="s1">(!validFixTypes.has(fixType)) {</span>
+            <span class="s3">throw new </span><span class="s1">Error(`Invalid fix type </span><span class="s2">&quot;${fixType}&quot; </span><span class="s1">found.`);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * It will calculate the error and warning count for collection of messages per file 
+ * @param {LintMessage[]} messages Collection of messages 
+ * @returns {Object} Contains the stats 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">calculateStatsPerFile(messages) {</span>
+    <span class="s1">const stat = {</span>
+        <span class="s1">errorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fatalErrorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">warningCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fixableErrorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fixableWarningCount: </span><span class="s4">0</span>
+    <span class="s1">};</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; messages.length; i++) {</span>
+        <span class="s1">const message = messages[i];</span>
+
+        <span class="s3">if </span><span class="s1">(message.fatal || message.severity === </span><span class="s4">2</span><span class="s1">) {</span>
+            <span class="s1">stat.errorCount++;</span>
+            <span class="s3">if </span><span class="s1">(message.fatal) {</span>
+                <span class="s1">stat.fatalErrorCount++;</span>
+            <span class="s1">}</span>
+            <span class="s3">if </span><span class="s1">(message.fix) {</span>
+                <span class="s1">stat.fixableErrorCount++;</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">stat.warningCount++;</span>
+            <span class="s3">if </span><span class="s1">(message.fix) {</span>
+                <span class="s1">stat.fixableWarningCount++;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">stat;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * It will calculate the error and warning count for collection of results from all files 
+ * @param {LintResult[]} results Collection of messages from all the files 
+ * @returns {Object} Contains the stats 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">calculateStatsPerRun(results) {</span>
+    <span class="s1">const stat = {</span>
+        <span class="s1">errorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fatalErrorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">warningCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fixableErrorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fixableWarningCount: </span><span class="s4">0</span>
+    <span class="s1">};</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; results.length; i++) {</span>
+        <span class="s1">const result = results[i];</span>
+
+        <span class="s1">stat.errorCount += result.errorCount;</span>
+        <span class="s1">stat.fatalErrorCount += result.fatalErrorCount;</span>
+        <span class="s1">stat.warningCount += result.warningCount;</span>
+        <span class="s1">stat.fixableErrorCount += result.fixableErrorCount;</span>
+        <span class="s1">stat.fixableWarningCount += result.fixableWarningCount;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">stat;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Processes an source code using ESLint. 
+ * @param {Object} config The config object. 
+ * @param {string} config.text The source code to verify. 
+ * @param {string} config.cwd The path to the current working directory. 
+ * @param {string|undefined} config.filePath The path to the file of `text`. If this is undefined, it uses `&lt;text&gt;`. 
+ * @param {ConfigArray} config.config The config. 
+ * @param {boolean} config.fix If `true` then it does fix. 
+ * @param {boolean} config.allowInlineConfig If `true` then it uses directive comments. 
+ * @param {boolean} config.reportUnusedDisableDirectives If `true` then it reports unused `eslint-disable` comments. 
+ * @param {FileEnumerator} config.fileEnumerator The file enumerator to check if a path is a target or not. 
+ * @param {Linter} config.linter The linter instance to verify. 
+ * @returns {LintResult} The result of linting. 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">verifyText({</span>
+    <span class="s1">text,</span>
+    <span class="s1">cwd,</span>
+    <span class="s1">filePath: providedFilePath,</span>
+    <span class="s1">config,</span>
+    <span class="s1">fix,</span>
+    <span class="s1">allowInlineConfig,</span>
+    <span class="s1">reportUnusedDisableDirectives,</span>
+    <span class="s1">fileEnumerator,</span>
+    <span class="s1">linter</span>
+<span class="s1">}) {</span>
+    <span class="s1">const filePath = providedFilePath || </span><span class="s2">&quot;&lt;text&gt;&quot;</span><span class="s1">;</span>
+
+    <span class="s1">debug(`Lint ${filePath}`);</span>
+
+    <span class="s0">/* 
+     * Verify. 
+     * `config.extractConfig(filePath)` requires an absolute path, but `linter` 
+     * doesn't know CWD, so it gives `linter` an absolute path always. 
+     */</span>
+    <span class="s1">const filePathToVerify = filePath === </span><span class="s2">&quot;&lt;text&gt;&quot; </span><span class="s1">? path.join(cwd, filePath) : filePath;</span>
+    <span class="s1">const { fixed, messages, output } = linter.verifyAndFix(</span>
+        <span class="s1">text,</span>
+        <span class="s1">config,</span>
+        <span class="s1">{</span>
+            <span class="s1">allowInlineConfig,</span>
+            <span class="s1">filename: filePathToVerify,</span>
+            <span class="s1">fix,</span>
+            <span class="s1">reportUnusedDisableDirectives,</span>
+
+            <span class="s0">/** 
+             * Check if the linter should adopt a given code block or not. 
+             * @param {string} blockFilename The virtual filename of a code block. 
+             * @returns {boolean} `true` if the linter should adopt the code block. 
+             */</span>
+            <span class="s1">filterCodeBlock(blockFilename) {</span>
+                <span class="s3">return </span><span class="s1">fileEnumerator.isTargetPath(blockFilename);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">);</span>
+
+    <span class="s0">// Tweak and return.</span>
+    <span class="s1">const result = {</span>
+        <span class="s1">filePath,</span>
+        <span class="s1">messages,</span>
+        <span class="s1">suppressedMessages: linter.getSuppressedMessages(),</span>
+        <span class="s1">...calculateStatsPerFile(messages)</span>
+    <span class="s1">};</span>
+
+    <span class="s3">if </span><span class="s1">(fixed) {</span>
+        <span class="s1">result.output = output;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">result.errorCount + result.warningCount &gt; </span><span class="s4">0 </span><span class="s1">&amp;&amp;</span>
+        <span class="s3">typeof </span><span class="s1">result.output === </span><span class="s2">&quot;undefined&quot;</span>
+    <span class="s1">) {</span>
+        <span class="s1">result.source = text;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">result;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Returns result with warning by ignore settings 
+ * @param {string} filePath File path of checked code 
+ * @param {string} baseDir Absolute path of base directory 
+ * @returns {LintResult} Result with single warning 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">createIgnoreResult(filePath, baseDir) {</span>
+    <span class="s1">let message;</span>
+    <span class="s1">const isHidden = filePath.split(path.sep)</span>
+        <span class="s1">.find(segment =&gt; /^\./u.test(segment));</span>
+    <span class="s1">const isInNodeModules = baseDir &amp;&amp; path.relative(baseDir, filePath).startsWith(</span><span class="s2">&quot;node_modules&quot;</span><span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(isHidden) {</span>
+        <span class="s1">message = </span><span class="s2">&quot;File ignored by default.  Use a negated ignore pattern (like </span><span class="s5">\&quot;</span><span class="s2">--ignore-pattern '!&lt;relative/path/to/filename&gt;'</span><span class="s5">\&quot;</span><span class="s2">) to override.&quot;</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(isInNodeModules) {</span>
+        <span class="s1">message = </span><span class="s2">&quot;File ignored by default. Use </span><span class="s5">\&quot;</span><span class="s2">--ignore-pattern '!node_modules/*'</span><span class="s5">\&quot; </span><span class="s2">to override.&quot;</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">message = </span><span class="s2">&quot;File ignored because of a matching ignore pattern. Use </span><span class="s5">\&quot;</span><span class="s2">--no-ignore</span><span class="s5">\&quot; </span><span class="s2">to override.&quot;</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">filePath: path.resolve(filePath),</span>
+        <span class="s1">messages: [</span>
+            <span class="s1">{</span>
+                <span class="s1">ruleId: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">fatal: </span><span class="s3">false</span><span class="s1">,</span>
+                <span class="s1">severity: </span><span class="s4">1</span><span class="s1">,</span>
+                <span class="s1">message,</span>
+                <span class="s1">nodeType: </span><span class="s3">null</span>
+            <span class="s1">}</span>
+        <span class="s1">],</span>
+        <span class="s1">suppressedMessages: [],</span>
+        <span class="s1">errorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fatalErrorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">warningCount: </span><span class="s4">1</span><span class="s1">,</span>
+        <span class="s1">fixableErrorCount: </span><span class="s4">0</span><span class="s1">,</span>
+        <span class="s1">fixableWarningCount: </span><span class="s4">0</span>
+    <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Get a rule. 
+ * @param {string} ruleId The rule ID to get. 
+ * @param {ConfigArray[]} configArrays The config arrays that have plugin rules. 
+ * @returns {Rule|null} The rule or null. 
+ */</span>
+<span class="s3">function </span><span class="s1">getRule(ruleId, configArrays) {</span>
+    <span class="s3">for </span><span class="s1">(const configArray of configArrays) {</span>
+        <span class="s1">const rule = configArray.pluginRules.get(ruleId);</span>
+
+        <span class="s3">if </span><span class="s1">(rule) {</span>
+            <span class="s3">return </span><span class="s1">rule;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">builtInRules.get(ruleId) || </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks whether a message's rule type should be fixed. 
+ * @param {LintMessage} message The message to check. 
+ * @param {ConfigArray[]} lastConfigArrays The list of config arrays that the last `executeOnFiles` or `executeOnText` used. 
+ * @param {string[]} fixTypes An array of fix types to check. 
+ * @returns {boolean} Whether the message should be fixed. 
+ */</span>
+<span class="s3">function </span><span class="s1">shouldMessageBeFixed(message, lastConfigArrays, fixTypes) {</span>
+    <span class="s3">if </span><span class="s1">(!message.ruleId) {</span>
+        <span class="s3">return </span><span class="s1">fixTypes.has(</span><span class="s2">&quot;directive&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const rule = message.ruleId &amp;&amp; getRule(message.ruleId, lastConfigArrays);</span>
+
+    <span class="s3">return </span><span class="s1">Boolean(rule &amp;&amp; rule.meta &amp;&amp; fixTypes.has(rule.meta.type));</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Collect used deprecated rules. 
+ * @param {ConfigArray[]} usedConfigArrays The config arrays which were used. 
+ * @returns {IterableIterator&lt;DeprecatedRuleInfo&gt;} Used deprecated rules. 
+ */</span>
+<span class="s3">function </span><span class="s1">*iterateRuleDeprecationWarnings(usedConfigArrays) {</span>
+    <span class="s1">const processedRuleIds = </span><span class="s3">new </span><span class="s1">Set();</span>
+
+    <span class="s0">// Flatten used configs.</span>
+    <span class="s0">/** @type {ExtractedConfig[]} */</span>
+    <span class="s1">const configs = usedConfigArrays.flatMap(getUsedExtractedConfigs);</span>
+
+    <span class="s0">// Traverse rule configs.</span>
+    <span class="s3">for </span><span class="s1">(const config of configs) {</span>
+        <span class="s3">for </span><span class="s1">(const [ruleId, ruleConfig] of Object.entries(config.rules)) {</span>
+
+            <span class="s0">// Skip if it was processed.</span>
+            <span class="s3">if </span><span class="s1">(processedRuleIds.has(ruleId)) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s1">processedRuleIds.add(ruleId);</span>
+
+            <span class="s0">// Skip if it's not used.</span>
+            <span class="s3">if </span><span class="s1">(!ConfigOps.getRuleSeverity(ruleConfig)) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s1">const rule = getRule(ruleId, usedConfigArrays);</span>
+
+            <span class="s0">// Skip if it's not deprecated.</span>
+            <span class="s3">if </span><span class="s1">(!(rule &amp;&amp; rule.meta &amp;&amp; rule.meta.deprecated)) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// This rule was used and deprecated.</span>
+            <span class="s1">yield {</span>
+                <span class="s1">ruleId,</span>
+                <span class="s1">replacedBy: rule.meta.replacedBy || []</span>
+            <span class="s1">};</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if the given message is an error message. 
+ * @param {LintMessage} message The message to check. 
+ * @returns {boolean} Whether or not the message is an error message. 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">isErrorMessage(message) {</span>
+    <span class="s3">return </span><span class="s1">message.severity === </span><span class="s4">2</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+
+<span class="s0">/** 
+ * return the cacheFile to be used by eslint, based on whether the provided parameter is 
+ * a directory or looks like a directory (ends in `path.sep`), in which case the file 
+ * name will be the `cacheFile/.cache_hashOfCWD` 
+ * 
+ * if cacheFile points to a file or looks like a file then it will just use that file 
+ * @param {string} cacheFile The name of file to be used to store the cache 
+ * @param {string} cwd Current working directory 
+ * @returns {string} the resolved path to the cache file 
+ */</span>
+<span class="s3">function </span><span class="s1">getCacheFile(cacheFile, cwd) {</span>
+
+    <span class="s0">/* 
+     * make sure the path separators are normalized for the environment/os 
+     * keeping the trailing path separator if present 
+     */</span>
+    <span class="s1">const normalizedCacheFile = path.normalize(cacheFile);</span>
+
+    <span class="s1">const resolvedCacheFile = path.resolve(cwd, normalizedCacheFile);</span>
+    <span class="s1">const looksLikeADirectory = normalizedCacheFile.slice(-</span><span class="s4">1</span><span class="s1">) === path.sep;</span>
+
+    <span class="s0">/** 
+     * return the name for the cache file in case the provided parameter is a directory 
+     * @returns {string} the resolved path to the cacheFile 
+     */</span>
+    <span class="s3">function </span><span class="s1">getCacheFileForDirectory() {</span>
+        <span class="s3">return </span><span class="s1">path.join(resolvedCacheFile, `.cache_${hash(cwd)}`);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let fileStats;</span>
+
+    <span class="s3">try </span><span class="s1">{</span>
+        <span class="s1">fileStats = fs.lstatSync(resolvedCacheFile);</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">{</span>
+        <span class="s1">fileStats = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+
+    <span class="s0">/* 
+     * in case the file exists we need to verify if the provided path 
+     * is a directory or a file. If it is a directory we want to create a file 
+     * inside that directory 
+     */</span>
+    <span class="s3">if </span><span class="s1">(fileStats) {</span>
+
+        <span class="s0">/* 
+         * is a directory or is a file, but the original file the user provided 
+         * looks like a directory but `path.resolve` removed the `last path.sep` 
+         * so we need to still treat this like a directory 
+         */</span>
+        <span class="s3">if </span><span class="s1">(fileStats.isDirectory() || looksLikeADirectory) {</span>
+            <span class="s3">return </span><span class="s1">getCacheFileForDirectory();</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// is file so just use that file</span>
+        <span class="s3">return </span><span class="s1">resolvedCacheFile;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* 
+     * here we known the file or directory doesn't exist, 
+     * so we will try to infer if its a directory if it looks like a directory 
+     * for the current operating system. 
+     */</span>
+
+    <span class="s0">// if the last character passed is a path separator we assume is a directory</span>
+    <span class="s3">if </span><span class="s1">(looksLikeADirectory) {</span>
+        <span class="s3">return </span><span class="s1">getCacheFileForDirectory();</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">resolvedCacheFile;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Convert a string array to a boolean map. 
+ * @param {string[]|null} keys The keys to assign true. 
+ * @param {boolean} defaultValue The default value for each property. 
+ * @param {string} displayName The property name which is used in error message. 
+ * @throws {Error} Requires array. 
+ * @returns {Record&lt;string,boolean&gt;} The boolean map. 
+ */</span>
+<span class="s3">function </span><span class="s1">toBooleanMap(keys, defaultValue, displayName) {</span>
+    <span class="s3">if </span><span class="s1">(keys &amp;&amp; !Array.isArray(keys)) {</span>
+        <span class="s3">throw new </span><span class="s1">Error(`${displayName} must be an array.`);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(keys &amp;&amp; keys.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">keys.reduce((map, def) =&gt; {</span>
+            <span class="s1">const [key, value] = def.split(</span><span class="s2">&quot;:&quot;</span><span class="s1">);</span>
+
+            <span class="s3">if </span><span class="s1">(key !== </span><span class="s2">&quot;__proto__&quot;</span><span class="s1">) {</span>
+                <span class="s1">map[key] = value === </span><span class="s3">void </span><span class="s4">0</span>
+                    <span class="s1">? defaultValue</span>
+                    <span class="s1">: value === </span><span class="s2">&quot;true&quot;</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s3">return </span><span class="s1">map;</span>
+        <span class="s1">}, {});</span>
+    <span class="s1">}</span>
+    <span class="s3">return void </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Create a config data from CLI options. 
+ * @param {CLIEngineOptions} options The options 
+ * @returns {ConfigData|null} The created config data. 
+ */</span>
+<span class="s3">function </span><span class="s1">createConfigDataFromOptions(options) {</span>
+    <span class="s1">const {</span>
+        <span class="s1">ignorePattern,</span>
+        <span class="s1">parser,</span>
+        <span class="s1">parserOptions,</span>
+        <span class="s1">plugins,</span>
+        <span class="s1">rules</span>
+    <span class="s1">} = options;</span>
+    <span class="s1">const env = toBooleanMap(options.envs, </span><span class="s3">true</span><span class="s1">, </span><span class="s2">&quot;envs&quot;</span><span class="s1">);</span>
+    <span class="s1">const globals = toBooleanMap(options.globals, </span><span class="s3">false</span><span class="s1">, </span><span class="s2">&quot;globals&quot;</span><span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">env === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">globals === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">(ignorePattern === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">|| ignorePattern.length === </span><span class="s4">0</span><span class="s1">) &amp;&amp;</span>
+        <span class="s1">parser === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">parserOptions === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">plugins === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">rules === </span><span class="s3">void </span><span class="s4">0</span>
+    <span class="s1">) {</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">env,</span>
+        <span class="s1">globals,</span>
+        <span class="s1">ignorePatterns: ignorePattern,</span>
+        <span class="s1">parser,</span>
+        <span class="s1">parserOptions,</span>
+        <span class="s1">plugins,</span>
+        <span class="s1">rules</span>
+    <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks whether a directory exists at the given location 
+ * @param {string} resolvedPath A path from the CWD 
+ * @throws {Error} As thrown by `fs.statSync` or `fs.isDirectory`. 
+ * @returns {boolean} `true` if a directory exists 
+ */</span>
+<span class="s3">function </span><span class="s1">directoryExists(resolvedPath) {</span>
+    <span class="s3">try </span><span class="s1">{</span>
+        <span class="s3">return </span><span class="s1">fs.statSync(resolvedPath).isDirectory();</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+        <span class="s3">if </span><span class="s1">(error &amp;&amp; (error.code === </span><span class="s2">&quot;ENOENT&quot; </span><span class="s1">|| error.code === </span><span class="s2">&quot;ENOTDIR&quot;</span><span class="s1">)) {</span>
+            <span class="s3">return false</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">throw </span><span class="s1">error;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Public Interface</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Core CLI. 
+ */</span>
+<span class="s1">class CLIEngine {</span>
+
+    <span class="s0">/** 
+     * Creates a new instance of the core CLI engine. 
+     * @param {CLIEngineOptions} providedOptions The options for this instance. 
+     * @param {Object} [additionalData] Additional settings that are not CLIEngineOptions. 
+     * @param {Record&lt;string,Plugin&gt;|null} [additionalData.preloadedPlugins] Preloaded plugins. 
+     */</span>
+    <span class="s1">constructor(providedOptions, { preloadedPlugins } = {}) {</span>
+        <span class="s1">const options = Object.assign(</span>
+            <span class="s1">Object.create(</span><span class="s3">null</span><span class="s1">),</span>
+            <span class="s1">defaultOptions,</span>
+            <span class="s1">{ cwd: process.cwd() },</span>
+            <span class="s1">providedOptions</span>
+        <span class="s1">);</span>
+
+        <span class="s3">if </span><span class="s1">(options.fix === </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">options.fix = </span><span class="s3">false</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const additionalPluginPool = </span><span class="s3">new </span><span class="s1">Map();</span>
+
+        <span class="s3">if </span><span class="s1">(preloadedPlugins) {</span>
+            <span class="s3">for </span><span class="s1">(const [id, plugin] of Object.entries(preloadedPlugins)) {</span>
+                <span class="s1">additionalPluginPool.set(id, plugin);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const cacheFilePath = getCacheFile(</span>
+            <span class="s1">options.cacheLocation || options.cacheFile,</span>
+            <span class="s1">options.cwd</span>
+        <span class="s1">);</span>
+        <span class="s1">const configArrayFactory = </span><span class="s3">new </span><span class="s1">CascadingConfigArrayFactory({</span>
+            <span class="s1">additionalPluginPool,</span>
+            <span class="s1">baseConfig: options.baseConfig || </span><span class="s3">null</span><span class="s1">,</span>
+            <span class="s1">cliConfig: createConfigDataFromOptions(options),</span>
+            <span class="s1">cwd: options.cwd,</span>
+            <span class="s1">ignorePath: options.ignorePath,</span>
+            <span class="s1">resolvePluginsRelativeTo: options.resolvePluginsRelativeTo,</span>
+            <span class="s1">rulePaths: options.rulePaths,</span>
+            <span class="s1">specificConfigPath: options.configFile,</span>
+            <span class="s1">useEslintrc: options.useEslintrc,</span>
+            <span class="s1">builtInRules,</span>
+            <span class="s1">loadRules,</span>
+            <span class="s1">getEslintRecommendedConfig: () =&gt; require(</span><span class="s2">&quot;@eslint/js&quot;</span><span class="s1">).configs.recommended,</span>
+            <span class="s1">getEslintAllConfig: () =&gt; require(</span><span class="s2">&quot;@eslint/js&quot;</span><span class="s1">).configs.all</span>
+        <span class="s1">});</span>
+        <span class="s1">const fileEnumerator = </span><span class="s3">new </span><span class="s1">FileEnumerator({</span>
+            <span class="s1">configArrayFactory,</span>
+            <span class="s1">cwd: options.cwd,</span>
+            <span class="s1">extensions: options.extensions,</span>
+            <span class="s1">globInputPaths: options.globInputPaths,</span>
+            <span class="s1">errorOnUnmatchedPattern: options.errorOnUnmatchedPattern,</span>
+            <span class="s1">ignore: options.ignore</span>
+        <span class="s1">});</span>
+        <span class="s1">const lintResultCache =</span>
+            <span class="s1">options.cache ? </span><span class="s3">new </span><span class="s1">LintResultCache(cacheFilePath, options.cacheStrategy) : </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s1">const linter = </span><span class="s3">new </span><span class="s1">Linter({ cwd: options.cwd });</span>
+
+        <span class="s0">/** @type {ConfigArray[]} */</span>
+        <span class="s1">const lastConfigArrays = [configArrayFactory.getConfigArrayForFile()];</span>
+
+        <span class="s0">// Store private data.</span>
+        <span class="s1">internalSlotsMap.set(</span><span class="s3">this</span><span class="s1">, {</span>
+            <span class="s1">additionalPluginPool,</span>
+            <span class="s1">cacheFilePath,</span>
+            <span class="s1">configArrayFactory,</span>
+            <span class="s1">defaultIgnores: IgnorePattern.createDefaultIgnore(options.cwd),</span>
+            <span class="s1">fileEnumerator,</span>
+            <span class="s1">lastConfigArrays,</span>
+            <span class="s1">lintResultCache,</span>
+            <span class="s1">linter,</span>
+            <span class="s1">options</span>
+        <span class="s1">});</span>
+
+        <span class="s0">// setup special filter for fixes</span>
+        <span class="s3">if </span><span class="s1">(options.fix &amp;&amp; options.fixTypes &amp;&amp; options.fixTypes.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">debug(`Using fix types ${options.fixTypes}`);</span>
+
+            <span class="s0">// throw an error if any invalid fix types are found</span>
+            <span class="s1">validateFixTypes(options.fixTypes);</span>
+
+            <span class="s0">// convert to Set for faster lookup</span>
+            <span class="s1">const fixTypes = </span><span class="s3">new </span><span class="s1">Set(options.fixTypes);</span>
+
+            <span class="s0">// save original value of options.fix in case it's a function</span>
+            <span class="s1">const originalFix = (</span><span class="s3">typeof </span><span class="s1">options.fix === </span><span class="s2">&quot;function&quot;</span><span class="s1">)</span>
+                <span class="s1">? options.fix : () =&gt; </span><span class="s3">true</span><span class="s1">;</span>
+
+            <span class="s1">options.fix = message =&gt; shouldMessageBeFixed(message, lastConfigArrays, fixTypes) &amp;&amp; originalFix(message);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">getRules() {</span>
+        <span class="s1">const { lastConfigArrays } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+
+        <span class="s3">return new </span><span class="s1">Map(</span><span class="s3">function </span><span class="s1">*() {</span>
+            <span class="s1">yield* builtInRules;</span>
+
+            <span class="s3">for </span><span class="s1">(const configArray of lastConfigArrays) {</span>
+                <span class="s1">yield* configArray.pluginRules;</span>
+            <span class="s1">}</span>
+        <span class="s1">}());</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Returns results that only contains errors. 
+     * @param {LintResult[]} results The results to filter. 
+     * @returns {LintResult[]} The filtered results. 
+     */</span>
+    <span class="s1">static getErrorResults(results) {</span>
+        <span class="s1">const filtered = [];</span>
+
+        <span class="s1">results.forEach(result =&gt; {</span>
+            <span class="s1">const filteredMessages = result.messages.filter(isErrorMessage);</span>
+            <span class="s1">const filteredSuppressedMessages = result.suppressedMessages.filter(isErrorMessage);</span>
+
+            <span class="s3">if </span><span class="s1">(filteredMessages.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s1">filtered.push({</span>
+                    <span class="s1">...result,</span>
+                    <span class="s1">messages: filteredMessages,</span>
+                    <span class="s1">suppressedMessages: filteredSuppressedMessages,</span>
+                    <span class="s1">errorCount: filteredMessages.length,</span>
+                    <span class="s1">warningCount: </span><span class="s4">0</span><span class="s1">,</span>
+                    <span class="s1">fixableErrorCount: result.fixableErrorCount,</span>
+                    <span class="s1">fixableWarningCount: </span><span class="s4">0</span>
+                <span class="s1">});</span>
+            <span class="s1">}</span>
+        <span class="s1">});</span>
+
+        <span class="s3">return </span><span class="s1">filtered;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Outputs fixes from the given results to files. 
+     * @param {LintReport} report The report object created by CLIEngine. 
+     * @returns {void} 
+     */</span>
+    <span class="s1">static outputFixes(report) {</span>
+        <span class="s1">report.results.filter(result =&gt; Object.prototype.hasOwnProperty.call(result, </span><span class="s2">&quot;output&quot;</span><span class="s1">)).forEach(result =&gt; {</span>
+            <span class="s1">fs.writeFileSync(result.filePath, result.output);</span>
+        <span class="s1">});</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Resolves the patterns passed into executeOnFiles() into glob-based patterns 
+     * for easier handling. 
+     * @param {string[]} patterns The file patterns passed on the command line. 
+     * @returns {string[]} The equivalent glob patterns. 
+     */</span>
+    <span class="s1">resolveFileGlobPatterns(patterns) {</span>
+        <span class="s1">const { options } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+
+        <span class="s3">if </span><span class="s1">(options.globInputPaths === </span><span class="s3">false</span><span class="s1">) {</span>
+            <span class="s3">return </span><span class="s1">patterns.filter(Boolean);</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const extensions = (options.extensions || [</span><span class="s2">&quot;.js&quot;</span><span class="s1">]).map(ext =&gt; ext.replace(/^\./u, </span><span class="s2">&quot;&quot;</span><span class="s1">));</span>
+        <span class="s1">const dirSuffix = `</span><span class="s0">/**/</span><span class="s1">*.{${extensions.join(</span><span class="s2">&quot;,&quot;</span><span class="s1">)}}`;</span>
+
+        <span class="s3">return </span><span class="s1">patterns.filter(Boolean).map(pathname =&gt; {</span>
+            <span class="s1">const resolvedPath = path.resolve(options.cwd, pathname);</span>
+            <span class="s1">const newPath = directoryExists(resolvedPath)</span>
+                <span class="s1">? pathname.replace(/[/\\]$/u, </span><span class="s2">&quot;&quot;</span><span class="s1">) + dirSuffix</span>
+                <span class="s1">: pathname;</span>
+
+            <span class="s3">return </span><span class="s1">path.normalize(newPath).replace(/\\/gu, </span><span class="s2">&quot;/&quot;</span><span class="s1">);</span>
+        <span class="s1">});</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Executes the current configuration on an array of file and directory names. 
+     * @param {string[]} patterns An array of file and directory names. 
+     * @throws {Error} As may be thrown by `fs.unlinkSync`. 
+     * @returns {LintReport} The results for all files that were linted. 
+     */</span>
+    <span class="s1">executeOnFiles(patterns) {</span>
+        <span class="s1">const {</span>
+            <span class="s1">cacheFilePath,</span>
+            <span class="s1">fileEnumerator,</span>
+            <span class="s1">lastConfigArrays,</span>
+            <span class="s1">lintResultCache,</span>
+            <span class="s1">linter,</span>
+            <span class="s1">options: {</span>
+                <span class="s1">allowInlineConfig,</span>
+                <span class="s1">cache,</span>
+                <span class="s1">cwd,</span>
+                <span class="s1">fix,</span>
+                <span class="s1">reportUnusedDisableDirectives</span>
+            <span class="s1">}</span>
+        <span class="s1">} = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const results = [];</span>
+        <span class="s1">const startTime = Date.now();</span>
+
+        <span class="s0">// Clear the last used config arrays.</span>
+        <span class="s1">lastConfigArrays.length = </span><span class="s4">0</span><span class="s1">;</span>
+
+        <span class="s0">// Delete cache file; should this do here?</span>
+        <span class="s3">if </span><span class="s1">(!cache) {</span>
+            <span class="s3">try </span><span class="s1">{</span>
+                <span class="s1">fs.unlinkSync(cacheFilePath);</span>
+            <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+                <span class="s1">const errorCode = error &amp;&amp; error.code;</span>
+
+                <span class="s0">// Ignore errors when no such file exists or file system is read only (and cache file does not exist)</span>
+                <span class="s3">if </span><span class="s1">(errorCode !== </span><span class="s2">&quot;ENOENT&quot; </span><span class="s1">&amp;&amp; !(errorCode === </span><span class="s2">&quot;EROFS&quot; </span><span class="s1">&amp;&amp; !fs.existsSync(cacheFilePath))) {</span>
+                    <span class="s3">throw </span><span class="s1">error;</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Iterate source code files.</span>
+        <span class="s3">for </span><span class="s1">(const { config, filePath, ignored } of fileEnumerator.iterateFiles(patterns)) {</span>
+            <span class="s3">if </span><span class="s1">(ignored) {</span>
+                <span class="s1">results.push(createIgnoreResult(filePath, cwd));</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">/* 
+             * Store used configs for: 
+             * - this method uses to collect used deprecated rules. 
+             * - `getRules()` method uses to collect all loaded rules. 
+             * - `--fix-type` option uses to get the loaded rule's meta data. 
+             */</span>
+            <span class="s3">if </span><span class="s1">(!lastConfigArrays.includes(config)) {</span>
+                <span class="s1">lastConfigArrays.push(config);</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Skip if there is cached result.</span>
+            <span class="s3">if </span><span class="s1">(lintResultCache) {</span>
+                <span class="s1">const cachedResult =</span>
+                    <span class="s1">lintResultCache.getCachedLintResults(filePath, config);</span>
+
+                <span class="s3">if </span><span class="s1">(cachedResult) {</span>
+                    <span class="s1">const hadMessages =</span>
+                        <span class="s1">cachedResult.messages &amp;&amp;</span>
+                        <span class="s1">cachedResult.messages.length &gt; </span><span class="s4">0</span><span class="s1">;</span>
+
+                    <span class="s3">if </span><span class="s1">(hadMessages &amp;&amp; fix) {</span>
+                        <span class="s1">debug(`Reprocessing cached file to allow autofix: ${filePath}`);</span>
+                    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                        <span class="s1">debug(`Skipping file since it hasn</span><span class="s2">'t changed: ${filePath}`);</span>
+                        <span class="s1">results.push(cachedResult);</span>
+                        <span class="s3">continue</span><span class="s1">;</span>
+                    <span class="s1">}</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Do lint.</span>
+            <span class="s1">const result = verifyText({</span>
+                <span class="s1">text: fs.readFileSync(filePath, </span><span class="s2">&quot;utf8&quot;</span><span class="s1">),</span>
+                <span class="s1">filePath,</span>
+                <span class="s1">config,</span>
+                <span class="s1">cwd,</span>
+                <span class="s1">fix,</span>
+                <span class="s1">allowInlineConfig,</span>
+                <span class="s1">reportUnusedDisableDirectives,</span>
+                <span class="s1">fileEnumerator,</span>
+                <span class="s1">linter</span>
+            <span class="s1">});</span>
+
+            <span class="s1">results.push(result);</span>
+
+            <span class="s0">/* 
+             * Store the lint result in the LintResultCache. 
+             * NOTE: The LintResultCache will remove the file source and any 
+             * other properties that are difficult to serialize, and will 
+             * hydrate those properties back in on future lint runs. 
+             */</span>
+            <span class="s3">if </span><span class="s1">(lintResultCache) {</span>
+                <span class="s1">lintResultCache.setCachedLintResults(filePath, config, result);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Persist the cache to disk.</span>
+        <span class="s3">if </span><span class="s1">(lintResultCache) {</span>
+            <span class="s1">lintResultCache.reconcile();</span>
+        <span class="s1">}</span>
+
+        <span class="s1">debug(`Linting complete </span><span class="s3">in</span><span class="s1">: ${Date.now() - startTime}ms`);</span>
+        <span class="s1">let usedDeprecatedRules;</span>
+
+        <span class="s3">return </span><span class="s1">{</span>
+            <span class="s1">results,</span>
+            <span class="s1">...calculateStatsPerRun(results),</span>
+
+            <span class="s0">// Initialize it lazily because CLI and `ESLint` API don't use it.</span>
+            <span class="s1">get usedDeprecatedRules() {</span>
+                <span class="s3">if </span><span class="s1">(!usedDeprecatedRules) {</span>
+                    <span class="s1">usedDeprecatedRules = Array.from(</span>
+                        <span class="s1">iterateRuleDeprecationWarnings(lastConfigArrays)</span>
+                    <span class="s1">);</span>
+                <span class="s1">}</span>
+                <span class="s3">return </span><span class="s1">usedDeprecatedRules;</span>
+            <span class="s1">}</span>
+        <span class="s1">};</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Executes the current configuration on text. 
+     * @param {string} text A string of JavaScript code to lint. 
+     * @param {string} [filename] An optional string representing the texts filename. 
+     * @param {boolean} [warnIgnored] Always warn when a file is ignored 
+     * @returns {LintReport} The results for the linting. 
+     */</span>
+    <span class="s1">executeOnText(text, filename, warnIgnored) {</span>
+        <span class="s1">const {</span>
+            <span class="s1">configArrayFactory,</span>
+            <span class="s1">fileEnumerator,</span>
+            <span class="s1">lastConfigArrays,</span>
+            <span class="s1">linter,</span>
+            <span class="s1">options: {</span>
+                <span class="s1">allowInlineConfig,</span>
+                <span class="s1">cwd,</span>
+                <span class="s1">fix,</span>
+                <span class="s1">reportUnusedDisableDirectives</span>
+            <span class="s1">}</span>
+        <span class="s1">} = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const results = [];</span>
+        <span class="s1">const startTime = Date.now();</span>
+        <span class="s1">const resolvedFilename = filename &amp;&amp; path.resolve(cwd, filename);</span>
+
+
+        <span class="s0">// Clear the last used config arrays.</span>
+        <span class="s1">lastConfigArrays.length = </span><span class="s4">0</span><span class="s1">;</span>
+        <span class="s3">if </span><span class="s1">(resolvedFilename &amp;&amp; </span><span class="s3">this</span><span class="s1">.isPathIgnored(resolvedFilename)) {</span>
+            <span class="s3">if </span><span class="s1">(warnIgnored) {</span>
+                <span class="s1">results.push(createIgnoreResult(resolvedFilename, cwd));</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">const config = configArrayFactory.getConfigArrayForFile(</span>
+                <span class="s1">resolvedFilename || </span><span class="s2">&quot;__placeholder__.js&quot;</span>
+            <span class="s1">);</span>
+
+            <span class="s0">/* 
+             * Store used configs for: 
+             * - this method uses to collect used deprecated rules. 
+             * - `getRules()` method uses to collect all loaded rules. 
+             * - `--fix-type` option uses to get the loaded rule's meta data. 
+             */</span>
+            <span class="s1">lastConfigArrays.push(config);</span>
+
+            <span class="s0">// Do lint.</span>
+            <span class="s1">results.push(verifyText({</span>
+                <span class="s1">text,</span>
+                <span class="s1">filePath: resolvedFilename,</span>
+                <span class="s1">config,</span>
+                <span class="s1">cwd,</span>
+                <span class="s1">fix,</span>
+                <span class="s1">allowInlineConfig,</span>
+                <span class="s1">reportUnusedDisableDirectives,</span>
+                <span class="s1">fileEnumerator,</span>
+                <span class="s1">linter</span>
+            <span class="s1">}));</span>
+        <span class="s1">}</span>
+
+        <span class="s1">debug(`Linting complete </span><span class="s3">in</span><span class="s1">: ${Date.now() - startTime}ms`);</span>
+        <span class="s1">let usedDeprecatedRules;</span>
+
+        <span class="s3">return </span><span class="s1">{</span>
+            <span class="s1">results,</span>
+            <span class="s1">...calculateStatsPerRun(results),</span>
+
+            <span class="s0">// Initialize it lazily because CLI and `ESLint` API don't use it.</span>
+            <span class="s1">get usedDeprecatedRules() {</span>
+                <span class="s3">if </span><span class="s1">(!usedDeprecatedRules) {</span>
+                    <span class="s1">usedDeprecatedRules = Array.from(</span>
+                        <span class="s1">iterateRuleDeprecationWarnings(lastConfigArrays)</span>
+                    <span class="s1">);</span>
+                <span class="s1">}</span>
+                <span class="s3">return </span><span class="s1">usedDeprecatedRules;</span>
+            <span class="s1">}</span>
+        <span class="s1">};</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Returns a configuration object for the given file based on the CLI options. 
+     * This is the same logic used by the ESLint CLI executable to determine 
+     * configuration for each file it processes. 
+     * @param {string} filePath The path of the file to retrieve a config object for. 
+     * @throws {Error} If filepath a directory path. 
+     * @returns {ConfigData} A configuration object for the file. 
+     */</span>
+    <span class="s1">getConfigForFile(filePath) {</span>
+        <span class="s1">const { configArrayFactory, options } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const absolutePath = path.resolve(options.cwd, filePath);</span>
+
+        <span class="s3">if </span><span class="s1">(directoryExists(absolutePath)) {</span>
+            <span class="s3">throw </span><span class="s1">Object.assign(</span>
+                <span class="s3">new </span><span class="s1">Error(</span><span class="s2">&quot;'filePath' should not be a directory path.&quot;</span><span class="s1">),</span>
+                <span class="s1">{ messageTemplate: </span><span class="s2">&quot;print-config-with-directory-path&quot; </span><span class="s1">}</span>
+            <span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">configArrayFactory</span>
+            <span class="s1">.getConfigArrayForFile(absolutePath)</span>
+            <span class="s1">.extractConfig(absolutePath)</span>
+            <span class="s1">.toCompatibleObjectAsConfigFileContent();</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Checks if a given path is ignored by ESLint. 
+     * @param {string} filePath The path of the file to check. 
+     * @returns {boolean} Whether or not the given path is ignored. 
+     */</span>
+    <span class="s1">isPathIgnored(filePath) {</span>
+        <span class="s1">const {</span>
+            <span class="s1">configArrayFactory,</span>
+            <span class="s1">defaultIgnores,</span>
+            <span class="s1">options: { cwd, ignore }</span>
+        <span class="s1">} = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const absolutePath = path.resolve(cwd, filePath);</span>
+
+        <span class="s3">if </span><span class="s1">(ignore) {</span>
+            <span class="s1">const config = configArrayFactory</span>
+                <span class="s1">.getConfigArrayForFile(absolutePath)</span>
+                <span class="s1">.extractConfig(absolutePath);</span>
+            <span class="s1">const ignores = config.ignores || defaultIgnores;</span>
+
+            <span class="s3">return </span><span class="s1">ignores(absolutePath);</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">defaultIgnores(absolutePath);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Returns the formatter representing the given format or null if the `format` is not a string. 
+     * @param {string} [format] The name of the format to load or the path to a 
+     *      custom formatter. 
+     * @throws {any} As may be thrown by requiring of formatter 
+     * @returns {(FormatterFunction|null)} The formatter function or null if the `format` is not a string. 
+     */</span>
+    <span class="s1">getFormatter(format) {</span>
+
+        <span class="s0">// default is stylish</span>
+        <span class="s1">const resolvedFormatName = format || </span><span class="s2">&quot;stylish&quot;</span><span class="s1">;</span>
+
+        <span class="s0">// only strings are valid formatters</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">resolvedFormatName === </span><span class="s2">&quot;string&quot;</span><span class="s1">) {</span>
+
+            <span class="s0">// replace \ with / for Windows compatibility</span>
+            <span class="s1">const normalizedFormatName = resolvedFormatName.replace(/\\/gu, </span><span class="s2">&quot;/&quot;</span><span class="s1">);</span>
+
+            <span class="s1">const slots = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+            <span class="s1">const cwd = slots ? slots.options.cwd : process.cwd();</span>
+            <span class="s1">const namespace = naming.getNamespaceFromTerm(normalizedFormatName);</span>
+
+            <span class="s1">let formatterPath;</span>
+
+            <span class="s0">// if there's a slash, then it's a file (TODO: this check seems dubious for scoped npm packages)</span>
+            <span class="s3">if </span><span class="s1">(!namespace &amp;&amp; normalizedFormatName.includes(</span><span class="s2">&quot;/&quot;</span><span class="s1">)) {</span>
+                <span class="s1">formatterPath = path.resolve(cwd, normalizedFormatName);</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s3">try </span><span class="s1">{</span>
+                    <span class="s1">const npmFormat = naming.normalizePackageName(normalizedFormatName, </span><span class="s2">&quot;eslint-formatter&quot;</span><span class="s1">);</span>
+
+                    <span class="s1">formatterPath = ModuleResolver.resolve(npmFormat, path.join(cwd, </span><span class="s2">&quot;__placeholder__.js&quot;</span><span class="s1">));</span>
+                <span class="s1">} </span><span class="s3">catch </span><span class="s1">{</span>
+                    <span class="s1">formatterPath = path.resolve(__dirname, </span><span class="s2">&quot;formatters&quot;</span><span class="s1">, normalizedFormatName);</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s3">try </span><span class="s1">{</span>
+                <span class="s3">return </span><span class="s1">require(formatterPath);</span>
+            <span class="s1">} </span><span class="s3">catch </span><span class="s1">(ex) {</span>
+                <span class="s3">if </span><span class="s1">(format === </span><span class="s2">&quot;table&quot; </span><span class="s1">|| format === </span><span class="s2">&quot;codeframe&quot;</span><span class="s1">) {</span>
+                    <span class="s1">ex.message = `The ${format} formatter is no longer part of core ESLint. Install it manually </span><span class="s3">with </span><span class="s1">\`npm install -D eslint-formatter-${format}\``;</span>
+                <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                    <span class="s1">ex.message = `There was a problem loading formatter: ${formatterPath}\nError: ${ex.message}`;</span>
+                <span class="s1">}</span>
+                <span class="s3">throw </span><span class="s1">ex;</span>
+            <span class="s1">}</span>
+
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s3">return null</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">CLIEngine.version = pkg.version;</span>
+<span class="s1">CLIEngine.getFormatter = CLIEngine.prototype.getFormatter;</span>
+
+<span class="s1">module.exports = {</span>
+    <span class="s1">CLIEngine,</span>
+
+    <span class="s0">/** 
+     * Get the internal slots of a given CLIEngine instance for tests. 
+     * @param {CLIEngine} instance The CLIEngine instance to get. 
+     * @returns {CLIEngineInternalSlots} The internal slots. 
+     */</span>
+    <span class="s1">getCLIEngineInternalSlots(instance) {</span>
+        <span class="s3">return </span><span class="s1">internalSlotsMap.get(instance);</span>
+    <span class="s1">}</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

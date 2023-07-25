@@ -1,0 +1,404 @@
+<html>
+<head>
+<title>HmrServer.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+HmrServer.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type IncrementalBundler, {RevisionId} from './IncrementalBundler';</span>
+<span class="s0">import type {GraphOptions} from './shared/types.flow';</span>
+<span class="s0">import type {ConfigT, RootPerfLogger} from 'metro-config';</span>
+<span class="s0">import type {</span>
+  <span class="s0">HmrClientMessage,</span>
+  <span class="s0">HmrErrorMessage,</span>
+  <span class="s0">HmrMessage,</span>
+  <span class="s0">HmrUpdateMessage,</span>
+<span class="s0">} from 'metro-runtime/src/modules/types.flow';</span>
+<span class="s0">import type {UrlWithParsedQuery} from 'url';</span>
+
+<span class="s0">const hmrJSBundle = require('./DeltaBundler/Serializers/hmrJSBundle');</span>
+<span class="s0">const GraphNotFoundError = require('./IncrementalBundler/GraphNotFoundError');</span>
+<span class="s0">const RevisionNotFoundError = require('./IncrementalBundler/RevisionNotFoundError');</span>
+<span class="s0">const debounceAsyncQueue = require('./lib/debounceAsyncQueue');</span>
+<span class="s0">const formatBundlingError = require('./lib/formatBundlingError');</span>
+<span class="s0">const getGraphId = require('./lib/getGraphId');</span>
+<span class="s0">const parseOptionsFromUrl = require('./lib/parseOptionsFromUrl');</span>
+<span class="s0">const splitBundleOptions = require('./lib/splitBundleOptions');</span>
+<span class="s0">const transformHelpers = require('./lib/transformHelpers');</span>
+<span class="s0">const {</span>
+  <span class="s0">Logger: {createActionStartEntry, createActionEndEntry, log},</span>
+<span class="s0">} = require('metro-core');</span>
+<span class="s0">const nullthrows = require('nullthrows');</span>
+<span class="s0">const url = require('url');</span>
+
+<span class="s0">export type EntryPointURL = UrlWithParsedQuery;</span>
+
+<span class="s0">export type Client = {</span>
+  <span class="s0">optedIntoHMR: boolean,</span>
+  <span class="s0">revisionIds: Array&lt;RevisionId&gt;,</span>
+  <span class="s0">+sendFn: string =&gt; void,</span>
+<span class="s0">};</span>
+
+<span class="s0">type ClientGroup = {</span>
+  <span class="s0">+clients: Set&lt;Client&gt;,</span>
+  <span class="s0">clientUrl: EntryPointURL,</span>
+  <span class="s0">revisionId: RevisionId,</span>
+  <span class="s0">+unlisten: () =&gt; void,</span>
+  <span class="s0">+graphOptions: GraphOptions,</span>
+<span class="s0">};</span>
+
+<span class="s0">function send(sendFns: Array&lt;(string) =&gt; void&gt;, message: HmrMessage): void {</span>
+  <span class="s0">const strMessage = JSON.stringify(message);</span>
+  <span class="s0">sendFns.forEach((sendFn: string =&gt; void) =&gt; sendFn(strMessage));</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* The HmrServer (Hot Module Reloading) implements a lightweight interface</span>
+ <span class="s0">* to communicate easily to the logic in the React Native repository (which</span>
+ <span class="s0">* is the one that handles the Web Socket connections).</span>
+ <span class="s0">*</span>
+ <span class="s0">* This interface allows the HmrServer to hook its own logic to WS clients</span>
+ <span class="s0">* getting connected, disconnected or having errors (through the</span>
+ <span class="s0">* `onClientConnect`, `onClientDisconnect` and `onClientError` methods).</span>
+ <span class="s0">*/</span>
+<span class="s0">class HmrServer&lt;TClient: Client&gt; {</span>
+  <span class="s0">_config: ConfigT;</span>
+  <span class="s0">_bundler: IncrementalBundler;</span>
+  <span class="s0">_createModuleId: (path: string) =&gt; number;</span>
+  <span class="s0">_clientGroups: Map&lt;RevisionId, ClientGroup&gt;;</span>
+
+  <span class="s0">constructor(</span>
+    <span class="s0">bundler: IncrementalBundler,</span>
+    <span class="s0">createModuleId: (path: string) =&gt; number,</span>
+    <span class="s0">config: ConfigT,</span>
+  <span class="s0">) {</span>
+    <span class="s0">this._config = config;</span>
+    <span class="s0">this._bundler = bundler;</span>
+    <span class="s0">this._createModuleId = createModuleId;</span>
+    <span class="s0">this._clientGroups = new Map();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">onClientConnect: (</span>
+    <span class="s0">requestUrl: string,</span>
+    <span class="s0">sendFn: (data: string) =&gt; void,</span>
+  <span class="s0">) =&gt; Promise&lt;Client&gt; = async (requestUrl, sendFn) =&gt; {</span>
+    <span class="s0">return {</span>
+      <span class="s0">sendFn,</span>
+      <span class="s0">revisionIds: [],</span>
+      <span class="s0">optedIntoHMR: false,</span>
+    <span class="s0">};</span>
+  <span class="s0">};</span>
+
+  <span class="s0">async _registerEntryPoint(</span>
+    <span class="s0">client: Client,</span>
+    <span class="s0">requestUrl: string,</span>
+    <span class="s0">sendFn: (data: string) =&gt; void,</span>
+  <span class="s0">): Promise&lt;void&gt; {</span>
+    <span class="s0">requestUrl = this._config.server.rewriteRequestUrl(requestUrl);</span>
+    <span class="s0">const clientUrl = nullthrows(url.parse(requestUrl, true));</span>
+    <span class="s0">const options = parseOptionsFromUrl(</span>
+      <span class="s0">requestUrl,</span>
+      <span class="s0">new Set(this._config.resolver.platforms),</span>
+    <span class="s0">);</span>
+    <span class="s0">const {entryFile, resolverOptions, transformOptions, graphOptions} =</span>
+      <span class="s0">splitBundleOptions(options);</span>
+
+    <span class="s0">/**</span>
+     <span class="s0">* `entryFile` is relative to projectRoot, we need to use resolution function</span>
+     <span class="s0">* to find the appropriate file with supported extensions.</span>
+     <span class="s0">*/</span>
+    <span class="s0">const resolutionFn = await transformHelpers.getResolveDependencyFn(</span>
+      <span class="s0">this._bundler.getBundler(),</span>
+      <span class="s0">transformOptions.platform,</span>
+      <span class="s0">resolverOptions,</span>
+    <span class="s0">);</span>
+    <span class="s0">const resolvedEntryFilePath = resolutionFn(</span>
+      <span class="s0">(this._config.server.unstable_serverRoot ?? this._config.projectRoot) +</span>
+        <span class="s0">'/.',</span>
+      <span class="s0">entryFile,</span>
+    <span class="s0">).filePath;</span>
+    <span class="s0">const graphId = getGraphId(resolvedEntryFilePath, transformOptions, {</span>
+      <span class="s0">resolverOptions,</span>
+      <span class="s0">shallow: graphOptions.shallow,</span>
+      <span class="s0">lazy: graphOptions.lazy,</span>
+      <span class="s0">unstable_allowRequireContext:</span>
+        <span class="s0">this._config.transformer.unstable_allowRequireContext,</span>
+    <span class="s0">});</span>
+    <span class="s0">const revPromise = this._bundler.getRevisionByGraphId(graphId);</span>
+    <span class="s0">if (!revPromise) {</span>
+      <span class="s0">send([sendFn], {</span>
+        <span class="s0">type: 'error',</span>
+        <span class="s0">body: formatBundlingError(new GraphNotFoundError(graphId)),</span>
+      <span class="s0">});</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const {graph, id} = await revPromise;</span>
+    <span class="s0">client.revisionIds.push(id);</span>
+
+    <span class="s0">let clientGroup: ?ClientGroup = this._clientGroups.get(id);</span>
+    <span class="s0">if (clientGroup != null) {</span>
+      <span class="s0">clientGroup.clients.add(client);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">// Prepare the clientUrl to be used as sourceUrl in HMR updates.</span>
+      <span class="s0">clientUrl.protocol = 'http';</span>
+      <span class="s0">const {</span>
+        <span class="s0">dev,</span>
+        <span class="s0">minify,</span>
+        <span class="s0">runModule,</span>
+        <span class="s0">bundleEntry: _bundleEntry,</span>
+        <span class="s0">...query</span>
+      <span class="s0">} = clientUrl.query || {};</span>
+      <span class="s0">clientUrl.query = {</span>
+        <span class="s0">...query,</span>
+        <span class="s0">dev: dev || 'true',</span>
+        <span class="s0">minify: minify || 'false',</span>
+        <span class="s0">modulesOnly: 'true',</span>
+        <span class="s0">runModule: runModule || 'false',</span>
+        <span class="s0">shallow: 'true',</span>
+      <span class="s0">};</span>
+      <span class="s0">clientUrl.search = '';</span>
+
+      <span class="s0">clientGroup = {</span>
+        <span class="s0">clients: new Set([client]),</span>
+        <span class="s0">clientUrl,</span>
+        <span class="s0">revisionId: id,</span>
+        <span class="s0">graphOptions,</span>
+        <span class="s0">unlisten: (): void =&gt; unlisten(),</span>
+      <span class="s0">};</span>
+
+      <span class="s0">this._clientGroups.set(id, clientGroup);</span>
+
+      <span class="s0">let latestEventArgs: Array&lt;any&gt; = [];</span>
+
+      <span class="s0">const debounceCallHandleFileChange = debounceAsyncQueue(async () =&gt; {</span>
+        <span class="s0">await this._handleFileChange(</span>
+          <span class="s0">nullthrows(clientGroup),</span>
+          <span class="s0">{isInitialUpdate: false},</span>
+          <span class="s0">...latestEventArgs,</span>
+        <span class="s0">);</span>
+      <span class="s0">}, 50);</span>
+
+      <span class="s0">const unlisten = this._bundler</span>
+        <span class="s0">.getDeltaBundler()</span>
+        <span class="s0">// $FlowFixMe[missing-local-annot]</span>
+        <span class="s0">.listen(graph, async (...args) =&gt; {</span>
+          <span class="s0">latestEventArgs = args;</span>
+          <span class="s0">await debounceCallHandleFileChange();</span>
+        <span class="s0">});</span>
+    <span class="s0">}</span>
+
+    <span class="s0">await this._handleFileChange(clientGroup, {isInitialUpdate: true});</span>
+    <span class="s0">send([sendFn], {type: 'bundle-registered'});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">onClientMessage: (</span>
+    <span class="s0">client: TClient,</span>
+    <span class="s0">message: string,</span>
+    <span class="s0">sendFn: (data: string) =&gt; void,</span>
+  <span class="s0">) =&gt; Promise&lt;void&gt; = async (client, message, sendFn) =&gt; {</span>
+    <span class="s0">let data: HmrClientMessage;</span>
+    <span class="s0">try {</span>
+      <span class="s0">data = JSON.parse(message);</span>
+    <span class="s0">} catch (error) {</span>
+      <span class="s0">send([sendFn], {</span>
+        <span class="s0">type: 'error',</span>
+        <span class="s0">body: formatBundlingError(error),</span>
+      <span class="s0">});</span>
+      <span class="s0">return Promise.resolve();</span>
+    <span class="s0">}</span>
+    <span class="s0">if (data &amp;&amp; data.type) {</span>
+      <span class="s0">switch (data.type) {</span>
+        <span class="s0">case 'register-entrypoints':</span>
+          <span class="s0">return Promise.all(</span>
+            <span class="s0">data.entryPoints.map(entryPoint =&gt;</span>
+              <span class="s0">this._registerEntryPoint(client, entryPoint, sendFn),</span>
+            <span class="s0">),</span>
+          <span class="s0">);</span>
+        <span class="s0">case 'log':</span>
+          <span class="s0">this._config.reporter.update({</span>
+            <span class="s0">type: 'client_log',</span>
+            <span class="s0">level: data.level,</span>
+            <span class="s0">data: data.data,</span>
+            <span class="s0">mode: data.mode,</span>
+          <span class="s0">});</span>
+          <span class="s0">break;</span>
+        <span class="s0">case 'log-opt-in':</span>
+          <span class="s0">client.optedIntoHMR = true;</span>
+          <span class="s0">break;</span>
+        <span class="s0">default:</span>
+          <span class="s0">break;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">return Promise.resolve();</span>
+  <span class="s0">};</span>
+
+  <span class="s0">onClientError: (client: TClient, e: ErrorEvent) =&gt; void = (client, e) =&gt; {</span>
+    <span class="s0">this._config.reporter.update({</span>
+      <span class="s0">type: 'hmr_client_error',</span>
+      <span class="s0">error: e.error,</span>
+    <span class="s0">});</span>
+    <span class="s0">this.onClientDisconnect(client);</span>
+  <span class="s0">};</span>
+
+  <span class="s0">onClientDisconnect: (client: TClient) =&gt; void = client =&gt; {</span>
+    <span class="s0">client.revisionIds.forEach(revisionId =&gt; {</span>
+      <span class="s0">const group = this._clientGroups.get(revisionId);</span>
+      <span class="s0">if (group != null) {</span>
+        <span class="s0">if (group.clients.size === 1) {</span>
+          <span class="s0">this._clientGroups.delete(revisionId);</span>
+          <span class="s0">group.unlisten();</span>
+        <span class="s0">} else {</span>
+          <span class="s0">group.clients.delete(client);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+  <span class="s0">};</span>
+
+  <span class="s0">async _handleFileChange(</span>
+    <span class="s0">group: ClientGroup,</span>
+    <span class="s0">options: {isInitialUpdate: boolean},</span>
+    <span class="s0">changeEvent: ?{</span>
+      <span class="s0">logger: ?RootPerfLogger,</span>
+    <span class="s0">},</span>
+  <span class="s0">): Promise&lt;void&gt; {</span>
+    <span class="s0">const logger = !options.isInitialUpdate ? changeEvent?.logger : null;</span>
+    <span class="s0">if (logger) {</span>
+      <span class="s0">logger.point('fileChange_end');</span>
+      <span class="s0">logger.point('hmrPrepareAndSendMessage_start');</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const optedIntoHMR = [...group.clients].some(</span>
+      <span class="s0">(client: Client) =&gt; client.optedIntoHMR,</span>
+    <span class="s0">);</span>
+    <span class="s0">const processingHmrChange = log(</span>
+      <span class="s0">createActionStartEntry({</span>
+        <span class="s0">// Even when HMR is disabled on the client, this function still</span>
+        <span class="s0">// runs so we can stash updates while it's off and apply them later.</span>
+        <span class="s0">// However, this would mess up our internal analytics because we track</span>
+        <span class="s0">// HMR as being used even for people who have it disabled.</span>
+        <span class="s0">// As a workaround, we use a different event name for clients</span>
+        <span class="s0">// that didn't explicitly opt into HMR.</span>
+        <span class="s0">action_name: optedIntoHMR</span>
+          <span class="s0">? 'Processing HMR change'</span>
+          <span class="s0">: 'Processing HMR change (no client opt-in)',</span>
+      <span class="s0">}),</span>
+    <span class="s0">);</span>
+
+    <span class="s0">const sendFns = [...group.clients].map((client: Client) =&gt; client.sendFn);</span>
+
+    <span class="s0">send(sendFns, {</span>
+      <span class="s0">type: 'update-start',</span>
+      <span class="s0">body: options,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">const message = await this._prepareMessage(group, options, changeEvent);</span>
+    <span class="s0">send(sendFns, message);</span>
+    <span class="s0">send(sendFns, {type: 'update-done'});</span>
+
+    <span class="s0">log({</span>
+      <span class="s0">...createActionEndEntry(processingHmrChange),</span>
+      <span class="s0">outdated_modules:</span>
+        <span class="s0">message.type === 'update'</span>
+          <span class="s0">? message.body.added.length + message.body.modified.length</span>
+          <span class="s0">: undefined,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">if (logger) {</span>
+      <span class="s0">logger.point('hmrPrepareAndSendMessage_end');</span>
+      <span class="s0">logger.end('SUCCESS');</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async _prepareMessage(</span>
+    <span class="s0">group: ClientGroup,</span>
+    <span class="s0">options: {isInitialUpdate: boolean},</span>
+    <span class="s0">changeEvent: ?{</span>
+      <span class="s0">logger: ?RootPerfLogger,</span>
+    <span class="s0">},</span>
+  <span class="s0">): Promise&lt;HmrUpdateMessage | HmrErrorMessage&gt; {</span>
+    <span class="s0">const logger = !options.isInitialUpdate ? changeEvent?.logger : null;</span>
+    <span class="s0">try {</span>
+      <span class="s0">const revPromise = this._bundler.getRevision(group.revisionId);</span>
+      <span class="s0">if (!revPromise) {</span>
+        <span class="s0">return {</span>
+          <span class="s0">type: 'error',</span>
+          <span class="s0">body: formatBundlingError(</span>
+            <span class="s0">new RevisionNotFoundError(group.revisionId),</span>
+          <span class="s0">),</span>
+        <span class="s0">};</span>
+      <span class="s0">}</span>
+
+      <span class="s0">logger?.point('updateGraph_start');</span>
+
+      <span class="s0">const {revision, delta} = await this._bundler.updateGraph(</span>
+        <span class="s0">await revPromise,</span>
+        <span class="s0">false,</span>
+      <span class="s0">);</span>
+
+      <span class="s0">logger?.point('updateGraph_end');</span>
+
+      <span class="s0">this._clientGroups.delete(group.revisionId);</span>
+      <span class="s0">group.revisionId = revision.id;</span>
+      <span class="s0">for (const client of group.clients) {</span>
+        <span class="s0">client.revisionIds = client.revisionIds.filter(</span>
+          <span class="s0">revisionId =&gt; revisionId !== group.revisionId,</span>
+        <span class="s0">);</span>
+        <span class="s0">client.revisionIds.push(revision.id);</span>
+      <span class="s0">}</span>
+      <span class="s0">this._clientGroups.set(group.revisionId, group);</span>
+
+      <span class="s0">logger?.point('serialize_start');</span>
+
+      <span class="s0">const hmrUpdate = hmrJSBundle(delta, revision.graph, {</span>
+        <span class="s0">clientUrl: group.clientUrl,</span>
+        <span class="s0">createModuleId: this._createModuleId,</span>
+        <span class="s0">includeAsyncPaths: group.graphOptions.lazy,</span>
+        <span class="s0">projectRoot: this._config.projectRoot,</span>
+        <span class="s0">serverRoot:</span>
+          <span class="s0">this._config.server.unstable_serverRoot ?? this._config.projectRoot,</span>
+      <span class="s0">});</span>
+
+      <span class="s0">logger?.point('serialize_end');</span>
+
+      <span class="s0">return {</span>
+        <span class="s0">type: 'update',</span>
+        <span class="s0">body: {</span>
+          <span class="s0">revisionId: revision.id,</span>
+          <span class="s0">isInitialUpdate: options.isInitialUpdate,</span>
+          <span class="s0">...hmrUpdate,</span>
+        <span class="s0">},</span>
+      <span class="s0">};</span>
+    <span class="s0">} catch (error) {</span>
+      <span class="s0">const formattedError = formatBundlingError(error);</span>
+
+      <span class="s0">this._config.reporter.update({type: 'bundling_error', error});</span>
+
+      <span class="s0">return {type: 'error', body: formattedError};</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = HmrServer;</span>
+</pre>
+</body>
+</html>

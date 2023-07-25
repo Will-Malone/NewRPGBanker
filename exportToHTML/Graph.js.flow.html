@@ -1,0 +1,916 @@
+<html>
+<head>
+<title>Graph.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Graph.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict-local</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Portions of this code are based on the Synchronous Cycle Collection</span>
+ <span class="s0">* algorithm described in:</span>
+ <span class="s0">*</span>
+ <span class="s0">* David F. Bacon and V. T. Rajan. 2001. Concurrent Cycle Collection in</span>
+ <span class="s0">* Reference Counted Systems. In Proceedings of the 15th European Conference on</span>
+ <span class="s0">* Object-Oriented Programming (ECOOP '01). Springer-Verlag, Berlin,</span>
+ <span class="s0">* Heidelberg, 207–235.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Notable differences from the algorithm in the paper:</span>
+ <span class="s0">* 1. Our implementation uses the inverseDependencies set (which we already</span>
+ <span class="s0">*    have to maintain) instead of a separate refcount variable. A module's</span>
+ <span class="s0">*    reference count is equal to the size of its inverseDependencies set, plus</span>
+ <span class="s0">*    1 if it's an entry point of the graph.</span>
+ <span class="s0">* 2. We keep the &quot;root buffer&quot; (possibleCycleRoots) free of duplicates by</span>
+ <span class="s0">*    making it a Set, instead of storing a &quot;buffered&quot; flag on each node.</span>
+ <span class="s0">* 3. On top of tracking edges between nodes, we also count references between</span>
+ <span class="s0">*    nodes and entries in the importBundleNodes set.</span>
+ <span class="s0">*/</span>
+
+<span class="s0">import type {RequireContextParams} from '../ModuleGraph/worker/collectDependencies';</span>
+<span class="s0">import type {RequireContext} from '../lib/contextModule';</span>
+<span class="s0">import type {</span>
+  <span class="s0">Dependencies,</span>
+  <span class="s0">Dependency,</span>
+  <span class="s0">GraphInputOptions,</span>
+  <span class="s0">MixedOutput,</span>
+  <span class="s0">Module,</span>
+  <span class="s0">Options,</span>
+  <span class="s0">TransformInputOptions,</span>
+  <span class="s0">TransformResultDependency,</span>
+<span class="s0">} from './types.flow';</span>
+
+<span class="s0">import CountingSet from '../lib/CountingSet';</span>
+<span class="s0">import {</span>
+  <span class="s0">deriveAbsolutePathFromContext,</span>
+  <span class="s0">fileMatchesContext,</span>
+<span class="s0">} from '../lib/contextModule';</span>
+
+<span class="s0">import * as path from 'path';</span>
+<span class="s0">const invariant = require('invariant');</span>
+<span class="s0">const nullthrows = require('nullthrows');</span>
+
+<span class="s0">// TODO: Convert to a Flow enum</span>
+<span class="s0">type NodeColor =</span>
+  <span class="s0">// In use or free</span>
+  <span class="s0">| 'black'</span>
+
+  <span class="s0">// Possible member of cycle</span>
+  <span class="s0">| 'gray'</span>
+
+  <span class="s0">// Member of garbage cycle</span>
+  <span class="s0">| 'white'</span>
+
+  <span class="s0">// Possible root of cycle</span>
+  <span class="s0">| 'purple'</span>
+
+  <span class="s0">// Inherently acyclic node (Not currently used)</span>
+  <span class="s0">| 'green';</span>
+
+<span class="s0">export type Result&lt;T&gt; = {</span>
+  <span class="s0">added: Map&lt;string, Module&lt;T&gt;&gt;,</span>
+  <span class="s0">modified: Map&lt;string, Module&lt;T&gt;&gt;,</span>
+  <span class="s0">deleted: Set&lt;string&gt;,</span>
+<span class="s0">};</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Internal data structure that the traversal logic uses to know which of the</span>
+ <span class="s0">* files have been modified. This allows to return the added modules before the</span>
+ <span class="s0">* modified ones (which is useful for things like Hot Module Reloading).</span>
+ <span class="s0">**/</span>
+<span class="s0">type Delta = $ReadOnly&lt;{</span>
+  <span class="s0">// `added` and `deleted` are mutually exclusive.</span>
+  <span class="s0">// Internally, a module can be in both `modified` and (either) `added` or</span>
+  <span class="s0">// `deleted`. We fix this up before returning the delta to the client.</span>
+  <span class="s0">added: Set&lt;string&gt;,</span>
+  <span class="s0">modified: Set&lt;string&gt;,</span>
+  <span class="s0">deleted: Set&lt;string&gt;,</span>
+
+  <span class="s0">// A place to temporarily track inverse dependencies for a module while it is</span>
+  <span class="s0">// being processed but has not been added to `graph.dependencies` yet.</span>
+  <span class="s0">earlyInverseDependencies: Map&lt;string, CountingSet&lt;string&gt;&gt;,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">type InternalOptions&lt;T&gt; = $ReadOnly&lt;{</span>
+  <span class="s0">lazy: boolean,</span>
+  <span class="s0">onDependencyAdd: () =&gt; mixed,</span>
+  <span class="s0">onDependencyAdded: () =&gt; mixed,</span>
+  <span class="s0">resolve: Options&lt;T&gt;['resolve'],</span>
+  <span class="s0">transform: Options&lt;T&gt;['transform'],</span>
+  <span class="s0">shallow: boolean,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">function getInternalOptions&lt;T&gt;({</span>
+  <span class="s0">transform,</span>
+  <span class="s0">resolve,</span>
+  <span class="s0">onProgress,</span>
+  <span class="s0">lazy,</span>
+  <span class="s0">shallow,</span>
+<span class="s0">}: Options&lt;T&gt;): InternalOptions&lt;T&gt; {</span>
+  <span class="s0">let numProcessed = 0;</span>
+  <span class="s0">let total = 0;</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">lazy,</span>
+    <span class="s0">transform,</span>
+    <span class="s0">resolve,</span>
+    <span class="s0">onDependencyAdd: () =&gt; onProgress &amp;&amp; onProgress(numProcessed, ++total),</span>
+    <span class="s0">onDependencyAdded: () =&gt; onProgress &amp;&amp; onProgress(++numProcessed, total),</span>
+    <span class="s0">shallow,</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">export class Graph&lt;T = MixedOutput&gt; {</span>
+  <span class="s0">+entryPoints: $ReadOnlySet&lt;string&gt;;</span>
+  <span class="s0">+transformOptions: TransformInputOptions;</span>
+  <span class="s0">+dependencies: Dependencies&lt;T&gt; = new Map();</span>
+  <span class="s0">+#importBundleNodes: Map&lt;</span>
+    <span class="s0">string,</span>
+    <span class="s0">$ReadOnly&lt;{</span>
+      <span class="s0">inverseDependencies: CountingSet&lt;string&gt;,</span>
+    <span class="s0">}&gt;,</span>
+  <span class="s0">&gt; = new Map();</span>
+
+  <span class="s0">/// GC state for nodes in the graph (this.dependencies)</span>
+  <span class="s0">+#gc: {</span>
+    <span class="s0">+color: Map&lt;string, NodeColor&gt;,</span>
+    <span class="s0">+possibleCycleRoots: Set&lt;string&gt;,</span>
+  <span class="s0">} = {</span>
+    <span class="s0">color: new Map(),</span>
+    <span class="s0">possibleCycleRoots: new Set(),</span>
+  <span class="s0">};</span>
+
+  <span class="s0">/** Resolved context parameters from `require.context`. */</span>
+  <span class="s0">#resolvedContexts: Map&lt;string, RequireContext&gt; = new Map();</span>
+
+  <span class="s0">constructor(options: GraphInputOptions) {</span>
+    <span class="s0">this.entryPoints = options.entryPoints;</span>
+    <span class="s0">this.transformOptions = options.transformOptions;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Dependency Traversal logic for the Delta Bundler. This method calculates</span>
+   <span class="s0">* the modules that should be included in the bundle by traversing the</span>
+   <span class="s0">* dependency graph.</span>
+   <span class="s0">* Instead of traversing the whole graph each time, it just calculates the</span>
+   <span class="s0">* difference between runs by only traversing the added/removed dependencies.</span>
+   <span class="s0">* To do so, it uses the passed graph dependencies and it mutates it.</span>
+   <span class="s0">* The paths parameter contains the absolute paths of the root files that the</span>
+   <span class="s0">* method should traverse. Normally, these paths should be the modified files</span>
+   <span class="s0">* since the last traversal.</span>
+   <span class="s0">*/</span>
+  <span class="s0">async traverseDependencies(</span>
+    <span class="s0">paths: $ReadOnlyArray&lt;string&gt;,</span>
+    <span class="s0">options: Options&lt;T&gt;,</span>
+  <span class="s0">): Promise&lt;Result&lt;T&gt;&gt; {</span>
+    <span class="s0">const delta = {</span>
+      <span class="s0">added: new Set&lt;string&gt;(),</span>
+      <span class="s0">modified: new Set&lt;string&gt;(),</span>
+      <span class="s0">deleted: new Set&lt;string&gt;(),</span>
+      <span class="s0">earlyInverseDependencies: new Map&lt;string, CountingSet&lt;string&gt;&gt;(),</span>
+    <span class="s0">};</span>
+
+    <span class="s0">const internalOptions = getInternalOptions(options);</span>
+
+    <span class="s0">// Record the paths that are part of the dependency graph before we start</span>
+    <span class="s0">// traversing - we'll use this to ensure we don't report modules modified</span>
+    <span class="s0">// that only exist as part of the graph mid-traversal, and to eliminate</span>
+    <span class="s0">// modules that end up in the same state that they started from the delta.</span>
+    <span class="s0">const originalModules = new Map&lt;string, Module&lt;T&gt;&gt;();</span>
+    <span class="s0">for (const path of paths) {</span>
+      <span class="s0">const originalModule = this.dependencies.get(path);</span>
+      <span class="s0">if (originalModule) {</span>
+        <span class="s0">originalModules.set(path, originalModule);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">for (const [path] of originalModules) {</span>
+      <span class="s0">// Traverse over modules that are part of the dependency graph.</span>
+      <span class="s0">//</span>
+      <span class="s0">// Note: A given path may not be part of the graph *at this time*, in</span>
+      <span class="s0">// particular it may have been removed since we started traversing, but</span>
+      <span class="s0">// in that case the path will be visited if and when we add it back to</span>
+      <span class="s0">// the graph in a subsequent iteration.</span>
+      <span class="s0">if (this.dependencies.has(path)) {</span>
+        <span class="s0">await this._traverseDependenciesForSingleFile(</span>
+          <span class="s0">path,</span>
+          <span class="s0">delta,</span>
+          <span class="s0">internalOptions,</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">this._collectCycles(delta);</span>
+
+    <span class="s0">const added = new Map&lt;string, Module&lt;T&gt;&gt;();</span>
+    <span class="s0">for (const path of delta.added) {</span>
+      <span class="s0">added.set(path, nullthrows(this.dependencies.get(path)));</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const modified = new Map&lt;string, Module&lt;T&gt;&gt;();</span>
+
+    <span class="s0">// A path in delta.modified has been processed during this traversal,</span>
+    <span class="s0">// but may not actually differ, may be new, or may have been deleted after</span>
+    <span class="s0">// processing. The actually-modified modules are the intersection of</span>
+    <span class="s0">// delta.modified with the pre-existing paths, minus modules deleted.</span>
+    <span class="s0">for (const [path, originalModule] of originalModules) {</span>
+      <span class="s0">invariant(</span>
+        <span class="s0">!delta.added.has(path),</span>
+        <span class="s0">'delta.added has %s, but this path was already in the graph.',</span>
+        <span class="s0">path,</span>
+      <span class="s0">);</span>
+      <span class="s0">if (delta.modified.has(path)) {</span>
+        <span class="s0">// It's expected that a module may be both modified and subsequently</span>
+        <span class="s0">// deleted - we'll only return it as deleted.</span>
+        <span class="s0">if (!delta.deleted.has(path)) {</span>
+          <span class="s0">// If a module existed before and has not been deleted, it must be</span>
+          <span class="s0">// in the dependencies map.</span>
+          <span class="s0">const newModule = nullthrows(this.dependencies.get(path));</span>
+          <span class="s0">if (</span>
+            <span class="s0">// Module.dependencies is mutable, so it's not obviously the case</span>
+            <span class="s0">// that referential equality implies no modification. However, we</span>
+            <span class="s0">// only mutate dependencies in two cases:</span>
+            <span class="s0">// 1. Within _processModule. In that case, we always mutate a new</span>
+            <span class="s0">//    module and set a new reference in this.dependencies.</span>
+            <span class="s0">// 2. During _releaseModule, when recursively removing</span>
+            <span class="s0">//    dependencies. In that case, we immediately discard the module</span>
+            <span class="s0">//    object.</span>
+            <span class="s0">// TODO: Refactor for more explicit immutability</span>
+            <span class="s0">newModule !== originalModule ||</span>
+            <span class="s0">transfromOutputMayDiffer(newModule, originalModule) ||</span>
+            <span class="s0">// $FlowFixMe[incompatible-call]</span>
+            <span class="s0">!allDependenciesEqual(newModule, originalModule)</span>
+          <span class="s0">) {</span>
+            <span class="s0">modified.set(path, newModule);</span>
+          <span class="s0">}</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return {</span>
+      <span class="s0">added,</span>
+      <span class="s0">modified,</span>
+      <span class="s0">deleted: delta.deleted,</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async initialTraverseDependencies(options: Options&lt;T&gt;): Promise&lt;Result&lt;T&gt;&gt; {</span>
+    <span class="s0">const delta = {</span>
+      <span class="s0">added: new Set&lt;string&gt;(),</span>
+      <span class="s0">modified: new Set&lt;string&gt;(),</span>
+      <span class="s0">deleted: new Set&lt;string&gt;(),</span>
+      <span class="s0">earlyInverseDependencies: new Map&lt;string, CountingSet&lt;string&gt;&gt;(),</span>
+    <span class="s0">};</span>
+
+    <span class="s0">const internalOptions = getInternalOptions(options);</span>
+
+    <span class="s0">invariant(</span>
+      <span class="s0">this.dependencies.size === 0,</span>
+      <span class="s0">'initialTraverseDependencies called on nonempty graph',</span>
+    <span class="s0">);</span>
+
+    <span class="s0">this.#gc.color.clear();</span>
+    <span class="s0">this.#gc.possibleCycleRoots.clear();</span>
+    <span class="s0">this.#importBundleNodes.clear();</span>
+
+    <span class="s0">for (const path of this.entryPoints) {</span>
+      <span class="s0">// Each entry point implicitly has a refcount of 1, so mark them all black.</span>
+      <span class="s0">this.#gc.color.set(path, 'black');</span>
+    <span class="s0">}</span>
+
+    <span class="s0">await Promise.all(</span>
+      <span class="s0">[...this.entryPoints].map((path: string) =&gt;</span>
+        <span class="s0">this._traverseDependenciesForSingleFile(path, delta, internalOptions),</span>
+      <span class="s0">),</span>
+    <span class="s0">);</span>
+
+    <span class="s0">this.reorderGraph({</span>
+      <span class="s0">shallow: options.shallow,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">return {</span>
+      <span class="s0">added: this.dependencies,</span>
+      <span class="s0">modified: new Map(),</span>
+      <span class="s0">deleted: new Set(),</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async _traverseDependenciesForSingleFile(</span>
+    <span class="s0">path: string,</span>
+    <span class="s0">delta: Delta,</span>
+    <span class="s0">options: InternalOptions&lt;T&gt;,</span>
+  <span class="s0">): Promise&lt;void&gt; {</span>
+    <span class="s0">options.onDependencyAdd();</span>
+
+    <span class="s0">await this._processModule(path, delta, options);</span>
+
+    <span class="s0">options.onDependencyAdded();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async _processModule(</span>
+    <span class="s0">path: string,</span>
+    <span class="s0">delta: Delta,</span>
+    <span class="s0">options: InternalOptions&lt;T&gt;,</span>
+  <span class="s0">): Promise&lt;Module&lt;T&gt;&gt; {</span>
+    <span class="s0">const resolvedContext = this.#resolvedContexts.get(path);</span>
+
+    <span class="s0">// Transform the file via the given option.</span>
+    <span class="s0">// TODO: Unbind the transform method from options</span>
+    <span class="s0">const result = await options.transform(path, resolvedContext);</span>
+
+    <span class="s0">// Get the absolute path of all sub-dependencies (some of them could have been</span>
+    <span class="s0">// moved but maintain the same relative path).</span>
+    <span class="s0">const currentDependencies = this._resolveDependencies(</span>
+      <span class="s0">path,</span>
+      <span class="s0">result.dependencies,</span>
+      <span class="s0">options,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">const previousModule = this.dependencies.get(path);</span>
+
+    <span class="s0">const previousDependencies = previousModule?.dependencies ?? new Map();</span>
+
+    <span class="s0">const nextModule = {</span>
+      <span class="s0">...(previousModule ?? {</span>
+        <span class="s0">inverseDependencies:</span>
+          <span class="s0">delta.earlyInverseDependencies.get(path) ?? new CountingSet(),</span>
+        <span class="s0">path,</span>
+      <span class="s0">}),</span>
+      <span class="s0">dependencies: new Map(previousDependencies),</span>
+      <span class="s0">getSource: result.getSource,</span>
+      <span class="s0">output: result.output,</span>
+      <span class="s0">unstable_transformResultKey: result.unstable_transformResultKey,</span>
+    <span class="s0">};</span>
+
+    <span class="s0">// Update the module information.</span>
+    <span class="s0">this.dependencies.set(nextModule.path, nextModule);</span>
+
+    <span class="s0">// Diff dependencies (1/2): remove dependencies that have changed or been removed.</span>
+    <span class="s0">let dependenciesRemoved = false;</span>
+    <span class="s0">for (const [key, prevDependency] of previousDependencies) {</span>
+      <span class="s0">const curDependency = currentDependencies.get(key);</span>
+      <span class="s0">if (</span>
+        <span class="s0">!curDependency ||</span>
+        <span class="s0">!dependenciesEqual(prevDependency, curDependency, options)</span>
+      <span class="s0">) {</span>
+        <span class="s0">dependenciesRemoved = true;</span>
+        <span class="s0">this._removeDependency(nextModule, key, prevDependency, delta, options);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">// Diff dependencies (2/2): add dependencies that have changed or been added.</span>
+    <span class="s0">const addDependencyPromises = [];</span>
+    <span class="s0">for (const [key, curDependency] of currentDependencies) {</span>
+      <span class="s0">const prevDependency = previousDependencies.get(key);</span>
+      <span class="s0">if (</span>
+        <span class="s0">!prevDependency ||</span>
+        <span class="s0">!dependenciesEqual(prevDependency, curDependency, options)</span>
+      <span class="s0">) {</span>
+        <span class="s0">addDependencyPromises.push(</span>
+          <span class="s0">this._addDependency(nextModule, key, curDependency, delta, options),</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (</span>
+      <span class="s0">previousModule &amp;&amp;</span>
+      <span class="s0">!transfromOutputMayDiffer(previousModule, nextModule) &amp;&amp;</span>
+      <span class="s0">!dependenciesRemoved &amp;&amp;</span>
+      <span class="s0">addDependencyPromises.length === 0</span>
+    <span class="s0">) {</span>
+      <span class="s0">// We have not operated on nextModule, so restore previousModule</span>
+      <span class="s0">// to aid diffing.</span>
+      <span class="s0">this.dependencies.set(previousModule.path, previousModule);</span>
+      <span class="s0">return previousModule;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">delta.modified.add(path);</span>
+
+    <span class="s0">await Promise.all(addDependencyPromises);</span>
+
+    <span class="s0">// Replace dependencies with the correctly-ordered version. As long as all</span>
+    <span class="s0">// the above promises have resolved, this will be the same map but without</span>
+    <span class="s0">// the added nondeterminism of promise resolution order. Because this</span>
+    <span class="s0">// assignment does not add or remove edges, it does NOT invalidate any of the</span>
+    <span class="s0">// garbage collection state.</span>
+
+    <span class="s0">// Catch obvious errors with a cheap assertion.</span>
+    <span class="s0">invariant(</span>
+      <span class="s0">nextModule.dependencies.size === currentDependencies.size,</span>
+      <span class="s0">'Failed to add the correct dependencies',</span>
+    <span class="s0">);</span>
+
+    <span class="s0">nextModule.dependencies = currentDependencies;</span>
+
+    <span class="s0">return nextModule;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async _addDependency(</span>
+    <span class="s0">parentModule: Module&lt;T&gt;,</span>
+    <span class="s0">key: string,</span>
+    <span class="s0">dependency: Dependency,</span>
+    <span class="s0">delta: Delta,</span>
+    <span class="s0">options: InternalOptions&lt;T&gt;,</span>
+  <span class="s0">): Promise&lt;void&gt; {</span>
+    <span class="s0">const path = dependency.absolutePath;</span>
+
+    <span class="s0">// The module may already exist, in which case we just need to update some</span>
+    <span class="s0">// bookkeeping instead of adding a new node to the graph.</span>
+    <span class="s0">let module = this.dependencies.get(path);</span>
+
+    <span class="s0">if (options.shallow) {</span>
+      <span class="s0">// Don't add a node for the module if the graph is shallow (single-module).</span>
+    <span class="s0">} else if (dependency.data.data.asyncType === 'weak') {</span>
+      <span class="s0">// Exclude weak dependencies from the bundle.</span>
+    <span class="s0">} else if (options.lazy &amp;&amp; dependency.data.data.asyncType != null) {</span>
+      <span class="s0">// Don't add a node for the module if we are traversing async dependencies</span>
+      <span class="s0">// lazily (and this is an async dependency). Instead, record it in</span>
+      <span class="s0">// importBundleNodes.</span>
+      <span class="s0">this._incrementImportBundleReference(dependency, parentModule);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">if (!module) {</span>
+        <span class="s0">// Add a new node to the graph.</span>
+        <span class="s0">const earlyInverseDependencies =</span>
+          <span class="s0">delta.earlyInverseDependencies.get(path);</span>
+        <span class="s0">if (earlyInverseDependencies) {</span>
+          <span class="s0">// This module is being transformed at the moment in parallel, so we</span>
+          <span class="s0">// should only mark its parent as an inverse dependency.</span>
+          <span class="s0">earlyInverseDependencies.add(parentModule.path);</span>
+        <span class="s0">} else {</span>
+          <span class="s0">if (delta.deleted.has(path)) {</span>
+            <span class="s0">// Mark the addition by clearing a prior deletion.</span>
+            <span class="s0">delta.deleted.delete(path);</span>
+          <span class="s0">} else {</span>
+            <span class="s0">// Mark the addition in the added set.</span>
+            <span class="s0">delta.added.add(path);</span>
+          <span class="s0">}</span>
+          <span class="s0">delta.earlyInverseDependencies.set(path, new CountingSet());</span>
+
+          <span class="s0">options.onDependencyAdd();</span>
+          <span class="s0">module = await this._processModule(path, delta, options);</span>
+          <span class="s0">options.onDependencyAdded();</span>
+
+          <span class="s0">this.dependencies.set(module.path, module);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+      <span class="s0">if (module) {</span>
+        <span class="s0">// We either added a new node to the graph, or we're updating an existing one.</span>
+        <span class="s0">module.inverseDependencies.add(parentModule.path);</span>
+        <span class="s0">this._markModuleInUse(module);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">// Always update the parent's dependency map.</span>
+    <span class="s0">// This means the parent's dependencies can get desynced from</span>
+    <span class="s0">// inverseDependencies and the other fields in the case of lazy edges.</span>
+    <span class="s0">// Not an optimal representation :(</span>
+    <span class="s0">parentModule.dependencies.set(key, dependency);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_removeDependency(</span>
+    <span class="s0">parentModule: Module&lt;T&gt;,</span>
+    <span class="s0">key: string,</span>
+    <span class="s0">dependency: Dependency,</span>
+    <span class="s0">delta: Delta,</span>
+    <span class="s0">options: InternalOptions&lt;T&gt;,</span>
+  <span class="s0">): void {</span>
+    <span class="s0">parentModule.dependencies.delete(key);</span>
+
+    <span class="s0">const {absolutePath} = dependency;</span>
+
+    <span class="s0">if (dependency.data.data.asyncType === 'weak') {</span>
+      <span class="s0">// Weak dependencies are excluded from the bundle.</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (options.lazy &amp;&amp; dependency.data.data.asyncType != null) {</span>
+      <span class="s0">this._decrementImportBundleReference(dependency, parentModule);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const module = this.dependencies.get(absolutePath);</span>
+
+    <span class="s0">if (!module) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+    <span class="s0">module.inverseDependencies.delete(parentModule.path);</span>
+    <span class="s0">if (</span>
+      <span class="s0">module.inverseDependencies.size &gt; 0 ||</span>
+      <span class="s0">this.entryPoints.has(absolutePath)</span>
+    <span class="s0">) {</span>
+      <span class="s0">// The reference count has decreased, but not to zero.</span>
+      <span class="s0">// NOTE: Each entry point implicitly has a refcount of 1.</span>
+      <span class="s0">this._markAsPossibleCycleRoot(module);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">// The reference count has decreased to zero.</span>
+      <span class="s0">this._releaseModule(module, delta, options);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Collect a list of context modules which include a given file.</span>
+   <span class="s0">*/</span>
+  <span class="s0">markModifiedContextModules(</span>
+    <span class="s0">filePath: string,</span>
+    <span class="s0">modifiedPaths: Set&lt;string&gt; | CountingSet&lt;string&gt;,</span>
+  <span class="s0">) {</span>
+    <span class="s0">for (const [absolutePath, context] of this.#resolvedContexts) {</span>
+      <span class="s0">if (</span>
+        <span class="s0">!modifiedPaths.has(absolutePath) &amp;&amp;</span>
+        <span class="s0">fileMatchesContext(filePath, context)</span>
+      <span class="s0">) {</span>
+        <span class="s0">modifiedPaths.add(absolutePath);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Gets the list of modules affected by the deletion of a given file. The</span>
+   <span class="s0">* caller is expected to mark these modules as modified in the next call to</span>
+   <span class="s0">* traverseDependencies. Note that the list may contain duplicates.</span>
+   <span class="s0">*/</span>
+  <span class="s0">*getModifiedModulesForDeletedPath(filePath: string): Iterable&lt;string&gt; {</span>
+    <span class="s0">yield* this.dependencies.get(filePath)?.inverseDependencies ?? [];</span>
+    <span class="s0">yield* this.#importBundleNodes.get(filePath)?.inverseDependencies ?? [];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_resolveDependencies(</span>
+    <span class="s0">parentPath: string,</span>
+    <span class="s0">dependencies: $ReadOnlyArray&lt;TransformResultDependency&gt;,</span>
+    <span class="s0">options: InternalOptions&lt;T&gt;,</span>
+  <span class="s0">): Map&lt;string, Dependency&gt; {</span>
+    <span class="s0">const maybeResolvedDeps = new Map&lt;</span>
+      <span class="s0">string,</span>
+      <span class="s0">void | {absolutePath: string, data: TransformResultDependency},</span>
+    <span class="s0">&gt;();</span>
+    <span class="s0">for (const dep of dependencies) {</span>
+      <span class="s0">let resolvedDep;</span>
+
+      <span class="s0">// `require.context`</span>
+      <span class="s0">const {contextParams} = dep.data;</span>
+      <span class="s0">if (contextParams) {</span>
+        <span class="s0">// Ensure the filepath has uniqueness applied to ensure multiple `require.context`</span>
+        <span class="s0">// statements can be used to target the same file with different properties.</span>
+        <span class="s0">const from = path.join(parentPath, '..', dep.name);</span>
+        <span class="s0">const absolutePath = deriveAbsolutePathFromContext(from, contextParams);</span>
+
+        <span class="s0">const resolvedContext: RequireContext = {</span>
+          <span class="s0">from,</span>
+          <span class="s0">mode: contextParams.mode,</span>
+          <span class="s0">recursive: contextParams.recursive,</span>
+          <span class="s0">filter: new RegExp(</span>
+            <span class="s0">contextParams.filter.pattern,</span>
+            <span class="s0">contextParams.filter.flags,</span>
+          <span class="s0">),</span>
+        <span class="s0">};</span>
+
+        <span class="s0">this.#resolvedContexts.set(absolutePath, resolvedContext);</span>
+
+        <span class="s0">resolvedDep = {</span>
+          <span class="s0">absolutePath,</span>
+          <span class="s0">data: dep,</span>
+        <span class="s0">};</span>
+      <span class="s0">} else {</span>
+        <span class="s0">try {</span>
+          <span class="s0">resolvedDep = {</span>
+            <span class="s0">absolutePath: options.resolve(parentPath, dep.name).filePath,</span>
+            <span class="s0">data: dep,</span>
+          <span class="s0">};</span>
+
+          <span class="s0">// This dependency may have existed previously as a require.context -</span>
+          <span class="s0">// clean it up.</span>
+          <span class="s0">this.#resolvedContexts.delete(resolvedDep.absolutePath);</span>
+        <span class="s0">} catch (error) {</span>
+          <span class="s0">// Ignore unavailable optional dependencies. They are guarded</span>
+          <span class="s0">// with a try-catch block and will be handled during runtime.</span>
+          <span class="s0">if (dep.data.isOptional !== true) {</span>
+            <span class="s0">throw error;</span>
+          <span class="s0">}</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+
+      <span class="s0">const key = dep.data.key;</span>
+      <span class="s0">if (maybeResolvedDeps.has(key)) {</span>
+        <span class="s0">throw new Error(</span>
+          <span class="s0">`resolveDependencies: Found duplicate dependency key '${key}' in ${parentPath}`,</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+      <span class="s0">maybeResolvedDeps.set(key, resolvedDep);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const resolvedDeps = new Map&lt;string, Dependency&gt;();</span>
+    <span class="s0">// Return just the dependencies we successfully resolved.</span>
+    <span class="s0">// FIXME: This has a bad bug affecting all dependencies *after* an unresolved</span>
+    <span class="s0">// optional dependency. We'll need to propagate the nulls all the way to the</span>
+    <span class="s0">// serializer and the require() runtime to keep the dependency map from being</span>
+    <span class="s0">// desynced from the contents of the module.</span>
+    <span class="s0">for (const [key, resolvedDep] of maybeResolvedDeps) {</span>
+      <span class="s0">if (resolvedDep) {</span>
+        <span class="s0">resolvedDeps.set(key, resolvedDep);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">return resolvedDeps;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Re-traverse the dependency graph in DFS order to reorder the modules and</span>
+   <span class="s0">* guarantee the same order between runs. This method mutates the passed graph.</span>
+   <span class="s0">*/</span>
+  <span class="s0">reorderGraph(options: {shallow: boolean, ...}): void {</span>
+    <span class="s0">const orderedDependencies = new Map&lt;string, Module&lt;T&gt;&gt;();</span>
+
+    <span class="s0">this.entryPoints.forEach((entryPoint: string) =&gt; {</span>
+      <span class="s0">const mainModule = this.dependencies.get(entryPoint);</span>
+
+      <span class="s0">if (!mainModule) {</span>
+        <span class="s0">throw new ReferenceError(</span>
+          <span class="s0">'Module not registered in graph: ' + entryPoint,</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">this._reorderDependencies(mainModule, orderedDependencies, options);</span>
+    <span class="s0">});</span>
+    <span class="s0">this.dependencies.clear();</span>
+    <span class="s0">for (const [key, dep] of orderedDependencies) {</span>
+      <span class="s0">this.dependencies.set(key, dep);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_reorderDependencies(</span>
+    <span class="s0">module: Module&lt;T&gt;,</span>
+    <span class="s0">orderedDependencies: Map&lt;string, Module&lt;T&gt;&gt;,</span>
+    <span class="s0">options: {shallow: boolean, ...},</span>
+  <span class="s0">): void {</span>
+    <span class="s0">if (module.path) {</span>
+      <span class="s0">if (orderedDependencies.has(module.path)) {</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">orderedDependencies.set(module.path, module);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">module.dependencies.forEach((dependency: Dependency) =&gt; {</span>
+      <span class="s0">const path = dependency.absolutePath;</span>
+      <span class="s0">const childModule = this.dependencies.get(path);</span>
+
+      <span class="s0">if (!childModule) {</span>
+        <span class="s0">if (dependency.data.data.asyncType != null || options.shallow) {</span>
+          <span class="s0">return;</span>
+        <span class="s0">} else {</span>
+          <span class="s0">throw new ReferenceError('Module not registered in graph: ' + path);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+
+      <span class="s0">this._reorderDependencies(childModule, orderedDependencies, options);</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/** Garbage collection functions */</span>
+
+  <span class="s0">// Add an entry to importBundleNodes (or record an inverse dependency of an existing one)</span>
+  <span class="s0">_incrementImportBundleReference(</span>
+    <span class="s0">dependency: Dependency,</span>
+    <span class="s0">parentModule: Module&lt;T&gt;,</span>
+  <span class="s0">) {</span>
+    <span class="s0">const {absolutePath} = dependency;</span>
+    <span class="s0">const importBundleNode = this.#importBundleNodes.get(absolutePath) ?? {</span>
+      <span class="s0">inverseDependencies: new CountingSet(),</span>
+    <span class="s0">};</span>
+    <span class="s0">importBundleNode.inverseDependencies.add(parentModule.path);</span>
+    <span class="s0">this.#importBundleNodes.set(absolutePath, importBundleNode);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Decrease the reference count of an entry in importBundleNodes (and delete it if necessary)</span>
+  <span class="s0">_decrementImportBundleReference(</span>
+    <span class="s0">dependency: Dependency,</span>
+    <span class="s0">parentModule: Module&lt;T&gt;,</span>
+  <span class="s0">) {</span>
+    <span class="s0">const {absolutePath} = dependency;</span>
+
+    <span class="s0">const importBundleNode = nullthrows(</span>
+      <span class="s0">this.#importBundleNodes.get(absolutePath),</span>
+    <span class="s0">);</span>
+    <span class="s0">invariant(</span>
+      <span class="s0">importBundleNode.inverseDependencies.has(parentModule.path),</span>
+      <span class="s0">'lazy: import bundle inverse references',</span>
+    <span class="s0">);</span>
+    <span class="s0">importBundleNode.inverseDependencies.delete(parentModule.path);</span>
+    <span class="s0">if (importBundleNode.inverseDependencies.size === 0) {</span>
+      <span class="s0">this.#importBundleNodes.delete(absolutePath);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Mark a module as in use (ref count &gt;= 1)</span>
+  <span class="s0">_markModuleInUse(module: Module&lt;T&gt;) {</span>
+    <span class="s0">this.#gc.color.set(module.path, 'black');</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Delete an unreachable module (and its outbound edges) from the graph</span>
+  <span class="s0">// immediately.</span>
+  <span class="s0">// Called when the reference count of a module has reached 0.</span>
+  <span class="s0">_releaseModule(module: Module&lt;T&gt;, delta: Delta, options: InternalOptions&lt;T&gt;) {</span>
+    <span class="s0">for (const [key, dependency] of module.dependencies) {</span>
+      <span class="s0">this._removeDependency(module, key, dependency, delta, options);</span>
+    <span class="s0">}</span>
+    <span class="s0">this.#gc.color.set(module.path, 'black');</span>
+    <span class="s0">this._freeModule(module, delta);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Delete an unreachable module from the graph.</span>
+  <span class="s0">_freeModule(module: Module&lt;T&gt;, delta: Delta) {</span>
+    <span class="s0">if (delta.added.has(module.path)) {</span>
+      <span class="s0">// Mark the deletion by clearing a prior addition.</span>
+      <span class="s0">delta.added.delete(module.path);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">// Mark the deletion in the deleted set.</span>
+      <span class="s0">delta.deleted.add(module.path);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">// This module is not used anywhere else! We can clear it from the bundle.</span>
+    <span class="s0">// Clean up all the state associated with this module in order to correctly</span>
+    <span class="s0">// re-add it if we encounter it again.</span>
+    <span class="s0">this.dependencies.delete(module.path);</span>
+    <span class="s0">delta.earlyInverseDependencies.delete(module.path);</span>
+    <span class="s0">this.#gc.possibleCycleRoots.delete(module.path);</span>
+    <span class="s0">this.#gc.color.delete(module.path);</span>
+    <span class="s0">this.#resolvedContexts.delete(module.path);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Mark a module as a possible cycle root</span>
+  <span class="s0">_markAsPossibleCycleRoot(module: Module&lt;T&gt;) {</span>
+    <span class="s0">if (nullthrows(this.#gc.color.get(module.path)) !== 'purple') {</span>
+      <span class="s0">this.#gc.color.set(module.path, 'purple');</span>
+      <span class="s0">this.#gc.possibleCycleRoots.add(module.path);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Collect any unreachable cycles in the graph.</span>
+  <span class="s0">_collectCycles(delta: Delta) {</span>
+    <span class="s0">// Mark recursively from roots (trial deletion)</span>
+    <span class="s0">for (const path of this.#gc.possibleCycleRoots) {</span>
+      <span class="s0">const module = nullthrows(this.dependencies.get(path));</span>
+      <span class="s0">const color = nullthrows(this.#gc.color.get(path));</span>
+      <span class="s0">if (color === 'purple') {</span>
+        <span class="s0">this._markGray(module);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">this.#gc.possibleCycleRoots.delete(path);</span>
+        <span class="s0">if (</span>
+          <span class="s0">color === 'black' &amp;&amp;</span>
+          <span class="s0">module.inverseDependencies.size === 0 &amp;&amp;</span>
+          <span class="s0">!this.entryPoints.has(path)</span>
+        <span class="s0">) {</span>
+          <span class="s0">this._freeModule(module, delta);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">// Scan recursively from roots (undo unsuccessful trial deletions)</span>
+    <span class="s0">for (const path of this.#gc.possibleCycleRoots) {</span>
+      <span class="s0">const module = nullthrows(this.dependencies.get(path));</span>
+      <span class="s0">this._scan(module);</span>
+    <span class="s0">}</span>
+    <span class="s0">// Collect recursively from roots (free unreachable cycles)</span>
+    <span class="s0">for (const path of this.#gc.possibleCycleRoots) {</span>
+      <span class="s0">this.#gc.possibleCycleRoots.delete(path);</span>
+      <span class="s0">const module = nullthrows(this.dependencies.get(path));</span>
+      <span class="s0">this._collectWhite(module, delta);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_markGray(module: Module&lt;T&gt;) {</span>
+    <span class="s0">const color = nullthrows(this.#gc.color.get(module.path));</span>
+    <span class="s0">if (color !== 'gray') {</span>
+      <span class="s0">this.#gc.color.set(module.path, 'gray');</span>
+      <span class="s0">for (const dependency of module.dependencies.values()) {</span>
+        <span class="s0">const childModule = nullthrows(</span>
+          <span class="s0">this.dependencies.get(dependency.absolutePath),</span>
+        <span class="s0">);</span>
+        <span class="s0">// The inverse dependency will be restored during the scan phase if this module remains live.</span>
+        <span class="s0">childModule.inverseDependencies.delete(module.path);</span>
+        <span class="s0">this._markGray(childModule);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_scan(module: Module&lt;T&gt;) {</span>
+    <span class="s0">const color = nullthrows(this.#gc.color.get(module.path));</span>
+    <span class="s0">if (color === 'gray') {</span>
+      <span class="s0">if (</span>
+        <span class="s0">module.inverseDependencies.size &gt; 0 ||</span>
+        <span class="s0">this.entryPoints.has(module.path)</span>
+      <span class="s0">) {</span>
+        <span class="s0">this._scanBlack(module);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">this.#gc.color.set(module.path, 'white');</span>
+        <span class="s0">for (const dependency of module.dependencies.values()) {</span>
+          <span class="s0">const childModule = nullthrows(</span>
+            <span class="s0">this.dependencies.get(dependency.absolutePath),</span>
+          <span class="s0">);</span>
+          <span class="s0">this._scan(childModule);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_scanBlack(module: Module&lt;T&gt;) {</span>
+    <span class="s0">this.#gc.color.set(module.path, 'black');</span>
+    <span class="s0">for (const dependency of module.dependencies.values()) {</span>
+      <span class="s0">const childModule = nullthrows(</span>
+        <span class="s0">this.dependencies.get(dependency.absolutePath),</span>
+      <span class="s0">);</span>
+      <span class="s0">// The inverse dependency must have been deleted during the mark phase.</span>
+      <span class="s0">childModule.inverseDependencies.add(module.path);</span>
+      <span class="s0">const childColor = nullthrows(this.#gc.color.get(childModule.path));</span>
+      <span class="s0">if (childColor !== 'black') {</span>
+        <span class="s0">this._scanBlack(childModule);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_collectWhite(module: Module&lt;T&gt;, delta: Delta) {</span>
+    <span class="s0">const color = nullthrows(this.#gc.color.get(module.path));</span>
+    <span class="s0">if (color === 'white' &amp;&amp; !this.#gc.possibleCycleRoots.has(module.path)) {</span>
+      <span class="s0">this.#gc.color.set(module.path, 'black');</span>
+      <span class="s0">for (const dependency of module.dependencies.values()) {</span>
+        <span class="s0">const childModule = this.dependencies.get(dependency.absolutePath);</span>
+        <span class="s0">// The child may already have been collected.</span>
+        <span class="s0">if (childModule) {</span>
+          <span class="s0">this._collectWhite(childModule, delta);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+      <span class="s0">this._freeModule(module, delta);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/** End of garbage collection functions */</span>
+<span class="s0">}</span>
+
+<span class="s0">function dependenciesEqual(</span>
+  <span class="s0">a: Dependency,</span>
+  <span class="s0">b: Dependency,</span>
+  <span class="s0">options: $ReadOnly&lt;{lazy: boolean, ...}&gt;,</span>
+<span class="s0">): boolean {</span>
+  <span class="s0">return (</span>
+    <span class="s0">a === b ||</span>
+    <span class="s0">(a.absolutePath === b.absolutePath &amp;&amp;</span>
+      <span class="s0">(!options.lazy || a.data.data.asyncType === b.data.data.asyncType) &amp;&amp;</span>
+      <span class="s0">contextParamsEqual(a.data.data.contextParams, b.data.data.contextParams))</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function allDependenciesEqual&lt;T&gt;(</span>
+  <span class="s0">a: Module&lt;T&gt;,</span>
+  <span class="s0">b: Module&lt;T&gt;,</span>
+  <span class="s0">options: $ReadOnly&lt;{lazy: boolean, ...}&gt;,</span>
+<span class="s0">): boolean {</span>
+  <span class="s0">if (a.dependencies.size !== b.dependencies.size) {</span>
+    <span class="s0">return false;</span>
+  <span class="s0">}</span>
+  <span class="s0">for (const [key, depA] of a.dependencies) {</span>
+    <span class="s0">const depB = b.dependencies.get(key);</span>
+    <span class="s0">if (!depB || !dependenciesEqual(depA, depB, options)) {</span>
+      <span class="s0">return false;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s0">return true;</span>
+<span class="s0">}</span>
+
+<span class="s0">function contextParamsEqual(</span>
+  <span class="s0">a: ?RequireContextParams,</span>
+  <span class="s0">b: ?RequireContextParams,</span>
+<span class="s0">): boolean {</span>
+  <span class="s0">return (</span>
+    <span class="s0">a === b ||</span>
+    <span class="s0">(a == null &amp;&amp; b == null) ||</span>
+    <span class="s0">(a != null &amp;&amp;</span>
+      <span class="s0">b != null &amp;&amp;</span>
+      <span class="s0">a.recursive === b.recursive &amp;&amp;</span>
+      <span class="s0">a.filter.pattern === b.filter.pattern &amp;&amp;</span>
+      <span class="s0">a.filter.flags === b.filter.flags &amp;&amp;</span>
+      <span class="s0">a.mode === b.mode)</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function transfromOutputMayDiffer&lt;T&gt;(a: Module&lt;T&gt;, b: Module&lt;T&gt;): boolean {</span>
+  <span class="s0">return (</span>
+    <span class="s0">a.unstable_transformResultKey == null ||</span>
+    <span class="s0">a.unstable_transformResultKey !== b.unstable_transformResultKey</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+</pre>
+</body>
+</html>

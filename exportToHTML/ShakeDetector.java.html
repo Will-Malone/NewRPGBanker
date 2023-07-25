@@ -1,0 +1,164 @@
+<html>
+<head>
+<title>ShakeDetector.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #629755; font-weight: bold; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ShakeDetector.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.common</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.hardware.Sensor</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.hardware.SensorEvent</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.hardware.SensorEventListener</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.hardware.SensorManager</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.TimeUnit</span><span class="s2">;</span>
+
+<span class="s3">/** Listens for the user shaking their phone. Allocation-less once it starts listening. */</span>
+<span class="s2">public class </span><span class="s1">ShakeDetector </span><span class="s2">implements </span><span class="s1">SensorEventListener {</span>
+  <span class="s0">// Collect sensor data in this interval (nanoseconds)</span>
+  <span class="s2">private static final long </span><span class="s1">MIN_TIME_BETWEEN_SAMPLES_NS =</span>
+      <span class="s1">TimeUnit.NANOSECONDS.convert(</span><span class="s4">20</span><span class="s2">, </span><span class="s1">TimeUnit.MILLISECONDS)</span><span class="s2">;</span>
+  <span class="s0">// Number of nanoseconds to listen for and count shakes (nanoseconds)</span>
+  <span class="s2">private static final float </span><span class="s1">SHAKING_WINDOW_NS = TimeUnit.NANOSECONDS.convert(</span><span class="s4">3</span><span class="s2">, </span><span class="s1">TimeUnit.SECONDS)</span><span class="s2">;</span>
+  <span class="s0">// Required force to constitute a rage shake. Need to multiply gravity by 1.33 because a rage</span>
+  <span class="s0">// shake in one direction should have more force than just the magnitude of free fall.</span>
+  <span class="s2">private static final float </span><span class="s1">REQUIRED_FORCE = SensorManager.GRAVITY_EARTH * </span><span class="s4">1.33f</span><span class="s2">;</span>
+
+  <span class="s2">private float </span><span class="s1">mAccelerationX</span><span class="s2">, </span><span class="s1">mAccelerationY</span><span class="s2">, </span><span class="s1">mAccelerationZ</span><span class="s2">;</span>
+
+  <span class="s2">public interface </span><span class="s1">ShakeListener {</span>
+    <span class="s2">void </span><span class="s1">onShake()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final </span><span class="s1">ShakeListener mShakeListener</span><span class="s2">;</span>
+
+  <span class="s1">@Nullable </span><span class="s2">private </span><span class="s1">SensorManager mSensorManager</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mLastTimestamp</span><span class="s2">;</span>
+  <span class="s2">private int </span><span class="s1">mNumShakes</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mLastShakeTimestamp</span><span class="s2">;</span>
+  <span class="s0">// number of shakes required to trigger onShake()</span>
+  <span class="s2">private int </span><span class="s1">mMinNumShakes</span><span class="s2">;</span>
+
+  <span class="s2">public </span><span class="s1">ShakeDetector(ShakeListener listener) {</span>
+    <span class="s2">this</span><span class="s1">(listener</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">ShakeDetector(ShakeListener listener</span><span class="s2">, int </span><span class="s1">minNumShakes) {</span>
+    <span class="s1">mShakeListener = listener</span><span class="s2">;</span>
+    <span class="s1">mMinNumShakes = minNumShakes</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Start listening for shakes. */</span>
+  <span class="s2">public void </span><span class="s1">start(SensorManager manager) {</span>
+    <span class="s1">Assertions.assertNotNull(manager)</span><span class="s2">;</span>
+    <span class="s1">Sensor accelerometer = manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(accelerometer != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mSensorManager = manager</span><span class="s2">;</span>
+      <span class="s1">mLastTimestamp = -</span><span class="s4">1</span><span class="s2">;</span>
+      <span class="s1">mSensorManager.registerListener(</span><span class="s2">this, </span><span class="s1">accelerometer</span><span class="s2">, </span><span class="s1">SensorManager.SENSOR_DELAY_UI)</span><span class="s2">;</span>
+      <span class="s1">mLastShakeTimestamp = </span><span class="s4">0</span><span class="s2">;</span>
+      <span class="s1">reset()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Stop listening for shakes. */</span>
+  <span class="s2">public void </span><span class="s1">stop() {</span>
+    <span class="s2">if </span><span class="s1">(mSensorManager != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mSensorManager.unregisterListener(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">mSensorManager = </span><span class="s2">null;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Reset all variables used to keep track of number of shakes recorded. */</span>
+  <span class="s2">private void </span><span class="s1">reset() {</span>
+    <span class="s1">mNumShakes = </span><span class="s4">0</span><span class="s2">;</span>
+    <span class="s1">mAccelerationX = </span><span class="s4">0</span><span class="s2">;</span>
+    <span class="s1">mAccelerationY = </span><span class="s4">0</span><span class="s2">;</span>
+    <span class="s1">mAccelerationZ = </span><span class="s4">0</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Determine if acceleration applied to sensor is large enough to count as a rage shake.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s5">@param </span><span class="s3">a acceleration in x, y, or z applied to the sensor</span>
+   <span class="s3">* </span><span class="s5">@return </span><span class="s3">true if the magnitude of the force exceeds the minimum required amount of force. false</span>
+   <span class="s3">*     otherwise.</span>
+   <span class="s3">*/</span>
+  <span class="s2">private boolean </span><span class="s1">atLeastRequiredForce(</span><span class="s2">float </span><span class="s1">a) {</span>
+    <span class="s2">return </span><span class="s1">Math.abs(a) &gt; REQUIRED_FORCE</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Save data about last shake</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s5">@param </span><span class="s3">timestamp (ns) of last sensor event</span>
+   <span class="s3">*/</span>
+  <span class="s2">private void </span><span class="s1">recordShake(</span><span class="s2">long </span><span class="s1">timestamp) {</span>
+    <span class="s1">mLastShakeTimestamp = timestamp</span><span class="s2">;</span>
+    <span class="s1">mNumShakes++</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onSensorChanged(SensorEvent sensorEvent) {</span>
+    <span class="s2">if </span><span class="s1">(sensorEvent.timestamp - mLastTimestamp &lt; MIN_TIME_BETWEEN_SAMPLES_NS) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">float </span><span class="s1">ax = sensorEvent.values[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">;</span>
+    <span class="s2">float </span><span class="s1">ay = sensorEvent.values[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">;</span>
+    <span class="s2">float </span><span class="s1">az = sensorEvent.values[</span><span class="s4">2</span><span class="s1">] - SensorManager.GRAVITY_EARTH</span><span class="s2">;</span>
+
+    <span class="s1">mLastTimestamp = sensorEvent.timestamp</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(atLeastRequiredForce(ax) &amp;&amp; ax * mAccelerationX &lt;= </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">recordShake(sensorEvent.timestamp)</span><span class="s2">;</span>
+      <span class="s1">mAccelerationX = ax</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(atLeastRequiredForce(ay) &amp;&amp; ay * mAccelerationY &lt;= </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">recordShake(sensorEvent.timestamp)</span><span class="s2">;</span>
+      <span class="s1">mAccelerationY = ay</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(atLeastRequiredForce(az) &amp;&amp; az * mAccelerationZ &lt;= </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">recordShake(sensorEvent.timestamp)</span><span class="s2">;</span>
+      <span class="s1">mAccelerationZ = az</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">maybeDispatchShake(sensorEvent.timestamp)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onAccuracyChanged(Sensor sensor</span><span class="s2">, int </span><span class="s1">i) {}</span>
+
+  <span class="s2">private void </span><span class="s1">maybeDispatchShake(</span><span class="s2">long </span><span class="s1">currentTimestamp) {</span>
+    <span class="s2">if </span><span class="s1">(mNumShakes &gt;= </span><span class="s4">8 </span><span class="s1">* mMinNumShakes) {</span>
+      <span class="s1">reset()</span><span class="s2">;</span>
+      <span class="s1">mShakeListener.onShake()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(currentTimestamp - mLastShakeTimestamp &gt; SHAKING_WINDOW_NS) {</span>
+      <span class="s1">reset()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

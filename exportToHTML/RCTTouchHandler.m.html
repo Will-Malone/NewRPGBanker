@@ -1,0 +1,400 @@
+<html>
+<head>
+<title>RCTTouchHandler.m</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+.s6 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTTouchHandler.m</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTTouchHandler.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;UIKit/UIGestureRecognizerSubclass.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTAssert.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTEventDispatcherProtocol.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTLog.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfaceView.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTTouchEvent.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUIManager.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUtils.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;UIView+React.h&quot;</span>
+
+<span class="s4">@interface </span><span class="s1">RCTTouchHandler () &lt;UIGestureRecognizerDelegate&gt;</span>
+<span class="s4">@end</span>
+
+<span class="s0">// TODO: this class behaves a lot like a module, and could be implemented as a</span>
+<span class="s0">// module if we were to assume that modules and RootViews had a 1:1 relationship</span>
+<span class="s4">@implementation </span><span class="s1">RCTTouchHandler {</span>
+  <span class="s4">__weak </span><span class="s1">id&lt;RCTEventDispatcherProtocol&gt; _eventDispatcher</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Arrays managed in parallel tracking native touch object along with the 
+   * native view that was touched, and the React touch data dictionary. 
+   * These must be kept track of because `UIKit` destroys the touch targets 
+   * if touches are canceled, and we have no other way to recover this info. 
+   */</span>
+  <span class="s1">NSMutableOrderedSet&lt;UITouch *&gt; *_nativeTouches</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray&lt;NSMutableDictionary *&gt; *_reactTouches</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray&lt;UIView *&gt; *_touchViews</span><span class="s4">;</span>
+
+  <span class="s4">__weak </span><span class="s1">UIView *_cachedRootView</span><span class="s4">;</span>
+
+  <span class="s1">uint16_t _coalescingKey</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithBridge:(RCTBridge *)bridge</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertParam(bridge)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">((self = [super initWithTarget:nil action:NULL])) {</span>
+    <span class="s1">_eventDispatcher = bridge.eventDispatcher</span><span class="s4">;</span>
+
+    <span class="s1">_nativeTouches = [NSMutableOrderedSet new]</span><span class="s4">;</span>
+    <span class="s1">_reactTouches = [NSMutableArray new]</span><span class="s4">;</span>
+    <span class="s1">_touchViews = [NSMutableArray new]</span><span class="s4">;</span>
+
+    <span class="s0">// `cancelsTouchesInView` and `delaysTouches*` are needed in order to be used as a top level</span>
+    <span class="s0">// event delegated recognizer. Otherwise, lower-level components not built</span>
+    <span class="s0">// using RCT, will fail to recognize gestures.</span>
+    <span class="s1">self.cancelsTouchesInView = NO</span><span class="s4">;</span>
+    <span class="s1">self.delaysTouchesBegan = NO</span><span class="s4">; </span><span class="s0">// This is default value.</span>
+    <span class="s1">self.delaysTouchesEnded = NO</span><span class="s4">;</span>
+
+    <span class="s1">self.delegate = self</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_NOT_IMPLEMENTED(-(instancetype)initWithTarget : (id)target action : (SEL)action)</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)attachToView:(UIView *)view</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssert(self.view == nil</span><span class="s4">, @</span><span class="s3">&quot;RCTTouchHandler already has attached view.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">[view addGestureRecognizer:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)detachFromView:(UIView *)view</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertParam(view)</span><span class="s4">;</span>
+  <span class="s1">RCTAssert(self.view == view</span><span class="s4">, @</span><span class="s3">&quot;RCTTouchHandler attached to another view.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">[view removeGestureRecognizer:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Bookkeeping </span><span class="s4">for </span><span class="s1">touch indices</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_recordNewTouches:(NSSet&lt;UITouch *&gt; *)touches</span>
+<span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(UITouch *touch in touches) {</span>
+    <span class="s1">RCTAssert(![_nativeTouches containsObject:touch]</span><span class="s4">, @</span><span class="s3">&quot;Touch is already recorded. This is a critical bug.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s0">// Find closest React-managed touchable view</span>
+    <span class="s1">UIView *targetView = touch.view</span><span class="s4">;</span>
+    <span class="s4">while </span><span class="s1">(targetView) {</span>
+      <span class="s4">if </span><span class="s1">(targetView.reactTag &amp;&amp; targetView.userInteractionEnabled) {</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s1">targetView = targetView.superview</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">NSNumber *reactTag = [targetView reactTagAtPoint:[touch locationInView:targetView]]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!reactTag || !targetView.userInteractionEnabled) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Get new, unique touch identifier for the react touch</span>
+    <span class="s4">const </span><span class="s1">NSUInteger RCTMaxTouches = </span><span class="s5">11</span><span class="s4">; </span><span class="s0">// This is the maximum supported by iDevices</span>
+    <span class="s1">NSInteger touchID = ([_reactTouches.lastObject[</span><span class="s4">@</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] integerValue] + </span><span class="s5">1</span><span class="s1">) % RCTMaxTouches</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(NSDictionary *reactTouch in _reactTouches) {</span>
+      <span class="s1">NSInteger usedID = [reactTouch[</span><span class="s4">@</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] integerValue]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(usedID == touchID) {</span>
+        <span class="s0">// ID has already been used, try next value</span>
+        <span class="s1">touchID++</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else if </span><span class="s1">(usedID &gt; touchID) {</span>
+        <span class="s0">// If usedID &gt; touchID, touchID must be unique, so we can stop looking</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Create touch</span>
+    <span class="s1">NSMutableDictionary *reactTouch = [[NSMutableDictionary alloc] initWithCapacity:RCTMaxTouches]</span><span class="s4">;</span>
+    <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;target&quot;</span><span class="s1">] = reactTag</span><span class="s4">;</span>
+    <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;identifier&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(touchID)</span><span class="s4">;</span>
+
+    <span class="s0">// Add to arrays</span>
+    <span class="s1">[_touchViews addObject:targetView]</span><span class="s4">;</span>
+    <span class="s1">[_nativeTouches addObject:touch]</span><span class="s4">;</span>
+    <span class="s1">[_reactTouches addObject:reactTouch]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_recordRemovedTouches:(NSSet&lt;UITouch *&gt; *)touches</span>
+<span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(UITouch *touch in touches) {</span>
+    <span class="s1">NSUInteger index = [_nativeTouches indexOfObject:touch]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(index == NSNotFound) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">[_touchViews removeObjectAtIndex:index]</span><span class="s4">;</span>
+    <span class="s1">[_nativeTouches removeObjectAtIndex:index]</span><span class="s4">;</span>
+    <span class="s1">[_reactTouches removeObjectAtIndex:index]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_updateReactTouchAtIndex:(NSInteger)touchIndex</span>
+<span class="s1">{</span>
+  <span class="s1">UITouch *nativeTouch = _nativeTouches[touchIndex]</span><span class="s4">;</span>
+  <span class="s1">CGPoint windowLocation = [nativeTouch locationInView:nativeTouch.window]</span><span class="s4">;</span>
+  <span class="s1">RCTAssert(_cachedRootView</span><span class="s4">, @</span><span class="s3">&quot;We were unable to find a root view for the touch&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">CGPoint rootViewLocation = [nativeTouch.window convertPoint:windowLocation toView:_cachedRootView]</span><span class="s4">;</span>
+
+  <span class="s1">UIView *touchView = _touchViews[touchIndex]</span><span class="s4">;</span>
+  <span class="s1">CGPoint touchViewLocation = [nativeTouch.window convertPoint:windowLocation toView:touchView]</span><span class="s4">;</span>
+
+  <span class="s1">NSMutableDictionary *reactTouch = _reactTouches[touchIndex]</span><span class="s4">;</span>
+  <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;pageX&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(RCTSanitizeNaNValue(rootViewLocation.x</span><span class="s4">, @</span><span class="s3">&quot;touchEvent.pageX&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;pageY&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(RCTSanitizeNaNValue(rootViewLocation.y</span><span class="s4">, @</span><span class="s3">&quot;touchEvent.pageY&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;locationX&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(RCTSanitizeNaNValue(touchViewLocation.x</span><span class="s4">, @</span><span class="s3">&quot;touchEvent.locationX&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;locationY&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(RCTSanitizeNaNValue(touchViewLocation.y</span><span class="s4">, @</span><span class="s3">&quot;touchEvent.locationY&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;timestamp&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(nativeTouch.timestamp * </span><span class="s5">1000</span><span class="s1">)</span><span class="s4">; </span><span class="s0">// in ms, for JS</span>
+
+  <span class="s0">// TODO: force for a 'normal' touch is usually 1.0;</span>
+  <span class="s0">// should we expose a `normalTouchForce` constant somewhere (which would</span>
+  <span class="s0">// have a value of `1.0 / nativeTouch.maximumPossibleForce`)?</span>
+  <span class="s4">if </span><span class="s1">(RCTForceTouchAvailable()) {</span>
+    <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;force&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(RCTZeroIfNaN(nativeTouch.force / nativeTouch.maximumPossibleForce))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(nativeTouch.type == UITouchTypePencil) {</span>
+    <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;force&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(RCTZeroIfNaN(nativeTouch.force / nativeTouch.maximumPossibleForce))</span><span class="s4">;</span>
+    <span class="s1">reactTouch[</span><span class="s4">@</span><span class="s3">&quot;altitudeAngle&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(RCTZeroIfNaN(nativeTouch.altitudeAngle))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Constructs information about touch events to send across the serialized 
+ * boundary. This data should be compliant with W3C `Touch` objects. This data 
+ * alone isn't sufficient to construct W3C `Event` objects. To construct that, 
+ * there must be a simple receiver on the other side of the bridge that 
+ * organizes the touch objects into `Event`s. 
+ * 
+ * We send the data as an array of `Touch`es, the type of action 
+ * (start/end/move/cancel) and the indices that represent &quot;changed&quot; `Touch`es 
+ * from that array. 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_updateAndDispatchTouches:(NSSet&lt;UITouch *&gt; *)touches eventName:(NSString *)eventName</span>
+<span class="s1">{</span>
+  <span class="s0">// Update touches</span>
+  <span class="s1">NSMutableArray&lt;NSNumber *&gt; *changedIndexes = [NSMutableArray new]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(UITouch *touch in touches) {</span>
+    <span class="s1">NSInteger index = [_nativeTouches indexOfObject:touch]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(index == NSNotFound) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">[self _updateReactTouchAtIndex:index]</span><span class="s4">;</span>
+    <span class="s1">[changedIndexes addObject:</span><span class="s4">@</span><span class="s1">(index)]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(changedIndexes.count == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Deep copy the touches because they will be accessed from another thread</span>
+  <span class="s0">// TODO: would it be safer to do this in the bridge or executor, rather than trusting caller?</span>
+  <span class="s1">NSMutableArray&lt;NSDictionary *&gt; *reactTouches = [[NSMutableArray alloc] initWithCapacity:_reactTouches.count]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(NSDictionary *touch in _reactTouches) {</span>
+    <span class="s1">[reactTouches addObject:[touch copy]]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">BOOL canBeCoalesced = [eventName isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;touchMove&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s0">// We increment `_coalescingKey` twice here just for sure that</span>
+  <span class="s0">// this `_coalescingKey` will not be reused by another (preceding or following) event</span>
+  <span class="s0">// (yes, even if coalescing only happens (and makes sense) on events of the same type).</span>
+
+  <span class="s4">if </span><span class="s1">(!canBeCoalesced) {</span>
+    <span class="s1">_coalescingKey++</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTTouchEvent *event = [[RCTTouchEvent alloc] initWithEventName:eventName</span>
+                                                         <span class="s1">reactTag:self.view.reactTag</span>
+                                                     <span class="s1">reactTouches:reactTouches</span>
+                                                   <span class="s1">changedIndexes:changedIndexes</span>
+                                                    <span class="s1">coalescingKey:_coalescingKey]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!canBeCoalesced) {</span>
+    <span class="s1">_coalescingKey++</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[_eventDispatcher sendEvent:event]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/*** 
+ * To ensure compatibility when using UIManager.measure and RCTTouchHandler, we have to adopt 
+ * UIManager.measure's behavior in finding a &quot;root view&quot;. 
+ * Usually RCTTouchHandler is already attached to a root view but in some cases (e.g. Modal), 
+ * we are instead attached to some RCTView subtree. This is also the case when embedding some RN 
+ * views inside a separate ViewController not controlled by RN. 
+ * This logic will either find the nearest rootView, or go all the way to the UIWindow. 
+ * While this is not optimal, it is exactly what UIManager.measure does, and what Touchable.js 
+ * relies on. 
+ * We cache it here so that we don't have to repeat it for every touch in the gesture. 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_cacheRootView</span>
+<span class="s1">{</span>
+  <span class="s1">UIView *rootView = self.view</span><span class="s4">;</span>
+  <span class="s4">while </span><span class="s1">(rootView.superview &amp;&amp; ![rootView isReactRootView] &amp;&amp; ![rootView isKindOfClass:[RCTSurfaceView </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s1">rootView = rootView.superview</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">_cachedRootView = rootView</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Gesture Recognizer Delegate Callbacks</span>
+
+<span class="s4">static </span><span class="s1">BOOL RCTAllTouchesAreCancelledOrEnded(NSSet&lt;UITouch *&gt; *touches)</span>
+<span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(UITouch *touch in touches) {</span>
+    <span class="s4">if </span><span class="s1">(touch.phase == UITouchPhaseBegan || touch.phase == UITouchPhaseMoved || touch.phase == UITouchPhaseStationary) {</span>
+      <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">BOOL RCTAnyTouchesChanged(NSSet&lt;UITouch *&gt; *touches)</span>
+<span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(UITouch *touch in touches) {</span>
+    <span class="s4">if </span><span class="s1">(touch.phase == UITouchPhaseBegan || touch.phase == UITouchPhaseMoved) {</span>
+      <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - </span><span class="s6">`</span><span class="s1">UIResponder</span><span class="s6">`</span><span class="s1">-ish touch-delivery methods</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)touchesBegan:(NSSet&lt;UITouch *&gt; *)touches withEvent:(UIEvent *)event</span>
+<span class="s1">{</span>
+  <span class="s1">[super touchesBegan:touches withEvent:event]</span><span class="s4">;</span>
+
+  <span class="s1">[self _cacheRootView]</span><span class="s4">;</span>
+
+  <span class="s0">// &quot;start&quot; has to record new touches *before* extracting the event.</span>
+  <span class="s0">// &quot;end&quot;/&quot;cancel&quot; needs to remove the touch *after* extracting the event.</span>
+  <span class="s1">[self _recordNewTouches:touches]</span><span class="s4">;</span>
+
+  <span class="s1">[self _updateAndDispatchTouches:touches eventName:</span><span class="s4">@</span><span class="s3">&quot;touchStart&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(self.state == UIGestureRecognizerStatePossible) {</span>
+    <span class="s1">self.state = UIGestureRecognizerStateBegan</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(self.state == UIGestureRecognizerStateBegan) {</span>
+    <span class="s1">self.state = UIGestureRecognizerStateChanged</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)touchesMoved:(NSSet&lt;UITouch *&gt; *)touches withEvent:(UIEvent *)event</span>
+<span class="s1">{</span>
+  <span class="s1">[super touchesMoved:touches withEvent:event]</span><span class="s4">;</span>
+
+  <span class="s1">[self _updateAndDispatchTouches:touches eventName:</span><span class="s4">@</span><span class="s3">&quot;touchMove&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">self.state = UIGestureRecognizerStateChanged</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)touchesEnded:(NSSet&lt;UITouch *&gt; *)touches withEvent:(UIEvent *)event</span>
+<span class="s1">{</span>
+  <span class="s1">[super touchesEnded:touches withEvent:event]</span><span class="s4">;</span>
+
+  <span class="s1">[self _updateAndDispatchTouches:touches eventName:</span><span class="s4">@</span><span class="s3">&quot;touchEnd&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(RCTAllTouchesAreCancelledOrEnded(event.allTouches)) {</span>
+    <span class="s1">self.state = UIGestureRecognizerStateEnded</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(RCTAnyTouchesChanged(event.allTouches)) {</span>
+    <span class="s1">self.state = UIGestureRecognizerStateChanged</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _recordRemovedTouches:touches]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)touchesCancelled:(NSSet&lt;UITouch *&gt; *)touches withEvent:(UIEvent *)event</span>
+<span class="s1">{</span>
+  <span class="s1">[super touchesCancelled:touches withEvent:event]</span><span class="s4">;</span>
+
+  <span class="s1">[self _updateAndDispatchTouches:touches eventName:</span><span class="s4">@</span><span class="s3">&quot;touchCancel&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(RCTAllTouchesAreCancelledOrEnded(event.allTouches)) {</span>
+    <span class="s1">self.state = UIGestureRecognizerStateCancelled</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(RCTAnyTouchesChanged(event.allTouches)) {</span>
+    <span class="s1">self.state = UIGestureRecognizerStateChanged</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _recordRemovedTouches:touches]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)canPreventGestureRecognizer:(__unused UIGestureRecognizer *)preventedGestureRecognizer</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)canBePreventedByGestureRecognizer:(UIGestureRecognizer *)preventingGestureRecognizer</span>
+<span class="s1">{</span>
+  <span class="s0">// We fail in favour of other external gesture recognizers.</span>
+  <span class="s0">// iOS will ask `delegate`'s opinion about this gesture recognizer little bit later.</span>
+  <span class="s4">return </span><span class="s1">![preventingGestureRecognizer.view isDescendantOfView:self.view]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)reset</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_nativeTouches.count != </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">[self _updateAndDispatchTouches:_nativeTouches.set eventName:</span><span class="s4">@</span><span class="s3">&quot;touchCancel&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+    <span class="s1">[_nativeTouches removeAllObjects]</span><span class="s4">;</span>
+    <span class="s1">[_reactTouches removeAllObjects]</span><span class="s4">;</span>
+    <span class="s1">[_touchViews removeAllObjects]</span><span class="s4">;</span>
+
+    <span class="s1">_cachedRootView = nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Other</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)cancel</span>
+<span class="s1">{</span>
+  <span class="s1">self.enabled = NO</span><span class="s4">;</span>
+  <span class="s1">self.enabled = YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - UIGestureRecognizerDelegate</span>
+
+<span class="s1">- (BOOL)gestureRecognizer:(__unused UIGestureRecognizer *)gestureRecognizer</span>
+    <span class="s1">shouldRequireFailureOfGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer</span>
+<span class="s1">{</span>
+  <span class="s0">// Same condition for `failure of` as for `be prevented by`.</span>
+  <span class="s4">return </span><span class="s1">[self canBePreventedByGestureRecognizer:otherGestureRecognizer]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

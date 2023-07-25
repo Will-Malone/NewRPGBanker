@@ -1,0 +1,196 @@
+<html>
+<head>
+<title>RuntimeScheduler.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RuntimeScheduler.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;RuntimeScheduler.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;SchedulerPriorityUtils.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;utility&gt;</span>
+<span class="s2">#include </span><span class="s3">&quot;ErrorUtils.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Public</span>
+
+<span class="s1">RuntimeScheduler::RuntimeScheduler(</span>
+    <span class="s1">RuntimeExecutor runtimeExecutor</span><span class="s4">,</span>
+    <span class="s1">std::function&lt;RuntimeSchedulerTimePoint()&gt; now)</span>
+    <span class="s1">: runtimeExecutor_(std::move(runtimeExecutor))</span><span class="s4">, </span><span class="s1">now_(std::move(now)) {}</span>
+
+<span class="s4">void </span><span class="s1">RuntimeScheduler::scheduleWork(RawCallback callback) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">runtimeAccessRequests_ += </span><span class="s5">1</span><span class="s4">;</span>
+
+  <span class="s1">runtimeExecutor_(</span>
+      <span class="s1">[</span><span class="s4">this, </span><span class="s1">callback = std::move(callback)](jsi::Runtime &amp;runtime) {</span>
+        <span class="s1">runtimeAccessRequests_ -= </span><span class="s5">1</span><span class="s4">;</span>
+        <span class="s1">callback(runtime)</span><span class="s4">;</span>
+        <span class="s1">startWorkLoop(runtime)</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;Task&gt; RuntimeScheduler::scheduleTask(</span>
+    <span class="s1">SchedulerPriority priority</span><span class="s4">,</span>
+    <span class="s1">jsi::Function callback) {</span>
+  <span class="s4">auto </span><span class="s1">expirationTime = now_() + timeoutForSchedulerPriority(priority)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">task =</span>
+      <span class="s1">std::make_shared&lt;Task&gt;(priority</span><span class="s4">, </span><span class="s1">std::move(callback)</span><span class="s4">, </span><span class="s1">expirationTime)</span><span class="s4">;</span>
+  <span class="s1">taskQueue_.push(task)</span><span class="s4">;</span>
+
+  <span class="s1">scheduleWorkLoopIfNecessary()</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">task</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;Task&gt; RuntimeScheduler::scheduleTask(</span>
+    <span class="s1">SchedulerPriority priority</span><span class="s4">,</span>
+    <span class="s1">RawCallback callback) {</span>
+  <span class="s4">auto </span><span class="s1">expirationTime = now_() + timeoutForSchedulerPriority(priority)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">task =</span>
+      <span class="s1">std::make_shared&lt;Task&gt;(priority</span><span class="s4">, </span><span class="s1">std::move(callback)</span><span class="s4">, </span><span class="s1">expirationTime)</span><span class="s4">;</span>
+  <span class="s1">taskQueue_.push(task)</span><span class="s4">;</span>
+
+  <span class="s1">scheduleWorkLoopIfNecessary()</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">task</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">RuntimeScheduler::getShouldYield() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">runtimeAccessRequests_ &gt; </span><span class="s5">0</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">RuntimeScheduler::getIsSynchronous() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">isSynchronous_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RuntimeScheduler::cancelTask(Task &amp;task) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s1">task.callback.reset()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SchedulerPriority RuntimeScheduler::getCurrentPriorityLevel() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">currentPriority_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RuntimeSchedulerTimePoint RuntimeScheduler::now() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">now_()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RuntimeScheduler::executeNowOnTheSameThread(RawCallback callback) {</span>
+  <span class="s1">runtimeAccessRequests_ += </span><span class="s5">1</span><span class="s4">;</span>
+  <span class="s1">executeSynchronouslyOnSameThread_CAN_DEADLOCK(</span>
+      <span class="s1">runtimeExecutor_</span><span class="s4">,</span>
+      <span class="s1">[</span><span class="s4">this, </span><span class="s1">callback = std::move(callback)](jsi::Runtime &amp;runtime) {</span>
+        <span class="s1">runtimeAccessRequests_ -= </span><span class="s5">1</span><span class="s4">;</span>
+        <span class="s1">isSynchronous_ = </span><span class="s4">true;</span>
+        <span class="s1">callback(runtime)</span><span class="s4">;</span>
+        <span class="s1">isSynchronous_ = </span><span class="s4">false;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s0">// Resume work loop if needed. In synchronous mode</span>
+  <span class="s0">// only expired tasks are executed. Tasks with lower priority</span>
+  <span class="s0">// might be still in the queue.</span>
+  <span class="s1">scheduleWorkLoopIfNecessary()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RuntimeScheduler::callExpiredTasks(jsi::Runtime &amp;runtime) {</span>
+  <span class="s4">auto </span><span class="s1">previousPriority = currentPriority_</span><span class="s4">;</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s4">while </span><span class="s1">(!taskQueue_.empty()) {</span>
+      <span class="s4">auto </span><span class="s1">topPriorityTask = taskQueue_.top()</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">now = now_()</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">didUserCallbackTimeout = topPriorityTask-&gt;expirationTime &lt;= now</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(!didUserCallbackTimeout) {</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">currentPriority_ = topPriorityTask-&gt;priority</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">result = topPriorityTask-&gt;execute(runtime</span><span class="s4">, </span><span class="s1">didUserCallbackTimeout)</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(result.isObject() &amp;&amp; result.getObject(runtime).isFunction(runtime)) {</span>
+        <span class="s1">topPriorityTask-&gt;callback =</span>
+            <span class="s1">result.getObject(runtime).getFunction(runtime)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s4">if </span><span class="s1">(taskQueue_.top() == topPriorityTask) {</span>
+          <span class="s1">taskQueue_.pop()</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(jsi::JSError &amp;error) {</span>
+    <span class="s1">handleFatalError(runtime</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">currentPriority_ = previousPriority</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private</span>
+
+<span class="s4">void </span><span class="s1">RuntimeScheduler::scheduleWorkLoopIfNecessary() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!isWorkLoopScheduled_ &amp;&amp; !isPerformingWork_) {</span>
+    <span class="s1">isWorkLoopScheduled_ = </span><span class="s4">true;</span>
+    <span class="s1">runtimeExecutor_([</span><span class="s4">this</span><span class="s1">](jsi::Runtime &amp;runtime) {</span>
+      <span class="s1">isWorkLoopScheduled_ = </span><span class="s4">false;</span>
+      <span class="s1">startWorkLoop(runtime)</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RuntimeScheduler::startWorkLoop(jsi::Runtime &amp;runtime) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">previousPriority = currentPriority_</span><span class="s4">;</span>
+  <span class="s1">isPerformingWork_ = </span><span class="s4">true;</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s4">while </span><span class="s1">(!taskQueue_.empty()) {</span>
+      <span class="s4">auto </span><span class="s1">topPriorityTask = taskQueue_.top()</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">now = now_()</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">didUserCallbackTimeout = topPriorityTask-&gt;expirationTime &lt;= now</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(!didUserCallbackTimeout &amp;&amp; getShouldYield()) {</span>
+        <span class="s0">// This currentTask hasn't expired, and we need to yield.</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">currentPriority_ = topPriorityTask-&gt;priority</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">result = topPriorityTask-&gt;execute(runtime</span><span class="s4">, </span><span class="s1">didUserCallbackTimeout)</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(result.isObject() &amp;&amp; result.getObject(runtime).isFunction(runtime)) {</span>
+        <span class="s1">topPriorityTask-&gt;callback =</span>
+            <span class="s1">result.getObject(runtime).getFunction(runtime)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s4">if </span><span class="s1">(taskQueue_.top() == topPriorityTask) {</span>
+          <span class="s1">taskQueue_.pop()</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(jsi::JSError &amp;error) {</span>
+    <span class="s1">handleFatalError(runtime</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">currentPriority_ = previousPriority</span><span class="s4">;</span>
+  <span class="s1">isPerformingWork_ = </span><span class="s4">false;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

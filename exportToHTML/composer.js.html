@@ -1,0 +1,239 @@
+<html>
+<head>
+<title>composer.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #6a8759;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #4646f1;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+composer.js</font>
+</center></td></tr></table>
+<pre><span class="s0">import { Directives } from </span><span class="s1">'../doc/directives.js'</span><span class="s0">;</span>
+<span class="s0">import { Document } from </span><span class="s1">'../doc/Document.js'</span><span class="s0">;</span>
+<span class="s0">import { YAMLWarning, YAMLParseError } from </span><span class="s1">'../errors.js'</span><span class="s0">;</span>
+<span class="s0">import { isCollection, isPair } from </span><span class="s1">'../nodes/identity.js'</span><span class="s0">;</span>
+<span class="s0">import { composeDoc } from </span><span class="s1">'./compose-doc.js'</span><span class="s0">;</span>
+<span class="s0">import { resolveEnd } from </span><span class="s1">'./resolve-end.js'</span><span class="s0">;</span>
+
+<span class="s2">function </span><span class="s0">getErrorPos(src) {</span>
+    <span class="s2">if </span><span class="s0">(</span><span class="s2">typeof </span><span class="s0">src === </span><span class="s1">'number'</span><span class="s0">)</span>
+        <span class="s2">return </span><span class="s0">[src, src + </span><span class="s3">1</span><span class="s0">];</span>
+    <span class="s2">if </span><span class="s0">(Array.isArray(src))</span>
+        <span class="s2">return </span><span class="s0">src.length === </span><span class="s3">2 </span><span class="s0">? src : [src[</span><span class="s3">0</span><span class="s0">], src[</span><span class="s3">1</span><span class="s0">]];</span>
+    <span class="s0">const { offset, source } = src;</span>
+    <span class="s2">return </span><span class="s0">[offset, offset + (</span><span class="s2">typeof </span><span class="s0">source === </span><span class="s1">'string' </span><span class="s0">? source.length : </span><span class="s3">1</span><span class="s0">)];</span>
+<span class="s0">}</span>
+<span class="s2">function </span><span class="s0">parsePrelude(prelude) {</span>
+    <span class="s0">let comment = </span><span class="s1">''</span><span class="s0">;</span>
+    <span class="s0">let atComment = </span><span class="s2">false</span><span class="s0">;</span>
+    <span class="s0">let afterEmptyLine = </span><span class="s2">false</span><span class="s0">;</span>
+    <span class="s2">for </span><span class="s0">(let i = </span><span class="s3">0</span><span class="s0">; i &lt; prelude.length; ++i) {</span>
+        <span class="s0">const source = prelude[i];</span>
+        <span class="s2">switch </span><span class="s0">(source[</span><span class="s3">0</span><span class="s0">]) {</span>
+            <span class="s2">case </span><span class="s1">'#'</span><span class="s0">:</span>
+                <span class="s0">comment +=</span>
+                    <span class="s0">(comment === </span><span class="s1">'' </span><span class="s0">? </span><span class="s1">'' </span><span class="s0">: afterEmptyLine ? </span><span class="s1">'</span><span class="s4">\n\n</span><span class="s1">' </span><span class="s0">: </span><span class="s1">'</span><span class="s4">\n</span><span class="s1">'</span><span class="s0">) +</span>
+                        <span class="s0">(source.substring(</span><span class="s3">1</span><span class="s0">) || </span><span class="s1">' '</span><span class="s0">);</span>
+                <span class="s0">atComment = </span><span class="s2">true</span><span class="s0">;</span>
+                <span class="s0">afterEmptyLine = </span><span class="s2">false</span><span class="s0">;</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s2">case </span><span class="s1">'%'</span><span class="s0">:</span>
+                <span class="s2">if </span><span class="s0">(prelude[i + </span><span class="s3">1</span><span class="s0">]?.[</span><span class="s3">0</span><span class="s0">] !== </span><span class="s1">'#'</span><span class="s0">)</span>
+                    <span class="s0">i += </span><span class="s3">1</span><span class="s0">;</span>
+                <span class="s0">atComment = </span><span class="s2">false</span><span class="s0">;</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s2">default</span><span class="s0">:</span>
+                <span class="s5">// This may be wrong after doc-end, but in that case it doesn't matter</span>
+                <span class="s2">if </span><span class="s0">(!atComment)</span>
+                    <span class="s0">afterEmptyLine = </span><span class="s2">true</span><span class="s0">;</span>
+                <span class="s0">atComment = </span><span class="s2">false</span><span class="s0">;</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s2">return </span><span class="s0">{ comment, afterEmptyLine };</span>
+<span class="s0">}</span>
+<span class="s5">/** 
+ * Compose a stream of CST nodes into a stream of YAML Documents. 
+ * 
+ * ```ts 
+ * import { Composer, Parser } from 'yaml' 
+ * 
+ * const src: string = ... 
+ * const tokens = new Parser().parse(src) 
+ * const docs = new Composer().compose(tokens) 
+ * ``` 
+ */</span>
+<span class="s0">class Composer {</span>
+    <span class="s0">constructor(options = {}) {</span>
+        <span class="s2">this</span><span class="s0">.doc = </span><span class="s2">null</span><span class="s0">;</span>
+        <span class="s2">this</span><span class="s0">.atDirectives = </span><span class="s2">false</span><span class="s0">;</span>
+        <span class="s2">this</span><span class="s0">.prelude = [];</span>
+        <span class="s2">this</span><span class="s0">.errors = [];</span>
+        <span class="s2">this</span><span class="s0">.warnings = [];</span>
+        <span class="s2">this</span><span class="s0">.onError = (source, code, message, warning) =&gt; {</span>
+            <span class="s0">const pos = getErrorPos(source);</span>
+            <span class="s2">if </span><span class="s0">(warning)</span>
+                <span class="s2">this</span><span class="s0">.warnings.push(</span><span class="s2">new </span><span class="s0">YAMLWarning(pos, code, message));</span>
+            <span class="s2">else</span>
+                <span class="s2">this</span><span class="s0">.errors.push(</span><span class="s2">new </span><span class="s0">YAMLParseError(pos, code, message));</span>
+        <span class="s0">};</span>
+        <span class="s5">// eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing</span>
+        <span class="s2">this</span><span class="s0">.directives = </span><span class="s2">new </span><span class="s0">Directives({ version: options.version || </span><span class="s1">'1.2' </span><span class="s0">});</span>
+        <span class="s2">this</span><span class="s0">.options = options;</span>
+    <span class="s0">}</span>
+    <span class="s0">decorate(doc, afterDoc) {</span>
+        <span class="s0">const { comment, afterEmptyLine } = parsePrelude(</span><span class="s2">this</span><span class="s0">.prelude);</span>
+        <span class="s5">//console.log({ dc: doc.comment, prelude, comment })</span>
+        <span class="s2">if </span><span class="s0">(comment) {</span>
+            <span class="s0">const dc = doc.contents;</span>
+            <span class="s2">if </span><span class="s0">(afterDoc) {</span>
+                <span class="s0">doc.comment = doc.comment ? `${doc.comment}\n${comment}` : comment;</span>
+            <span class="s0">}</span>
+            <span class="s2">else if </span><span class="s0">(afterEmptyLine || doc.directives.docStart || !dc) {</span>
+                <span class="s0">doc.commentBefore = comment;</span>
+            <span class="s0">}</span>
+            <span class="s2">else if </span><span class="s0">(isCollection(dc) &amp;&amp; !dc.flow &amp;&amp; dc.items.length &gt; </span><span class="s3">0</span><span class="s0">) {</span>
+                <span class="s0">let it = dc.items[</span><span class="s3">0</span><span class="s0">];</span>
+                <span class="s2">if </span><span class="s0">(isPair(it))</span>
+                    <span class="s0">it = it.key;</span>
+                <span class="s0">const cb = it.commentBefore;</span>
+                <span class="s0">it.commentBefore = cb ? `${comment}\n${cb}` : comment;</span>
+            <span class="s0">}</span>
+            <span class="s2">else </span><span class="s0">{</span>
+                <span class="s0">const cb = dc.commentBefore;</span>
+                <span class="s0">dc.commentBefore = cb ? `${comment}\n${cb}` : comment;</span>
+            <span class="s0">}</span>
+        <span class="s0">}</span>
+        <span class="s2">if </span><span class="s0">(afterDoc) {</span>
+            <span class="s0">Array.prototype.push.apply(doc.errors, </span><span class="s2">this</span><span class="s0">.errors);</span>
+            <span class="s0">Array.prototype.push.apply(doc.warnings, </span><span class="s2">this</span><span class="s0">.warnings);</span>
+        <span class="s0">}</span>
+        <span class="s2">else </span><span class="s0">{</span>
+            <span class="s0">doc.errors = </span><span class="s2">this</span><span class="s0">.errors;</span>
+            <span class="s0">doc.warnings = </span><span class="s2">this</span><span class="s0">.warnings;</span>
+        <span class="s0">}</span>
+        <span class="s2">this</span><span class="s0">.prelude = [];</span>
+        <span class="s2">this</span><span class="s0">.errors = [];</span>
+        <span class="s2">this</span><span class="s0">.warnings = [];</span>
+    <span class="s0">}</span>
+    <span class="s5">/** 
+     * Current stream status information. 
+     * 
+     * Mostly useful at the end of input for an empty stream. 
+     */</span>
+    <span class="s0">streamInfo() {</span>
+        <span class="s2">return </span><span class="s0">{</span>
+            <span class="s0">comment: parsePrelude(</span><span class="s2">this</span><span class="s0">.prelude).comment,</span>
+            <span class="s0">directives: </span><span class="s2">this</span><span class="s0">.directives,</span>
+            <span class="s0">errors: </span><span class="s2">this</span><span class="s0">.errors,</span>
+            <span class="s0">warnings: </span><span class="s2">this</span><span class="s0">.warnings</span>
+        <span class="s0">};</span>
+    <span class="s0">}</span>
+    <span class="s5">/** 
+     * Compose tokens into documents. 
+     * 
+     * @param forceDoc - If the stream contains no document, still emit a final document including any comments and directives that would be applied to a subsequent document. 
+     * @param endOffset - Should be set if `forceDoc` is also set, to set the document range end and to indicate errors correctly. 
+     */</span>
+    <span class="s0">*compose(tokens, forceDoc = </span><span class="s2">false</span><span class="s0">, endOffset = -</span><span class="s3">1</span><span class="s0">) {</span>
+        <span class="s2">for </span><span class="s0">(const token of tokens)</span>
+            <span class="s0">yield* </span><span class="s2">this</span><span class="s0">.next(token);</span>
+        <span class="s0">yield* </span><span class="s2">this</span><span class="s0">.end(forceDoc, endOffset);</span>
+    <span class="s0">}</span>
+    <span class="s5">/** Advance the composer by one CST token. */</span>
+    <span class="s0">*next(token) {</span>
+        <span class="s2">switch </span><span class="s0">(token.type) {</span>
+            <span class="s2">case </span><span class="s1">'directive'</span><span class="s0">:</span>
+                <span class="s2">this</span><span class="s0">.directives.add(token.source, (offset, message, warning) =&gt; {</span>
+                    <span class="s0">const pos = getErrorPos(token);</span>
+                    <span class="s0">pos[</span><span class="s3">0</span><span class="s0">] += offset;</span>
+                    <span class="s2">this</span><span class="s0">.onError(pos, </span><span class="s1">'BAD_DIRECTIVE'</span><span class="s0">, message, warning);</span>
+                <span class="s0">});</span>
+                <span class="s2">this</span><span class="s0">.prelude.push(token.source);</span>
+                <span class="s2">this</span><span class="s0">.atDirectives = </span><span class="s2">true</span><span class="s0">;</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s2">case </span><span class="s1">'document'</span><span class="s0">: {</span>
+                <span class="s0">const doc = composeDoc(</span><span class="s2">this</span><span class="s0">.options, </span><span class="s2">this</span><span class="s0">.directives, token, </span><span class="s2">this</span><span class="s0">.onError);</span>
+                <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.atDirectives &amp;&amp; !doc.directives.docStart)</span>
+                    <span class="s2">this</span><span class="s0">.onError(token, </span><span class="s1">'MISSING_CHAR'</span><span class="s0">, </span><span class="s1">'Missing directives-end/doc-start indicator line'</span><span class="s0">);</span>
+                <span class="s2">this</span><span class="s0">.decorate(doc, </span><span class="s2">false</span><span class="s0">);</span>
+                <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.doc)</span>
+                    <span class="s0">yield </span><span class="s2">this</span><span class="s0">.doc;</span>
+                <span class="s2">this</span><span class="s0">.doc = doc;</span>
+                <span class="s2">this</span><span class="s0">.atDirectives = </span><span class="s2">false</span><span class="s0">;</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s2">case </span><span class="s1">'byte-order-mark'</span><span class="s0">:</span>
+            <span class="s2">case </span><span class="s1">'space'</span><span class="s0">:</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s2">case </span><span class="s1">'comment'</span><span class="s0">:</span>
+            <span class="s2">case </span><span class="s1">'newline'</span><span class="s0">:</span>
+                <span class="s2">this</span><span class="s0">.prelude.push(token.source);</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s2">case </span><span class="s1">'error'</span><span class="s0">: {</span>
+                <span class="s0">const msg = token.source</span>
+                    <span class="s0">? `${token.message}: ${JSON.stringify(token.source)}`</span>
+                    <span class="s0">: token.message;</span>
+                <span class="s0">const error = </span><span class="s2">new </span><span class="s0">YAMLParseError(getErrorPos(token), </span><span class="s1">'UNEXPECTED_TOKEN'</span><span class="s0">, msg);</span>
+                <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.atDirectives || !</span><span class="s2">this</span><span class="s0">.doc)</span>
+                    <span class="s2">this</span><span class="s0">.errors.push(error);</span>
+                <span class="s2">else</span>
+                    <span class="s2">this</span><span class="s0">.doc.errors.push(error);</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s2">case </span><span class="s1">'doc-end'</span><span class="s0">: {</span>
+                <span class="s2">if </span><span class="s0">(!</span><span class="s2">this</span><span class="s0">.doc) {</span>
+                    <span class="s0">const msg = </span><span class="s1">'Unexpected doc-end without preceding document'</span><span class="s0">;</span>
+                    <span class="s2">this</span><span class="s0">.errors.push(</span><span class="s2">new </span><span class="s0">YAMLParseError(getErrorPos(token), </span><span class="s1">'UNEXPECTED_TOKEN'</span><span class="s0">, msg));</span>
+                    <span class="s2">break</span><span class="s0">;</span>
+                <span class="s0">}</span>
+                <span class="s2">this</span><span class="s0">.doc.directives.docEnd = </span><span class="s2">true</span><span class="s0">;</span>
+                <span class="s0">const end = resolveEnd(token.end, token.offset + token.source.length, </span><span class="s2">this</span><span class="s0">.doc.options.strict, </span><span class="s2">this</span><span class="s0">.onError);</span>
+                <span class="s2">this</span><span class="s0">.decorate(</span><span class="s2">this</span><span class="s0">.doc, </span><span class="s2">true</span><span class="s0">);</span>
+                <span class="s2">if </span><span class="s0">(end.comment) {</span>
+                    <span class="s0">const dc = </span><span class="s2">this</span><span class="s0">.doc.comment;</span>
+                    <span class="s2">this</span><span class="s0">.doc.comment = dc ? `${dc}\n${end.comment}` : end.comment;</span>
+                <span class="s0">}</span>
+                <span class="s2">this</span><span class="s0">.doc.range[</span><span class="s3">2</span><span class="s0">] = end.offset;</span>
+                <span class="s2">break</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s2">default</span><span class="s0">:</span>
+                <span class="s2">this</span><span class="s0">.errors.push(</span><span class="s2">new </span><span class="s0">YAMLParseError(getErrorPos(token), </span><span class="s1">'UNEXPECTED_TOKEN'</span><span class="s0">, `Unsupported token ${token.type}`));</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s5">/** 
+     * Call at end of input to yield any remaining document. 
+     * 
+     * @param forceDoc - If the stream contains no document, still emit a final document including any comments and directives that would be applied to a subsequent document. 
+     * @param endOffset - Should be set if `forceDoc` is also set, to set the document range end and to indicate errors correctly. 
+     */</span>
+    <span class="s0">*end(forceDoc = </span><span class="s2">false</span><span class="s0">, endOffset = -</span><span class="s3">1</span><span class="s0">) {</span>
+        <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.doc) {</span>
+            <span class="s2">this</span><span class="s0">.decorate(</span><span class="s2">this</span><span class="s0">.doc, </span><span class="s2">true</span><span class="s0">);</span>
+            <span class="s0">yield </span><span class="s2">this</span><span class="s0">.doc;</span>
+            <span class="s2">this</span><span class="s0">.doc = </span><span class="s2">null</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s2">else if </span><span class="s0">(forceDoc) {</span>
+            <span class="s0">const opts = Object.assign({ _directives: </span><span class="s2">this</span><span class="s0">.directives }, </span><span class="s2">this</span><span class="s0">.options);</span>
+            <span class="s0">const doc = </span><span class="s2">new </span><span class="s0">Document(undefined, opts);</span>
+            <span class="s2">if </span><span class="s0">(</span><span class="s2">this</span><span class="s0">.atDirectives)</span>
+                <span class="s2">this</span><span class="s0">.onError(endOffset, </span><span class="s1">'MISSING_CHAR'</span><span class="s0">, </span><span class="s1">'Missing directives-end indicator line'</span><span class="s0">);</span>
+            <span class="s0">doc.range = [</span><span class="s3">0</span><span class="s0">, endOffset, endOffset];</span>
+            <span class="s2">this</span><span class="s0">.decorate(doc, </span><span class="s2">false</span><span class="s0">);</span>
+            <span class="s0">yield doc;</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">export { Composer };</span>
+</pre>
+</body>
+</html>

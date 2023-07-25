@@ -1,0 +1,283 @@
+<html>
+<head>
+<title>as-indexed-file.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+as-indexed-file.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {RamBundleInfo} from '../../../DeltaBundler/Serializers/getRamBundleInfo';</span>
+<span class="s0">import type {</span>
+  <span class="s0">ModuleGroups,</span>
+  <span class="s0">ModuleTransportLike,</span>
+  <span class="s0">OutputOptions,</span>
+<span class="s0">} from '../../types.flow';</span>
+<span class="s0">import type {WriteStream} from 'fs';</span>
+
+<span class="s0">const relativizeSourceMapInline = require('../../../lib/relativizeSourceMap');</span>
+<span class="s0">const buildSourcemapWithMetadata = require('./buildSourcemapWithMetadata');</span>
+<span class="s0">const MAGIC_UNBUNDLE_FILE_HEADER = require('./magic-number');</span>
+<span class="s0">const {joinModules} = require('./util');</span>
+<span class="s0">const writeSourceMap = require('./write-sourcemap');</span>
+<span class="s0">const fs = require('fs');</span>
+
+<span class="s0">const SIZEOF_UINT32 = 4;</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Saves all JS modules of an app as a single file, separated with null bytes.</span>
+ <span class="s0">* The file begins with an offset table that contains module ids and their</span>
+ <span class="s0">* lengths/offsets.</span>
+ <span class="s0">* The module id for the startup code (prelude, polyfills etc.) is the</span>
+ <span class="s0">* empty string.</span>
+ <span class="s0">*/</span>
+<span class="s0">function saveAsIndexedFile(</span>
+  <span class="s0">bundle: RamBundleInfo,</span>
+  <span class="s0">options: OutputOptions,</span>
+  <span class="s0">log: (...args: Array&lt;string&gt;) =&gt; void,</span>
+<span class="s0">): Promise&lt;mixed&gt; {</span>
+  <span class="s0">const {</span>
+    <span class="s0">bundleOutput,</span>
+    <span class="s0">bundleEncoding: encoding,</span>
+    <span class="s0">sourcemapOutput,</span>
+    <span class="s0">sourcemapSourcesRoot,</span>
+  <span class="s0">} = options;</span>
+
+  <span class="s0">log('start');</span>
+  <span class="s0">const {startupModules, lazyModules, groups} = bundle;</span>
+  <span class="s0">log('finish');</span>
+
+  <span class="s0">const moduleGroups = createModuleGroups(groups, lazyModules);</span>
+  <span class="s0">const startupCode = joinModules(startupModules);</span>
+
+  <span class="s0">log('Writing unbundle output to:', bundleOutput);</span>
+  <span class="s0">const writeUnbundle = writeBuffers(</span>
+    <span class="s0">fs.createWriteStream(bundleOutput),</span>
+    <span class="s0">buildTableAndContents(startupCode, lazyModules, moduleGroups, encoding),</span>
+  <span class="s0">).then(() =&gt; log('Done writing unbundle output'));</span>
+
+  <span class="s0">if (sourcemapOutput) {</span>
+    <span class="s0">const sourceMap = buildSourcemapWithMetadata({</span>
+      <span class="s0">startupModules: startupModules.concat&lt;</span>
+        <span class="s0">ModuleTransportLike,</span>
+        <span class="s0">ModuleTransportLike,</span>
+      <span class="s0">&gt;(),</span>
+      <span class="s0">lazyModules: lazyModules.concat&lt;</span>
+        <span class="s0">ModuleTransportLike,</span>
+        <span class="s0">ModuleTransportLike,</span>
+      <span class="s0">&gt;(),</span>
+      <span class="s0">moduleGroups,</span>
+      <span class="s0">fixWrapperOffset: true,</span>
+    <span class="s0">});</span>
+    <span class="s0">if (sourcemapSourcesRoot !== undefined) {</span>
+      <span class="s0">relativizeSourceMapInline(sourceMap, sourcemapSourcesRoot);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const wroteSourceMap = writeSourceMap(</span>
+      <span class="s0">sourcemapOutput,</span>
+      <span class="s0">JSON.stringify(sourceMap),</span>
+      <span class="s0">log,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">return Promise.all([writeUnbundle, wroteSourceMap]);</span>
+  <span class="s0">} else {</span>
+    <span class="s0">return writeUnbundle;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">const fileHeader = Buffer.alloc(4);</span>
+<span class="s0">fileHeader.writeUInt32LE(MAGIC_UNBUNDLE_FILE_HEADER, 0);</span>
+<span class="s0">const nullByteBuffer: Buffer = Buffer.alloc(1).fill(0);</span>
+
+<span class="s0">function writeBuffers(</span>
+  <span class="s0">stream: WriteStream,</span>
+  <span class="s0">buffers: Array&lt;Buffer&gt;,</span>
+<span class="s0">): Promise&lt;void&gt; {</span>
+  <span class="s0">buffers.forEach((buffer: Buffer) =&gt; stream.write(buffer));</span>
+  <span class="s0">return new Promise((resolve: () =&gt; void, reject: mixed =&gt; mixed) =&gt; {</span>
+    <span class="s0">stream.on('error', reject);</span>
+    <span class="s0">stream.on('finish', () =&gt; resolve());</span>
+    <span class="s0">stream.end();</span>
+  <span class="s0">});</span>
+<span class="s0">}</span>
+
+<span class="s0">function nullTerminatedBuffer(</span>
+  <span class="s0">contents: string,</span>
+  <span class="s0">encoding: void | 'ascii' | 'utf16le' | 'utf8',</span>
+<span class="s0">): Buffer {</span>
+  <span class="s0">return Buffer.concat([Buffer.from(contents, encoding), nullByteBuffer]);</span>
+<span class="s0">}</span>
+
+<span class="s0">function moduleToBuffer(</span>
+  <span class="s0">id: number,</span>
+  <span class="s0">code: string,</span>
+  <span class="s0">encoding: void | 'ascii' | 'utf16le' | 'utf8',</span>
+<span class="s0">): {buffer: Buffer, id: number} {</span>
+  <span class="s0">return {</span>
+    <span class="s0">id,</span>
+    <span class="s0">buffer: nullTerminatedBuffer(code, encoding),</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function entryOffset(n: number): number {</span>
+  <span class="s0">// 2: num_entries + startup_code_len</span>
+  <span class="s0">// n * 2: each entry consists of two uint32s</span>
+  <span class="s0">return (2 + n * 2) * SIZEOF_UINT32;</span>
+<span class="s0">}</span>
+
+<span class="s0">function buildModuleTable(</span>
+  <span class="s0">startupCode: Buffer,</span>
+  <span class="s0">moduleBuffers: Array&lt;{</span>
+    <span class="s0">buffer: Buffer,</span>
+    <span class="s0">id: number,</span>
+    <span class="s0">...</span>
+  <span class="s0">}&gt;,</span>
+  <span class="s0">moduleGroups: ModuleGroups,</span>
+<span class="s0">): Buffer {</span>
+  <span class="s0">// table format:</span>
+  <span class="s0">// - num_entries:      uint_32  number of entries</span>
+  <span class="s0">// - startup_code_len: uint_32  length of the startup section</span>
+  <span class="s0">// - entries:          entry...</span>
+  <span class="s0">//</span>
+  <span class="s0">// entry:</span>
+  <span class="s0">//  - module_offset:   uint_32  offset into the modules blob</span>
+  <span class="s0">//  - module_length:   uint_32  length of the module code in bytes</span>
+
+  <span class="s0">const moduleIds = [...moduleGroups.modulesById.keys()];</span>
+  <span class="s0">const maxId = moduleIds.reduce((max: number, id: number) =&gt;</span>
+    <span class="s0">Math.max(max, id),</span>
+  <span class="s0">);</span>
+  <span class="s0">const numEntries = maxId + 1;</span>
+  <span class="s0">const table: Buffer = Buffer.alloc(entryOffset(numEntries)).fill(0);</span>
+
+  <span class="s0">// num_entries</span>
+  <span class="s0">table.writeUInt32LE(numEntries, 0);</span>
+
+  <span class="s0">// startup_code_len</span>
+  <span class="s0">table.writeUInt32LE(startupCode.length, SIZEOF_UINT32);</span>
+
+  <span class="s0">// entries</span>
+  <span class="s0">let codeOffset = startupCode.length;</span>
+  <span class="s0">moduleBuffers.forEach(({id, buffer}) =&gt; {</span>
+    <span class="s0">const group = moduleGroups.groups.get(id);</span>
+    <span class="s0">const idsInGroup: Array&lt;number&gt; = group</span>
+      <span class="s0">? [id].concat(Array.from(group))</span>
+      <span class="s0">: [id];</span>
+
+    <span class="s0">idsInGroup.forEach((moduleId: number) =&gt; {</span>
+      <span class="s0">const offset = entryOffset(moduleId);</span>
+      <span class="s0">// module_offset</span>
+      <span class="s0">table.writeUInt32LE(codeOffset, offset);</span>
+      <span class="s0">// module_length</span>
+      <span class="s0">table.writeUInt32LE(buffer.length, offset + SIZEOF_UINT32);</span>
+    <span class="s0">});</span>
+    <span class="s0">codeOffset += buffer.length;</span>
+  <span class="s0">});</span>
+
+  <span class="s0">return table;</span>
+<span class="s0">}</span>
+
+<span class="s0">function groupCode(</span>
+  <span class="s0">rootCode: string,</span>
+  <span class="s0">moduleGroup: void | Set&lt;number&gt;,</span>
+  <span class="s0">modulesById: Map&lt;number, ModuleTransportLike&gt;,</span>
+<span class="s0">): string {</span>
+  <span class="s0">if (!moduleGroup || !moduleGroup.size) {</span>
+    <span class="s0">return rootCode;</span>
+  <span class="s0">}</span>
+  <span class="s0">const code = [rootCode];</span>
+  <span class="s0">for (const id of moduleGroup) {</span>
+    <span class="s0">code.push((modulesById.get(id) || {code: ''}).code);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return code.join('\n');</span>
+<span class="s0">}</span>
+
+<span class="s0">function buildModuleBuffers(</span>
+  <span class="s0">modules: $ReadOnlyArray&lt;ModuleTransportLike&gt;,</span>
+  <span class="s0">moduleGroups: ModuleGroups,</span>
+  <span class="s0">encoding: void | 'ascii' | 'utf16le' | 'utf8',</span>
+<span class="s0">): Array&lt;{</span>
+  <span class="s0">buffer: Buffer,</span>
+  <span class="s0">id: number,</span>
+  <span class="s0">...</span>
+<span class="s0">}&gt; {</span>
+  <span class="s0">return modules</span>
+    <span class="s0">.filter((m: ModuleTransportLike) =&gt; !moduleGroups.modulesInGroups.has(m.id))</span>
+    <span class="s0">.map(({id, code}) =&gt;</span>
+      <span class="s0">moduleToBuffer(</span>
+        <span class="s0">id,</span>
+        <span class="s0">groupCode(code, moduleGroups.groups.get(id), moduleGroups.modulesById),</span>
+        <span class="s0">encoding,</span>
+      <span class="s0">),</span>
+    <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function buildTableAndContents(</span>
+  <span class="s0">startupCode: string,</span>
+  <span class="s0">modules: $ReadOnlyArray&lt;ModuleTransportLike&gt;,</span>
+  <span class="s0">moduleGroups: ModuleGroups,</span>
+  <span class="s0">encoding?: 'utf8' | 'utf16le' | 'ascii',</span>
+<span class="s0">): Array&lt;Buffer&gt; {</span>
+  <span class="s0">// file contents layout:</span>
+  <span class="s0">// - magic number      char[4]  0xE5 0xD1 0x0B 0xFB (0xFB0BD1E5 uint32 LE)</span>
+  <span class="s0">// - offset table      table    see `buildModuleTables`</span>
+  <span class="s0">// - code blob         char[]   null-terminated code strings, starting with</span>
+  <span class="s0">//                              the startup code</span>
+
+  <span class="s0">const startupCodeBuffer = nullTerminatedBuffer(startupCode, encoding);</span>
+  <span class="s0">const moduleBuffers = buildModuleBuffers(modules, moduleGroups, encoding);</span>
+  <span class="s0">const table = buildModuleTable(</span>
+    <span class="s0">startupCodeBuffer,</span>
+    <span class="s0">moduleBuffers,</span>
+    <span class="s0">moduleGroups,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">return [fileHeader, table, startupCodeBuffer].concat(</span>
+    <span class="s0">moduleBuffers.map(({buffer}) =&gt; buffer),</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function createModuleGroups(</span>
+  <span class="s0">groups: Map&lt;number, Set&lt;number&gt;&gt;,</span>
+  <span class="s0">modules: $ReadOnlyArray&lt;ModuleTransportLike&gt;,</span>
+<span class="s0">): ModuleGroups {</span>
+  <span class="s0">return {</span>
+    <span class="s0">groups,</span>
+    <span class="s0">modulesById: new Map(modules.map((m: ModuleTransportLike) =&gt; [m.id, m])),</span>
+    <span class="s0">modulesInGroups: new Set(concat(groups.values())),</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function* concat(</span>
+  <span class="s0">iterators: Iterator&lt;Set&lt;number&gt;&gt;,</span>
+<span class="s0">): Generator&lt;number, void, void&gt; {</span>
+  <span class="s0">for (const it of iterators) {</span>
+    <span class="s0">yield* it;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">exports.save = saveAsIndexedFile;</span>
+<span class="s0">exports.buildTableAndContents = buildTableAndContents;</span>
+<span class="s0">exports.createModuleGroups = createModuleGroups;</span>
+</pre>
+</body>
+</html>

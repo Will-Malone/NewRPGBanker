@@ -1,0 +1,544 @@
+<html>
+<head>
+<title>config-array.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+config-array.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview `ConfigArray` class. 
+ * 
+ * `ConfigArray` class expresses the full of a configuration. It has the entry 
+ * config file, base config files that were extended, loaded parsers, and loaded 
+ * plugins. 
+ * 
+ * `ConfigArray` class provides three properties and two methods. 
+ * 
+ * - `pluginEnvironments` 
+ * - `pluginProcessors` 
+ * - `pluginRules` 
+ *      The `Map` objects that contain the members of all plugins that this 
+ *      config array contains. Those map objects don't have mutation methods. 
+ *      Those keys are the member ID such as `pluginId/memberName`. 
+ * - `isRoot()` 
+ *      If `true` then this configuration has `root:true` property. 
+ * - `extractConfig(filePath)` 
+ *      Extract the final configuration for a given file. This means merging 
+ *      every config array element which that `criteria` property matched. The 
+ *      `filePath` argument must be an absolute path. 
+ * 
+ * `ConfigArrayFactory` provides the loading logic of config files. 
+ * 
+ * @author Toru Nagashima &lt;https://github.com/mysticatea&gt; 
+ */</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">import { ExtractedConfig } from </span><span class="s2">&quot;./extracted-config.js&quot;</span><span class="s1">;</span>
+<span class="s1">import { IgnorePattern } from </span><span class="s2">&quot;./ignore-pattern.js&quot;</span><span class="s1">;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">// Define types for VSCode IntelliSense.</span>
+<span class="s0">/** @typedef {import(&quot;../../shared/types&quot;).Environment} Environment */</span>
+<span class="s0">/** @typedef {import(&quot;../../shared/types&quot;).GlobalConf} GlobalConf */</span>
+<span class="s0">/** @typedef {import(&quot;../../shared/types&quot;).RuleConf} RuleConf */</span>
+<span class="s0">/** @typedef {import(&quot;../../shared/types&quot;).Rule} Rule */</span>
+<span class="s0">/** @typedef {import(&quot;../../shared/types&quot;).Plugin} Plugin */</span>
+<span class="s0">/** @typedef {import(&quot;../../shared/types&quot;).Processor} Processor */</span>
+<span class="s0">/** @typedef {import(&quot;./config-dependency&quot;).DependentParser} DependentParser */</span>
+<span class="s0">/** @typedef {import(&quot;./config-dependency&quot;).DependentPlugin} DependentPlugin */</span>
+<span class="s0">/** @typedef {import(&quot;./override-tester&quot;)[&quot;OverrideTester&quot;]} OverrideTester */</span>
+
+<span class="s0">/** 
+ * @typedef {Object} ConfigArrayElement 
+ * @property {string} name The name of this config element. 
+ * @property {string} filePath The path to the source file of this config element. 
+ * @property {InstanceType&lt;OverrideTester&gt;|null} criteria The tester for the `files` and `excludedFiles` of this config element. 
+ * @property {Record&lt;string, boolean&gt;|undefined} env The environment settings. 
+ * @property {Record&lt;string, GlobalConf&gt;|undefined} globals The global variable settings. 
+ * @property {IgnorePattern|undefined} ignorePattern The ignore patterns. 
+ * @property {boolean|undefined} noInlineConfig The flag that disables directive comments. 
+ * @property {DependentParser|undefined} parser The parser loader. 
+ * @property {Object|undefined} parserOptions The parser options. 
+ * @property {Record&lt;string, DependentPlugin&gt;|undefined} plugins The plugin loaders. 
+ * @property {string|undefined} processor The processor name to refer plugin's processor. 
+ * @property {boolean|undefined} reportUnusedDisableDirectives The flag to report unused `eslint-disable` comments. 
+ * @property {boolean|undefined} root The flag to express root. 
+ * @property {Record&lt;string, RuleConf&gt;|undefined} rules The rule settings 
+ * @property {Object|undefined} settings The shared settings. 
+ * @property {&quot;config&quot; | &quot;ignore&quot; | &quot;implicit-processor&quot;} type The element type. 
+ */</span>
+
+<span class="s0">/** 
+ * @typedef {Object} ConfigArrayInternalSlots 
+ * @property {Map&lt;string, ExtractedConfig&gt;} cache The cache to extract configs. 
+ * @property {ReadonlyMap&lt;string, Environment&gt;|null} envMap The map from environment ID to environment definition. 
+ * @property {ReadonlyMap&lt;string, Processor&gt;|null} processorMap The map from processor ID to environment definition. 
+ * @property {ReadonlyMap&lt;string, Rule&gt;|null} ruleMap The map from rule ID to rule definition. 
+ */</span>
+
+<span class="s0">/** @type {WeakMap&lt;ConfigArray, ConfigArrayInternalSlots&gt;} */</span>
+<span class="s1">const internalSlotsMap = </span><span class="s3">new </span><span class="s1">class extends WeakMap {</span>
+    <span class="s1">get(key) {</span>
+        <span class="s1">let value = super.get(key);</span>
+
+        <span class="s3">if </span><span class="s1">(!value) {</span>
+            <span class="s1">value = {</span>
+                <span class="s1">cache: </span><span class="s3">new </span><span class="s1">Map(),</span>
+                <span class="s1">envMap: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">processorMap: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">ruleMap: </span><span class="s3">null</span>
+            <span class="s1">};</span>
+            <span class="s1">super.set(key, value);</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">value;</span>
+    <span class="s1">}</span>
+<span class="s1">}();</span>
+
+<span class="s0">/** 
+ * Get the indices which are matched to a given file. 
+ * @param {ConfigArrayElement[]} elements The elements. 
+ * @param {string} filePath The path to a target file. 
+ * @returns {number[]} The indices. 
+ */</span>
+<span class="s3">function </span><span class="s1">getMatchedIndices(elements, filePath) {</span>
+    <span class="s1">const indices = [];</span>
+
+    <span class="s3">for </span><span class="s1">(let i = elements.length - </span><span class="s4">1</span><span class="s1">; i &gt;= </span><span class="s4">0</span><span class="s1">; --i) {</span>
+        <span class="s1">const element = elements[i];</span>
+
+        <span class="s3">if </span><span class="s1">(!element.criteria || (filePath &amp;&amp; element.criteria.test(filePath))) {</span>
+            <span class="s1">indices.push(i);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">indices;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Check if a value is a non-null object. 
+ * @param {any} x The value to check. 
+ * @returns {boolean} `true` if the value is a non-null object. 
+ */</span>
+<span class="s3">function </span><span class="s1">isNonNullObject(x) {</span>
+    <span class="s3">return typeof </span><span class="s1">x === </span><span class="s2">&quot;object&quot; </span><span class="s1">&amp;&amp; x !== </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Merge two objects. 
+ * 
+ * Assign every property values of `y` to `x` if `x` doesn't have the property. 
+ * If `x`'s property value is an object, it does recursive. 
+ * @param {Object} target The destination to merge 
+ * @param {Object|undefined} source The source to merge. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">mergeWithoutOverwrite(target, source) {</span>
+    <span class="s3">if </span><span class="s1">(!isNonNullObject(source)) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">for </span><span class="s1">(const key of Object.keys(source)) {</span>
+        <span class="s3">if </span><span class="s1">(key === </span><span class="s2">&quot;__proto__&quot;</span><span class="s1">) {</span>
+            <span class="s3">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s3">if </span><span class="s1">(isNonNullObject(target[key])) {</span>
+            <span class="s1">mergeWithoutOverwrite(target[key], source[key]);</span>
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(target[key] === </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s3">if </span><span class="s1">(isNonNullObject(source[key])) {</span>
+                <span class="s1">target[key] = Array.isArray(source[key]) ? [] : {};</span>
+                <span class="s1">mergeWithoutOverwrite(target[key], source[key]);</span>
+            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(source[key] !== </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s1">target[key] = source[key];</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * The error for plugin conflicts. 
+ */</span>
+<span class="s1">class PluginConflictError extends Error {</span>
+
+    <span class="s0">/** 
+     * Initialize this error object. 
+     * @param {string} pluginId The plugin ID. 
+     * @param {{filePath:string, importerName:string}[]} plugins The resolved plugins. 
+     */</span>
+    <span class="s1">constructor(pluginId, plugins) {</span>
+        <span class="s1">super(`Plugin </span><span class="s2">&quot;${pluginId}&quot; </span><span class="s1">was conflicted between ${plugins.map(p =&gt; `</span><span class="s2">&quot;${p.importerName}&quot;</span><span class="s1">`).join(</span><span class="s2">&quot; and &quot;</span><span class="s1">)}.`);</span>
+        <span class="s3">this</span><span class="s1">.messageTemplate = </span><span class="s2">&quot;plugin-conflict&quot;</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.messageData = { pluginId, plugins };</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Merge plugins. 
+ * `target`'s definition is prior to `source`'s. 
+ * @param {Record&lt;string, DependentPlugin&gt;} target The destination to merge 
+ * @param {Record&lt;string, DependentPlugin&gt;|undefined} source The source to merge. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">mergePlugins(target, source) {</span>
+    <span class="s3">if </span><span class="s1">(!isNonNullObject(source)) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">for </span><span class="s1">(const key of Object.keys(source)) {</span>
+        <span class="s3">if </span><span class="s1">(key === </span><span class="s2">&quot;__proto__&quot;</span><span class="s1">) {</span>
+            <span class="s3">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">const targetValue = target[key];</span>
+        <span class="s1">const sourceValue = source[key];</span>
+
+        <span class="s0">// Adopt the plugin which was found at first.</span>
+        <span class="s3">if </span><span class="s1">(targetValue === </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s3">if </span><span class="s1">(sourceValue.error) {</span>
+                <span class="s3">throw </span><span class="s1">sourceValue.error;</span>
+            <span class="s1">}</span>
+            <span class="s1">target[key] = sourceValue;</span>
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(sourceValue.filePath !== targetValue.filePath) {</span>
+            <span class="s3">throw new </span><span class="s1">PluginConflictError(key, [</span>
+                <span class="s1">{</span>
+                    <span class="s1">filePath: targetValue.filePath,</span>
+                    <span class="s1">importerName: targetValue.importerName</span>
+                <span class="s1">},</span>
+                <span class="s1">{</span>
+                    <span class="s1">filePath: sourceValue.filePath,</span>
+                    <span class="s1">importerName: sourceValue.importerName</span>
+                <span class="s1">}</span>
+            <span class="s1">]);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Merge rule configs. 
+ * `target`'s definition is prior to `source`'s. 
+ * @param {Record&lt;string, Array&gt;} target The destination to merge 
+ * @param {Record&lt;string, RuleConf&gt;|undefined} source The source to merge. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">mergeRuleConfigs(target, source) {</span>
+    <span class="s3">if </span><span class="s1">(!isNonNullObject(source)) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">for </span><span class="s1">(const key of Object.keys(source)) {</span>
+        <span class="s3">if </span><span class="s1">(key === </span><span class="s2">&quot;__proto__&quot;</span><span class="s1">) {</span>
+            <span class="s3">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">const targetDef = target[key];</span>
+        <span class="s1">const sourceDef = source[key];</span>
+
+        <span class="s0">// Adopt the rule config which was found at first.</span>
+        <span class="s3">if </span><span class="s1">(targetDef === </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s3">if </span><span class="s1">(Array.isArray(sourceDef)) {</span>
+                <span class="s1">target[key] = [...sourceDef];</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s1">target[key] = [sourceDef];</span>
+            <span class="s1">}</span>
+
+        <span class="s0">/* 
+         * If the first found rule config is severity only and the current rule 
+         * config has options, merge the severity and the options. 
+         */</span>
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span>
+            <span class="s1">targetDef.length === </span><span class="s4">1 </span><span class="s1">&amp;&amp;</span>
+            <span class="s1">Array.isArray(sourceDef) &amp;&amp;</span>
+            <span class="s1">sourceDef.length &gt;= </span><span class="s4">2</span>
+        <span class="s1">) {</span>
+            <span class="s1">targetDef.push(...sourceDef.slice(</span><span class="s4">1</span><span class="s1">));</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Create the extracted config. 
+ * @param {ConfigArray} instance The config elements. 
+ * @param {number[]} indices The indices to use. 
+ * @returns {ExtractedConfig} The extracted config. 
+ */</span>
+<span class="s3">function </span><span class="s1">createConfig(instance, indices) {</span>
+    <span class="s1">const config = </span><span class="s3">new </span><span class="s1">ExtractedConfig();</span>
+    <span class="s1">const ignorePatterns = [];</span>
+
+    <span class="s0">// Merge elements.</span>
+    <span class="s3">for </span><span class="s1">(const index of indices) {</span>
+        <span class="s1">const element = instance[index];</span>
+
+        <span class="s0">// Adopt the parser which was found at first.</span>
+        <span class="s3">if </span><span class="s1">(!config.parser &amp;&amp; element.parser) {</span>
+            <span class="s3">if </span><span class="s1">(element.parser.error) {</span>
+                <span class="s3">throw </span><span class="s1">element.parser.error;</span>
+            <span class="s1">}</span>
+            <span class="s1">config.parser = element.parser;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Adopt the processor which was found at first.</span>
+        <span class="s3">if </span><span class="s1">(!config.processor &amp;&amp; element.processor) {</span>
+            <span class="s1">config.processor = element.processor;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Adopt the noInlineConfig which was found at first.</span>
+        <span class="s3">if </span><span class="s1">(config.noInlineConfig === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">&amp;&amp; element.noInlineConfig !== </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">config.noInlineConfig = element.noInlineConfig;</span>
+            <span class="s1">config.configNameOfNoInlineConfig = element.name;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Adopt the reportUnusedDisableDirectives which was found at first.</span>
+        <span class="s3">if </span><span class="s1">(config.reportUnusedDisableDirectives === </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">&amp;&amp; element.reportUnusedDisableDirectives !== </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">config.reportUnusedDisableDirectives = element.reportUnusedDisableDirectives;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Collect ignorePatterns</span>
+        <span class="s3">if </span><span class="s1">(element.ignorePattern) {</span>
+            <span class="s1">ignorePatterns.push(element.ignorePattern);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Merge others.</span>
+        <span class="s1">mergeWithoutOverwrite(config.env, element.env);</span>
+        <span class="s1">mergeWithoutOverwrite(config.globals, element.globals);</span>
+        <span class="s1">mergeWithoutOverwrite(config.parserOptions, element.parserOptions);</span>
+        <span class="s1">mergeWithoutOverwrite(config.settings, element.settings);</span>
+        <span class="s1">mergePlugins(config.plugins, element.plugins);</span>
+        <span class="s1">mergeRuleConfigs(config.rules, element.rules);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Create the predicate function for ignore patterns.</span>
+    <span class="s3">if </span><span class="s1">(ignorePatterns.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">config.ignores = IgnorePattern.createIgnore(ignorePatterns.reverse());</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">config;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Collect definitions. 
+ * @template T, U 
+ * @param {string} pluginId The plugin ID for prefix. 
+ * @param {Record&lt;string,T&gt;} defs The definitions to collect. 
+ * @param {Map&lt;string, U&gt;} map The map to output. 
+ * @param {function(T): U} [normalize] The normalize function for each value. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">collect(pluginId, defs, map, normalize) {</span>
+    <span class="s3">if </span><span class="s1">(defs) {</span>
+        <span class="s1">const prefix = pluginId &amp;&amp; `${pluginId}/`;</span>
+
+        <span class="s3">for </span><span class="s1">(const [key, value] of Object.entries(defs)) {</span>
+            <span class="s1">map.set(</span>
+                <span class="s1">`${prefix}${key}`,</span>
+                <span class="s1">normalize ? normalize(value) : value</span>
+            <span class="s1">);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Normalize a rule definition. 
+ * @param {Function|Rule} rule The rule definition to normalize. 
+ * @returns {Rule} The normalized rule definition. 
+ */</span>
+<span class="s3">function </span><span class="s1">normalizePluginRule(rule) {</span>
+    <span class="s3">return typeof </span><span class="s1">rule === </span><span class="s2">&quot;function&quot; </span><span class="s1">? { create: rule } : rule;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Delete the mutation methods from a given map. 
+ * @param {Map&lt;any, any&gt;} map The map object to delete. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">deleteMutationMethods(map) {</span>
+    <span class="s1">Object.defineProperties(map, {</span>
+        <span class="s1">clear: { configurable: </span><span class="s3">true</span><span class="s1">, value: </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">},</span>
+        <span class="s3">delete</span><span class="s1">: { configurable: </span><span class="s3">true</span><span class="s1">, value: </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">},</span>
+        <span class="s1">set: { configurable: </span><span class="s3">true</span><span class="s1">, value: </span><span class="s3">void </span><span class="s4">0 </span><span class="s1">}</span>
+    <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Create `envMap`, `processorMap`, `ruleMap` with the plugins in the config array. 
+ * @param {ConfigArrayElement[]} elements The config elements. 
+ * @param {ConfigArrayInternalSlots} slots The internal slots. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">initPluginMemberMaps(elements, slots) {</span>
+    <span class="s1">const processed = </span><span class="s3">new </span><span class="s1">Set();</span>
+
+    <span class="s1">slots.envMap = </span><span class="s3">new </span><span class="s1">Map();</span>
+    <span class="s1">slots.processorMap = </span><span class="s3">new </span><span class="s1">Map();</span>
+    <span class="s1">slots.ruleMap = </span><span class="s3">new </span><span class="s1">Map();</span>
+
+    <span class="s3">for </span><span class="s1">(const element of elements) {</span>
+        <span class="s3">if </span><span class="s1">(!element.plugins) {</span>
+            <span class="s3">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s3">for </span><span class="s1">(const [pluginId, value] of Object.entries(element.plugins)) {</span>
+            <span class="s1">const plugin = value.definition;</span>
+
+            <span class="s3">if </span><span class="s1">(!plugin || processed.has(pluginId)) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s1">processed.add(pluginId);</span>
+
+            <span class="s1">collect(pluginId, plugin.environments, slots.envMap);</span>
+            <span class="s1">collect(pluginId, plugin.processors, slots.processorMap);</span>
+            <span class="s1">collect(pluginId, plugin.rules, slots.ruleMap, normalizePluginRule);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">deleteMutationMethods(slots.envMap);</span>
+    <span class="s1">deleteMutationMethods(slots.processorMap);</span>
+    <span class="s1">deleteMutationMethods(slots.ruleMap);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Create `envMap`, `processorMap`, `ruleMap` with the plugins in the config array. 
+ * @param {ConfigArray} instance The config elements. 
+ * @returns {ConfigArrayInternalSlots} The extracted config. 
+ */</span>
+<span class="s3">function </span><span class="s1">ensurePluginMemberMaps(instance) {</span>
+    <span class="s1">const slots = internalSlotsMap.get(instance);</span>
+
+    <span class="s3">if </span><span class="s1">(!slots.ruleMap) {</span>
+        <span class="s1">initPluginMemberMaps(instance, slots);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">slots;</span>
+<span class="s1">}</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Public Interface</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * The Config Array. 
+ * 
+ * `ConfigArray` instance contains all settings, parsers, and plugins. 
+ * You need to call `ConfigArray#extractConfig(filePath)` method in order to 
+ * extract, merge and get only the config data which is related to an arbitrary 
+ * file. 
+ * @extends {Array&lt;ConfigArrayElement&gt;} 
+ */</span>
+<span class="s1">class ConfigArray extends Array {</span>
+
+    <span class="s0">/** 
+     * Get the plugin environments. 
+     * The returned map cannot be mutated. 
+     * @type {ReadonlyMap&lt;string, Environment&gt;} The plugin environments. 
+     */</span>
+    <span class="s1">get pluginEnvironments() {</span>
+        <span class="s3">return </span><span class="s1">ensurePluginMemberMaps(</span><span class="s3">this</span><span class="s1">).envMap;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Get the plugin processors. 
+     * The returned map cannot be mutated. 
+     * @type {ReadonlyMap&lt;string, Processor&gt;} The plugin processors. 
+     */</span>
+    <span class="s1">get pluginProcessors() {</span>
+        <span class="s3">return </span><span class="s1">ensurePluginMemberMaps(</span><span class="s3">this</span><span class="s1">).processorMap;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Get the plugin rules. 
+     * The returned map cannot be mutated. 
+     * @returns {ReadonlyMap&lt;string, Rule&gt;} The plugin rules. 
+     */</span>
+    <span class="s1">get pluginRules() {</span>
+        <span class="s3">return </span><span class="s1">ensurePluginMemberMaps(</span><span class="s3">this</span><span class="s1">).ruleMap;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Check if this config has `root` flag. 
+     * @returns {boolean} `true` if this config array is root. 
+     */</span>
+    <span class="s1">isRoot() {</span>
+        <span class="s3">for </span><span class="s1">(let i = </span><span class="s3">this</span><span class="s1">.length - </span><span class="s4">1</span><span class="s1">; i &gt;= </span><span class="s4">0</span><span class="s1">; --i) {</span>
+            <span class="s1">const root = </span><span class="s3">this</span><span class="s1">[i].root;</span>
+
+            <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">root === </span><span class="s2">&quot;boolean&quot;</span><span class="s1">) {</span>
+                <span class="s3">return </span><span class="s1">root;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s3">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Extract the config data which is related to a given file. 
+     * @param {string} filePath The absolute path to the target file. 
+     * @returns {ExtractedConfig} The extracted config data. 
+     */</span>
+    <span class="s1">extractConfig(filePath) {</span>
+        <span class="s1">const { cache } = internalSlotsMap.get(</span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">const indices = getMatchedIndices(</span><span class="s3">this</span><span class="s1">, filePath);</span>
+        <span class="s1">const cacheKey = indices.join(</span><span class="s2">&quot;,&quot;</span><span class="s1">);</span>
+
+        <span class="s3">if </span><span class="s1">(!cache.has(cacheKey)) {</span>
+            <span class="s1">cache.set(cacheKey, createConfig(</span><span class="s3">this</span><span class="s1">, indices));</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">cache.get(cacheKey);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Check if a given path is an additional lint target. 
+     * @param {string} filePath The absolute path to the target file. 
+     * @returns {boolean} `true` if the file is an additional lint target. 
+     */</span>
+    <span class="s1">isAdditionalTargetPath(filePath) {</span>
+        <span class="s3">for </span><span class="s1">(const { criteria, type } of </span><span class="s3">this</span><span class="s1">) {</span>
+            <span class="s3">if </span><span class="s1">(</span>
+                <span class="s1">type === </span><span class="s2">&quot;config&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">criteria &amp;&amp;</span>
+                <span class="s1">!criteria.endsWithWildcard &amp;&amp;</span>
+                <span class="s1">criteria.test(filePath)</span>
+            <span class="s1">) {</span>
+                <span class="s3">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s3">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Get the used extracted configs. 
+ * CLIEngine will use this method to collect used deprecated rules. 
+ * @param {ConfigArray} instance The config array object to get. 
+ * @returns {ExtractedConfig[]} The used extracted configs. 
+ * @private 
+ */</span>
+<span class="s3">function </span><span class="s1">getUsedExtractedConfigs(instance) {</span>
+    <span class="s1">const { cache } = internalSlotsMap.get(instance);</span>
+
+    <span class="s3">return </span><span class="s1">Array.from(cache.values());</span>
+<span class="s1">}</span>
+
+
+<span class="s1">export {</span>
+    <span class="s1">ConfigArray,</span>
+    <span class="s1">getUsedExtractedConfigs</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

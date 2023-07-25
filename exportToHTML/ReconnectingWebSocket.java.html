@@ -1,0 +1,215 @@
+<html>
+<head>
+<title>ReconnectingWebSocket.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ReconnectingWebSocket.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.packagerconnection</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.os.Handler</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.os.Looper</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.io.IOException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.nio.channels.ClosedChannelException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.TimeUnit</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.OkHttpClient</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.Request</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.Response</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.WebSocket</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.WebSocketListener</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okio.ByteString</span><span class="s2">;</span>
+
+<span class="s3">/** A wrapper around WebSocketClient that reconnects automatically */</span>
+<span class="s2">public final class </span><span class="s1">ReconnectingWebSocket </span><span class="s2">extends </span><span class="s1">WebSocketListener {</span>
+  <span class="s2">private static final </span><span class="s1">String TAG = ReconnectingWebSocket.</span><span class="s2">class</span><span class="s1">.getSimpleName()</span><span class="s2">;</span>
+
+  <span class="s2">private static final int </span><span class="s1">RECONNECT_DELAY_MS = </span><span class="s4">2000</span><span class="s2">;</span>
+
+  <span class="s2">public interface </span><span class="s1">MessageCallback {</span>
+    <span class="s2">void </span><span class="s1">onMessage(String text)</span><span class="s2">;</span>
+
+    <span class="s2">void </span><span class="s1">onMessage(ByteString bytes)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public interface </span><span class="s1">ConnectionCallback {</span>
+    <span class="s2">void </span><span class="s1">onConnected()</span><span class="s2">;</span>
+
+    <span class="s2">void </span><span class="s1">onDisconnected()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final </span><span class="s1">String mUrl</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Handler mHandler</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">OkHttpClient mOkHttpClient</span><span class="s2">;</span>
+  <span class="s2">private boolean </span><span class="s1">mClosed = </span><span class="s2">false;</span>
+  <span class="s2">private boolean </span><span class="s1">mSuppressConnectionErrors</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable WebSocket mWebSocket</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable MessageCallback mMessageCallback</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable ConnectionCallback mConnectionCallback</span><span class="s2">;</span>
+
+  <span class="s2">public </span><span class="s1">ReconnectingWebSocket(</span>
+      <span class="s1">String url</span><span class="s2">,</span>
+      <span class="s1">@Nullable MessageCallback messageCallback</span><span class="s2">,</span>
+      <span class="s1">@Nullable ConnectionCallback connectionCallback) {</span>
+    <span class="s2">super</span><span class="s1">()</span><span class="s2">;</span>
+    <span class="s1">mUrl = url</span><span class="s2">;</span>
+    <span class="s1">mMessageCallback = messageCallback</span><span class="s2">;</span>
+    <span class="s1">mConnectionCallback = connectionCallback</span><span class="s2">;</span>
+    <span class="s1">mHandler = </span><span class="s2">new </span><span class="s1">Handler(Looper.getMainLooper())</span><span class="s2">;</span>
+    <span class="s1">mOkHttpClient =</span>
+        <span class="s2">new </span><span class="s1">OkHttpClient.Builder()</span>
+            <span class="s1">.connectTimeout(</span><span class="s4">10</span><span class="s2">, </span><span class="s1">TimeUnit.SECONDS)</span>
+            <span class="s1">.writeTimeout(</span><span class="s4">10</span><span class="s2">, </span><span class="s1">TimeUnit.SECONDS)</span>
+            <span class="s1">.readTimeout(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">TimeUnit.MINUTES) </span><span class="s0">// Disable timeouts for read</span>
+            <span class="s1">.build()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">connect() {</span>
+    <span class="s2">if </span><span class="s1">(mClosed) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;Can't connect closed client&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Request request = </span><span class="s2">new </span><span class="s1">Request.Builder().url(mUrl).build()</span><span class="s2">;</span>
+    <span class="s1">mOkHttpClient.newWebSocket(request</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private synchronized void </span><span class="s1">delayedReconnect() {</span>
+    <span class="s0">// check that we haven't been closed in the meantime</span>
+    <span class="s2">if </span><span class="s1">(!mClosed) {</span>
+      <span class="s1">connect()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">reconnect() {</span>
+    <span class="s2">if </span><span class="s1">(mClosed) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;Can't reconnect closed client&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(!mSuppressConnectionErrors) {</span>
+      <span class="s1">FLog.w(TAG</span><span class="s2">, </span><span class="s5">&quot;Couldn't connect to </span><span class="s2">\&quot;</span><span class="s5">&quot; </span><span class="s1">+ mUrl + </span><span class="s5">&quot;</span><span class="s2">\&quot;</span><span class="s5">, will silently retry&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">mSuppressConnectionErrors = </span><span class="s2">true;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mHandler.postDelayed(</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s1">delayedReconnect()</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span><span class="s2">,</span>
+        <span class="s1">RECONNECT_DELAY_MS)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">closeQuietly() {</span>
+    <span class="s1">mClosed = </span><span class="s2">true;</span>
+    <span class="s1">closeWebSocketQuietly()</span><span class="s2">;</span>
+    <span class="s1">mMessageCallback = </span><span class="s2">null;</span>
+
+    <span class="s2">if </span><span class="s1">(mConnectionCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mConnectionCallback.onDisconnected()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">closeWebSocketQuietly() {</span>
+    <span class="s2">if </span><span class="s1">(mWebSocket != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mWebSocket.close(</span><span class="s4">1000</span><span class="s2">, </span><span class="s5">&quot;End of session&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+        <span class="s0">// swallow, no need to handle it here</span>
+      <span class="s1">}</span>
+      <span class="s1">mWebSocket = </span><span class="s2">null;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">abort(String message</span><span class="s2">, </span><span class="s1">Throwable cause) {</span>
+    <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s5">&quot;Error occurred, shutting down websocket connection: &quot; </span><span class="s1">+ message</span><span class="s2">, </span><span class="s1">cause)</span><span class="s2">;</span>
+    <span class="s1">closeWebSocketQuietly()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public synchronized void </span><span class="s1">onOpen(WebSocket webSocket</span><span class="s2">, </span><span class="s1">Response response) {</span>
+    <span class="s1">mWebSocket = webSocket</span><span class="s2">;</span>
+    <span class="s1">mSuppressConnectionErrors = </span><span class="s2">false;</span>
+
+    <span class="s2">if </span><span class="s1">(mConnectionCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mConnectionCallback.onConnected()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public synchronized void </span><span class="s1">onFailure(WebSocket webSocket</span><span class="s2">, </span><span class="s1">Throwable t</span><span class="s2">, </span><span class="s1">Response response) {</span>
+    <span class="s2">if </span><span class="s1">(mWebSocket != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">abort(</span><span class="s5">&quot;Websocket exception&quot;</span><span class="s2">, </span><span class="s1">t)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!mClosed) {</span>
+      <span class="s2">if </span><span class="s1">(mConnectionCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">mConnectionCallback.onDisconnected()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s1">reconnect()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public synchronized void </span><span class="s1">onMessage(WebSocket webSocket</span><span class="s2">, </span><span class="s1">String text) {</span>
+    <span class="s2">if </span><span class="s1">(mMessageCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mMessageCallback.onMessage(text)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public synchronized void </span><span class="s1">onMessage(WebSocket webSocket</span><span class="s2">, </span><span class="s1">ByteString bytes) {</span>
+    <span class="s2">if </span><span class="s1">(mMessageCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mMessageCallback.onMessage(bytes)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public synchronized void </span><span class="s1">onClosed(WebSocket webSocket</span><span class="s2">, int </span><span class="s1">code</span><span class="s2">, </span><span class="s1">String reason) {</span>
+    <span class="s1">mWebSocket = </span><span class="s2">null;</span>
+    <span class="s2">if </span><span class="s1">(!mClosed) {</span>
+      <span class="s2">if </span><span class="s1">(mConnectionCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">mConnectionCallback.onDisconnected()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s1">reconnect()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public synchronized void </span><span class="s1">sendMessage(String message) </span><span class="s2">throws </span><span class="s1">IOException {</span>
+    <span class="s2">if </span><span class="s1">(mWebSocket != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mWebSocket.send(message)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s2">throw new </span><span class="s1">ClosedChannelException()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public synchronized void </span><span class="s1">sendMessage(ByteString message) </span><span class="s2">throws </span><span class="s1">IOException {</span>
+    <span class="s2">if </span><span class="s1">(mWebSocket != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mWebSocket.send(message)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s2">throw new </span><span class="s1">ClosedChannelException()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

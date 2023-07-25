@@ -1,0 +1,225 @@
+<html>
+<head>
+<title>HMRClient.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+HMRClient.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict-local</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+<span class="s0">import type {HmrModule} from './types.flow';</span>
+
+<span class="s0">import type {HmrMessage, HmrUpdate} from './types.flow';</span>
+
+<span class="s0">const EventEmitter = require('./vendor/eventemitter3');</span>
+
+<span class="s0">type SocketState = 'opening' | 'open' | 'closed';</span>
+
+<span class="s0">const inject = ({module: [id, code], sourceURL}: HmrModule) =&gt; {</span>
+  <span class="s0">// Some engines do not support `sourceURL` as a comment. We expose a</span>
+  <span class="s0">// `globalEvalWithSourceUrl` function to handle updates in that case.</span>
+  <span class="s0">if (global.globalEvalWithSourceUrl) {</span>
+    <span class="s0">global.globalEvalWithSourceUrl(code, sourceURL);</span>
+  <span class="s0">} else {</span>
+    <span class="s0">// eslint-disable-next-line no-eval</span>
+    <span class="s0">eval(code);</span>
+  <span class="s0">}</span>
+<span class="s0">};</span>
+
+<span class="s0">const injectUpdate = (update: HmrUpdate) =&gt; {</span>
+  <span class="s0">update.added.forEach(inject);</span>
+  <span class="s0">update.modified.forEach(inject);</span>
+<span class="s0">};</span>
+
+<span class="s0">class HMRClient extends EventEmitter {</span>
+  <span class="s0">_isEnabled: boolean = false;</span>
+  <span class="s0">_pendingUpdate: HmrUpdate | null = null;</span>
+  <span class="s0">_queue: Array&lt;string&gt; = [];</span>
+  <span class="s0">_state: SocketState = 'opening';</span>
+  <span class="s0">_ws: WebSocket;</span>
+
+  <span class="s0">constructor(url: string) {</span>
+    <span class="s0">super();</span>
+
+    <span class="s0">// Access the global WebSocket object only after enabling the client,</span>
+    <span class="s0">// since some polyfills do the initialization lazily.</span>
+    <span class="s0">this._ws = new global.WebSocket(url);</span>
+    <span class="s0">this._ws.onopen = () =&gt; {</span>
+      <span class="s0">this._state = 'open';</span>
+      <span class="s0">this.emit('open');</span>
+      <span class="s0">this._flushQueue();</span>
+    <span class="s0">};</span>
+    <span class="s0">this._ws.onerror = error =&gt; {</span>
+      <span class="s0">this.emit('connection-error', error);</span>
+    <span class="s0">};</span>
+    <span class="s0">this._ws.onclose = closeEvent =&gt; {</span>
+      <span class="s0">this._state = 'closed';</span>
+      <span class="s0">this.emit('close', closeEvent);</span>
+    <span class="s0">};</span>
+    <span class="s0">this._ws.onmessage = message =&gt; {</span>
+      <span class="s0">const data: HmrMessage = JSON.parse(String(message.data));</span>
+
+      <span class="s0">switch (data.type) {</span>
+        <span class="s0">case 'bundle-registered':</span>
+          <span class="s0">this.emit('bundle-registered');</span>
+          <span class="s0">break;</span>
+
+        <span class="s0">case 'update-start':</span>
+          <span class="s0">this.emit('update-start', data.body);</span>
+          <span class="s0">break;</span>
+
+        <span class="s0">case 'update':</span>
+          <span class="s0">this.emit('update', data.body);</span>
+          <span class="s0">break;</span>
+
+        <span class="s0">case 'update-done':</span>
+          <span class="s0">this.emit('update-done');</span>
+          <span class="s0">break;</span>
+
+        <span class="s0">case 'error':</span>
+          <span class="s0">this.emit('error', data.body);</span>
+          <span class="s0">break;</span>
+
+        <span class="s0">default:</span>
+          <span class="s0">this.emit('error', {type: 'unknown-message', message: data});</span>
+      <span class="s0">}</span>
+    <span class="s0">};</span>
+
+    <span class="s0">this.on('update', (update: HmrUpdate) =&gt; {</span>
+      <span class="s0">if (this._isEnabled) {</span>
+        <span class="s0">injectUpdate(update);</span>
+      <span class="s0">} else if (this._pendingUpdate == null) {</span>
+        <span class="s0">this._pendingUpdate = update;</span>
+      <span class="s0">} else {</span>
+        <span class="s0">this._pendingUpdate = mergeUpdates(this._pendingUpdate, update);</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">close(): void {</span>
+    <span class="s0">this._ws.close();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">send(message: string): void {</span>
+    <span class="s0">switch (this._state) {</span>
+      <span class="s0">case 'opening':</span>
+        <span class="s0">this._queue.push(message);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'open':</span>
+        <span class="s0">this._ws.send(message);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'closed':</span>
+        <span class="s0">// Ignore.</span>
+        <span class="s0">break;</span>
+      <span class="s0">default:</span>
+        <span class="s0">throw new Error('[WebSocketHMRClient] Unknown state: ' + this._state);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_flushQueue(): void {</span>
+    <span class="s0">this._queue.forEach(message =&gt; this.send(message));</span>
+    <span class="s0">this._queue.length = 0;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">enable() {</span>
+    <span class="s0">this._isEnabled = true;</span>
+    <span class="s0">const update = this._pendingUpdate;</span>
+    <span class="s0">this._pendingUpdate = null;</span>
+    <span class="s0">if (update != null) {</span>
+      <span class="s0">injectUpdate(update);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">disable() {</span>
+    <span class="s0">this._isEnabled = false;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">isEnabled(): boolean {</span>
+    <span class="s0">return this._isEnabled;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">hasPendingUpdates(): boolean {</span>
+    <span class="s0">return this._pendingUpdate != null;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function mergeUpdates(base: HmrUpdate, next: HmrUpdate): HmrUpdate {</span>
+  <span class="s0">const addedIDs = new Set&lt;number&gt;();</span>
+  <span class="s0">const deletedIDs = new Set&lt;number&gt;();</span>
+  <span class="s0">const moduleMap = new Map&lt;number, HmrModule&gt;();</span>
+
+  <span class="s0">// Fill in the temporary maps and sets from both updates in their order.</span>
+  <span class="s0">applyUpdateLocally(base);</span>
+  <span class="s0">applyUpdateLocally(next);</span>
+
+  <span class="s0">function applyUpdateLocally(update: HmrUpdate) {</span>
+    <span class="s0">update.deleted.forEach(id =&gt; {</span>
+      <span class="s0">if (addedIDs.has(id)) {</span>
+        <span class="s0">addedIDs.delete(id);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">deletedIDs.add(id);</span>
+      <span class="s0">}</span>
+      <span class="s0">moduleMap.delete(id);</span>
+    <span class="s0">});</span>
+    <span class="s0">update.added.forEach(item =&gt; {</span>
+      <span class="s0">const id = item.module[0];</span>
+      <span class="s0">if (deletedIDs.has(id)) {</span>
+        <span class="s0">deletedIDs.delete(id);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">addedIDs.add(id);</span>
+      <span class="s0">}</span>
+      <span class="s0">moduleMap.set(id, item);</span>
+    <span class="s0">});</span>
+    <span class="s0">update.modified.forEach(item =&gt; {</span>
+      <span class="s0">const id = item.module[0];</span>
+      <span class="s0">moduleMap.set(id, item);</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Now reconstruct a unified update from our in-memory maps and sets.</span>
+  <span class="s0">// Applying it should be equivalent to applying both of them individually.</span>
+  <span class="s0">const result = {</span>
+    <span class="s0">isInitialUpdate: next.isInitialUpdate,</span>
+    <span class="s0">revisionId: next.revisionId,</span>
+    <span class="s0">added: ([]: Array&lt;HmrModule&gt;),</span>
+    <span class="s0">modified: ([]: Array&lt;HmrModule&gt;),</span>
+    <span class="s0">deleted: ([]: Array&lt;number&gt;),</span>
+  <span class="s0">};</span>
+  <span class="s0">deletedIDs.forEach(id =&gt; {</span>
+    <span class="s0">result.deleted.push(id);</span>
+  <span class="s0">});</span>
+  <span class="s0">moduleMap.forEach((item, id) =&gt; {</span>
+    <span class="s0">if (deletedIDs.has(id)) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (addedIDs.has(id)) {</span>
+      <span class="s0">result.added.push(item);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">result.modified.push(item);</span>
+    <span class="s0">}</span>
+  <span class="s0">});</span>
+  <span class="s0">return result;</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = HMRClient;</span>
+</pre>
+</body>
+</html>

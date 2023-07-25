@@ -1,0 +1,274 @@
+<html>
+<head>
+<title>FillRateHelper.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+FillRateHelper.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow 
+ * @format 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">import type {FrameMetricProps} from </span><span class="s2">'./VirtualizedListProps'</span><span class="s1">;</span>
+
+<span class="s1">export type FillRateInfo = Info;</span>
+
+<span class="s1">class Info {</span>
+  <span class="s1">any_blank_count: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">any_blank_ms: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">any_blank_speed_sum: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">mostly_blank_count: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">mostly_blank_ms: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">pixels_blank: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">pixels_sampled: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">pixels_scrolled: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">total_time_spent: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">sample_count: number = </span><span class="s3">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s1">type FrameMetrics = {</span>
+  <span class="s1">inLayout?: boolean,</span>
+  <span class="s1">length: number,</span>
+  <span class="s1">offset: number,</span>
+  <span class="s1">...</span>
+<span class="s1">};</span>
+
+<span class="s1">const DEBUG = </span><span class="s4">false</span><span class="s1">;</span>
+
+<span class="s1">let _listeners: Array&lt;(Info) =&gt; </span><span class="s4">void</span><span class="s1">&gt; = [];</span>
+<span class="s1">let _minSampleCount = </span><span class="s3">10</span><span class="s1">;</span>
+<span class="s1">let _sampleRate = DEBUG ? </span><span class="s3">1 </span><span class="s1">: </span><span class="s4">null</span><span class="s1">;</span>
+
+<span class="s0">/** 
+ * A helper class for detecting when the maximem fill rate of `VirtualizedList` is exceeded. 
+ * By default the sampling rate is set to zero and this will do nothing. If you want to collect 
+ * samples (e.g. to log them), make sure to call `FillRateHelper.setSampleRate(0.0-1.0)`. 
+ * 
+ * Listeners and sample rate are global for all `VirtualizedList`s - typical usage will combine with 
+ * `SceneTracker.getActiveScene` to determine the context of the events. 
+ */</span>
+<span class="s1">class FillRateHelper {</span>
+  <span class="s1">_anyBlankStartTime: ?number = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">_enabled = </span><span class="s4">false</span><span class="s1">;</span>
+  <span class="s1">_getFrameMetrics: (index: number, props: FrameMetricProps) =&gt; ?FrameMetrics;</span>
+  <span class="s1">_info: Info = </span><span class="s4">new </span><span class="s1">Info();</span>
+  <span class="s1">_mostlyBlankStartTime: ?number = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">_samplesStartTime: ?number = </span><span class="s4">null</span><span class="s1">;</span>
+
+  <span class="s1">static addListener(callback: FillRateInfo =&gt; </span><span class="s4">void</span><span class="s1">): {</span>
+    <span class="s1">remove: () =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+    <span class="s1">...</span>
+  <span class="s1">} {</span>
+    <span class="s4">if </span><span class="s1">(_sampleRate === </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">console.warn(</span><span class="s2">'Call `FillRateHelper.setSampleRate` before `addListener`.'</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">_listeners.push(callback);</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">remove: () =&gt; {</span>
+        <span class="s1">_listeners = _listeners.filter(listener =&gt; callback !== listener);</span>
+      <span class="s1">},</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static setSampleRate(sampleRate: number) {</span>
+    <span class="s1">_sampleRate = sampleRate;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static setMinSampleCount(minSampleCount: number) {</span>
+    <span class="s1">_minSampleCount = minSampleCount;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">constructor(</span>
+    <span class="s1">getFrameMetrics: (index: number, props: FrameMetricProps) =&gt; ?FrameMetrics,</span>
+  <span class="s1">) {</span>
+    <span class="s4">this</span><span class="s1">._getFrameMetrics = getFrameMetrics;</span>
+    <span class="s4">this</span><span class="s1">._enabled = (_sampleRate || </span><span class="s3">0</span><span class="s1">) &gt; Math.random();</span>
+    <span class="s4">this</span><span class="s1">._resetData();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">activate() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._enabled &amp;&amp; </span><span class="s4">this</span><span class="s1">._samplesStartTime == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">DEBUG &amp;&amp; console.debug(</span><span class="s2">'FillRateHelper: activate'</span><span class="s1">);</span>
+      <span class="s4">this</span><span class="s1">._samplesStartTime = global.performance.now();</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">deactivateAndFlush() {</span>
+    <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._enabled) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const start = </span><span class="s4">this</span><span class="s1">._samplesStartTime; </span><span class="s0">// const for flow</span>
+    <span class="s4">if </span><span class="s1">(start == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">DEBUG &amp;&amp;</span>
+        <span class="s1">console.debug(</span><span class="s2">'FillRateHelper: bail on deactivate with no start time'</span><span class="s1">);</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._info.sample_count &lt; _minSampleCount) {</span>
+      <span class="s0">// Don't bother with under-sampled events.</span>
+      <span class="s4">this</span><span class="s1">._resetData();</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const total_time_spent = global.performance.now() - start;</span>
+    <span class="s1">const info: any = {</span>
+      <span class="s1">...</span><span class="s4">this</span><span class="s1">._info,</span>
+      <span class="s1">total_time_spent,</span>
+    <span class="s1">};</span>
+    <span class="s4">if </span><span class="s1">(DEBUG) {</span>
+      <span class="s1">const derived = {</span>
+        <span class="s1">avg_blankness: </span><span class="s4">this</span><span class="s1">._info.pixels_blank / </span><span class="s4">this</span><span class="s1">._info.pixels_sampled,</span>
+        <span class="s1">avg_speed: </span><span class="s4">this</span><span class="s1">._info.pixels_scrolled / (total_time_spent / </span><span class="s3">1000</span><span class="s1">),</span>
+        <span class="s1">avg_speed_when_any_blank:</span>
+          <span class="s4">this</span><span class="s1">._info.any_blank_speed_sum / </span><span class="s4">this</span><span class="s1">._info.any_blank_count,</span>
+        <span class="s1">any_blank_per_min:</span>
+          <span class="s4">this</span><span class="s1">._info.any_blank_count / (total_time_spent / </span><span class="s3">1000 </span><span class="s1">/ </span><span class="s3">60</span><span class="s1">),</span>
+        <span class="s1">any_blank_time_frac: </span><span class="s4">this</span><span class="s1">._info.any_blank_ms / total_time_spent,</span>
+        <span class="s1">mostly_blank_per_min:</span>
+          <span class="s4">this</span><span class="s1">._info.mostly_blank_count / (total_time_spent / </span><span class="s3">1000 </span><span class="s1">/ </span><span class="s3">60</span><span class="s1">),</span>
+        <span class="s1">mostly_blank_time_frac: </span><span class="s4">this</span><span class="s1">._info.mostly_blank_ms / total_time_spent,</span>
+      <span class="s1">};</span>
+      <span class="s4">for </span><span class="s1">(const key </span><span class="s4">in </span><span class="s1">derived) {</span>
+        <span class="s0">// $FlowFixMe[prop-missing]</span>
+        <span class="s1">derived[key] = Math.round(</span><span class="s3">1000 </span><span class="s1">* derived[key]) / </span><span class="s3">1000</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">console.debug(</span><span class="s2">'FillRateHelper deactivateAndFlush: '</span><span class="s1">, {derived, info});</span>
+    <span class="s1">}</span>
+    <span class="s1">_listeners.forEach(listener =&gt; listener(info));</span>
+    <span class="s4">this</span><span class="s1">._resetData();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">computeBlankness(</span>
+    <span class="s1">props: {</span>
+      <span class="s1">...FrameMetricProps,</span>
+      <span class="s1">initialNumToRender?: ?number,</span>
+      <span class="s1">...</span>
+    <span class="s1">},</span>
+    <span class="s1">cellsAroundViewport: {</span>
+      <span class="s1">first: number,</span>
+      <span class="s1">last: number,</span>
+      <span class="s1">...</span>
+    <span class="s1">},</span>
+    <span class="s1">scrollMetrics: {</span>
+      <span class="s1">dOffset: number,</span>
+      <span class="s1">offset: number,</span>
+      <span class="s1">velocity: number,</span>
+      <span class="s1">visibleLength: number,</span>
+      <span class="s1">...</span>
+    <span class="s1">},</span>
+  <span class="s1">): number {</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">!</span><span class="s4">this</span><span class="s1">._enabled ||</span>
+      <span class="s1">props.getItemCount(props.data) === </span><span class="s3">0 </span><span class="s1">||</span>
+      <span class="s1">cellsAroundViewport.last &lt; cellsAroundViewport.first ||</span>
+      <span class="s4">this</span><span class="s1">._samplesStartTime == </span><span class="s4">null</span>
+    <span class="s1">) {</span>
+      <span class="s4">return </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const {dOffset, offset, velocity, visibleLength} = scrollMetrics;</span>
+
+    <span class="s0">// Denominator metrics that we track for all events - most of the time there is no blankness and</span>
+    <span class="s0">// we want to capture that.</span>
+    <span class="s4">this</span><span class="s1">._info.sample_count++;</span>
+    <span class="s4">this</span><span class="s1">._info.pixels_sampled += Math.round(visibleLength);</span>
+    <span class="s4">this</span><span class="s1">._info.pixels_scrolled += Math.round(Math.abs(dOffset));</span>
+    <span class="s1">const scrollSpeed = Math.round(Math.abs(velocity) * </span><span class="s3">1000</span><span class="s1">); </span><span class="s0">// px / sec</span>
+
+    <span class="s0">// Whether blank now or not, record the elapsed time blank if we were blank last time.</span>
+    <span class="s1">const now = global.performance.now();</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._anyBlankStartTime != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._info.any_blank_ms += now - </span><span class="s4">this</span><span class="s1">._anyBlankStartTime;</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._anyBlankStartTime = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._mostlyBlankStartTime != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._info.mostly_blank_ms += now - </span><span class="s4">this</span><span class="s1">._mostlyBlankStartTime;</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._mostlyBlankStartTime = </span><span class="s4">null</span><span class="s1">;</span>
+
+    <span class="s1">let blankTop = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">let first = cellsAroundViewport.first;</span>
+    <span class="s1">let firstFrame = </span><span class="s4">this</span><span class="s1">._getFrameMetrics(first, props);</span>
+    <span class="s4">while </span><span class="s1">(</span>
+      <span class="s1">first &lt;= cellsAroundViewport.last &amp;&amp;</span>
+      <span class="s1">(!firstFrame || !firstFrame.inLayout)</span>
+    <span class="s1">) {</span>
+      <span class="s1">firstFrame = </span><span class="s4">this</span><span class="s1">._getFrameMetrics(first, props);</span>
+      <span class="s1">first++;</span>
+    <span class="s1">}</span>
+    <span class="s0">// Only count blankTop if we aren't rendering the first item, otherwise we will count the header</span>
+    <span class="s0">// as blank.</span>
+    <span class="s4">if </span><span class="s1">(firstFrame &amp;&amp; first &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">blankTop = Math.min(</span>
+        <span class="s1">visibleLength,</span>
+        <span class="s1">Math.max(</span><span class="s3">0</span><span class="s1">, firstFrame.offset - offset),</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">let blankBottom = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">let last = cellsAroundViewport.last;</span>
+    <span class="s1">let lastFrame = </span><span class="s4">this</span><span class="s1">._getFrameMetrics(last, props);</span>
+    <span class="s4">while </span><span class="s1">(</span>
+      <span class="s1">last &gt;= cellsAroundViewport.first &amp;&amp;</span>
+      <span class="s1">(!lastFrame || !lastFrame.inLayout)</span>
+    <span class="s1">) {</span>
+      <span class="s1">lastFrame = </span><span class="s4">this</span><span class="s1">._getFrameMetrics(last, props);</span>
+      <span class="s1">last--;</span>
+    <span class="s1">}</span>
+    <span class="s0">// Only count blankBottom if we aren't rendering the last item, otherwise we will count the</span>
+    <span class="s0">// footer as blank.</span>
+    <span class="s4">if </span><span class="s1">(lastFrame &amp;&amp; last &lt; props.getItemCount(props.data) - </span><span class="s3">1</span><span class="s1">) {</span>
+      <span class="s1">const bottomEdge = lastFrame.offset + lastFrame.length;</span>
+      <span class="s1">blankBottom = Math.min(</span>
+        <span class="s1">visibleLength,</span>
+        <span class="s1">Math.max(</span><span class="s3">0</span><span class="s1">, offset + visibleLength - bottomEdge),</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">const pixels_blank = Math.round(blankTop + blankBottom);</span>
+    <span class="s1">const blankness = pixels_blank / visibleLength;</span>
+    <span class="s4">if </span><span class="s1">(blankness &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._anyBlankStartTime = now;</span>
+      <span class="s4">this</span><span class="s1">._info.any_blank_speed_sum += scrollSpeed;</span>
+      <span class="s4">this</span><span class="s1">._info.any_blank_count++;</span>
+      <span class="s4">this</span><span class="s1">._info.pixels_blank += pixels_blank;</span>
+      <span class="s4">if </span><span class="s1">(blankness &gt; </span><span class="s3">0.5</span><span class="s1">) {</span>
+        <span class="s4">this</span><span class="s1">._mostlyBlankStartTime = now;</span>
+        <span class="s4">this</span><span class="s1">._info.mostly_blank_count++;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(scrollSpeed &lt; </span><span class="s3">0.01 </span><span class="s1">|| Math.abs(dOffset) &lt; </span><span class="s3">1</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">.deactivateAndFlush();</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">blankness;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">enabled(): boolean {</span>
+    <span class="s4">return this</span><span class="s1">._enabled;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_resetData() {</span>
+    <span class="s4">this</span><span class="s1">._anyBlankStartTime = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._info = </span><span class="s4">new </span><span class="s1">Info();</span>
+    <span class="s4">this</span><span class="s1">._mostlyBlankStartTime = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._samplesStartTime = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = FillRateHelper;</span>
+</pre>
+</body>
+</html>

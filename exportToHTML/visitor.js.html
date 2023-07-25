@@ -1,0 +1,864 @@
+<html>
+<head>
+<title>visitor.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #6a8759;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+visitor.js</font>
+</center></td></tr></table>
+<pre><span class="s0">const { createHash } = require(</span><span class="s1">'crypto'</span><span class="s0">);</span>
+<span class="s0">const { template } = require(</span><span class="s1">'@babel/core'</span><span class="s0">);</span>
+<span class="s0">const { defaults } = require(</span><span class="s1">'@istanbuljs/schema'</span><span class="s0">);</span>
+<span class="s0">const { SourceCoverage } = require(</span><span class="s1">'./source-coverage'</span><span class="s0">);</span>
+<span class="s0">const { SHA, MAGIC_KEY, MAGIC_VALUE } = require(</span><span class="s1">'./constants'</span><span class="s0">);</span>
+
+<span class="s2">// pattern for istanbul to ignore a section</span>
+<span class="s0">const COMMENT_RE = /^\s*istanbul\s+ignore\s+(</span><span class="s3">if</span><span class="s0">|</span><span class="s3">else</span><span class="s0">|next)(?=\W|$)/;</span>
+<span class="s2">// pattern for istanbul to ignore the whole file</span>
+<span class="s0">const COMMENT_FILE_RE = /^\s*istanbul\s+ignore\s+(file)(?=\W|$)/;</span>
+<span class="s2">// source map URL pattern</span>
+<span class="s0">const SOURCE_MAP_RE = /[#@]\s*sourceMappingURL=(.*)\s*$/m;</span>
+
+<span class="s2">// generate a variable name from hashing the supplied file path</span>
+<span class="s3">function </span><span class="s0">genVar(filename) {</span>
+    <span class="s0">const hash = createHash(SHA);</span>
+    <span class="s0">hash.update(filename);</span>
+    <span class="s3">return </span><span class="s1">'cov_' </span><span class="s0">+ parseInt(hash.digest(</span><span class="s1">'hex'</span><span class="s0">).substr(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">12</span><span class="s0">), </span><span class="s4">16</span><span class="s0">).toString(</span><span class="s4">36</span><span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s2">// VisitState holds the state of the visitor, provides helper functions</span>
+<span class="s2">// and is the `this` for the individual coverage visitors.</span>
+<span class="s0">class VisitState {</span>
+    <span class="s0">constructor(</span>
+        <span class="s0">types,</span>
+        <span class="s0">sourceFilePath,</span>
+        <span class="s0">inputSourceMap,</span>
+        <span class="s0">ignoreClassMethods = [],</span>
+        <span class="s0">reportLogic = </span><span class="s3">false</span>
+    <span class="s0">) {</span>
+        <span class="s3">this</span><span class="s0">.varName = genVar(sourceFilePath);</span>
+        <span class="s3">this</span><span class="s0">.attrs = {};</span>
+        <span class="s3">this</span><span class="s0">.nextIgnore = </span><span class="s3">null</span><span class="s0">;</span>
+        <span class="s3">this</span><span class="s0">.cov = </span><span class="s3">new </span><span class="s0">SourceCoverage(sourceFilePath);</span>
+
+        <span class="s3">if </span><span class="s0">(</span><span class="s3">typeof </span><span class="s0">inputSourceMap !== </span><span class="s1">'undefined'</span><span class="s0">) {</span>
+            <span class="s3">this</span><span class="s0">.cov.inputSourceMap(inputSourceMap);</span>
+        <span class="s0">}</span>
+        <span class="s3">this</span><span class="s0">.ignoreClassMethods = ignoreClassMethods;</span>
+        <span class="s3">this</span><span class="s0">.types = types;</span>
+        <span class="s3">this</span><span class="s0">.sourceMappingURL = </span><span class="s3">null</span><span class="s0">;</span>
+        <span class="s3">this</span><span class="s0">.reportLogic = reportLogic;</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// should we ignore the node? Yes, if specifically ignoring</span>
+    <span class="s2">// or if the node is generated.</span>
+    <span class="s0">shouldIgnore(path) {</span>
+        <span class="s3">return this</span><span class="s0">.nextIgnore || !path.node.loc;</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// extract the ignore comment hint (next|if|else) or null</span>
+    <span class="s0">hintFor(node) {</span>
+        <span class="s0">let hint = </span><span class="s3">null</span><span class="s0">;</span>
+        <span class="s3">if </span><span class="s0">(node.leadingComments) {</span>
+            <span class="s0">node.leadingComments.forEach(c =&gt; {</span>
+                <span class="s0">const v = (</span>
+                    <span class="s0">c.value || </span><span class="s2">/* istanbul ignore next: paranoid check */ </span><span class="s1">''</span>
+                <span class="s0">).trim();</span>
+                <span class="s0">const groups = v.match(COMMENT_RE);</span>
+                <span class="s3">if </span><span class="s0">(groups) {</span>
+                    <span class="s0">hint = groups[</span><span class="s4">1</span><span class="s0">];</span>
+                <span class="s0">}</span>
+            <span class="s0">});</span>
+        <span class="s0">}</span>
+        <span class="s3">return </span><span class="s0">hint;</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// extract a source map URL from comments and keep track of it</span>
+    <span class="s0">maybeAssignSourceMapURL(node) {</span>
+        <span class="s0">const extractURL = comments =&gt; {</span>
+            <span class="s3">if </span><span class="s0">(!comments) {</span>
+                <span class="s3">return</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s0">comments.forEach(c =&gt; {</span>
+                <span class="s0">const v = (</span>
+                    <span class="s0">c.value || </span><span class="s2">/* istanbul ignore next: paranoid check */ </span><span class="s1">''</span>
+                <span class="s0">).trim();</span>
+                <span class="s0">const groups = v.match(SOURCE_MAP_RE);</span>
+                <span class="s3">if </span><span class="s0">(groups) {</span>
+                    <span class="s3">this</span><span class="s0">.sourceMappingURL = groups[</span><span class="s4">1</span><span class="s0">];</span>
+                <span class="s0">}</span>
+            <span class="s0">});</span>
+        <span class="s0">};</span>
+        <span class="s0">extractURL(node.leadingComments);</span>
+        <span class="s0">extractURL(node.trailingComments);</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// for these expressions the statement counter needs to be hoisted, so</span>
+    <span class="s2">// function name inference can be preserved</span>
+    <span class="s0">counterNeedsHoisting(path) {</span>
+        <span class="s3">return </span><span class="s0">(</span>
+            <span class="s0">path.isFunctionExpression() ||</span>
+            <span class="s0">path.isArrowFunctionExpression() ||</span>
+            <span class="s0">path.isClassExpression()</span>
+        <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// all the generic stuff that needs to be done on enter for every node</span>
+    <span class="s0">onEnter(path) {</span>
+        <span class="s0">const n = path.node;</span>
+
+        <span class="s3">this</span><span class="s0">.maybeAssignSourceMapURL(n);</span>
+
+        <span class="s2">// if already ignoring, nothing more to do</span>
+        <span class="s3">if </span><span class="s0">(</span><span class="s3">this</span><span class="s0">.nextIgnore !== </span><span class="s3">null</span><span class="s0">) {</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s2">// check hint to see if ignore should be turned on</span>
+        <span class="s0">const hint = </span><span class="s3">this</span><span class="s0">.hintFor(n);</span>
+        <span class="s3">if </span><span class="s0">(hint === </span><span class="s1">'next'</span><span class="s0">) {</span>
+            <span class="s3">this</span><span class="s0">.nextIgnore = n;</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s2">// else check custom node attribute set by a prior visitor</span>
+        <span class="s3">if </span><span class="s0">(</span><span class="s3">this</span><span class="s0">.getAttr(path.node, </span><span class="s1">'skip-all'</span><span class="s0">) !== </span><span class="s3">null</span><span class="s0">) {</span>
+            <span class="s3">this</span><span class="s0">.nextIgnore = n;</span>
+        <span class="s0">}</span>
+
+        <span class="s2">// else check for ignored class methods</span>
+        <span class="s3">if </span><span class="s0">(</span>
+            <span class="s0">path.isFunctionExpression() &amp;&amp;</span>
+            <span class="s3">this</span><span class="s0">.ignoreClassMethods.some(</span>
+                <span class="s0">name =&gt; path.node.id &amp;&amp; name === path.node.id.name</span>
+            <span class="s0">)</span>
+        <span class="s0">) {</span>
+            <span class="s3">this</span><span class="s0">.nextIgnore = n;</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s3">if </span><span class="s0">(</span>
+            <span class="s0">path.isClassMethod() &amp;&amp;</span>
+            <span class="s3">this</span><span class="s0">.ignoreClassMethods.some(name =&gt; name === path.node.key.name)</span>
+        <span class="s0">) {</span>
+            <span class="s3">this</span><span class="s0">.nextIgnore = n;</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// all the generic stuff on exit of a node,</span>
+    <span class="s2">// including reseting ignores and custom node attrs</span>
+    <span class="s0">onExit(path) {</span>
+        <span class="s2">// restore ignore status, if needed</span>
+        <span class="s3">if </span><span class="s0">(path.node === </span><span class="s3">this</span><span class="s0">.nextIgnore) {</span>
+            <span class="s3">this</span><span class="s0">.nextIgnore = </span><span class="s3">null</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s2">// nuke all attributes for the node</span>
+        <span class="s3">delete </span><span class="s0">path.node.__cov__;</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// set a node attribute for the supplied node</span>
+    <span class="s0">setAttr(node, name, value) {</span>
+        <span class="s0">node.__cov__ = node.__cov__ || {};</span>
+        <span class="s0">node.__cov__[name] = value;</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// retrieve a node attribute for the supplied node or null</span>
+    <span class="s0">getAttr(node, name) {</span>
+        <span class="s0">const c = node.__cov__;</span>
+        <span class="s3">if </span><span class="s0">(!c) {</span>
+            <span class="s3">return null</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s3">return </span><span class="s0">c[name];</span>
+    <span class="s0">}</span>
+
+    <span class="s2">//</span>
+    <span class="s0">increase(type, id, index) {</span>
+        <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+        <span class="s0">const wrap =</span>
+            <span class="s0">index !== </span><span class="s3">null</span>
+                <span class="s0">? </span><span class="s2">// If `index` present, turn `x` into `x[index]`.</span>
+                  <span class="s0">x =&gt; T.memberExpression(x, T.numericLiteral(index), </span><span class="s3">true</span><span class="s0">)</span>
+                <span class="s0">: x =&gt; x;</span>
+        <span class="s3">return </span><span class="s0">T.updateExpression(</span>
+            <span class="s1">'++'</span><span class="s0">,</span>
+            <span class="s0">wrap(</span>
+                <span class="s0">T.memberExpression(</span>
+                    <span class="s0">T.memberExpression(</span>
+                        <span class="s0">T.callExpression(T.identifier(</span><span class="s3">this</span><span class="s0">.varName), []),</span>
+                        <span class="s0">T.identifier(type)</span>
+                    <span class="s0">),</span>
+                    <span class="s0">T.numericLiteral(id),</span>
+                    <span class="s3">true</span>
+                <span class="s0">)</span>
+            <span class="s0">)</span>
+        <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s2">// Reads the logic expression conditions and conditionally increments truthy counter.</span>
+    <span class="s0">increaseTrue(type, id, index, node) {</span>
+        <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+        <span class="s0">const tempName = `${</span><span class="s3">this</span><span class="s0">.varName}_temp`;</span>
+
+        <span class="s3">return </span><span class="s0">T.sequenceExpression([</span>
+            <span class="s0">T.assignmentExpression(</span>
+                <span class="s1">'='</span><span class="s0">,</span>
+                <span class="s0">T.memberExpression(</span>
+                    <span class="s0">T.callExpression(T.identifier(</span><span class="s3">this</span><span class="s0">.varName), []),</span>
+                    <span class="s0">T.identifier(tempName)</span>
+                <span class="s0">),</span>
+                <span class="s0">node </span><span class="s2">// Only evaluates once.</span>
+            <span class="s0">),</span>
+            <span class="s0">T.parenthesizedExpression(</span>
+                <span class="s0">T.conditionalExpression(</span>
+                    <span class="s3">this</span><span class="s0">.validateTrueNonTrivial(T, tempName),</span>
+                    <span class="s3">this</span><span class="s0">.increase(type, id, index),</span>
+                    <span class="s0">T.nullLiteral()</span>
+                <span class="s0">)</span>
+            <span class="s0">),</span>
+            <span class="s0">T.memberExpression(</span>
+                <span class="s0">T.callExpression(T.identifier(</span><span class="s3">this</span><span class="s0">.varName), []),</span>
+                <span class="s0">T.identifier(tempName)</span>
+            <span class="s0">)</span>
+        <span class="s0">]);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">validateTrueNonTrivial(T, tempName) {</span>
+        <span class="s3">return </span><span class="s0">T.logicalExpression(</span>
+            <span class="s1">'&amp;&amp;'</span><span class="s0">,</span>
+            <span class="s0">T.memberExpression(</span>
+                <span class="s0">T.callExpression(T.identifier(</span><span class="s3">this</span><span class="s0">.varName), []),</span>
+                <span class="s0">T.identifier(tempName)</span>
+            <span class="s0">),</span>
+            <span class="s0">T.logicalExpression(</span>
+                <span class="s1">'&amp;&amp;'</span><span class="s0">,</span>
+                <span class="s0">T.parenthesizedExpression(</span>
+                    <span class="s0">T.logicalExpression(</span>
+                        <span class="s1">'||'</span><span class="s0">,</span>
+                        <span class="s0">T.unaryExpression(</span>
+                            <span class="s1">'!'</span><span class="s0">,</span>
+                            <span class="s0">T.callExpression(</span>
+                                <span class="s0">T.memberExpression(</span>
+                                    <span class="s0">T.identifier(</span><span class="s1">'Array'</span><span class="s0">),</span>
+                                    <span class="s0">T.identifier(</span><span class="s1">'isArray'</span><span class="s0">)</span>
+                                <span class="s0">),</span>
+                                <span class="s0">[</span>
+                                    <span class="s0">T.memberExpression(</span>
+                                        <span class="s0">T.callExpression(</span>
+                                            <span class="s0">T.identifier(</span><span class="s3">this</span><span class="s0">.varName),</span>
+                                            <span class="s0">[]</span>
+                                        <span class="s0">),</span>
+                                        <span class="s0">T.identifier(tempName)</span>
+                                    <span class="s0">)</span>
+                                <span class="s0">]</span>
+                            <span class="s0">)</span>
+                        <span class="s0">),</span>
+                        <span class="s0">T.memberExpression(</span>
+                            <span class="s0">T.memberExpression(</span>
+                                <span class="s0">T.callExpression(</span>
+                                    <span class="s0">T.identifier(</span><span class="s3">this</span><span class="s0">.varName),</span>
+                                    <span class="s0">[]</span>
+                                <span class="s0">),</span>
+                                <span class="s0">T.identifier(tempName)</span>
+                            <span class="s0">),</span>
+                            <span class="s0">T.identifier(</span><span class="s1">'length'</span><span class="s0">)</span>
+                        <span class="s0">)</span>
+                    <span class="s0">)</span>
+                <span class="s0">),</span>
+                <span class="s0">T.parenthesizedExpression(</span>
+                    <span class="s0">T.logicalExpression(</span>
+                        <span class="s1">'||'</span><span class="s0">,</span>
+                        <span class="s0">T.binaryExpression(</span>
+                            <span class="s1">'!=='</span><span class="s0">,</span>
+                            <span class="s0">T.callExpression(</span>
+                                <span class="s0">T.memberExpression(</span>
+                                    <span class="s0">T.identifier(</span><span class="s1">'Object'</span><span class="s0">),</span>
+                                    <span class="s0">T.identifier(</span><span class="s1">'getPrototypeOf'</span><span class="s0">)</span>
+                                <span class="s0">),</span>
+                                <span class="s0">[</span>
+                                    <span class="s0">T.memberExpression(</span>
+                                        <span class="s0">T.callExpression(</span>
+                                            <span class="s0">T.identifier(</span><span class="s3">this</span><span class="s0">.varName),</span>
+                                            <span class="s0">[]</span>
+                                        <span class="s0">),</span>
+                                        <span class="s0">T.identifier(tempName)</span>
+                                    <span class="s0">)</span>
+                                <span class="s0">]</span>
+                            <span class="s0">),</span>
+                            <span class="s0">T.memberExpression(</span>
+                                <span class="s0">T.identifier(</span><span class="s1">'Object'</span><span class="s0">),</span>
+                                <span class="s0">T.identifier(</span><span class="s1">'prototype'</span><span class="s0">)</span>
+                            <span class="s0">)</span>
+                        <span class="s0">),</span>
+                        <span class="s0">T.memberExpression(</span>
+                            <span class="s0">T.callExpression(</span>
+                                <span class="s0">T.memberExpression(</span>
+                                    <span class="s0">T.identifier(</span><span class="s1">'Object'</span><span class="s0">),</span>
+                                    <span class="s0">T.identifier(</span><span class="s1">'values'</span><span class="s0">)</span>
+                                <span class="s0">),</span>
+                                <span class="s0">[</span>
+                                    <span class="s0">T.memberExpression(</span>
+                                        <span class="s0">T.callExpression(</span>
+                                            <span class="s0">T.identifier(</span><span class="s3">this</span><span class="s0">.varName),</span>
+                                            <span class="s0">[]</span>
+                                        <span class="s0">),</span>
+                                        <span class="s0">T.identifier(tempName)</span>
+                                    <span class="s0">)</span>
+                                <span class="s0">]</span>
+                            <span class="s0">),</span>
+                            <span class="s0">T.identifier(</span><span class="s1">'length'</span><span class="s0">)</span>
+                        <span class="s0">)</span>
+                    <span class="s0">)</span>
+                <span class="s0">)</span>
+            <span class="s0">)</span>
+        <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">insertCounter(path, increment) {</span>
+        <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+        <span class="s3">if </span><span class="s0">(path.isBlockStatement()) {</span>
+            <span class="s0">path.node.body.unshift(T.expressionStatement(increment));</span>
+        <span class="s0">} </span><span class="s3">else if </span><span class="s0">(path.isStatement()) {</span>
+            <span class="s0">path.insertBefore(T.expressionStatement(increment));</span>
+        <span class="s0">} </span><span class="s3">else if </span><span class="s0">(</span>
+            <span class="s3">this</span><span class="s0">.counterNeedsHoisting(path) &amp;&amp;</span>
+            <span class="s0">T.isVariableDeclarator(path.parentPath)</span>
+        <span class="s0">) {</span>
+            <span class="s2">// make an attempt to hoist the statement counter, so that</span>
+            <span class="s2">// function names are maintained.</span>
+            <span class="s0">const parent = path.parentPath.parentPath;</span>
+            <span class="s3">if </span><span class="s0">(parent &amp;&amp; T.isExportNamedDeclaration(parent.parentPath)) {</span>
+                <span class="s0">parent.parentPath.insertBefore(</span>
+                    <span class="s0">T.expressionStatement(increment)</span>
+                <span class="s0">);</span>
+            <span class="s0">} </span><span class="s3">else if </span><span class="s0">(</span>
+                <span class="s0">parent &amp;&amp;</span>
+                <span class="s0">(T.isProgram(parent.parentPath) ||</span>
+                    <span class="s0">T.isBlockStatement(parent.parentPath))</span>
+            <span class="s0">) {</span>
+                <span class="s0">parent.insertBefore(T.expressionStatement(increment));</span>
+            <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+                <span class="s0">path.replaceWith(T.sequenceExpression([increment, path.node]));</span>
+            <span class="s0">}</span>
+        <span class="s0">} </span><span class="s2">/* istanbul ignore else: not expected */ </span><span class="s3">else if </span><span class="s0">(</span>
+            <span class="s0">path.isExpression()</span>
+        <span class="s0">) {</span>
+            <span class="s0">path.replaceWith(T.sequenceExpression([increment, path.node]));</span>
+        <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+            <span class="s0">console.error(</span>
+                <span class="s1">'Unable to insert counter for node type:'</span><span class="s0">,</span>
+                <span class="s0">path.node.type</span>
+            <span class="s0">);</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">insertStatementCounter(path) {</span>
+        <span class="s2">/* istanbul ignore if: paranoid check */</span>
+        <span class="s3">if </span><span class="s0">(!(path.node &amp;&amp; path.node.loc)) {</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s0">const index = </span><span class="s3">this</span><span class="s0">.cov.newStatement(path.node.loc);</span>
+        <span class="s0">const increment = </span><span class="s3">this</span><span class="s0">.increase(</span><span class="s1">'s'</span><span class="s0">, index, </span><span class="s3">null</span><span class="s0">);</span>
+        <span class="s3">this</span><span class="s0">.insertCounter(path, increment);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">insertFunctionCounter(path) {</span>
+        <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+        <span class="s2">/* istanbul ignore if: paranoid check */</span>
+        <span class="s3">if </span><span class="s0">(!(path.node &amp;&amp; path.node.loc)) {</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s0">const n = path.node;</span>
+
+        <span class="s0">let dloc = </span><span class="s3">null</span><span class="s0">;</span>
+        <span class="s2">// get location for declaration</span>
+        <span class="s3">switch </span><span class="s0">(n.type) {</span>
+            <span class="s3">case </span><span class="s1">'FunctionDeclaration'</span><span class="s0">:</span>
+            <span class="s3">case </span><span class="s1">'FunctionExpression'</span><span class="s0">:</span>
+                <span class="s2">/* istanbul ignore else: paranoid check */</span>
+                <span class="s3">if </span><span class="s0">(n.id) {</span>
+                    <span class="s0">dloc = n.id.loc;</span>
+                <span class="s0">}</span>
+                <span class="s3">break</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s3">if </span><span class="s0">(!dloc) {</span>
+            <span class="s0">dloc = {</span>
+                <span class="s0">start: n.loc.start,</span>
+                <span class="s0">end: { line: n.loc.start.line, column: n.loc.start.column + </span><span class="s4">1 </span><span class="s0">}</span>
+            <span class="s0">};</span>
+        <span class="s0">}</span>
+
+        <span class="s0">const name = path.node.id ? path.node.id.name : path.node.name;</span>
+        <span class="s0">const index = </span><span class="s3">this</span><span class="s0">.cov.newFunction(name, dloc, path.node.body.loc);</span>
+        <span class="s0">const increment = </span><span class="s3">this</span><span class="s0">.increase(</span><span class="s1">'f'</span><span class="s0">, index, </span><span class="s3">null</span><span class="s0">);</span>
+        <span class="s0">const body = path.get(</span><span class="s1">'body'</span><span class="s0">);</span>
+        <span class="s2">/* istanbul ignore else: not expected */</span>
+        <span class="s3">if </span><span class="s0">(body.isBlockStatement()) {</span>
+            <span class="s0">body.node.body.unshift(T.expressionStatement(increment));</span>
+        <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+            <span class="s0">console.error(</span>
+                <span class="s1">'Unable to process function body node type:'</span><span class="s0">,</span>
+                <span class="s0">path.node.type</span>
+            <span class="s0">);</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">getBranchIncrement(branchName, loc) {</span>
+        <span class="s0">const index = </span><span class="s3">this</span><span class="s0">.cov.addBranchPath(branchName, loc);</span>
+        <span class="s3">return this</span><span class="s0">.increase(</span><span class="s1">'b'</span><span class="s0">, branchName, index);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">getBranchLogicIncrement(path, branchName, loc) {</span>
+        <span class="s0">const index = </span><span class="s3">this</span><span class="s0">.cov.addBranchPath(branchName, loc);</span>
+        <span class="s3">return </span><span class="s0">[</span>
+            <span class="s3">this</span><span class="s0">.increase(</span><span class="s1">'b'</span><span class="s0">, branchName, index),</span>
+            <span class="s3">this</span><span class="s0">.increaseTrue(</span><span class="s1">'bT'</span><span class="s0">, branchName, index, path.node)</span>
+        <span class="s0">];</span>
+    <span class="s0">}</span>
+
+    <span class="s0">insertBranchCounter(path, branchName, loc) {</span>
+        <span class="s0">const increment = </span><span class="s3">this</span><span class="s0">.getBranchIncrement(</span>
+            <span class="s0">branchName,</span>
+            <span class="s0">loc || path.node.loc</span>
+        <span class="s0">);</span>
+        <span class="s3">this</span><span class="s0">.insertCounter(path, increment);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">findLeaves(node, accumulator, parent, property) {</span>
+        <span class="s3">if </span><span class="s0">(!node) {</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s3">if </span><span class="s0">(node.type === </span><span class="s1">'LogicalExpression'</span><span class="s0">) {</span>
+            <span class="s0">const hint = </span><span class="s3">this</span><span class="s0">.hintFor(node);</span>
+            <span class="s3">if </span><span class="s0">(hint !== </span><span class="s1">'next'</span><span class="s0">) {</span>
+                <span class="s3">this</span><span class="s0">.findLeaves(node.left, accumulator, node, </span><span class="s1">'left'</span><span class="s0">);</span>
+                <span class="s3">this</span><span class="s0">.findLeaves(node.right, accumulator, node, </span><span class="s1">'right'</span><span class="s0">);</span>
+            <span class="s0">}</span>
+        <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+            <span class="s0">accumulator.push({</span>
+                <span class="s0">node,</span>
+                <span class="s0">parent,</span>
+                <span class="s0">property</span>
+            <span class="s0">});</span>
+        <span class="s0">}</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s2">// generic function that takes a set of visitor methods and</span>
+<span class="s2">// returns a visitor object with `enter` and `exit` properties,</span>
+<span class="s2">// such that:</span>
+<span class="s2">//</span>
+<span class="s2">// * standard entry processing is done</span>
+<span class="s2">// * the supplied visitors are called only when ignore is not in effect</span>
+<span class="s2">//   This relieves them from worrying about ignore states and generated nodes.</span>
+<span class="s2">// * standard exit processing is done</span>
+<span class="s2">//</span>
+<span class="s3">function </span><span class="s0">entries(...enter) {</span>
+    <span class="s2">// the enter function</span>
+    <span class="s0">const wrappedEntry = </span><span class="s3">function</span><span class="s0">(path, node) {</span>
+        <span class="s3">this</span><span class="s0">.onEnter(path);</span>
+        <span class="s3">if </span><span class="s0">(</span><span class="s3">this</span><span class="s0">.shouldIgnore(path)) {</span>
+            <span class="s3">return</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s0">enter.forEach(e =&gt; {</span>
+            <span class="s0">e.call(</span><span class="s3">this</span><span class="s0">, path, node);</span>
+        <span class="s0">});</span>
+    <span class="s0">};</span>
+    <span class="s0">const exit = </span><span class="s3">function</span><span class="s0">(path, node) {</span>
+        <span class="s3">this</span><span class="s0">.onExit(path, node);</span>
+    <span class="s0">};</span>
+    <span class="s3">return </span><span class="s0">{</span>
+        <span class="s0">enter: wrappedEntry,</span>
+        <span class="s0">exit</span>
+    <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverStatement(path) {</span>
+    <span class="s3">this</span><span class="s0">.insertStatementCounter(path);</span>
+<span class="s0">}</span>
+
+<span class="s2">/* istanbul ignore next: no node.js support */</span>
+<span class="s3">function </span><span class="s0">coverAssignmentPattern(path) {</span>
+    <span class="s0">const n = path.node;</span>
+    <span class="s0">const b = </span><span class="s3">this</span><span class="s0">.cov.newBranch(</span><span class="s1">'default-arg'</span><span class="s0">, n.loc);</span>
+    <span class="s3">this</span><span class="s0">.insertBranchCounter(path.get(</span><span class="s1">'right'</span><span class="s0">), b);</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverFunction(path) {</span>
+    <span class="s3">this</span><span class="s0">.insertFunctionCounter(path);</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverVariableDeclarator(path) {</span>
+    <span class="s3">this</span><span class="s0">.insertStatementCounter(path.get(</span><span class="s1">'init'</span><span class="s0">));</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverClassPropDeclarator(path) {</span>
+    <span class="s3">this</span><span class="s0">.insertStatementCounter(path.get(</span><span class="s1">'value'</span><span class="s0">));</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">makeBlock(path) {</span>
+    <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+    <span class="s3">if </span><span class="s0">(!path.node) {</span>
+        <span class="s0">path.replaceWith(T.blockStatement([]));</span>
+    <span class="s0">}</span>
+    <span class="s3">if </span><span class="s0">(!path.isBlockStatement()) {</span>
+        <span class="s0">path.replaceWith(T.blockStatement([path.node]));</span>
+        <span class="s0">path.node.loc = path.node.body[</span><span class="s4">0</span><span class="s0">].loc;</span>
+        <span class="s0">path.node.body[</span><span class="s4">0</span><span class="s0">].leadingComments = path.node.leadingComments;</span>
+        <span class="s0">path.node.leadingComments = undefined;</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">blockProp(prop) {</span>
+    <span class="s3">return function</span><span class="s0">(path) {</span>
+        <span class="s0">makeBlock.call(</span><span class="s3">this</span><span class="s0">, path.get(prop));</span>
+    <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">makeParenthesizedExpressionForNonIdentifier(path) {</span>
+    <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+    <span class="s3">if </span><span class="s0">(path.node &amp;&amp; !path.isIdentifier()) {</span>
+        <span class="s0">path.replaceWith(T.parenthesizedExpression(path.node));</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">parenthesizedExpressionProp(prop) {</span>
+    <span class="s3">return function</span><span class="s0">(path) {</span>
+        <span class="s0">makeParenthesizedExpressionForNonIdentifier.call(</span><span class="s3">this</span><span class="s0">, path.get(prop));</span>
+    <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">convertArrowExpression(path) {</span>
+    <span class="s0">const n = path.node;</span>
+    <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+    <span class="s3">if </span><span class="s0">(!T.isBlockStatement(n.body)) {</span>
+        <span class="s0">const bloc = n.body.loc;</span>
+        <span class="s3">if </span><span class="s0">(n.expression === </span><span class="s3">true</span><span class="s0">) {</span>
+            <span class="s0">n.expression = </span><span class="s3">false</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s0">n.body = T.blockStatement([T.returnStatement(n.body)]);</span>
+        <span class="s2">// restore body location</span>
+        <span class="s0">n.body.loc = bloc;</span>
+        <span class="s2">// set up the location for the return statement so it gets</span>
+        <span class="s2">// instrumented</span>
+        <span class="s0">n.body.body[</span><span class="s4">0</span><span class="s0">].loc = bloc;</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverIfBranches(path) {</span>
+    <span class="s0">const n = path.node;</span>
+    <span class="s0">const hint = </span><span class="s3">this</span><span class="s0">.hintFor(n);</span>
+    <span class="s0">const ignoreIf = hint === </span><span class="s1">'if'</span><span class="s0">;</span>
+    <span class="s0">const ignoreElse = hint === </span><span class="s1">'else'</span><span class="s0">;</span>
+    <span class="s0">const branch = </span><span class="s3">this</span><span class="s0">.cov.newBranch(</span><span class="s1">'if'</span><span class="s0">, n.loc);</span>
+
+    <span class="s3">if </span><span class="s0">(ignoreIf) {</span>
+        <span class="s3">this</span><span class="s0">.setAttr(n.consequent, </span><span class="s1">'skip-all'</span><span class="s0">, </span><span class="s3">true</span><span class="s0">);</span>
+    <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+        <span class="s3">this</span><span class="s0">.insertBranchCounter(path.get(</span><span class="s1">'consequent'</span><span class="s0">), branch, n.loc);</span>
+    <span class="s0">}</span>
+    <span class="s3">if </span><span class="s0">(ignoreElse) {</span>
+        <span class="s3">this</span><span class="s0">.setAttr(n.alternate, </span><span class="s1">'skip-all'</span><span class="s0">, </span><span class="s3">true</span><span class="s0">);</span>
+    <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+        <span class="s3">this</span><span class="s0">.insertBranchCounter(path.get(</span><span class="s1">'alternate'</span><span class="s0">), branch);</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">createSwitchBranch(path) {</span>
+    <span class="s0">const b = </span><span class="s3">this</span><span class="s0">.cov.newBranch(</span><span class="s1">'switch'</span><span class="s0">, path.node.loc);</span>
+    <span class="s3">this</span><span class="s0">.setAttr(path.node, </span><span class="s1">'branchName'</span><span class="s0">, b);</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverSwitchCase(path) {</span>
+    <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+    <span class="s0">const b = </span><span class="s3">this</span><span class="s0">.getAttr(path.parentPath.node, </span><span class="s1">'branchName'</span><span class="s0">);</span>
+    <span class="s2">/* istanbul ignore if: paranoid check */</span>
+    <span class="s3">if </span><span class="s0">(b === </span><span class="s3">null</span><span class="s0">) {</span>
+        <span class="s3">throw new </span><span class="s0">Error(</span><span class="s1">'Unable to get switch branch name'</span><span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s0">const increment = </span><span class="s3">this</span><span class="s0">.getBranchIncrement(b, path.node.loc);</span>
+    <span class="s0">path.node.consequent.unshift(T.expressionStatement(increment));</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverTernary(path) {</span>
+    <span class="s0">const n = path.node;</span>
+    <span class="s0">const branch = </span><span class="s3">this</span><span class="s0">.cov.newBranch(</span><span class="s1">'cond-expr'</span><span class="s0">, path.node.loc);</span>
+    <span class="s0">const cHint = </span><span class="s3">this</span><span class="s0">.hintFor(n.consequent);</span>
+    <span class="s0">const aHint = </span><span class="s3">this</span><span class="s0">.hintFor(n.alternate);</span>
+
+    <span class="s3">if </span><span class="s0">(cHint !== </span><span class="s1">'next'</span><span class="s0">) {</span>
+        <span class="s3">this</span><span class="s0">.insertBranchCounter(path.get(</span><span class="s1">'consequent'</span><span class="s0">), branch);</span>
+    <span class="s0">}</span>
+    <span class="s3">if </span><span class="s0">(aHint !== </span><span class="s1">'next'</span><span class="s0">) {</span>
+        <span class="s3">this</span><span class="s0">.insertBranchCounter(path.get(</span><span class="s1">'alternate'</span><span class="s0">), branch);</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s3">function </span><span class="s0">coverLogicalExpression(path) {</span>
+    <span class="s0">const T = </span><span class="s3">this</span><span class="s0">.types;</span>
+    <span class="s3">if </span><span class="s0">(path.parentPath.node.type === </span><span class="s1">'LogicalExpression'</span><span class="s0">) {</span>
+        <span class="s3">return</span><span class="s0">; </span><span class="s2">// already processed</span>
+    <span class="s0">}</span>
+    <span class="s0">const leaves = [];</span>
+    <span class="s3">this</span><span class="s0">.findLeaves(path.node, leaves);</span>
+    <span class="s0">const b = </span><span class="s3">this</span><span class="s0">.cov.newBranch(</span>
+        <span class="s1">'binary-expr'</span><span class="s0">,</span>
+        <span class="s0">path.node.loc,</span>
+        <span class="s3">this</span><span class="s0">.reportLogic</span>
+    <span class="s0">);</span>
+    <span class="s3">for </span><span class="s0">(let i = </span><span class="s4">0</span><span class="s0">; i &lt; leaves.length; i += </span><span class="s4">1</span><span class="s0">) {</span>
+        <span class="s0">const leaf = leaves[i];</span>
+        <span class="s0">const hint = </span><span class="s3">this</span><span class="s0">.hintFor(leaf.node);</span>
+        <span class="s3">if </span><span class="s0">(hint === </span><span class="s1">'next'</span><span class="s0">) {</span>
+            <span class="s3">continue</span><span class="s0">;</span>
+        <span class="s0">}</span>
+
+        <span class="s3">if </span><span class="s0">(</span><span class="s3">this</span><span class="s0">.reportLogic) {</span>
+            <span class="s0">const increment = </span><span class="s3">this</span><span class="s0">.getBranchLogicIncrement(</span>
+                <span class="s0">leaf,</span>
+                <span class="s0">b,</span>
+                <span class="s0">leaf.node.loc</span>
+            <span class="s0">);</span>
+            <span class="s3">if </span><span class="s0">(!increment[</span><span class="s4">0</span><span class="s0">]) {</span>
+                <span class="s3">continue</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s0">leaf.parent[leaf.property] = T.sequenceExpression([</span>
+                <span class="s0">increment[</span><span class="s4">0</span><span class="s0">],</span>
+                <span class="s0">increment[</span><span class="s4">1</span><span class="s0">]</span>
+            <span class="s0">]);</span>
+            <span class="s3">continue</span><span class="s0">;</span>
+        <span class="s0">}</span>
+
+        <span class="s0">const increment = </span><span class="s3">this</span><span class="s0">.getBranchIncrement(b, leaf.node.loc);</span>
+        <span class="s3">if </span><span class="s0">(!increment) {</span>
+            <span class="s3">continue</span><span class="s0">;</span>
+        <span class="s0">}</span>
+        <span class="s0">leaf.parent[leaf.property] = T.sequenceExpression([</span>
+            <span class="s0">increment,</span>
+            <span class="s0">leaf.node</span>
+        <span class="s0">]);</span>
+    <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">const codeVisitor = {</span>
+    <span class="s0">ArrowFunctionExpression: entries(convertArrowExpression, coverFunction),</span>
+    <span class="s0">AssignmentPattern: entries(coverAssignmentPattern),</span>
+    <span class="s0">BlockStatement: entries(), </span><span class="s2">// ignore processing only</span>
+    <span class="s0">ExportDefaultDeclaration: entries(), </span><span class="s2">// ignore processing only</span>
+    <span class="s0">ExportNamedDeclaration: entries(), </span><span class="s2">// ignore processing only</span>
+    <span class="s0">ClassMethod: entries(coverFunction),</span>
+    <span class="s0">ClassDeclaration: entries(parenthesizedExpressionProp(</span><span class="s1">'superClass'</span><span class="s0">)),</span>
+    <span class="s0">ClassProperty: entries(coverClassPropDeclarator),</span>
+    <span class="s0">ClassPrivateProperty: entries(coverClassPropDeclarator),</span>
+    <span class="s0">ObjectMethod: entries(coverFunction),</span>
+    <span class="s0">ExpressionStatement: entries(coverStatement),</span>
+    <span class="s0">BreakStatement: entries(coverStatement),</span>
+    <span class="s0">ContinueStatement: entries(coverStatement),</span>
+    <span class="s0">DebuggerStatement: entries(coverStatement),</span>
+    <span class="s0">ReturnStatement: entries(coverStatement),</span>
+    <span class="s0">ThrowStatement: entries(coverStatement),</span>
+    <span class="s0">TryStatement: entries(coverStatement),</span>
+    <span class="s0">VariableDeclaration: entries(), </span><span class="s2">// ignore processing only</span>
+    <span class="s0">VariableDeclarator: entries(coverVariableDeclarator),</span>
+    <span class="s0">IfStatement: entries(</span>
+        <span class="s0">blockProp(</span><span class="s1">'consequent'</span><span class="s0">),</span>
+        <span class="s0">blockProp(</span><span class="s1">'alternate'</span><span class="s0">),</span>
+        <span class="s0">coverStatement,</span>
+        <span class="s0">coverIfBranches</span>
+    <span class="s0">),</span>
+    <span class="s0">ForStatement: entries(blockProp(</span><span class="s1">'body'</span><span class="s0">), coverStatement),</span>
+    <span class="s0">ForInStatement: entries(blockProp(</span><span class="s1">'body'</span><span class="s0">), coverStatement),</span>
+    <span class="s0">ForOfStatement: entries(blockProp(</span><span class="s1">'body'</span><span class="s0">), coverStatement),</span>
+    <span class="s0">WhileStatement: entries(blockProp(</span><span class="s1">'body'</span><span class="s0">), coverStatement),</span>
+    <span class="s0">DoWhileStatement: entries(blockProp(</span><span class="s1">'body'</span><span class="s0">), coverStatement),</span>
+    <span class="s0">SwitchStatement: entries(createSwitchBranch, coverStatement),</span>
+    <span class="s0">SwitchCase: entries(coverSwitchCase),</span>
+    <span class="s0">WithStatement: entries(blockProp(</span><span class="s1">'body'</span><span class="s0">), coverStatement),</span>
+    <span class="s0">FunctionDeclaration: entries(coverFunction),</span>
+    <span class="s0">FunctionExpression: entries(coverFunction),</span>
+    <span class="s0">LabeledStatement: entries(coverStatement),</span>
+    <span class="s0">ConditionalExpression: entries(coverTernary),</span>
+    <span class="s0">LogicalExpression: entries(coverLogicalExpression)</span>
+<span class="s0">};</span>
+<span class="s0">const globalTemplateAlteredFunction = template(`</span>
+        <span class="s3">var </span><span class="s0">Function = (</span><span class="s3">function</span><span class="s0">(){}).constructor;</span>
+        <span class="s3">var </span><span class="s0">global = (</span><span class="s3">new </span><span class="s0">Function(GLOBAL_COVERAGE_SCOPE))();</span>
+<span class="s0">`);</span>
+<span class="s0">const globalTemplateFunction = template(`</span>
+        <span class="s3">var </span><span class="s0">global = (</span><span class="s3">new </span><span class="s0">Function(GLOBAL_COVERAGE_SCOPE))();</span>
+<span class="s0">`);</span>
+<span class="s0">const globalTemplateVariable = template(`</span>
+        <span class="s3">var </span><span class="s0">global = GLOBAL_COVERAGE_SCOPE;</span>
+<span class="s0">`);</span>
+<span class="s2">// the template to insert at the top of the program.</span>
+<span class="s0">const coverageTemplate = template(</span>
+    <span class="s0">`</span>
+    <span class="s3">function </span><span class="s0">COVERAGE_FUNCTION () {</span>
+        <span class="s3">var </span><span class="s0">path = PATH;</span>
+        <span class="s3">var </span><span class="s0">hash = HASH;</span>
+        <span class="s0">GLOBAL_COVERAGE_TEMPLATE</span>
+        <span class="s3">var </span><span class="s0">gcv = GLOBAL_COVERAGE_VAR;</span>
+        <span class="s3">var </span><span class="s0">coverageData = INITIAL;</span>
+        <span class="s3">var </span><span class="s0">coverage = global[gcv] || (global[gcv] = {});</span>
+        <span class="s3">if </span><span class="s0">(!coverage[path] || coverage[path].hash !== hash) {</span>
+            <span class="s0">coverage[path] = coverageData;</span>
+        <span class="s0">}</span>
+
+        <span class="s3">var </span><span class="s0">actualCoverage = coverage[path];</span>
+        <span class="s0">{</span>
+            <span class="s2">// @ts-ignore</span>
+            <span class="s0">COVERAGE_FUNCTION = </span><span class="s3">function </span><span class="s0">() {</span>
+                <span class="s3">return </span><span class="s0">actualCoverage;</span>
+            <span class="s0">}</span>
+        <span class="s0">}</span>
+
+        <span class="s3">return </span><span class="s0">actualCoverage;</span>
+    <span class="s0">}</span>
+<span class="s0">`,</span>
+    <span class="s0">{ preserveComments: </span><span class="s3">true </span><span class="s0">}</span>
+<span class="s0">);</span>
+<span class="s2">// the rewire plugin (and potentially other babel middleware)</span>
+<span class="s2">// may cause files to be instrumented twice, see:</span>
+<span class="s2">// https://github.com/istanbuljs/babel-plugin-istanbul/issues/94</span>
+<span class="s2">// we should only instrument code for coverage the first time</span>
+<span class="s2">// it's run through istanbul-lib-instrument.</span>
+<span class="s3">function </span><span class="s0">alreadyInstrumented(path, visitState) {</span>
+    <span class="s3">return </span><span class="s0">path.scope.hasBinding(visitState.varName);</span>
+<span class="s0">}</span>
+<span class="s3">function </span><span class="s0">shouldIgnoreFile(programNode) {</span>
+    <span class="s3">return </span><span class="s0">(</span>
+        <span class="s0">programNode.parent &amp;&amp;</span>
+        <span class="s0">programNode.parent.comments.some(c =&gt; COMMENT_FILE_RE.test(c.value))</span>
+    <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s2">/** 
+ * programVisitor is a `babel` adaptor for instrumentation. 
+ * It returns an object with two methods `enter` and `exit`. 
+ * These should be assigned to or called from `Program` entry and exit functions 
+ * in a babel visitor. 
+ * These functions do not make assumptions about the state set by Babel and thus 
+ * can be used in a context other than a Babel plugin. 
+ * 
+ * The exit function returns an object that currently has the following keys: 
+ * 
+ * `fileCoverage` - the file coverage object created for the source file. 
+ * `sourceMappingURL` - any source mapping URL found when processing the file. 
+ * 
+ * @param {Object} types - an instance of babel-types. 
+ * @param {string} sourceFilePath - the path to source file. 
+ * @param {Object} opts - additional options. 
+ * @param {string} [opts.coverageVariable=__coverage__] the global coverage variable name. 
+ * @param {boolean} [opts.reportLogic=false] report boolean value of logical expressions. 
+ * @param {string} [opts.coverageGlobalScope=this] the global coverage variable scope. 
+ * @param {boolean} [opts.coverageGlobalScopeFunc=true] use an evaluated function to find coverageGlobalScope. 
+ * @param {Array} [opts.ignoreClassMethods=[]] names of methods to ignore by default on classes. 
+ * @param {object} [opts.inputSourceMap=undefined] the input source map, that maps the uninstrumented code back to the 
+ * original code. 
+ */</span>
+<span class="s3">function </span><span class="s0">programVisitor(types, sourceFilePath = </span><span class="s1">'unknown.js'</span><span class="s0">, opts = {}) {</span>
+    <span class="s0">const T = types;</span>
+    <span class="s0">opts = {</span>
+        <span class="s0">...defaults.instrumentVisitor,</span>
+        <span class="s0">...opts</span>
+    <span class="s0">};</span>
+    <span class="s0">const visitState = </span><span class="s3">new </span><span class="s0">VisitState(</span>
+        <span class="s0">types,</span>
+        <span class="s0">sourceFilePath,</span>
+        <span class="s0">opts.inputSourceMap,</span>
+        <span class="s0">opts.ignoreClassMethods,</span>
+        <span class="s0">opts.reportLogic</span>
+    <span class="s0">);</span>
+    <span class="s3">return </span><span class="s0">{</span>
+        <span class="s0">enter(path) {</span>
+            <span class="s3">if </span><span class="s0">(shouldIgnoreFile(path.find(p =&gt; p.isProgram()))) {</span>
+                <span class="s3">return</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s3">if </span><span class="s0">(alreadyInstrumented(path, visitState)) {</span>
+                <span class="s3">return</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s0">path.traverse(codeVisitor, visitState);</span>
+        <span class="s0">},</span>
+        <span class="s0">exit(path) {</span>
+            <span class="s3">if </span><span class="s0">(alreadyInstrumented(path, visitState)) {</span>
+                <span class="s3">return</span><span class="s0">;</span>
+            <span class="s0">}</span>
+            <span class="s0">visitState.cov.freeze();</span>
+            <span class="s0">const coverageData = visitState.cov.toJSON();</span>
+            <span class="s3">if </span><span class="s0">(shouldIgnoreFile(path.find(p =&gt; p.isProgram()))) {</span>
+                <span class="s3">return </span><span class="s0">{</span>
+                    <span class="s0">fileCoverage: coverageData,</span>
+                    <span class="s0">sourceMappingURL: visitState.sourceMappingURL</span>
+                <span class="s0">};</span>
+            <span class="s0">}</span>
+            <span class="s0">coverageData[MAGIC_KEY] = MAGIC_VALUE;</span>
+            <span class="s0">const hash = createHash(SHA)</span>
+                <span class="s0">.update(JSON.stringify(coverageData))</span>
+                <span class="s0">.digest(</span><span class="s1">'hex'</span><span class="s0">);</span>
+            <span class="s0">coverageData.hash = hash;</span>
+            <span class="s3">if </span><span class="s0">(</span>
+                <span class="s0">coverageData.inputSourceMap &amp;&amp;</span>
+                <span class="s0">Object.getPrototypeOf(coverageData.inputSourceMap) !==</span>
+                    <span class="s0">Object.prototype</span>
+            <span class="s0">) {</span>
+                <span class="s0">coverageData.inputSourceMap = {</span>
+                    <span class="s0">...coverageData.inputSourceMap</span>
+                <span class="s0">};</span>
+            <span class="s0">}</span>
+            <span class="s0">const coverageNode = T.valueToNode(coverageData);</span>
+            <span class="s3">delete </span><span class="s0">coverageData[MAGIC_KEY];</span>
+            <span class="s3">delete </span><span class="s0">coverageData.hash;</span>
+            <span class="s0">let gvTemplate;</span>
+            <span class="s3">if </span><span class="s0">(opts.coverageGlobalScopeFunc) {</span>
+                <span class="s3">if </span><span class="s0">(path.scope.getBinding(</span><span class="s1">'Function'</span><span class="s0">)) {</span>
+                    <span class="s0">gvTemplate = globalTemplateAlteredFunction({</span>
+                        <span class="s0">GLOBAL_COVERAGE_SCOPE: T.stringLiteral(</span>
+                            <span class="s1">'return ' </span><span class="s0">+ opts.coverageGlobalScope</span>
+                        <span class="s0">)</span>
+                    <span class="s0">});</span>
+                <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+                    <span class="s0">gvTemplate = globalTemplateFunction({</span>
+                        <span class="s0">GLOBAL_COVERAGE_SCOPE: T.stringLiteral(</span>
+                            <span class="s1">'return ' </span><span class="s0">+ opts.coverageGlobalScope</span>
+                        <span class="s0">)</span>
+                    <span class="s0">});</span>
+                <span class="s0">}</span>
+            <span class="s0">} </span><span class="s3">else </span><span class="s0">{</span>
+                <span class="s0">gvTemplate = globalTemplateVariable({</span>
+                    <span class="s0">GLOBAL_COVERAGE_SCOPE: opts.coverageGlobalScope</span>
+                <span class="s0">});</span>
+            <span class="s0">}</span>
+            <span class="s0">const cv = coverageTemplate({</span>
+                <span class="s0">GLOBAL_COVERAGE_VAR: T.stringLiteral(opts.coverageVariable),</span>
+                <span class="s0">GLOBAL_COVERAGE_TEMPLATE: gvTemplate,</span>
+                <span class="s0">COVERAGE_FUNCTION: T.identifier(visitState.varName),</span>
+                <span class="s0">PATH: T.stringLiteral(sourceFilePath),</span>
+                <span class="s0">INITIAL: coverageNode,</span>
+                <span class="s0">HASH: T.stringLiteral(hash)</span>
+            <span class="s0">});</span>
+            <span class="s2">// explicitly call this.varName to ensure coverage is always initialized</span>
+            <span class="s0">path.node.body.unshift(</span>
+                <span class="s0">T.expressionStatement(</span>
+                    <span class="s0">T.callExpression(T.identifier(visitState.varName), [])</span>
+                <span class="s0">)</span>
+            <span class="s0">);</span>
+            <span class="s0">path.node.body.unshift(cv);</span>
+            <span class="s3">return </span><span class="s0">{</span>
+                <span class="s0">fileCoverage: coverageData,</span>
+                <span class="s0">sourceMappingURL: visitState.sourceMappingURL</span>
+            <span class="s0">};</span>
+        <span class="s0">}</span>
+    <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = programVisitor;</span>
+</pre>
+</body>
+</html>

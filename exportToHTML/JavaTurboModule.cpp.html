@@ -1,0 +1,811 @@
+<html>
+<head>
+<title>JavaTurboModule.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JavaTurboModule.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;sstream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;string&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;fbjni/fbjni.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;ReactCommon/TurboModule.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;ReactCommon/TurboModulePerfLogger.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;ReactCommon/TurboModuleUtils.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;butter/function.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/JSIDynamic.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/jni/NativeMap.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/jni/ReadableNativeMap.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/jni/WritableNativeMap.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;JavaTurboModule.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">namespace </span><span class="s1">TMPL = TurboModulePerfLogger</span><span class="s4">;</span>
+
+<span class="s1">JavaTurboModule::JavaTurboModule(</span><span class="s4">const </span><span class="s1">InitParams &amp;params)</span>
+    <span class="s1">: TurboModule(params.moduleName</span><span class="s4">, </span><span class="s1">params.jsInvoker)</span><span class="s4">,</span>
+      <span class="s1">instance_(jni::make_global(params.instance))</span><span class="s4">,</span>
+      <span class="s1">nativeInvoker_(params.nativeInvoker) {}</span>
+
+<span class="s1">JavaTurboModule::~JavaTurboModule() {</span>
+  <span class="s0">/** 
+   * TODO(T75896241): In E2E tests, instance_ is null. Investigate why. Can we 
+   * get rid of this null check? 
+   */</span>
+  <span class="s4">if </span><span class="s1">(!instance_) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">nativeInvoker_-&gt;invokeAsync([instance = std::move(instance_)]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s0">/** 
+     * Reset the global NativeModule ref on the NativeModules thread. Why: 
+     *   - ~JavaTurboModule() can be called on a non-JVM thread. If we reset the 
+     *     global ref in ~JavaTurboModule(), we might access the JVM from a 
+     *     non-JVM thread, which will crash the app. 
+     */</span>
+    <span class="s1">instance.reset()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">struct </span><span class="s1">JNIArgs {</span>
+  <span class="s1">JNIArgs(size_t count) : args_(count) {}</span>
+  <span class="s1">std::vector&lt;jvalue&gt; args_</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;jobject&gt; globalRefs_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">jni::local_ref&lt;JCxxCallbackImpl::JavaPart&gt; createJavaCallbackFromJSIFunction(</span>
+    <span class="s1">jsi::Function &amp;&amp;function</span><span class="s4">,</span>
+    <span class="s1">jsi::Runtime &amp;rt</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::shared_ptr&lt;CallInvoker&gt; &amp;jsInvoker) {</span>
+  <span class="s4">auto </span><span class="s1">weakWrapper =</span>
+      <span class="s1">CallbackWrapper::createWeak(std::move(function)</span><span class="s4">, </span><span class="s1">rt</span><span class="s4">, </span><span class="s1">jsInvoker)</span><span class="s4">;</span>
+
+  <span class="s0">// This needs to be a shared_ptr because:</span>
+  <span class="s0">// 1. It cannot be unique_ptr. std::function is copyable but unique_ptr is</span>
+  <span class="s0">// not.</span>
+  <span class="s0">// 2. It cannot be weak_ptr since we need this object to live on.</span>
+  <span class="s0">// 3. It cannot be a value, because that would be deleted as soon as this</span>
+  <span class="s0">// function returns.</span>
+  <span class="s4">auto </span><span class="s1">callbackWrapperOwner =</span>
+      <span class="s1">std::make_shared&lt;RAIICallbackWrapperDestroyer&gt;(weakWrapper)</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">JCxxCallbackImpl::newObjectCxxArgs(</span>
+      <span class="s1">[weakWrapper = std::move(weakWrapper)</span><span class="s4">,</span>
+       <span class="s1">callbackWrapperOwner = std::move(callbackWrapperOwner)</span><span class="s4">,</span>
+       <span class="s1">wrapperWasCalled = </span><span class="s4">false</span><span class="s1">](folly::dynamic responses) </span><span class="s4">mutable </span><span class="s1">{</span>
+        <span class="s4">if </span><span class="s1">(wrapperWasCalled) {</span>
+          <span class="s4">throw </span><span class="s1">std::runtime_error(</span>
+              <span class="s3">&quot;Callback arg cannot be called more than once&quot;</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+
+        <span class="s4">auto </span><span class="s1">strongWrapper = weakWrapper.lock()</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(!strongWrapper) {</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">strongWrapper-&gt;jsInvoker().invokeAsync(</span>
+            <span class="s1">[weakWrapper = std::move(weakWrapper)</span><span class="s4">,</span>
+             <span class="s1">callbackWrapperOwner = std::move(callbackWrapperOwner)</span><span class="s4">,</span>
+             <span class="s1">responses = std::move(responses)]() {</span>
+              <span class="s4">auto </span><span class="s1">strongWrapper2 = weakWrapper.lock()</span><span class="s4">;</span>
+              <span class="s4">if </span><span class="s1">(!strongWrapper2) {</span>
+                <span class="s4">return;</span>
+              <span class="s1">}</span>
+
+              <span class="s1">std::vector&lt;jsi::Value&gt; args</span><span class="s4">;</span>
+              <span class="s1">args.reserve(responses.size())</span><span class="s4">;</span>
+              <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;val : responses) {</span>
+                <span class="s1">args.emplace_back(</span>
+                    <span class="s1">jsi::valueFromDynamic(strongWrapper2-&gt;runtime()</span><span class="s4">, </span><span class="s1">val))</span><span class="s4">;</span>
+              <span class="s1">}</span>
+
+              <span class="s1">strongWrapper2-&gt;callback().call(</span>
+                  <span class="s1">strongWrapper2-&gt;runtime()</span><span class="s4">,</span>
+                  <span class="s1">(</span><span class="s4">const </span><span class="s1">jsi::Value *)args.data()</span><span class="s4">,</span>
+                  <span class="s1">args.size())</span><span class="s4">;</span>
+            <span class="s1">})</span><span class="s4">;</span>
+
+        <span class="s1">wrapperWasCalled = </span><span class="s4">true;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// This is used for generating short exception strings.</span>
+<span class="s1">std::string stringifyJSIValue(</span><span class="s4">const </span><span class="s1">jsi::Value &amp;v</span><span class="s4">, </span><span class="s1">jsi::Runtime *rt = </span><span class="s4">nullptr</span><span class="s1">) {</span>
+  <span class="s4">if </span><span class="s1">(v.isUndefined()) {</span>
+    <span class="s4">return </span><span class="s3">&quot;undefined&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(v.isNull()) {</span>
+    <span class="s4">return </span><span class="s3">&quot;null&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(v.isBool()) {</span>
+    <span class="s4">return </span><span class="s1">std::string(</span><span class="s3">&quot;a boolean (&quot;</span><span class="s1">) + (v.getBool() ? </span><span class="s3">&quot;true&quot; </span><span class="s1">: </span><span class="s3">&quot;false&quot;</span><span class="s1">) + </span><span class="s3">&quot;)&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(v.isNumber()) {</span>
+    <span class="s4">return </span><span class="s3">&quot;a number (&quot; </span><span class="s1">+ std::to_string(v.getNumber()) + </span><span class="s3">&quot;)&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(v.isString()) {</span>
+    <span class="s4">return </span><span class="s3">&quot;a string (</span><span class="s4">\&quot;</span><span class="s3">&quot; </span><span class="s1">+ v.getString(*rt).utf8(*rt) + </span><span class="s3">&quot;</span><span class="s4">\&quot;</span><span class="s3">)&quot;</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">react_native_assert(v.isObject() &amp;&amp; </span><span class="s3">&quot;Expecting object.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">rt != </span><span class="s4">nullptr </span><span class="s1">&amp;&amp; v.getObject(*rt).isFunction(*rt) ? </span><span class="s3">&quot;a function&quot;</span>
+                                                           <span class="s1">: </span><span class="s3">&quot;an object&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">class </span><span class="s1">JavaTurboModuleArgumentConversionException : </span><span class="s4">public </span><span class="s1">std::runtime_error {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">JavaTurboModuleArgumentConversionException(</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;expectedType</span><span class="s4">,</span>
+      <span class="s4">int </span><span class="s1">index</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;methodName</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">jsi::Value *arg</span><span class="s4">,</span>
+      <span class="s1">jsi::Runtime *rt)</span>
+      <span class="s1">: std::runtime_error(</span>
+            <span class="s3">&quot;Expected argument &quot; </span><span class="s1">+ std::to_string(index) + </span><span class="s3">&quot; of method </span><span class="s4">\&quot;</span><span class="s3">&quot; </span><span class="s1">+</span>
+            <span class="s1">methodName + </span><span class="s3">&quot;</span><span class="s4">\&quot; </span><span class="s3">to be a &quot; </span><span class="s1">+ expectedType + </span><span class="s3">&quot;, but got &quot; </span><span class="s1">+</span>
+            <span class="s1">stringifyJSIValue(*arg</span><span class="s4">, </span><span class="s1">rt)) {}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">JavaTurboModuleInvalidArgumentTypeException : </span><span class="s4">public </span><span class="s1">std::runtime_error {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">JavaTurboModuleInvalidArgumentTypeException(</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;actualType</span><span class="s4">,</span>
+      <span class="s4">int </span><span class="s1">argIndex</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;methodName)</span>
+      <span class="s1">: std::runtime_error(</span>
+            <span class="s3">&quot;Called method </span><span class="s4">\&quot;</span><span class="s3">&quot; </span><span class="s1">+ methodName + </span><span class="s3">&quot;</span><span class="s4">\&quot; </span><span class="s3">with unsupported type &quot; </span><span class="s1">+</span>
+            <span class="s1">actualType + </span><span class="s3">&quot; at argument &quot; </span><span class="s1">+ std::to_string(argIndex)) {}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">JavaTurboModuleInvalidArgumentCountException : </span><span class="s4">public </span><span class="s1">std::runtime_error {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">JavaTurboModuleInvalidArgumentCountException(</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;methodName</span><span class="s4">,</span>
+      <span class="s4">int </span><span class="s1">actualArgCount</span><span class="s4">,</span>
+      <span class="s4">int </span><span class="s1">expectedArgCount)</span>
+      <span class="s1">: std::runtime_error(</span>
+            <span class="s3">&quot;TurboModule method </span><span class="s4">\&quot;</span><span class="s3">&quot; </span><span class="s1">+ methodName + </span><span class="s3">&quot;</span><span class="s4">\&quot; </span><span class="s3">called with &quot; </span><span class="s1">+</span>
+            <span class="s1">std::to_string(actualArgCount) +</span>
+            <span class="s3">&quot; arguments (expected argument count: &quot; </span><span class="s1">+</span>
+            <span class="s1">std::to_string(expectedArgCount) + </span><span class="s3">&quot;).&quot;</span><span class="s1">) {}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * See 
+ * https://docs.oracle.com/javase/7/docs/technotes/guides/jni/spec/types.html 
+ * for a description of Java method signature structure. 
+ */</span>
+<span class="s1">std::vector&lt;std::string&gt; getMethodArgTypesFromSignature(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;methodSignature) {</span>
+  <span class="s1">std::vector&lt;std::string&gt; methodArgs</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">it = methodSignature.begin()</span><span class="s4">; </span><span class="s1">it != methodSignature.end()</span><span class="s4">;</span>
+       <span class="s1">it += </span><span class="s5">1</span><span class="s1">) {</span>
+    <span class="s4">if </span><span class="s1">(*it == </span><span class="s3">'('</span><span class="s1">) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(*it == </span><span class="s3">')'</span><span class="s1">) {</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">std::string type</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(*it == </span><span class="s3">'['</span><span class="s1">) {</span>
+      <span class="s1">type += *it</span><span class="s4">;</span>
+      <span class="s1">it += </span><span class="s5">1</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(*it == </span><span class="s3">'L'</span><span class="s1">) {</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">; </span><span class="s1">it != methodSignature.end()</span><span class="s4">; </span><span class="s1">it += </span><span class="s5">1</span><span class="s1">) {</span>
+        <span class="s1">type += *it</span><span class="s4">;</span>
+
+        <span class="s4">if </span><span class="s1">(*it == </span><span class="s3">';'</span><span class="s1">) {</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">type += *it</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">methodArgs.push_back(type)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">methodArgs</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">int32_t getUniqueId() {</span>
+  <span class="s4">static </span><span class="s1">int32_t counter = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">counter++</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// fbjni already does this conversion, but since we are using plain JNI, this</span>
+<span class="s0">// needs to be done again</span>
+<span class="s0">// TODO (axe) Reuse existing implementation as needed - the exist in</span>
+<span class="s0">// MethodInvoker.cpp</span>
+<span class="s1">JNIArgs convertJSIArgsToJNIArgs(</span>
+    <span class="s1">JNIEnv *env</span><span class="s4">,</span>
+    <span class="s1">jsi::Runtime &amp;rt</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;methodName</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::vector&lt;std::string&gt; &amp;methodArgTypes</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+    <span class="s1">size_t count</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::shared_ptr&lt;CallInvoker&gt; &amp;jsInvoker</span><span class="s4">,</span>
+    <span class="s1">TurboModuleMethodValueKind valueKind) {</span>
+  <span class="s4">unsigned int </span><span class="s1">expectedArgumentCount = valueKind == PromiseKind</span>
+      <span class="s1">? methodArgTypes.size() - </span><span class="s5">1</span>
+      <span class="s1">: methodArgTypes.size()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(expectedArgumentCount != count) {</span>
+    <span class="s4">throw </span><span class="s1">JavaTurboModuleInvalidArgumentCountException(</span>
+        <span class="s1">methodName</span><span class="s4">, </span><span class="s1">count</span><span class="s4">, </span><span class="s1">expectedArgumentCount)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">JNIArgs jniArgs(valueKind == PromiseKind ? count + </span><span class="s5">1 </span><span class="s1">: count)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;jargs = jniArgs.args_</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;globalRefs = jniArgs.globalRefs_</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">makeGlobalIfNecessary =</span>
+      <span class="s1">[&amp;globalRefs</span><span class="s4">, </span><span class="s1">env</span><span class="s4">, </span><span class="s1">valueKind](jobject obj) -&gt; jobject {</span>
+    <span class="s4">if </span><span class="s1">(valueKind == VoidKind || valueKind == PromiseKind) {</span>
+      <span class="s1">jobject globalObj = env-&gt;NewGlobalRef(obj)</span><span class="s4">;</span>
+      <span class="s1">globalRefs.push_back(globalObj)</span><span class="s4">;</span>
+      <span class="s1">env-&gt;DeleteLocalRef(obj)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">globalObj</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return </span><span class="s1">obj</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">unsigned int </span><span class="s1">argIndex = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">argIndex &lt; count</span><span class="s4">; </span><span class="s1">argIndex += </span><span class="s5">1</span><span class="s1">) {</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;type = methodArgTypes.at(argIndex)</span><span class="s4">;</span>
+
+    <span class="s4">const </span><span class="s1">jsi::Value *arg = &amp;args[argIndex]</span><span class="s4">;</span>
+    <span class="s1">jvalue *jarg = &amp;jargs[argIndex]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(type == </span><span class="s3">&quot;D&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!arg-&gt;isNumber()) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;number&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">jarg-&gt;d = arg-&gt;getNumber()</span><span class="s4">;</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(type == </span><span class="s3">&quot;Z&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!arg-&gt;isBool()) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;boolean&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">jarg-&gt;z = (jboolean)arg-&gt;getBool()</span><span class="s4">;</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(arg-&gt;isNull() || arg-&gt;isUndefined()) {</span>
+      <span class="s1">jarg-&gt;l = </span><span class="s4">nullptr;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type == </span><span class="s3">&quot;Ljava/lang/Double;&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!arg-&gt;isNumber()) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;number&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">jarg-&gt;l = makeGlobalIfNecessary(</span>
+          <span class="s1">jni::JDouble::valueOf(arg-&gt;getNumber()).release())</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type == </span><span class="s3">&quot;Ljava/lang/Boolean;&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!arg-&gt;isBool()) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;boolean&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">jarg-&gt;l = makeGlobalIfNecessary(</span>
+          <span class="s1">jni::JBoolean::valueOf(arg-&gt;getBool()).release())</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type == </span><span class="s3">&quot;Ljava/lang/String;&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!arg-&gt;isString()) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;string&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">jarg-&gt;l = makeGlobalIfNecessary(</span>
+          <span class="s1">env-&gt;NewStringUTF(arg-&gt;getString(rt).utf8(rt).c_str()))</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type == </span><span class="s3">&quot;Lcom/facebook/react/bridge/Callback;&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!(arg-&gt;isObject() &amp;&amp; arg-&gt;getObject(rt).isFunction(rt))) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;Function&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">jsi::Function fn = arg-&gt;getObject(rt).getFunction(rt)</span><span class="s4">;</span>
+      <span class="s1">jarg-&gt;l = makeGlobalIfNecessary(</span>
+          <span class="s1">createJavaCallbackFromJSIFunction(std::move(fn)</span><span class="s4">, </span><span class="s1">rt</span><span class="s4">, </span><span class="s1">jsInvoker)</span>
+              <span class="s1">.release())</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type == </span><span class="s3">&quot;Lcom/facebook/react/bridge/ReadableArray;&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!(arg-&gt;isObject() &amp;&amp; arg-&gt;getObject(rt).isArray(rt))) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;Array&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">auto </span><span class="s1">dynamicFromValue = jsi::dynamicFromValue(rt</span><span class="s4">, </span><span class="s1">*arg)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">jParams =</span>
+          <span class="s1">ReadableNativeArray::newObjectCxxArgs(std::move(dynamicFromValue))</span><span class="s4">;</span>
+      <span class="s1">jarg-&gt;l = makeGlobalIfNecessary(jParams.release())</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type == </span><span class="s3">&quot;Lcom/facebook/react/bridge/ReadableMap;&quot;</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(!(arg-&gt;isObject())) {</span>
+        <span class="s4">throw </span><span class="s1">JavaTurboModuleArgumentConversionException(</span>
+            <span class="s3">&quot;Object&quot;</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">&amp;rt)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">auto </span><span class="s1">dynamicFromValue = jsi::dynamicFromValue(rt</span><span class="s4">, </span><span class="s1">*arg)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">jParams =</span>
+          <span class="s1">ReadableNativeMap::createWithContents(std::move(dynamicFromValue))</span><span class="s4">;</span>
+      <span class="s1">jarg-&gt;l = makeGlobalIfNecessary(jParams.release())</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">throw </span><span class="s1">JavaTurboModuleInvalidArgumentTypeException(</span>
+          <span class="s1">type</span><span class="s4">, </span><span class="s1">argIndex</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">jniArgs</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jsi::Value convertFromJMapToValue(JNIEnv *env</span><span class="s4">, </span><span class="s1">jsi::Runtime &amp;rt</span><span class="s4">, </span><span class="s1">jobject arg) {</span>
+  <span class="s0">// We currently use Java Argument.makeNativeMap() method to do this conversion</span>
+  <span class="s0">// This could also be done purely in C++, but iterative over map methods</span>
+  <span class="s0">// but those may end up calling reflection methods anyway</span>
+  <span class="s0">// TODO (axe) Investigate the best way to convert Java Map to Value</span>
+  <span class="s1">jclass jArguments = env-&gt;FindClass(</span><span class="s3">&quot;com/facebook/react/bridge/Arguments&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">jmethodID jMakeNativeMap = env-&gt;GetStaticMethodID(</span>
+      <span class="s1">jArguments</span><span class="s4">,</span>
+      <span class="s3">&quot;makeNativeMap&quot;</span><span class="s4">,</span>
+      <span class="s3">&quot;(Ljava/util/Map;)Lcom/facebook/react/bridge/WritableNativeMap;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">constants = env-&gt;CallStaticObjectMethod(jArguments</span><span class="s4">, </span><span class="s1">jMakeNativeMap</span><span class="s4">, </span><span class="s1">arg)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">jResult = jni::adopt_local(constants)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">result = jni::static_ref_cast&lt;NativeMap::jhybridobject&gt;(jResult)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">jsi::valueFromDynamic(rt</span><span class="s4">, </span><span class="s1">result-&gt;cthis()-&gt;consume())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">jsi::Value JavaTurboModule::invokeJavaMethod(</span>
+    <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+    <span class="s1">TurboModuleMethodValueKind valueKind</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;methodNameStr</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;methodSignature</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+    <span class="s1">size_t argCount</span><span class="s4">,</span>
+    <span class="s1">jmethodID &amp;methodID) {</span>
+  <span class="s4">const char </span><span class="s1">*methodName = methodNameStr.c_str()</span><span class="s4">;</span>
+  <span class="s4">const char </span><span class="s1">*moduleName = name_.c_str()</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">isMethodSync = !(valueKind == VoidKind || valueKind == PromiseKind)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(isMethodSync) {</span>
+    <span class="s1">TMPL::syncMethodCallStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">TMPL::syncMethodCallArgConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">TMPL::asyncMethodCallStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">TMPL::asyncMethodCallArgConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">JNIEnv *env = jni::Environment::current()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">instance = instance_.get()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * To account for jclasses and other misc LocalReferences we create. 
+   */</span>
+  <span class="s4">unsigned int </span><span class="s1">buffer = </span><span class="s5">6</span><span class="s4">;</span>
+  <span class="s0">/** 
+   * For promises, we have to create a resolve fn, a reject fn, and a promise 
+   * object. For normal returns, we just create the return object. 
+   */</span>
+  <span class="s4">unsigned int </span><span class="s1">maxReturnObjects = </span><span class="s5">3</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * When the return type is void, all JNI LocalReferences are converted to 
+   * GlobalReferences. The LocalReferences are then promptly deleted 
+   * after the conversion. 
+   */</span>
+  <span class="s4">unsigned int </span><span class="s1">actualArgCount = valueKind == VoidKind ? </span><span class="s5">0 </span><span class="s1">: argCount</span><span class="s4">;</span>
+  <span class="s4">unsigned int </span><span class="s1">estimatedLocalRefCount =</span>
+      <span class="s1">actualArgCount + maxReturnObjects + buffer</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * This will push a new JNI stack frame for the LocalReferences in this 
+   * function call. When the stack frame for invokeJavaMethod is popped, 
+   * all LocalReferences are deleted. 
+   * 
+   * In total, there can be at most kJniLocalRefMax (= 512) Jni 
+   * LocalReferences alive at a time. estimatedLocalRefCount is provided 
+   * so that PushLocalFrame can throw an out of memory error when the total 
+   * number of alive LocalReferences is estimatedLocalRefCount smaller than 
+   * kJniLocalRefMax. 
+   */</span>
+  <span class="s1">jni::JniLocalScope scope(env</span><span class="s4">, </span><span class="s1">estimatedLocalRefCount)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">checkJNIErrorForMethodCall = [&amp;]() -&gt; </span><span class="s4">void </span><span class="s1">{</span>
+    <span class="s4">try </span><span class="s1">{</span>
+      <span class="s1">FACEBOOK_JNI_THROW_PENDING_EXCEPTION()</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+      <span class="s4">if </span><span class="s1">(isMethodSync) {</span>
+        <span class="s1">TMPL::syncMethodCallFail(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">TMPL::asyncMethodCallFail(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">throw;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!methodID) {</span>
+    <span class="s1">jclass cls = env-&gt;GetObjectClass(instance)</span><span class="s4">;</span>
+    <span class="s1">methodID = env-&gt;GetMethodID(cls</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">methodSignature.c_str())</span><span class="s4">;</span>
+
+    <span class="s0">// If the method signature doesn't match, show a redbox here instead of</span>
+    <span class="s0">// crashing later.</span>
+    <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// TODO(T43933641): Refactor to remove this special-casing</span>
+  <span class="s4">if </span><span class="s1">(methodNameStr == </span><span class="s3">&quot;getConstants&quot;</span><span class="s1">) {</span>
+    <span class="s1">TMPL::syncMethodCallArgConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">TMPL::syncMethodCallExecutionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+    <span class="s4">auto </span><span class="s1">constantsMap = (jobject)env-&gt;CallObjectMethod(instance</span><span class="s4">, </span><span class="s1">methodID)</span><span class="s4">;</span>
+    <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+    <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+    <span class="s1">jsi::Value returnValue = constantsMap == </span><span class="s4">nullptr</span>
+        <span class="s1">? jsi::Value::undefined()</span>
+        <span class="s1">: convertFromJMapToValue(env</span><span class="s4">, </span><span class="s1">runtime</span><span class="s4">, </span><span class="s1">constantsMap)</span><span class="s4">;</span>
+
+    <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::vector&lt;std::string&gt; methodArgTypes =</span>
+      <span class="s1">getMethodArgTypesFromSignature(methodSignature)</span><span class="s4">;</span>
+
+  <span class="s1">JNIArgs jniArgs = convertJSIArgsToJNIArgs(</span>
+      <span class="s1">env</span><span class="s4">,</span>
+      <span class="s1">runtime</span><span class="s4">,</span>
+      <span class="s1">methodNameStr</span><span class="s4">,</span>
+      <span class="s1">methodArgTypes</span><span class="s4">,</span>
+      <span class="s1">args</span><span class="s4">,</span>
+      <span class="s1">argCount</span><span class="s4">,</span>
+      <span class="s1">jsInvoker_</span><span class="s4">,</span>
+      <span class="s1">valueKind)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(isMethodSync &amp;&amp; valueKind != PromiseKind) {</span>
+    <span class="s1">TMPL::syncMethodCallArgConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">TMPL::syncMethodCallExecutionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">&amp;jargs = jniArgs.args_</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;globalRefs = jniArgs.globalRefs_</span><span class="s4">;</span>
+
+  <span class="s4">switch </span><span class="s1">(valueKind) {</span>
+    <span class="s4">case </span><span class="s1">BooleanKind: {</span>
+      <span class="s1">std::string returnType =</span>
+          <span class="s1">methodSignature.substr(methodSignature.find_last_of(</span><span class="s3">')'</span><span class="s1">) + </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(returnType == </span><span class="s3">&quot;Ljava/lang/Boolean;&quot;</span><span class="s1">) {</span>
+        <span class="s4">auto </span><span class="s1">returnObject =</span>
+            <span class="s1">env-&gt;CallObjectMethodA(instance</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+        <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+        <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">returnValue = jsi::Value::null()</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(returnObject) {</span>
+          <span class="s4">auto </span><span class="s1">booleanObj = jni::adopt_local(</span>
+              <span class="s4">static_cast</span><span class="s1">&lt;jni::JBoolean::javaobject&gt;(returnObject))</span><span class="s4">;</span>
+          <span class="s1">returnValue = jsi::Value(</span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">bool</span><span class="s1">&gt;(booleanObj-&gt;value()))</span><span class="s4">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s4">bool </span><span class="s1">returnBoolean =</span>
+            <span class="s1">(</span><span class="s4">bool</span><span class="s1">)env-&gt;CallBooleanMethodA(instance</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+        <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+        <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+        <span class="s1">jsi::Value returnValue = jsi::Value(returnBoolean)</span><span class="s4">;</span>
+
+        <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+        <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">NumberKind: {</span>
+      <span class="s1">std::string returnType =</span>
+          <span class="s1">methodSignature.substr(methodSignature.find_last_of(</span><span class="s3">')'</span><span class="s1">) + </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(returnType == </span><span class="s3">&quot;Ljava/lang/Double;&quot;</span><span class="s1">) {</span>
+        <span class="s4">auto </span><span class="s1">returnObject =</span>
+            <span class="s1">env-&gt;CallObjectMethodA(instance</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+        <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+        <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+        <span class="s4">auto </span><span class="s1">returnValue = jsi::Value::null()</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(returnObject) {</span>
+          <span class="s4">auto </span><span class="s1">doubleObj = jni::adopt_local(</span>
+              <span class="s4">static_cast</span><span class="s1">&lt;jni::JDouble::javaobject&gt;(returnObject))</span><span class="s4">;</span>
+          <span class="s1">returnValue = jsi::Value(doubleObj-&gt;value())</span><span class="s4">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s4">double </span><span class="s1">returnDouble =</span>
+            <span class="s1">(</span><span class="s4">double</span><span class="s1">)env-&gt;CallDoubleMethodA(instance</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+        <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+        <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+        <span class="s1">jsi::Value returnValue = jsi::Value(returnDouble)</span><span class="s4">;</span>
+
+        <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+        <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">StringKind: {</span>
+      <span class="s4">auto </span><span class="s1">returnString =</span>
+          <span class="s1">(jstring)env-&gt;CallObjectMethodA(instance</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+      <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+      <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+      <span class="s1">jsi::Value returnValue = jsi::Value::null()</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(returnString != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+        <span class="s4">const char </span><span class="s1">*js = env-&gt;GetStringUTFChars(returnString</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">std::string result = js</span><span class="s4">;</span>
+        <span class="s1">env-&gt;ReleaseStringUTFChars(returnString</span><span class="s4">, </span><span class="s1">js)</span><span class="s4">;</span>
+        <span class="s1">returnValue =</span>
+            <span class="s1">jsi::Value(runtime</span><span class="s4">, </span><span class="s1">jsi::String::createFromUtf8(runtime</span><span class="s4">, </span><span class="s1">result))</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">ObjectKind: {</span>
+      <span class="s4">auto </span><span class="s1">returnObject =</span>
+          <span class="s1">env-&gt;CallObjectMethodA(instance</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+      <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+      <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+      <span class="s1">jsi::Value returnValue = jsi::Value::null()</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(returnObject != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+        <span class="s4">auto </span><span class="s1">jResult = jni::adopt_local(returnObject)</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">result = jni::static_ref_cast&lt;NativeMap::jhybridobject&gt;(jResult)</span><span class="s4">;</span>
+        <span class="s1">returnValue =</span>
+            <span class="s1">jsi::valueFromDynamic(runtime</span><span class="s4">, </span><span class="s1">result-&gt;cthis()-&gt;consume())</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">ArrayKind: {</span>
+      <span class="s4">auto </span><span class="s1">returnObject =</span>
+          <span class="s1">(jobject)env-&gt;CallObjectMethodA(instance</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+      <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+      <span class="s1">TMPL::syncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">TMPL::syncMethodCallReturnConversionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+      <span class="s1">jsi::Value returnValue = jsi::Value::null()</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(returnObject != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+        <span class="s4">auto </span><span class="s1">jResult = jni::adopt_local(returnObject)</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">result = jni::static_ref_cast&lt;NativeArray::jhybridobject&gt;(jResult)</span><span class="s4">;</span>
+        <span class="s1">returnValue =</span>
+            <span class="s1">jsi::valueFromDynamic(runtime</span><span class="s4">, </span><span class="s1">result-&gt;cthis()-&gt;consume())</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">TMPL::syncMethodCallReturnConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">TMPL::syncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">VoidKind: {</span>
+      <span class="s1">TMPL::asyncMethodCallArgConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s1">TMPL::asyncMethodCallDispatch(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+      <span class="s1">nativeInvoker_-&gt;invokeAsync(</span>
+          <span class="s1">[jargs</span><span class="s4">,</span>
+           <span class="s1">globalRefs</span><span class="s4">,</span>
+           <span class="s1">methodID</span><span class="s4">,</span>
+           <span class="s1">instance_ = jni::make_weak(instance_)</span><span class="s4">,</span>
+           <span class="s1">moduleNameStr = name_</span><span class="s4">,</span>
+           <span class="s1">methodNameStr</span><span class="s4">,</span>
+           <span class="s1">id = getUniqueId()]() </span><span class="s4">mutable </span><span class="s1">-&gt; </span><span class="s4">void </span><span class="s1">{</span>
+            <span class="s4">auto </span><span class="s1">instance = instance_.lockLocal()</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">(!instance) {</span>
+              <span class="s4">return;</span>
+            <span class="s1">}</span>
+            <span class="s0">/** 
+             * TODO(ramanpreet): Why do we have to require the environment 
+             * again? Why does JNI crash when we use the env from the upper 
+             * scope? 
+             */</span>
+            <span class="s1">JNIEnv *env = jni::Environment::current()</span><span class="s4">;</span>
+            <span class="s4">const char </span><span class="s1">*moduleName = moduleNameStr.c_str()</span><span class="s4">;</span>
+            <span class="s4">const char </span><span class="s1">*methodName = methodNameStr.c_str()</span><span class="s4">;</span>
+
+            <span class="s1">TMPL::asyncMethodCallExecutionStart(moduleName</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">id)</span><span class="s4">;</span>
+            <span class="s1">env-&gt;CallVoidMethodA(instance.get()</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+            <span class="s4">try </span><span class="s1">{</span>
+              <span class="s1">FACEBOOK_JNI_THROW_PENDING_EXCEPTION()</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+              <span class="s1">TMPL::asyncMethodCallExecutionFail(moduleName</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">id)</span><span class="s4">;</span>
+              <span class="s4">throw;</span>
+            <span class="s1">}</span>
+
+            <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">globalRef : globalRefs) {</span>
+              <span class="s1">env-&gt;DeleteGlobalRef(globalRef)</span><span class="s4">;</span>
+            <span class="s1">}</span>
+            <span class="s1">TMPL::asyncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">id)</span><span class="s4">;</span>
+          <span class="s1">})</span><span class="s4">;</span>
+
+      <span class="s1">TMPL::asyncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">jsi::Value::undefined()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">PromiseKind: {</span>
+      <span class="s1">jsi::Function Promise =</span>
+          <span class="s1">runtime.global().getPropertyAsFunction(runtime</span><span class="s4">, </span><span class="s3">&quot;Promise&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+      <span class="s1">jsi::Function promiseConstructorArg = jsi::Function::createFromHostFunction(</span>
+          <span class="s1">runtime</span><span class="s4">,</span>
+          <span class="s1">jsi::PropNameID::forAscii(runtime</span><span class="s4">, </span><span class="s3">&quot;fn&quot;</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">2</span><span class="s4">,</span>
+          <span class="s1">[</span><span class="s4">this,</span>
+           <span class="s1">&amp;jargs</span><span class="s4">,</span>
+           <span class="s1">&amp;globalRefs</span><span class="s4">,</span>
+           <span class="s1">argCount</span><span class="s4">,</span>
+           <span class="s1">methodID</span><span class="s4">,</span>
+           <span class="s1">moduleNameStr = name_</span><span class="s4">,</span>
+           <span class="s1">methodNameStr</span><span class="s4">,</span>
+           <span class="s1">env](</span>
+              <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value &amp;thisVal</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value *promiseConstructorArgs</span><span class="s4">,</span>
+              <span class="s1">size_t promiseConstructorArgCount) {</span>
+            <span class="s4">if </span><span class="s1">(promiseConstructorArgCount != </span><span class="s5">2</span><span class="s1">) {</span>
+              <span class="s4">throw </span><span class="s1">std::invalid_argument(</span><span class="s3">&quot;Promise fn arg count must be 2&quot;</span><span class="s1">)</span><span class="s4">;</span>
+            <span class="s1">}</span>
+
+            <span class="s1">jsi::Function resolveJSIFn =</span>
+                <span class="s1">promiseConstructorArgs[</span><span class="s5">0</span><span class="s1">].getObject(runtime).getFunction(</span>
+                    <span class="s1">runtime)</span><span class="s4">;</span>
+            <span class="s1">jsi::Function rejectJSIFn =</span>
+                <span class="s1">promiseConstructorArgs[</span><span class="s5">1</span><span class="s1">].getObject(runtime).getFunction(</span>
+                    <span class="s1">runtime)</span><span class="s4">;</span>
+
+            <span class="s4">auto </span><span class="s1">resolve = createJavaCallbackFromJSIFunction(</span>
+                               <span class="s1">std::move(resolveJSIFn)</span><span class="s4">, </span><span class="s1">runtime</span><span class="s4">, </span><span class="s1">jsInvoker_)</span>
+                               <span class="s1">.release()</span><span class="s4">;</span>
+            <span class="s4">auto </span><span class="s1">reject = createJavaCallbackFromJSIFunction(</span>
+                              <span class="s1">std::move(rejectJSIFn)</span><span class="s4">, </span><span class="s1">runtime</span><span class="s4">, </span><span class="s1">jsInvoker_)</span>
+                              <span class="s1">.release()</span><span class="s4">;</span>
+
+            <span class="s1">jclass jPromiseImpl =</span>
+                <span class="s1">env-&gt;FindClass(</span><span class="s3">&quot;com/facebook/react/bridge/PromiseImpl&quot;</span><span class="s1">)</span><span class="s4">;</span>
+            <span class="s1">jmethodID jPromiseImplConstructor = env-&gt;GetMethodID(</span>
+                <span class="s1">jPromiseImpl</span><span class="s4">,</span>
+                <span class="s3">&quot;&lt;init&gt;&quot;</span><span class="s4">,</span>
+                <span class="s3">&quot;(Lcom/facebook/react/bridge/Callback;Lcom/facebook/react/bridge/Callback;)V&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+            <span class="s1">jobject promise = env-&gt;NewObject(</span>
+                <span class="s1">jPromiseImpl</span><span class="s4">, </span><span class="s1">jPromiseImplConstructor</span><span class="s4">, </span><span class="s1">resolve</span><span class="s4">, </span><span class="s1">reject)</span><span class="s4">;</span>
+
+            <span class="s4">const char </span><span class="s1">*moduleName = moduleNameStr.c_str()</span><span class="s4">;</span>
+            <span class="s4">const char </span><span class="s1">*methodName = methodNameStr.c_str()</span><span class="s4">;</span>
+
+            <span class="s1">jobject globalPromise = env-&gt;NewGlobalRef(promise)</span><span class="s4">;</span>
+
+            <span class="s1">globalRefs.push_back(globalPromise)</span><span class="s4">;</span>
+            <span class="s1">env-&gt;DeleteLocalRef(promise)</span><span class="s4">;</span>
+
+            <span class="s1">jargs[argCount].l = globalPromise</span><span class="s4">;</span>
+            <span class="s1">TMPL::asyncMethodCallArgConversionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+            <span class="s1">TMPL::asyncMethodCallDispatch(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+            <span class="s1">nativeInvoker_-&gt;invokeAsync(</span>
+                <span class="s1">[jargs</span><span class="s4">,</span>
+                 <span class="s1">globalRefs</span><span class="s4">,</span>
+                 <span class="s1">methodID</span><span class="s4">,</span>
+                 <span class="s1">instance_ = jni::make_weak(instance_)</span><span class="s4">,</span>
+                 <span class="s1">moduleNameStr</span><span class="s4">,</span>
+                 <span class="s1">methodNameStr</span><span class="s4">,</span>
+                 <span class="s1">id = getUniqueId()]() </span><span class="s4">mutable </span><span class="s1">-&gt; </span><span class="s4">void </span><span class="s1">{</span>
+                  <span class="s4">auto </span><span class="s1">instance = instance_.lockLocal()</span><span class="s4">;</span>
+
+                  <span class="s4">if </span><span class="s1">(!instance) {</span>
+                    <span class="s4">return;</span>
+                  <span class="s1">}</span>
+                  <span class="s0">/** 
+                   * TODO(ramanpreet): Why do we have to require the 
+                   * environment again? Why does JNI crash when we use the env 
+                   * from the upper scope? 
+                   */</span>
+                  <span class="s1">JNIEnv *env = jni::Environment::current()</span><span class="s4">;</span>
+                  <span class="s4">const char </span><span class="s1">*moduleName = moduleNameStr.c_str()</span><span class="s4">;</span>
+                  <span class="s4">const char </span><span class="s1">*methodName = methodNameStr.c_str()</span><span class="s4">;</span>
+
+                  <span class="s1">TMPL::asyncMethodCallExecutionStart(</span>
+                      <span class="s1">moduleName</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">id)</span><span class="s4">;</span>
+                  <span class="s1">env-&gt;CallVoidMethodA(instance.get()</span><span class="s4">, </span><span class="s1">methodID</span><span class="s4">, </span><span class="s1">jargs.data())</span><span class="s4">;</span>
+                  <span class="s4">try </span><span class="s1">{</span>
+                    <span class="s1">FACEBOOK_JNI_THROW_PENDING_EXCEPTION()</span><span class="s4">;</span>
+                  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+                    <span class="s1">TMPL::asyncMethodCallExecutionFail(</span>
+                        <span class="s1">moduleName</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">id)</span><span class="s4">;</span>
+                    <span class="s4">throw;</span>
+                  <span class="s1">}</span>
+
+                  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">globalRef : globalRefs) {</span>
+                    <span class="s1">env-&gt;DeleteGlobalRef(globalRef)</span><span class="s4">;</span>
+                  <span class="s1">}</span>
+                  <span class="s1">TMPL::asyncMethodCallExecutionEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName</span><span class="s4">, </span><span class="s1">id)</span><span class="s4">;</span>
+                <span class="s1">})</span><span class="s4">;</span>
+
+            <span class="s4">return </span><span class="s1">jsi::Value::undefined()</span><span class="s4">;</span>
+          <span class="s1">})</span><span class="s4">;</span>
+
+      <span class="s1">jsi::Value promise =</span>
+          <span class="s1">Promise.callAsConstructor(runtime</span><span class="s4">, </span><span class="s1">promiseConstructorArg)</span><span class="s4">;</span>
+      <span class="s1">checkJNIErrorForMethodCall()</span><span class="s4">;</span>
+
+      <span class="s1">TMPL::asyncMethodCallEnd(moduleName</span><span class="s4">, </span><span class="s1">methodName)</span><span class="s4">;</span>
+
+      <span class="s4">return </span><span class="s1">promise</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">default</span><span class="s1">:</span>
+      <span class="s4">throw </span><span class="s1">std::runtime_error(</span>
+          <span class="s3">&quot;Unable to find method module: &quot; </span><span class="s1">+ methodNameStr + </span><span class="s3">&quot;(&quot; </span><span class="s1">+</span>
+          <span class="s1">methodSignature + </span><span class="s3">&quot;)&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

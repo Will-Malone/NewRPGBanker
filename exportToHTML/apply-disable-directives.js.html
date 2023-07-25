@@ -1,0 +1,372 @@
+<html>
+<head>
+<title>apply-disable-directives.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+apply-disable-directives.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview A module that filters reported problems based on `eslint-disable` and `eslint-enable` comments 
+ * @author Teddy Katz 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Typedefs</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** @typedef {import(&quot;../shared/types&quot;).LintMessage} LintMessage */</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Module Definition</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const escapeRegExp = require(</span><span class="s2">&quot;escape-string-regexp&quot;</span><span class="s1">);</span>
+
+<span class="s0">/** 
+ * Compares the locations of two objects in a source file 
+ * @param {{line: number, column: number}} itemA The first object 
+ * @param {{line: number, column: number}} itemB The second object 
+ * @returns {number} A value less than 1 if itemA appears before itemB in the source file, greater than 1 if 
+ * itemA appears after itemB in the source file, or 0 if itemA and itemB have the same location. 
+ */</span>
+<span class="s3">function </span><span class="s1">compareLocations(itemA, itemB) {</span>
+    <span class="s3">return </span><span class="s1">itemA.line - itemB.line || itemA.column - itemB.column;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Groups a set of directives into sub-arrays by their parent comment. 
+ * @param {Directive[]} directives Unused directives to be removed. 
+ * @returns {Directive[][]} Directives grouped by their parent comment. 
+ */</span>
+<span class="s3">function </span><span class="s1">groupByParentComment(directives) {</span>
+    <span class="s1">const groups = </span><span class="s3">new </span><span class="s1">Map();</span>
+
+    <span class="s3">for </span><span class="s1">(const directive of directives) {</span>
+        <span class="s1">const { unprocessedDirective: { parentComment } } = directive;</span>
+
+        <span class="s3">if </span><span class="s1">(groups.has(parentComment)) {</span>
+            <span class="s1">groups.get(parentComment).push(directive);</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">groups.set(parentComment, [directive]);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">[...groups.values()];</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Creates removal details for a set of directives within the same comment. 
+ * @param {Directive[]} directives Unused directives to be removed. 
+ * @param {Token} commentToken The backing Comment token. 
+ * @returns {{ description, fix, unprocessedDirective }[]} Details for later creation of output Problems. 
+ */</span>
+<span class="s3">function </span><span class="s1">createIndividualDirectivesRemoval(directives, commentToken) {</span>
+
+    <span class="s0">/* 
+     * `commentToken.value` starts right after `//` or `/*`. 
+     * All calculated offsets will be relative to this index. 
+     */</span>
+    <span class="s1">const commentValueStart = commentToken.range[</span><span class="s4">0</span><span class="s1">] + </span><span class="s2">&quot;//&quot;</span><span class="s1">.length;</span>
+
+    <span class="s0">// Find where the list of rules starts. `\S+` matches with the directive name (e.g. `eslint-disable-line`)</span>
+    <span class="s1">const listStartOffset = /^\s*\S+\s+/u.exec(commentToken.value)[</span><span class="s4">0</span><span class="s1">].length;</span>
+
+    <span class="s0">/* 
+     * Get the list text without any surrounding whitespace. In order to preserve the original 
+     * formatting, we don't want to change that whitespace. 
+     * 
+     *     // eslint-disable-line rule-one , rule-two , rule-three -- comment 
+     *                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 
+     */</span>
+    <span class="s1">const listText = commentToken.value</span>
+        <span class="s1">.slice(listStartOffset) </span><span class="s0">// remove directive name and all whitespace before the list</span>
+        <span class="s1">.split(/\s-{</span><span class="s4">2</span><span class="s1">,}\s/u)[</span><span class="s4">0</span><span class="s1">] </span><span class="s0">// remove `-- comment`, if it exists</span>
+        <span class="s1">.trimEnd(); </span><span class="s0">// remove all whitespace after the list</span>
+
+    <span class="s0">/* 
+     * We can assume that `listText` contains multiple elements. 
+     * Otherwise, this function wouldn't be called - if there is 
+     * only one rule in the list, then the whole comment must be removed. 
+     */</span>
+
+    <span class="s3">return </span><span class="s1">directives.map(directive =&gt; {</span>
+        <span class="s1">const { ruleId } = directive;</span>
+
+        <span class="s1">const regex = </span><span class="s3">new </span><span class="s1">RegExp(String.raw`(?:^|\s*,\s*)${escapeRegExp(ruleId)}(?:\s*,\s*|$)`, </span><span class="s2">&quot;u&quot;</span><span class="s1">);</span>
+        <span class="s1">const match = regex.exec(listText);</span>
+        <span class="s1">const matchedText = match[</span><span class="s4">0</span><span class="s1">];</span>
+        <span class="s1">const matchStartOffset = listStartOffset + match.index;</span>
+        <span class="s1">const matchEndOffset = matchStartOffset + matchedText.length;</span>
+
+        <span class="s1">const firstIndexOfComma = matchedText.indexOf(</span><span class="s2">&quot;,&quot;</span><span class="s1">);</span>
+        <span class="s1">const lastIndexOfComma = matchedText.lastIndexOf(</span><span class="s2">&quot;,&quot;</span><span class="s1">);</span>
+
+        <span class="s1">let removalStartOffset, removalEndOffset;</span>
+
+        <span class="s3">if </span><span class="s1">(firstIndexOfComma !== lastIndexOfComma) {</span>
+
+            <span class="s0">/* 
+             * Since there are two commas, this must one of the elements in the middle of the list. 
+             * Matched range starts where the previous rule name ends, and ends where the next rule name starts. 
+             * 
+             *     // eslint-disable-line rule-one , rule-two , rule-three -- comment 
+             *                                    ^^^^^^^^^^^^^^ 
+             * 
+             * We want to remove only the content between the two commas, and also one of the commas. 
+             * 
+             *     // eslint-disable-line rule-one , rule-two , rule-three -- comment 
+             *                                     ^^^^^^^^^^^ 
+             */</span>
+            <span class="s1">removalStartOffset = matchStartOffset + firstIndexOfComma;</span>
+            <span class="s1">removalEndOffset = matchStartOffset + lastIndexOfComma;</span>
+
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+
+            <span class="s0">/* 
+             * This is either the first element or the last element. 
+             * 
+             * If this is the first element, matched range starts where the first rule name starts 
+             * and ends where the second rule name starts. This is exactly the range we want 
+             * to remove so that the second rule name will start where the first one was starting 
+             * and thus preserve the original formatting. 
+             * 
+             *     // eslint-disable-line rule-one , rule-two , rule-three -- comment 
+             *                            ^^^^^^^^^^^ 
+             * 
+             * Similarly, if this is the last element, we've already matched the range we want to 
+             * remove. The previous rule name will end where the last one was ending, relative 
+             * to the content on the right side. 
+             * 
+             *     // eslint-disable-line rule-one , rule-two , rule-three -- comment 
+             *                                               ^^^^^^^^^^^^^ 
+             */</span>
+            <span class="s1">removalStartOffset = matchStartOffset;</span>
+            <span class="s1">removalEndOffset = matchEndOffset;</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">{</span>
+            <span class="s1">description: `</span><span class="s2">'${ruleId}'</span><span class="s1">`,</span>
+            <span class="s1">fix: {</span>
+                <span class="s1">range: [</span>
+                    <span class="s1">commentValueStart + removalStartOffset,</span>
+                    <span class="s1">commentValueStart + removalEndOffset</span>
+                <span class="s1">],</span>
+                <span class="s1">text: </span><span class="s2">&quot;&quot;</span>
+            <span class="s1">},</span>
+            <span class="s1">unprocessedDirective: directive.unprocessedDirective</span>
+        <span class="s1">};</span>
+    <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Creates a description of deleting an entire unused disable comment. 
+ * @param {Directive[]} directives Unused directives to be removed. 
+ * @param {Token} commentToken The backing Comment token. 
+ * @returns {{ description, fix, unprocessedDirective }} Details for later creation of an output Problem. 
+ */</span>
+<span class="s3">function </span><span class="s1">createCommentRemoval(directives, commentToken) {</span>
+    <span class="s1">const { range } = commentToken;</span>
+    <span class="s1">const ruleIds = directives.filter(directive =&gt; directive.ruleId).map(directive =&gt; `</span><span class="s2">'${directive.ruleId}'</span><span class="s1">`);</span>
+
+    <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">description: ruleIds.length &lt;= </span><span class="s4">2</span>
+            <span class="s1">? ruleIds.join(</span><span class="s2">&quot; or &quot;</span><span class="s1">)</span>
+            <span class="s1">: `${ruleIds.slice(</span><span class="s4">0</span><span class="s1">, ruleIds.length - </span><span class="s4">1</span><span class="s1">).join(</span><span class="s2">&quot;, &quot;</span><span class="s1">)}, or ${ruleIds[ruleIds.length - </span><span class="s4">1</span><span class="s1">]}`,</span>
+        <span class="s1">fix: {</span>
+            <span class="s1">range,</span>
+            <span class="s1">text: </span><span class="s2">&quot; &quot;</span>
+        <span class="s1">},</span>
+        <span class="s1">unprocessedDirective: directives[</span><span class="s4">0</span><span class="s1">].unprocessedDirective</span>
+    <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Parses details from directives to create output Problems. 
+ * @param {Directive[]} allDirectives Unused directives to be removed. 
+ * @returns {{ description, fix, unprocessedDirective }[]} Details for later creation of output Problems. 
+ */</span>
+<span class="s3">function </span><span class="s1">processUnusedDisableDirectives(allDirectives) {</span>
+    <span class="s1">const directiveGroups = groupByParentComment(allDirectives);</span>
+
+    <span class="s3">return </span><span class="s1">directiveGroups.flatMap(</span>
+        <span class="s1">directives =&gt; {</span>
+            <span class="s1">const { parentComment } = directives[</span><span class="s4">0</span><span class="s1">].unprocessedDirective;</span>
+            <span class="s1">const remainingRuleIds = </span><span class="s3">new </span><span class="s1">Set(parentComment.ruleIds);</span>
+
+            <span class="s3">for </span><span class="s1">(const directive of directives) {</span>
+                <span class="s1">remainingRuleIds.</span><span class="s3">delete</span><span class="s1">(directive.ruleId);</span>
+            <span class="s1">}</span>
+
+            <span class="s3">return </span><span class="s1">remainingRuleIds.size</span>
+                <span class="s1">? createIndividualDirectivesRemoval(directives, parentComment.commentToken)</span>
+                <span class="s1">: [createCommentRemoval(directives, parentComment.commentToken)];</span>
+        <span class="s1">}</span>
+    <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * This is the same as the exported function, except that it 
+ * doesn't handle disable-line and disable-next-line directives, and it always reports unused 
+ * disable directives. 
+ * @param {Object} options options for applying directives. This is the same as the options 
+ * for the exported function, except that `reportUnusedDisableDirectives` is not supported 
+ * (this function always reports unused disable directives). 
+ * @returns {{problems: LintMessage[], unusedDisableDirectives: LintMessage[]}} An object with a list 
+ * of problems (including suppressed ones) and unused eslint-disable directives 
+ */</span>
+<span class="s3">function </span><span class="s1">applyDirectives(options) {</span>
+    <span class="s1">const problems = [];</span>
+    <span class="s1">const usedDisableDirectives = </span><span class="s3">new </span><span class="s1">Set();</span>
+
+    <span class="s3">for </span><span class="s1">(const problem of options.problems) {</span>
+        <span class="s1">let disableDirectivesForProblem = [];</span>
+        <span class="s1">let nextDirectiveIndex = </span><span class="s4">0</span><span class="s1">;</span>
+
+        <span class="s3">while </span><span class="s1">(</span>
+            <span class="s1">nextDirectiveIndex &lt; options.directives.length &amp;&amp;</span>
+            <span class="s1">compareLocations(options.directives[nextDirectiveIndex], problem) &lt;= </span><span class="s4">0</span>
+        <span class="s1">) {</span>
+            <span class="s1">const directive = options.directives[nextDirectiveIndex++];</span>
+
+            <span class="s3">if </span><span class="s1">(directive.ruleId === </span><span class="s3">null </span><span class="s1">|| directive.ruleId === problem.ruleId) {</span>
+                <span class="s3">switch </span><span class="s1">(directive.type) {</span>
+                    <span class="s3">case </span><span class="s2">&quot;disable&quot;</span><span class="s1">:</span>
+                        <span class="s1">disableDirectivesForProblem.push(directive);</span>
+                        <span class="s3">break</span><span class="s1">;</span>
+
+                    <span class="s3">case </span><span class="s2">&quot;enable&quot;</span><span class="s1">:</span>
+                        <span class="s1">disableDirectivesForProblem = [];</span>
+                        <span class="s3">break</span><span class="s1">;</span>
+
+                    <span class="s0">// no default</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s3">if </span><span class="s1">(disableDirectivesForProblem.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">const suppressions = disableDirectivesForProblem.map(directive =&gt; ({</span>
+                <span class="s1">kind: </span><span class="s2">&quot;directive&quot;</span><span class="s1">,</span>
+                <span class="s1">justification: directive.unprocessedDirective.justification</span>
+            <span class="s1">}));</span>
+
+            <span class="s3">if </span><span class="s1">(problem.suppressions) {</span>
+                <span class="s1">problem.suppressions = problem.suppressions.concat(suppressions);</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s1">problem.suppressions = suppressions;</span>
+                <span class="s1">usedDisableDirectives.add(disableDirectivesForProblem[disableDirectivesForProblem.length - </span><span class="s4">1</span><span class="s1">]);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s1">problems.push(problem);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const unusedDisableDirectivesToReport = options.directives</span>
+        <span class="s1">.filter(directive =&gt; directive.type === </span><span class="s2">&quot;disable&quot; </span><span class="s1">&amp;&amp; !usedDisableDirectives.has(directive));</span>
+
+    <span class="s1">const processed = processUnusedDisableDirectives(unusedDisableDirectivesToReport);</span>
+
+    <span class="s1">const unusedDisableDirectives = processed</span>
+        <span class="s1">.map(({ description, fix, unprocessedDirective }) =&gt; {</span>
+            <span class="s1">const { parentComment, type, line, column } = unprocessedDirective;</span>
+
+            <span class="s3">return </span><span class="s1">{</span>
+                <span class="s1">ruleId: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">message: description</span>
+                    <span class="s1">? `Unused eslint-disable directive (no problems were reported from ${description}).`</span>
+                    <span class="s1">: </span><span class="s2">&quot;Unused eslint-disable directive (no problems were reported).&quot;</span><span class="s1">,</span>
+                <span class="s1">line: type === </span><span class="s2">&quot;disable-next-line&quot; </span><span class="s1">? parentComment.commentToken.loc.start.line : line,</span>
+                <span class="s1">column: type === </span><span class="s2">&quot;disable-next-line&quot; </span><span class="s1">? parentComment.commentToken.loc.start.column + </span><span class="s4">1 </span><span class="s1">: column,</span>
+                <span class="s1">severity: options.reportUnusedDisableDirectives === </span><span class="s2">&quot;warn&quot; </span><span class="s1">? </span><span class="s4">1 </span><span class="s1">: </span><span class="s4">2</span><span class="s1">,</span>
+                <span class="s1">nodeType: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">...options.disableFixes ? {} : { fix }</span>
+            <span class="s1">};</span>
+        <span class="s1">});</span>
+
+    <span class="s3">return </span><span class="s1">{ problems, unusedDisableDirectives };</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Given a list of directive comments (i.e. metadata about eslint-disable and eslint-enable comments) and a list 
+ * of reported problems, adds the suppression information to the problems. 
+ * @param {Object} options Information about directives and problems 
+ * @param {{ 
+ *      type: (&quot;disable&quot;|&quot;enable&quot;|&quot;disable-line&quot;|&quot;disable-next-line&quot;), 
+ *      ruleId: (string|null), 
+ *      line: number, 
+ *      column: number, 
+ *      justification: string 
+ * }} options.directives Directive comments found in the file, with one-based columns. 
+ * Two directive comments can only have the same location if they also have the same type (e.g. a single eslint-disable 
+ * comment for two different rules is represented as two directives). 
+ * @param {{ruleId: (string|null), line: number, column: number}[]} options.problems 
+ * A list of problems reported by rules, sorted by increasing location in the file, with one-based columns. 
+ * @param {&quot;off&quot; | &quot;warn&quot; | &quot;error&quot;} options.reportUnusedDisableDirectives If `&quot;warn&quot;` or `&quot;error&quot;`, adds additional problems for unused directives 
+ * @param {boolean} options.disableFixes If true, it doesn't make `fix` properties. 
+ * @returns {{ruleId: (string|null), line: number, column: number, suppressions?: {kind: string, justification: string}}[]} 
+ * An object with a list of reported problems, the suppressed of which contain the suppression information. 
+ */</span>
+<span class="s1">module.exports = ({ directives, disableFixes, problems, reportUnusedDisableDirectives = </span><span class="s2">&quot;off&quot; </span><span class="s1">}) =&gt; {</span>
+    <span class="s1">const blockDirectives = directives</span>
+        <span class="s1">.filter(directive =&gt; directive.type === </span><span class="s2">&quot;disable&quot; </span><span class="s1">|| directive.type === </span><span class="s2">&quot;enable&quot;</span><span class="s1">)</span>
+        <span class="s1">.map(directive =&gt; Object.assign({}, directive, { unprocessedDirective: directive }))</span>
+        <span class="s1">.sort(compareLocations);</span>
+
+    <span class="s1">const lineDirectives = directives.flatMap(directive =&gt; {</span>
+        <span class="s3">switch </span><span class="s1">(directive.type) {</span>
+            <span class="s3">case </span><span class="s2">&quot;disable&quot;</span><span class="s1">:</span>
+            <span class="s3">case </span><span class="s2">&quot;enable&quot;</span><span class="s1">:</span>
+                <span class="s3">return </span><span class="s1">[];</span>
+
+            <span class="s3">case </span><span class="s2">&quot;disable-line&quot;</span><span class="s1">:</span>
+                <span class="s3">return </span><span class="s1">[</span>
+                    <span class="s1">{ type: </span><span class="s2">&quot;disable&quot;</span><span class="s1">, line: directive.line, column: </span><span class="s4">1</span><span class="s1">, ruleId: directive.ruleId, unprocessedDirective: directive },</span>
+                    <span class="s1">{ type: </span><span class="s2">&quot;enable&quot;</span><span class="s1">, line: directive.line + </span><span class="s4">1</span><span class="s1">, column: </span><span class="s4">0</span><span class="s1">, ruleId: directive.ruleId, unprocessedDirective: directive }</span>
+                <span class="s1">];</span>
+
+            <span class="s3">case </span><span class="s2">&quot;disable-next-line&quot;</span><span class="s1">:</span>
+                <span class="s3">return </span><span class="s1">[</span>
+                    <span class="s1">{ type: </span><span class="s2">&quot;disable&quot;</span><span class="s1">, line: directive.line + </span><span class="s4">1</span><span class="s1">, column: </span><span class="s4">1</span><span class="s1">, ruleId: directive.ruleId, unprocessedDirective: directive },</span>
+                    <span class="s1">{ type: </span><span class="s2">&quot;enable&quot;</span><span class="s1">, line: directive.line + </span><span class="s4">2</span><span class="s1">, column: </span><span class="s4">0</span><span class="s1">, ruleId: directive.ruleId, unprocessedDirective: directive }</span>
+                <span class="s1">];</span>
+
+            <span class="s3">default</span><span class="s1">:</span>
+                <span class="s3">throw new </span><span class="s1">TypeError(`Unrecognized directive type </span><span class="s2">'${directive.type}'</span><span class="s1">`);</span>
+        <span class="s1">}</span>
+    <span class="s1">}).sort(compareLocations);</span>
+
+    <span class="s1">const blockDirectivesResult = applyDirectives({</span>
+        <span class="s1">problems,</span>
+        <span class="s1">directives: blockDirectives,</span>
+        <span class="s1">disableFixes,</span>
+        <span class="s1">reportUnusedDisableDirectives</span>
+    <span class="s1">});</span>
+    <span class="s1">const lineDirectivesResult = applyDirectives({</span>
+        <span class="s1">problems: blockDirectivesResult.problems,</span>
+        <span class="s1">directives: lineDirectives,</span>
+        <span class="s1">disableFixes,</span>
+        <span class="s1">reportUnusedDisableDirectives</span>
+    <span class="s1">});</span>
+
+    <span class="s3">return </span><span class="s1">reportUnusedDisableDirectives !== </span><span class="s2">&quot;off&quot;</span>
+        <span class="s1">? lineDirectivesResult.problems</span>
+            <span class="s1">.concat(blockDirectivesResult.unusedDisableDirectives)</span>
+            <span class="s1">.concat(lineDirectivesResult.unusedDisableDirectives)</span>
+            <span class="s1">.sort(compareLocations)</span>
+        <span class="s1">: lineDirectivesResult.problems;</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

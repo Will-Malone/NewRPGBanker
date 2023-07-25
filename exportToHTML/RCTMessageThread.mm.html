@@ -1,0 +1,136 @@
+<html>
+<head>
+<title>RCTMessageThread.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTMessageThread.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;RCTMessageThread.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;condition_variable&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTCxxUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+
+<span class="s0">// A note about the implementation: This class is not used</span>
+<span class="s0">// generically.  It's a thin wrapper around a run loop which</span>
+<span class="s0">// implements a C++ interface, for use by the C++ xplat bridge code.</span>
+<span class="s0">// This means it can make certain non-generic assumptions.  In</span>
+<span class="s0">// particular, the sync functions are only used for bridge setup and</span>
+<span class="s0">// teardown, and quitSynchronous is guaranteed to be called.</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s1">RCTMessageThread::RCTMessageThread(NSRunLoop *runLoop</span><span class="s4">, </span><span class="s1">RCTJavaScriptCompleteBlock errorBlock)</span>
+    <span class="s1">: m_cfRunLoop([runLoop getCFRunLoop])</span><span class="s4">, </span><span class="s1">m_errorBlock(errorBlock)</span><span class="s4">, </span><span class="s1">m_shutdown(</span><span class="s4">false</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s1">CFRetain(m_cfRunLoop)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCTMessageThread::~RCTMessageThread()</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssert(m_shutdown</span><span class="s4">, @</span><span class="s3">&quot;RCTMessageThread: quitSynchronous() not called before destructor&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">CFRelease(m_cfRunLoop)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// This is analogous to dispatch_async</span>
+<span class="s4">void </span><span class="s1">RCTMessageThread::runAsync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; func)</span>
+<span class="s1">{</span>
+  <span class="s1">CFRunLoopPerformBlock(m_cfRunLoop</span><span class="s4">, </span><span class="s1">kCFRunLoopCommonModes</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s0">// Create an autorelease pool each run loop to prevent memory footprint from growing too large, which can lead to</span>
+    <span class="s0">// performance problems.</span>
+    <span class="s4">@autoreleasepool </span><span class="s1">{</span>
+      <span class="s1">func()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">CFRunLoopWakeUp(m_cfRunLoop)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// This is analogous to dispatch_sync</span>
+<span class="s4">void </span><span class="s1">RCTMessageThread::runSync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; func)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(m_cfRunLoop == CFRunLoopGetCurrent()) {</span>
+    <span class="s1">func()</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">dispatch_semaphore_t sema = dispatch_semaphore_create(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">runAsync([func = std::make_shared&lt;std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt;&gt;(std::move(func))</span><span class="s4">, </span><span class="s1">&amp;sema] {</span>
+    <span class="s1">(*func)()</span><span class="s4">;</span>
+    <span class="s1">dispatch_semaphore_signal(sema)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">dispatch_semaphore_wait(sema</span><span class="s4">, </span><span class="s1">DISPATCH_TIME_FOREVER)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTMessageThread::tryFunc(</span><span class="s4">const </span><span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;func)</span>
+<span class="s1">{</span>
+  <span class="s1">NSError *error = tryAndReturnError(func)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(error) {</span>
+    <span class="s1">m_errorBlock(error)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTMessageThread::runOnQueue(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;func)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(m_shutdown) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">runAsync([sharedThis = shared_from_this()</span><span class="s4">, </span><span class="s1">func = std::make_shared&lt;std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt;&gt;(std::move(func))] {</span>
+    <span class="s4">if </span><span class="s1">(!sharedThis-&gt;m_shutdown) {</span>
+      <span class="s1">sharedThis-&gt;tryFunc(*func)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTMessageThread::runOnQueueSync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;func)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(m_shutdown) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">runSync([sharedThis = shared_from_this()</span><span class="s4">, </span><span class="s1">func = std::move(func)] {</span>
+    <span class="s4">if </span><span class="s1">(!sharedThis-&gt;m_shutdown) {</span>
+      <span class="s1">sharedThis-&gt;tryFunc(func)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTMessageThread::quitSynchronous()</span>
+<span class="s1">{</span>
+  <span class="s1">m_shutdown = </span><span class="s4">true;</span>
+  <span class="s1">runSync([] {})</span><span class="s4">;</span>
+  <span class="s1">CFRunLoopStop(m_cfRunLoop)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTMessageThread::setRunLoop(NSRunLoop *runLoop)</span>
+<span class="s1">{</span>
+  <span class="s1">CFRelease(m_cfRunLoop)</span><span class="s4">;</span>
+  <span class="s1">m_cfRunLoop = [runLoop getCFRunLoop]</span><span class="s4">;</span>
+  <span class="s1">CFRetain(m_cfRunLoop)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

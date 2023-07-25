@@ -1,0 +1,169 @@
+<html>
+<head>
+<title>RCTObjcExecutor.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTObjcExecutor.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTObjcExecutor.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTCxxUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTFollyConvert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTJavaScriptExecutor.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTLog.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTProfile.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;cxxreact/JSBigString.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;cxxreact/JSExecutor.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;cxxreact/MessageQueueThread.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;cxxreact/ModuleRegistry.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;cxxreact/RAMBundleRegistry.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;folly/json.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">class </span><span class="s1">JSEException : </span><span class="s4">public </span><span class="s1">std::runtime_error {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">JSEException(NSError *error) : runtime_error([[error description] UTF8String]) {}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">RCTObjcExecutor : </span><span class="s4">public </span><span class="s1">JSExecutor {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">RCTObjcExecutor(</span>
+      <span class="s1">id&lt;RCTJavaScriptExecutor&gt; jse</span><span class="s4">,</span>
+      <span class="s1">RCTJavaScriptCompleteBlock errorBlock</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;MessageQueueThread&gt; jsThread</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; delegate)</span>
+      <span class="s1">: m_jse(jse)</span><span class="s4">, </span><span class="s1">m_errorBlock(errorBlock)</span><span class="s4">, </span><span class="s1">m_delegate(std::move(delegate))</span><span class="s4">, </span><span class="s1">m_jsThread(std::move(jsThread))</span>
+  <span class="s1">{</span>
+    <span class="s1">m_jsCallback = ^(id json</span><span class="s4">, </span><span class="s1">NSError *error) {</span>
+      <span class="s4">if </span><span class="s1">(error) {</span>
+        <span class="s0">// Do not use &quot;m_errorBlock&quot; here as the bridge might be in the middle</span>
+        <span class="s0">// of invalidation as a result of error handling and &quot;this&quot; can be</span>
+        <span class="s0">// already deallocated.</span>
+        <span class="s1">errorBlock(error)</span><span class="s4">;</span>
+        <span class="s4">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">m_jsThread-&gt;runOnQueue(</span>
+          <span class="s1">[</span><span class="s4">this, </span><span class="s1">json] { m_delegate-&gt;callNativeModules(*</span><span class="s4">this, </span><span class="s1">convertIdToFollyDynamic(json)</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">}</span><span class="s4">;</span>
+
+    <span class="s0">// Synchronously initialize the executor</span>
+    <span class="s1">[jse setUp]</span><span class="s4">;</span>
+
+    <span class="s1">folly::</span><span class="s4">dynamic </span><span class="s1">nativeModuleConfig = folly::</span><span class="s4">dynamic</span><span class="s1">::array</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">moduleRegistry = m_delegate-&gt;getModuleRegistry()</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;name : moduleRegistry-&gt;moduleNames()) {</span>
+      <span class="s4">auto </span><span class="s1">config = moduleRegistry-&gt;getConfig(name)</span><span class="s4">;</span>
+      <span class="s1">nativeModuleConfig.push_back(config ? config-&gt;config : </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">folly::</span><span class="s4">dynamic </span><span class="s1">config = folly::</span><span class="s4">dynamic</span><span class="s1">::object(</span><span class="s3">&quot;remoteModuleConfig&quot;</span><span class="s4">, </span><span class="s1">std::move(nativeModuleConfig))</span><span class="s4">;</span>
+
+    <span class="s1">setGlobalVariable(</span><span class="s3">&quot;__fbBatchedBridgeConfig&quot;</span><span class="s4">, </span><span class="s1">std::make_unique&lt;JSBigStdString&gt;(folly::toJson(config)))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">initializeRuntime() override</span>
+  <span class="s1">{</span>
+    <span class="s0">// We do nothing here since initialization is done in the constructor</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">loadBundle(std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; script</span><span class="s4">, </span><span class="s1">std::string sourceURL) override</span>
+  <span class="s1">{</span>
+    <span class="s1">RCTProfileBeginFlowEvent()</span><span class="s4">;</span>
+    <span class="s1">[m_jse executeApplicationScript:[NSData dataWithBytes:script-&gt;c_str() length:script-&gt;size()]</span>
+                          <span class="s1">sourceURL:[[NSURL alloc] initWithString:</span><span class="s4">@</span><span class="s1">(sourceURL.c_str())]</span>
+                         <span class="s1">onComplete:^(NSError *error) {</span>
+                           <span class="s1">RCTProfileEndFlowEvent()</span><span class="s4">;</span>
+
+                           <span class="s4">if </span><span class="s1">(error) {</span>
+                             <span class="s1">m_errorBlock(error)</span><span class="s4">;</span>
+                             <span class="s4">return;</span>
+                           <span class="s1">}</span>
+
+                           <span class="s1">[m_jse flushedQueue:m_jsCallback]</span><span class="s4">;</span>
+                         <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">setBundleRegistry(std::unique_ptr&lt;RAMBundleRegistry&gt;) override</span>
+  <span class="s1">{</span>
+    <span class="s1">RCTAssert(NO</span><span class="s4">, @</span><span class="s3">&quot;RAM bundles are not supported in RCTObjcExecutor&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">registerBundle(uint32_t __unused bundleId</span><span class="s4">, const </span><span class="s1">std::string __unused &amp;bundlePath) override</span>
+  <span class="s1">{</span>
+    <span class="s1">RCTAssert(NO</span><span class="s4">, @</span><span class="s3">&quot;RAM bundles are not supported in RCTObjcExecutor&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">callFunction(</span><span class="s4">const </span><span class="s1">std::string &amp;module</span><span class="s4">, const </span><span class="s1">std::string &amp;method</span><span class="s4">, const </span><span class="s1">folly::</span><span class="s4">dynamic </span><span class="s1">&amp;arguments) override</span>
+  <span class="s1">{</span>
+    <span class="s1">[m_jse callFunctionOnModule:</span><span class="s4">@</span><span class="s1">(module.c_str())</span>
+                         <span class="s1">method:</span><span class="s4">@</span><span class="s1">(method.c_str())</span>
+                      <span class="s1">arguments:convertFollyDynamicToId(arguments)</span>
+                       <span class="s1">callback:m_jsCallback]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">invokeCallback(</span><span class="s4">double </span><span class="s1">callbackId</span><span class="s4">, const </span><span class="s1">folly::</span><span class="s4">dynamic </span><span class="s1">&amp;arguments) override</span>
+  <span class="s1">{</span>
+    <span class="s1">[m_jse invokeCallbackID:</span><span class="s4">@</span><span class="s1">(callbackId) arguments:convertFollyDynamicToId(arguments) callback:m_jsCallback]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">virtual void </span><span class="s1">setGlobalVariable(std::string propName</span><span class="s4">, </span><span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; jsonValue) override</span>
+  <span class="s1">{</span>
+    <span class="s1">[m_jse injectJSONText:</span><span class="s4">@</span><span class="s1">(jsonValue-&gt;c_str()) asGlobalObjectNamed:</span><span class="s4">@</span><span class="s1">(propName.c_str()) callback:m_errorBlock]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">virtual </span><span class="s1">std::string getDescription() override</span>
+  <span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">[NSStringFromClass([m_jse </span><span class="s4">class</span><span class="s1">]) UTF8String]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">id&lt;RCTJavaScriptExecutor&gt; m_jse</span><span class="s4">;</span>
+  <span class="s1">RCTJavaScriptCompleteBlock m_errorBlock</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; m_delegate</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;MessageQueueThread&gt; m_jsThread</span><span class="s4">;</span>
+  <span class="s1">RCTJavaScriptCallback m_jsCallback</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">}</span>
+
+<span class="s1">RCTObjcExecutorFactory::RCTObjcExecutorFactory(id&lt;RCTJavaScriptExecutor&gt; jse</span><span class="s4">, </span><span class="s1">RCTJavaScriptCompleteBlock errorBlock)</span>
+    <span class="s1">: m_jse(jse)</span><span class="s4">, </span><span class="s1">m_errorBlock(errorBlock)</span>
+<span class="s1">{</span>
+<span class="s1">}</span>
+
+<span class="s1">std::unique_ptr&lt;JSExecutor&gt; RCTObjcExecutorFactory::createJSExecutor(</span>
+    <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; delegate</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;MessageQueueThread&gt; jsQueue)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">std::unique_ptr&lt;JSExecutor&gt;(</span><span class="s4">new </span><span class="s1">RCTObjcExecutor(m_jse</span><span class="s4">, </span><span class="s1">m_errorBlock</span><span class="s4">, </span><span class="s1">jsQueue</span><span class="s4">, </span><span class="s1">delegate))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

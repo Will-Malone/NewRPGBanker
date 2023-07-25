@@ -1,0 +1,203 @@
+<html>
+<head>
+<title>BlobManager.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+BlobManager.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow strict-local 
+ * @format 
+ */</span>
+
+<span class="s1">import type {BlobCollector, BlobData, BlobOptions} from </span><span class="s2">'./BlobTypes'</span><span class="s1">;</span>
+
+<span class="s1">import NativeBlobModule from </span><span class="s2">'./NativeBlobModule'</span><span class="s1">;</span>
+<span class="s1">import invariant from </span><span class="s2">'invariant'</span><span class="s1">;</span>
+
+<span class="s1">const Blob = require(</span><span class="s2">'./Blob'</span><span class="s1">);</span>
+<span class="s1">const BlobRegistry = require(</span><span class="s2">'./BlobRegistry'</span><span class="s1">);</span>
+
+<span class="s0">/*eslint-disable no-bitwise */</span>
+<span class="s0">/*eslint-disable eqeqeq */</span>
+
+<span class="s0">/** 
+ * Based on the rfc4122-compliant solution posted at 
+ * http://stackoverflow.com/questions/105034 
+ */</span>
+<span class="s3">function </span><span class="s1">uuidv4(): string {</span>
+  <span class="s3">return </span><span class="s2">'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'</span><span class="s1">.replace(/[xy]/g, c =&gt; {</span>
+    <span class="s1">const r = (Math.random() * </span><span class="s4">16</span><span class="s1">) | </span><span class="s4">0</span><span class="s1">,</span>
+      <span class="s1">v = c == </span><span class="s2">'x' </span><span class="s1">? r : (r &amp; </span><span class="s4">0</span><span class="s1">x3) | </span><span class="s4">0</span><span class="s1">x8;</span>
+    <span class="s3">return </span><span class="s1">v.toString(</span><span class="s4">16</span><span class="s1">);</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s0">// **Temporary workaround**</span>
+<span class="s0">// TODO(#24654): Use turbomodules for the Blob module.</span>
+<span class="s0">// Blob collector is a jsi::HostObject that is used by native to know</span>
+<span class="s0">// when the a Blob instance is deallocated. This allows to free the</span>
+<span class="s0">// underlying native resources. This is a hack to workaround the fact</span>
+<span class="s0">// that the current bridge infra doesn't allow to track js objects</span>
+<span class="s0">// deallocation. Ideally the whole Blob object should be a jsi::HostObject.</span>
+<span class="s3">function </span><span class="s1">createBlobCollector(blobId: string): BlobCollector | </span><span class="s3">null </span><span class="s1">{</span>
+  <span class="s3">if </span><span class="s1">(global.__blobCollectorProvider == </span><span class="s3">null</span><span class="s1">) {</span>
+    <span class="s3">return null</span><span class="s1">;</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s3">return </span><span class="s1">global.__blobCollectorProvider(blobId);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Module to manage blobs. Wrapper around the native blob module. 
+ */</span>
+<span class="s1">class BlobManager {</span>
+  <span class="s0">/** 
+   * If the native blob module is available. 
+   */</span>
+  <span class="s1">static isAvailable: boolean = !!NativeBlobModule;</span>
+
+  <span class="s0">/** 
+   * Create blob from existing array of blobs. 
+   */</span>
+  <span class="s1">static createFromParts(</span>
+    <span class="s1">parts: Array&lt;Blob | string&gt;,</span>
+    <span class="s1">options?: BlobOptions,</span>
+  <span class="s1">): Blob {</span>
+    <span class="s1">invariant(NativeBlobModule, </span><span class="s2">'NativeBlobModule is available.'</span><span class="s1">);</span>
+
+    <span class="s1">const blobId = uuidv4();</span>
+    <span class="s1">const items = parts.map(part =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">part </span><span class="s3">instanceof </span><span class="s1">ArrayBuffer ||</span>
+        <span class="s1">(global.ArrayBufferView &amp;&amp; part </span><span class="s3">instanceof </span><span class="s1">global.ArrayBufferView)</span>
+      <span class="s1">) {</span>
+        <span class="s3">throw new </span><span class="s1">Error(</span>
+          <span class="s2">&quot;Creating blobs from 'ArrayBuffer' and 'ArrayBufferView' are not supported&quot;</span><span class="s1">,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">(part </span><span class="s3">instanceof </span><span class="s1">Blob) {</span>
+        <span class="s3">return </span><span class="s1">{</span>
+          <span class="s1">data: part.data,</span>
+          <span class="s1">type: </span><span class="s2">'blob'</span><span class="s1">,</span>
+        <span class="s1">};</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s3">return </span><span class="s1">{</span>
+          <span class="s1">data: String(part),</span>
+          <span class="s1">type: </span><span class="s2">'string'</span><span class="s1">,</span>
+        <span class="s1">};</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+    <span class="s1">const size = items.reduce((acc, curr) =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(curr.type === </span><span class="s2">'string'</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">acc + global.unescape(encodeURI(curr.data)).length;</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s3">return </span><span class="s1">acc + curr.data.size;</span>
+      <span class="s1">}</span>
+    <span class="s1">}, </span><span class="s4">0</span><span class="s1">);</span>
+
+    <span class="s1">NativeBlobModule.createFromParts(items, blobId);</span>
+
+    <span class="s3">return </span><span class="s1">BlobManager.createFromOptions({</span>
+      <span class="s1">blobId,</span>
+      <span class="s1">offset: </span><span class="s4">0</span><span class="s1">,</span>
+      <span class="s1">size,</span>
+      <span class="s1">type: options ? options.type : </span><span class="s2">''</span><span class="s1">,</span>
+      <span class="s1">lastModified: options ? options.lastModified : Date.now(),</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Create blob instance from blob data from native. 
+   * Used internally by modules like XHR, WebSocket, etc. 
+   */</span>
+  <span class="s1">static createFromOptions(options: BlobData): Blob {</span>
+    <span class="s1">BlobRegistry.register(options.blobId);</span>
+    <span class="s0">// $FlowFixMe[prop-missing]</span>
+    <span class="s3">return </span><span class="s1">Object.assign(Object.create(Blob.prototype), {</span>
+      <span class="s1">data:</span>
+        <span class="s0">// Reuse the collector instance when creating from an existing blob.</span>
+        <span class="s0">// This will make sure that the underlying resource is only deallocated</span>
+        <span class="s0">// when all blobs that refer to it are deallocated.</span>
+        <span class="s1">options.__collector == </span><span class="s3">null</span>
+          <span class="s1">? {</span>
+              <span class="s1">...options,</span>
+              <span class="s1">__collector: createBlobCollector(options.blobId),</span>
+            <span class="s1">}</span>
+          <span class="s1">: options,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Deallocate resources for a blob. 
+   */</span>
+  <span class="s1">static release(blobId: string): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(NativeBlobModule, </span><span class="s2">'NativeBlobModule is available.'</span><span class="s1">);</span>
+
+    <span class="s1">BlobRegistry.unregister(blobId);</span>
+    <span class="s3">if </span><span class="s1">(BlobRegistry.has(blobId)) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">NativeBlobModule.release(blobId);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Inject the blob content handler in the networking module to support blob 
+   * requests and responses. 
+   */</span>
+  <span class="s1">static addNetworkingHandler(): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(NativeBlobModule, </span><span class="s2">'NativeBlobModule is available.'</span><span class="s1">);</span>
+
+    <span class="s1">NativeBlobModule.addNetworkingHandler();</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Indicate the websocket should return a blob for incoming binary 
+   * messages. 
+   */</span>
+  <span class="s1">static addWebSocketHandler(socketId: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(NativeBlobModule, </span><span class="s2">'NativeBlobModule is available.'</span><span class="s1">);</span>
+
+    <span class="s1">NativeBlobModule.addWebSocketHandler(socketId);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Indicate the websocket should no longer return a blob for incoming 
+   * binary messages. 
+   */</span>
+  <span class="s1">static removeWebSocketHandler(socketId: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(NativeBlobModule, </span><span class="s2">'NativeBlobModule is available.'</span><span class="s1">);</span>
+
+    <span class="s1">NativeBlobModule.removeWebSocketHandler(socketId);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Send a blob message to a websocket. 
+   */</span>
+  <span class="s1">static sendOverSocket(blob: Blob, socketId: number): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">invariant(NativeBlobModule, </span><span class="s2">'NativeBlobModule is available.'</span><span class="s1">);</span>
+
+    <span class="s1">NativeBlobModule.sendOverSocket(blob.data, socketId);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = BlobManager;</span>
+</pre>
+</body>
+</html>

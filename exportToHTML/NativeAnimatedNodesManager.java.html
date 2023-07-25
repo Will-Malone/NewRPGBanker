@@ -1,0 +1,847 @@
+<html>
+<head>
+<title>NativeAnimatedNodesManager.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #77b767; font-style: italic;}
+.s5 { color: #6a8759;}
+.s6 { color: #6897bb;}
+.s7 { color: #629755; font-weight: bold; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+NativeAnimatedNodesManager.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.animated</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.util.SparseArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.UiThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.Arguments</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.Callback</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.JSApplicationCausedNativeException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.JSApplicationIllegalArgumentException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactApplicationContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactNoCrashSoftException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactSoftExceptionLogger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.UIManager</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.UiThreadUtil</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.WritableMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.UIManagerHelper</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.common.UIManagerType</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.events.Event</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.events.EventDispatcher</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.events.EventDispatcherListener</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayDeque</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.LinkedList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.List</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ListIterator</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Queue</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* This is the main class that coordinates how native animated JS implementation drives UI changes.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">It implements a management interface for animated nodes graph as well as implements a graph</span>
+ <span class="s3">* traversal algorithm that is run for each animation frame.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">For each animation frame we visit animated nodes that might've been updated as well as their</span>
+ <span class="s3">* children that may use parent's values to update themselves. At the end of the traversal algorithm</span>
+ <span class="s3">* we expect to reach a special type of the node: PropsAnimatedNode that is then responsible for</span>
+ <span class="s3">* calculating property map which can be sent to native view hierarchy to update the view.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">IMPORTANT: This class should be accessed only from the UI Thread</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">NativeAnimatedNodesManager </span><span class="s2">implements </span><span class="s1">EventDispatcherListener {</span>
+
+  <span class="s2">private static final </span><span class="s1">String TAG = </span><span class="s5">&quot;NativeAnimatedNodesManager&quot;</span><span class="s2">;</span>
+
+  <span class="s2">private final </span><span class="s1">SparseArray&lt;AnimatedNode&gt; mAnimatedNodes = </span><span class="s2">new </span><span class="s1">SparseArray&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">SparseArray&lt;AnimationDriver&gt; mActiveAnimations = </span><span class="s2">new </span><span class="s1">SparseArray&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">SparseArray&lt;AnimatedNode&gt; mUpdatedNodes = </span><span class="s2">new </span><span class="s1">SparseArray&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s0">// List of event animation drivers for an event on view.</span>
+  <span class="s0">// There may be multiple drivers for the same event and view.</span>
+  <span class="s2">private final </span><span class="s1">List&lt;EventAnimationDriver&gt; mEventDrivers = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ReactApplicationContext mReactApplicationContext</span><span class="s2">;</span>
+  <span class="s2">private int </span><span class="s1">mAnimatedGraphBFSColor = </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s0">// Used to avoid allocating a new array on every frame in `runUpdates` and `onEventDispatch`.</span>
+  <span class="s2">private final </span><span class="s1">List&lt;AnimatedNode&gt; mRunUpdateNodeList = </span><span class="s2">new </span><span class="s1">LinkedList&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s2">private boolean </span><span class="s1">mEventListenerInitializedForFabric = </span><span class="s2">false;</span>
+  <span class="s2">private boolean </span><span class="s1">mEventListenerInitializedForNonFabric = </span><span class="s2">false;</span>
+
+  <span class="s2">private boolean </span><span class="s1">mWarnedAboutGraphTraversal = </span><span class="s2">false;</span>
+
+  <span class="s2">public </span><span class="s1">NativeAnimatedNodesManager(ReactApplicationContext reactApplicationContext) {</span>
+    <span class="s1">mReactApplicationContext = reactApplicationContext</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Initialize event listeners for Fabric UIManager or non-Fabric UIManager, exactly once. Once</span>
+   <span class="s3">* Fabric is the only UIManager, this logic can be simplified. This is expected to only be called</span>
+   <span class="s3">* from the native module thread.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s7">@param </span><span class="s3">uiManagerType</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">initializeEventListenerForUIManagerType(@UIManagerType </span><span class="s2">final int </span><span class="s1">uiManagerType) {</span>
+    <span class="s2">if </span><span class="s1">(uiManagerType == UIManagerType.FABRIC</span>
+        <span class="s1">? mEventListenerInitializedForFabric</span>
+        <span class="s1">: mEventListenerInitializedForNonFabric) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">UIManager uiManager = UIManagerHelper.getUIManager(mReactApplicationContext</span><span class="s2">, </span><span class="s1">uiManagerType)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(uiManager != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">uiManager.&lt;EventDispatcher&gt;getEventDispatcher().addListener(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(uiManagerType == UIManagerType.FABRIC) {</span>
+        <span class="s1">mEventListenerInitializedForFabric = </span><span class="s2">true;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">mEventListenerInitializedForNonFabric = </span><span class="s2">true;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Nullable</span>
+  <span class="s2">public </span><span class="s1">AnimatedNode getNodeById(</span><span class="s2">int </span><span class="s1">id) {</span>
+    <span class="s2">return </span><span class="s1">mAnimatedNodes.get(id)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">hasActiveAnimations() {</span>
+    <span class="s2">return </span><span class="s1">mActiveAnimations.size() &gt; </span><span class="s6">0 </span><span class="s1">|| mUpdatedNodes.size() &gt; </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">createAnimatedNode(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">ReadableMap config) {</span>
+    <span class="s2">if </span><span class="s1">(mAnimatedNodes.get(tag) != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;createAnimatedNode: Animated node [&quot; </span><span class="s1">+ tag + </span><span class="s5">&quot;] already exists&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">String type = config.getString(</span><span class="s5">&quot;type&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">final </span><span class="s1">AnimatedNode node</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(</span><span class="s5">&quot;style&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">StyleAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;value&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">ValueAnimatedNode(config)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;color&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">ColorAnimatedNode(config</span><span class="s2">, this, </span><span class="s1">mReactApplicationContext)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;props&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">PropsAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;interpolation&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">InterpolationAnimatedNode(config)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;addition&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">AdditionAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;subtraction&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">SubtractionAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;division&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">DivisionAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;multiplication&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">MultiplicationAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;modulus&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">ModulusAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;diffclamp&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">DiffClampAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;transform&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">TransformAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;tracking&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">node = </span><span class="s2">new </span><span class="s1">TrackingAnimatedNode(config</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span><span class="s5">&quot;Unsupported node type: &quot; </span><span class="s1">+ type)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">node.mTag = tag</span><span class="s2">;</span>
+    <span class="s1">mAnimatedNodes.put(tag</span><span class="s2">, </span><span class="s1">node)</span><span class="s2">;</span>
+    <span class="s1">mUpdatedNodes.put(tag</span><span class="s2">, </span><span class="s1">node)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">updateAnimatedNodeConfig(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">ReadableMap config) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;updateAnimatedNode: Animated node [&quot; </span><span class="s1">+ tag + </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(node </span><span class="s2">instanceof </span><span class="s1">AnimatedNodeWithUpdateableConfig) {</span>
+      <span class="s1">stopAnimationsForNode(node)</span><span class="s2">;</span>
+      <span class="s1">((AnimatedNodeWithUpdateableConfig) node).onUpdateConfig(config)</span><span class="s2">;</span>
+      <span class="s1">mUpdatedNodes.put(tag</span><span class="s2">, </span><span class="s1">node)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">dropAnimatedNode(</span><span class="s2">int </span><span class="s1">tag) {</span>
+    <span class="s1">mAnimatedNodes.remove(tag)</span><span class="s2">;</span>
+    <span class="s1">mUpdatedNodes.remove(tag)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">startListeningToAnimatedNodeValue(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">AnimatedNodeValueListener listener) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null </span><span class="s1">|| !(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;startListeningToAnimatedNodeValue: Animated node [&quot;</span>
+              <span class="s1">+ tag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist, or is not a 'value' node&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">((ValueAnimatedNode) node).setValueListener(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">stopListeningToAnimatedNodeValue(</span><span class="s2">int </span><span class="s1">tag) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null </span><span class="s1">|| !(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;startListeningToAnimatedNodeValue: Animated node [&quot;</span>
+              <span class="s1">+ tag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist, or is not a 'value' node&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">((ValueAnimatedNode) node).setValueListener(</span><span class="s2">null</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">setAnimatedNodeValue(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, double </span><span class="s1">value) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null </span><span class="s1">|| !(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;setAnimatedNodeValue: Animated node [&quot;</span>
+              <span class="s1">+ tag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist, or is not a 'value' node&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">stopAnimationsForNode(node)</span><span class="s2">;</span>
+    <span class="s1">((ValueAnimatedNode) node).mValue = value</span><span class="s2">;</span>
+    <span class="s1">mUpdatedNodes.put(tag</span><span class="s2">, </span><span class="s1">node)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">setAnimatedNodeOffset(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, double </span><span class="s1">offset) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null </span><span class="s1">|| !(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;setAnimatedNodeOffset: Animated node [&quot;</span>
+              <span class="s1">+ tag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist, or is not a 'value' node&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">((ValueAnimatedNode) node).mOffset = offset</span><span class="s2">;</span>
+    <span class="s1">mUpdatedNodes.put(tag</span><span class="s2">, </span><span class="s1">node)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">flattenAnimatedNodeOffset(</span><span class="s2">int </span><span class="s1">tag) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null </span><span class="s1">|| !(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;flattenAnimatedNodeOffset: Animated node [&quot;</span>
+              <span class="s1">+ tag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist, or is not a 'value' node&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">((ValueAnimatedNode) node).flattenOffset()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">extractAnimatedNodeOffset(</span><span class="s2">int </span><span class="s1">tag) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null </span><span class="s1">|| !(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;extractAnimatedNodeOffset: Animated node [&quot;</span>
+              <span class="s1">+ tag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist, or is not a 'value' node&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">((ValueAnimatedNode) node).extractOffset()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">startAnimatingNode(</span>
+      <span class="s2">int </span><span class="s1">animationId</span><span class="s2">, int </span><span class="s1">animatedNodeTag</span><span class="s2">, </span><span class="s1">ReadableMap animationConfig</span><span class="s2">, </span><span class="s1">Callback endCallback) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(animatedNodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;startAnimatingNode: Animated node [&quot; </span><span class="s1">+ animatedNodeTag + </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;startAnimatingNode: Animated node [&quot;</span>
+              <span class="s1">+ animatedNodeTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] should be of type &quot;</span>
+              <span class="s1">+ ValueAnimatedNode.</span><span class="s2">class</span><span class="s1">.getName())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">final </span><span class="s1">AnimationDriver existingDriver = mActiveAnimations.get(animationId)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(existingDriver != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s0">// animation with the given ID is already running, we need to update its configuration instead</span>
+      <span class="s0">// of spawning a new one</span>
+      <span class="s1">existingDriver.resetConfig(animationConfig)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">String type = animationConfig.getString(</span><span class="s5">&quot;type&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">final </span><span class="s1">AnimationDriver animation</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(</span><span class="s5">&quot;frames&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">animation = </span><span class="s2">new </span><span class="s1">FrameBasedAnimationDriver(animationConfig)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;spring&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">animation = </span><span class="s2">new </span><span class="s1">SpringAnimation(animationConfig)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s5">&quot;decay&quot;</span><span class="s1">.equals(type)) {</span>
+      <span class="s1">animation = </span><span class="s2">new </span><span class="s1">DecayAnimation(animationConfig)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;startAnimatingNode: Unsupported animation type [&quot; </span><span class="s1">+ animatedNodeTag + </span><span class="s5">&quot;]: &quot; </span><span class="s1">+ type)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">animation.mId = animationId</span><span class="s2">;</span>
+    <span class="s1">animation.mEndCallback = endCallback</span><span class="s2">;</span>
+    <span class="s1">animation.mAnimatedValue = (ValueAnimatedNode) node</span><span class="s2">;</span>
+    <span class="s1">mActiveAnimations.put(animationId</span><span class="s2">, </span><span class="s1">animation)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">private void </span><span class="s1">stopAnimationsForNode(AnimatedNode animatedNode) {</span>
+    <span class="s0">// in most of the cases there should never be more than a few active animations running at the</span>
+    <span class="s0">// same time. Therefore it does not make much sense to create an animationId -&gt; animation</span>
+    <span class="s0">// object map that would require additional memory just to support the use-case of stopping</span>
+    <span class="s0">// an animation</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; mActiveAnimations.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">AnimationDriver animation = mActiveAnimations.valueAt(i)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(animatedNode.equals(animation.mAnimatedValue)) {</span>
+        <span class="s2">if </span><span class="s1">(animation.mEndCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+          <span class="s0">// Invoke animation end callback with {finished: false}</span>
+          <span class="s1">WritableMap endCallbackResponse = Arguments.createMap()</span><span class="s2">;</span>
+          <span class="s1">endCallbackResponse.putBoolean(</span><span class="s5">&quot;finished&quot;</span><span class="s2">, false</span><span class="s1">)</span><span class="s2">;</span>
+          <span class="s1">animation.mEndCallback.invoke(endCallbackResponse)</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">else if </span><span class="s1">(mReactApplicationContext != </span><span class="s2">null</span><span class="s1">) {</span>
+          <span class="s0">// If no callback is passed in, this /may/ be an animation set up by the single-op</span>
+          <span class="s0">// instruction from JS, meaning that no jsi::functions are passed into native and</span>
+          <span class="s0">// we communicate via RCTDeviceEventEmitter instead of callbacks.</span>
+          <span class="s1">WritableMap params = Arguments.createMap()</span><span class="s2">;</span>
+          <span class="s1">params.putInt(</span><span class="s5">&quot;animationId&quot;</span><span class="s2">, </span><span class="s1">animation.mId)</span><span class="s2">;</span>
+          <span class="s1">params.putBoolean(</span><span class="s5">&quot;finished&quot;</span><span class="s2">, false</span><span class="s1">)</span><span class="s2">;</span>
+          <span class="s1">mReactApplicationContext.emitDeviceEvent(</span>
+              <span class="s5">&quot;onNativeAnimatedModuleAnimationFinished&quot;</span><span class="s2">, </span><span class="s1">params)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s1">mActiveAnimations.removeAt(i)</span><span class="s2">;</span>
+        <span class="s1">i--</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">stopAnimation(</span><span class="s2">int </span><span class="s1">animationId) {</span>
+    <span class="s0">// in most of the cases there should never be more than a few active animations running at the</span>
+    <span class="s0">// same time. Therefore it does not make much sense to create an animationId -&gt; animation</span>
+    <span class="s0">// object map that would require additional memory just to support the use-case of stopping</span>
+    <span class="s0">// an animation</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; mActiveAnimations.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">AnimationDriver animation = mActiveAnimations.valueAt(i)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(animation.mId == animationId) {</span>
+        <span class="s2">if </span><span class="s1">(animation.mEndCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+          <span class="s0">// Invoke animation end callback with {finished: false}</span>
+          <span class="s1">WritableMap endCallbackResponse = Arguments.createMap()</span><span class="s2">;</span>
+          <span class="s1">endCallbackResponse.putBoolean(</span><span class="s5">&quot;finished&quot;</span><span class="s2">, false</span><span class="s1">)</span><span class="s2">;</span>
+          <span class="s1">animation.mEndCallback.invoke(endCallbackResponse)</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">else if </span><span class="s1">(mReactApplicationContext != </span><span class="s2">null</span><span class="s1">) {</span>
+          <span class="s0">// If no callback is passed in, this /may/ be an animation set up by the single-op</span>
+          <span class="s0">// instruction from JS, meaning that no jsi::functions are passed into native and</span>
+          <span class="s0">// we communicate via RCTDeviceEventEmitter instead of callbacks.</span>
+          <span class="s1">WritableMap params = Arguments.createMap()</span><span class="s2">;</span>
+          <span class="s1">params.putInt(</span><span class="s5">&quot;animationId&quot;</span><span class="s2">, </span><span class="s1">animation.mId)</span><span class="s2">;</span>
+          <span class="s1">params.putBoolean(</span><span class="s5">&quot;finished&quot;</span><span class="s2">, false</span><span class="s1">)</span><span class="s2">;</span>
+          <span class="s1">mReactApplicationContext.emitDeviceEvent(</span>
+              <span class="s5">&quot;onNativeAnimatedModuleAnimationFinished&quot;</span><span class="s2">, </span><span class="s1">params)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s1">mActiveAnimations.removeAt(i)</span><span class="s2">;</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">// Do not throw an error in the case animation could not be found. We only keep &quot;active&quot;</span>
+    <span class="s0">// animations in the registry and there is a chance that Animated.js will enqueue a</span>
+    <span class="s0">// stopAnimation call after the animation has ended or the call will reach native thread only</span>
+    <span class="s0">// when the animation is already over.</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">connectAnimatedNodes(</span><span class="s2">int </span><span class="s1">parentNodeTag</span><span class="s2">, int </span><span class="s1">childNodeTag) {</span>
+    <span class="s1">AnimatedNode parentNode = mAnimatedNodes.get(parentNodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(parentNode == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;connectAnimatedNodes: Animated node with tag (parent) [&quot;</span>
+              <span class="s1">+ parentNodeTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">AnimatedNode childNode = mAnimatedNodes.get(childNodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(childNode == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;connectAnimatedNodes: Animated node with tag (child) [&quot;</span>
+              <span class="s1">+ childNodeTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">parentNode.addChild(childNode)</span><span class="s2">;</span>
+    <span class="s1">mUpdatedNodes.put(childNodeTag</span><span class="s2">, </span><span class="s1">childNode)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">disconnectAnimatedNodes(</span><span class="s2">int </span><span class="s1">parentNodeTag</span><span class="s2">, int </span><span class="s1">childNodeTag) {</span>
+    <span class="s1">AnimatedNode parentNode = mAnimatedNodes.get(parentNodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(parentNode == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;disconnectAnimatedNodes: Animated node with tag (parent) [&quot;</span>
+              <span class="s1">+ parentNodeTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">AnimatedNode childNode = mAnimatedNodes.get(childNodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(childNode == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;disconnectAnimatedNodes: Animated node with tag (child) [&quot;</span>
+              <span class="s1">+ childNodeTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">parentNode.removeChild(childNode)</span><span class="s2">;</span>
+    <span class="s1">mUpdatedNodes.put(childNodeTag</span><span class="s2">, </span><span class="s1">childNode)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">connectAnimatedNodeToView(</span><span class="s2">int </span><span class="s1">animatedNodeTag</span><span class="s2">, int </span><span class="s1">viewTag) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(animatedNodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;connectAnimatedNodeToView: Animated node with tag [&quot;</span>
+              <span class="s1">+ animatedNodeTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!(node </span><span class="s2">instanceof </span><span class="s1">PropsAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;connectAnimatedNodeToView: Animated node connected to view [&quot;</span>
+              <span class="s1">+ viewTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] should be of type &quot;</span>
+              <span class="s1">+ PropsAnimatedNode.</span><span class="s2">class</span><span class="s1">.getName())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(mReactApplicationContext == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span>
+          <span class="s5">&quot;connectAnimatedNodeToView: Animated node could not be connected, no ReactApplicationContext: &quot;</span>
+              <span class="s1">+ viewTag)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Nullable</span>
+    <span class="s1">UIManager uiManager =</span>
+        <span class="s1">UIManagerHelper.getUIManagerForReactTag(mReactApplicationContext</span><span class="s2">, </span><span class="s1">viewTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(uiManager == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+          <span class="s1">TAG</span><span class="s2">,</span>
+          <span class="s2">new </span><span class="s1">ReactNoCrashSoftException(</span>
+              <span class="s5">&quot;connectAnimatedNodeToView: Animated node could not be connected to UIManager - uiManager disappeared for tag: &quot;</span>
+                  <span class="s1">+ viewTag))</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">PropsAnimatedNode propsAnimatedNode = (PropsAnimatedNode) node</span><span class="s2">;</span>
+    <span class="s1">propsAnimatedNode.connectToView(viewTag</span><span class="s2">, </span><span class="s1">uiManager)</span><span class="s2">;</span>
+    <span class="s1">mUpdatedNodes.put(animatedNodeTag</span><span class="s2">, </span><span class="s1">node)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">disconnectAnimatedNodeFromView(</span><span class="s2">int </span><span class="s1">animatedNodeTag</span><span class="s2">, int </span><span class="s1">viewTag) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(animatedNodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;disconnectAnimatedNodeFromView: Animated node with tag [&quot;</span>
+              <span class="s1">+ animatedNodeTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!(node </span><span class="s2">instanceof </span><span class="s1">PropsAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;disconnectAnimatedNodeFromView: Animated node connected to view [&quot;</span>
+              <span class="s1">+ viewTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] should be of type &quot;</span>
+              <span class="s1">+ PropsAnimatedNode.</span><span class="s2">class</span><span class="s1">.getName())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">PropsAnimatedNode propsAnimatedNode = (PropsAnimatedNode) node</span><span class="s2">;</span>
+    <span class="s1">propsAnimatedNode.disconnectFromView(viewTag)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">getValue(</span><span class="s2">int </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">Callback callback) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(tag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null </span><span class="s1">|| !(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;getValue: Animated node with tag [&quot; </span><span class="s1">+ tag + </span><span class="s5">&quot;] does not exist or is not a 'value' node&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">double </span><span class="s1">value = ((ValueAnimatedNode) node).getValue()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(callback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">callback.invoke(value)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// If there's no callback, that means that JS is using the single-operation mode, and not</span>
+    <span class="s0">// passing any callbacks into Java.</span>
+    <span class="s0">// See NativeAnimatedHelper.js for details.</span>
+    <span class="s0">// Instead, we use RCTDeviceEventEmitter to pass data back to JS and emulate callbacks.</span>
+    <span class="s2">if </span><span class="s1">(mReactApplicationContext == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">WritableMap params = Arguments.createMap()</span><span class="s2">;</span>
+    <span class="s1">params.putInt(</span><span class="s5">&quot;tag&quot;</span><span class="s2">, </span><span class="s1">tag)</span><span class="s2">;</span>
+    <span class="s1">params.putDouble(</span><span class="s5">&quot;value&quot;</span><span class="s2">, </span><span class="s1">value)</span><span class="s2">;</span>
+    <span class="s1">mReactApplicationContext.emitDeviceEvent(</span><span class="s5">&quot;onNativeAnimatedModuleGetValue&quot;</span><span class="s2">, </span><span class="s1">params)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">restoreDefaultValues(</span><span class="s2">int </span><span class="s1">animatedNodeTag) {</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(animatedNodeTag)</span><span class="s2">;</span>
+    <span class="s0">// Restoring default values needs to happen before UIManager operations so it is</span>
+    <span class="s0">// possible the node hasn't been created yet if it is being connected and</span>
+    <span class="s0">// disconnected in the same batch. In that case we don't need to restore</span>
+    <span class="s0">// default values since it will never actually update the view.</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!(node </span><span class="s2">instanceof </span><span class="s1">PropsAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;Animated node connected to view [?] should be of type &quot;</span>
+              <span class="s1">+ PropsAnimatedNode.</span><span class="s2">class</span><span class="s1">.getName())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">PropsAnimatedNode propsAnimatedNode = (PropsAnimatedNode) node</span><span class="s2">;</span>
+    <span class="s1">propsAnimatedNode.restoreDefaultValues()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">addAnimatedEventToView(</span>
+      <span class="s2">int </span><span class="s1">viewTag</span><span class="s2">, </span><span class="s1">String eventHandlerName</span><span class="s2">, </span><span class="s1">ReadableMap eventMapping) {</span>
+    <span class="s2">int </span><span class="s1">nodeTag = eventMapping.getInt(</span><span class="s5">&quot;animatedValueTag&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">AnimatedNode node = mAnimatedNodes.get(nodeTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(node == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;addAnimatedEventToView: Animated node with tag [&quot; </span><span class="s1">+ nodeTag + </span><span class="s5">&quot;] does not exist&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!(node </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode)) {</span>
+      <span class="s2">throw new </span><span class="s1">JSApplicationIllegalArgumentException(</span>
+          <span class="s5">&quot;addAnimatedEventToView: Animated node on view [&quot;</span>
+              <span class="s1">+ viewTag</span>
+              <span class="s1">+ </span><span class="s5">&quot;] connected to event handler (&quot;</span>
+              <span class="s1">+ eventHandlerName</span>
+              <span class="s1">+ </span><span class="s5">&quot;) should be of type &quot;</span>
+              <span class="s1">+ ValueAnimatedNode.</span><span class="s2">class</span><span class="s1">.getName())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ReadableArray path = eventMapping.getArray(</span><span class="s5">&quot;nativeEventPath&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">List&lt;String&gt; pathList = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;(path.size())</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; path.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">pathList.add(path.getString(i))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">String eventName = normalizeEventName(eventHandlerName)</span><span class="s2">;</span>
+
+    <span class="s1">EventAnimationDriver eventDriver =</span>
+        <span class="s2">new </span><span class="s1">EventAnimationDriver(eventName</span><span class="s2">, </span><span class="s1">viewTag</span><span class="s2">, </span><span class="s1">pathList</span><span class="s2">, </span><span class="s1">(ValueAnimatedNode) node)</span><span class="s2">;</span>
+    <span class="s1">mEventDrivers.add(eventDriver)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">removeAnimatedEventFromView(</span>
+      <span class="s2">int </span><span class="s1">viewTag</span><span class="s2">, </span><span class="s1">String eventHandlerName</span><span class="s2">, int </span><span class="s1">animatedValueTag) {</span>
+
+    <span class="s1">String eventName = normalizeEventName(eventHandlerName)</span><span class="s2">;</span>
+
+    <span class="s1">ListIterator&lt;EventAnimationDriver&gt; it = mEventDrivers.listIterator()</span><span class="s2">;</span>
+    <span class="s2">while </span><span class="s1">(it.hasNext()) {</span>
+      <span class="s1">EventAnimationDriver driver = it.next()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(eventName.equals(driver.mEventName)</span>
+          <span class="s1">&amp;&amp; viewTag == driver.mViewTag</span>
+          <span class="s1">&amp;&amp; animatedValueTag == driver.mValueNode.mTag) {</span>
+        <span class="s1">it.remove()</span><span class="s2">;</span>
+        <span class="s2">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onEventDispatch(</span><span class="s2">final </span><span class="s1">Event event) {</span>
+    <span class="s0">// Events can be dispatched from any thread so we have to make sure handleEvent is run from the</span>
+    <span class="s0">// UI thread.</span>
+    <span class="s2">if </span><span class="s1">(UiThreadUtil.isOnUiThread()) {</span>
+      <span class="s1">handleEvent(event)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">UiThreadUtil.runOnUiThread(</span>
+          <span class="s2">new </span><span class="s1">Runnable() {</span>
+            <span class="s1">@Override</span>
+            <span class="s2">public void </span><span class="s1">run() {</span>
+              <span class="s1">handleEvent(event)</span><span class="s2">;</span>
+            <span class="s1">}</span>
+          <span class="s1">})</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">private void </span><span class="s1">handleEvent(Event event) {</span>
+    <span class="s2">if </span><span class="s1">(!mEventDrivers.isEmpty()) {</span>
+      <span class="s0">// If the event has a different name in native convert it to it's JS name.</span>
+      <span class="s0">// TODO T64216139 Remove dependency of UIManagerModule when the Constants are not in Native</span>
+      <span class="s0">// anymore</span>
+      <span class="s2">if </span><span class="s1">(mReactApplicationContext == </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+      <span class="s1">UIManager uiManager =</span>
+          <span class="s1">UIManagerHelper.getUIManager(mReactApplicationContext</span><span class="s2">, </span><span class="s1">event.getUIManagerType())</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(uiManager == </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">boolean </span><span class="s1">foundAtLeastOneDriver = </span><span class="s2">false;</span>
+      <span class="s1">Event.EventAnimationDriverMatchSpec matchSpec = event.getEventAnimationDriverMatchSpec()</span><span class="s2">;</span>
+      <span class="s2">for </span><span class="s1">(EventAnimationDriver driver : mEventDrivers) {</span>
+        <span class="s2">if </span><span class="s1">(matchSpec.match(driver.mViewTag</span><span class="s2">, </span><span class="s1">driver.mEventName)) {</span>
+          <span class="s1">foundAtLeastOneDriver = </span><span class="s2">true;</span>
+          <span class="s1">stopAnimationsForNode(driver.mValueNode)</span><span class="s2">;</span>
+          <span class="s1">event.dispatch(driver)</span><span class="s2">;</span>
+          <span class="s1">mRunUpdateNodeList.add(driver.mValueNode)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s2">if </span><span class="s1">(foundAtLeastOneDriver) {</span>
+        <span class="s1">updateNodes(mRunUpdateNodeList)</span><span class="s2">;</span>
+        <span class="s1">mRunUpdateNodeList.clear()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Animation loop performs two BFSes over the graph of animated nodes. We use incremented {</span><span class="s7">@code</span>
+   <span class="s3">* mAnimatedGraphBFSColor} to mark nodes as visited in each of the BFSes which saves additional</span>
+   <span class="s3">* loops for clearing &quot;visited&quot; states.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">First BFS starts with nodes that are in {</span><span class="s7">@code </span><span class="s3">mUpdatedNodes} (that is, their value have</span>
+   <span class="s3">* been modified from JS in the last batch of JS operations) or directly attached to an active</span>
+   <span class="s3">* animation (hence linked to objects from {</span><span class="s7">@code </span><span class="s3">mActiveAnimations}). In that step we calculate</span>
+   <span class="s3">* an attribute {</span><span class="s7">@code </span><span class="s3">mActiveIncomingNodes}. The second BFS runs in topological order over the</span>
+   <span class="s3">* sub-graph of *active* nodes. This is done by adding node to the BFS queue only if all its</span>
+   <span class="s3">* &quot;predecessors&quot; have already been visited.</span>
+   <span class="s3">*/</span>
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">runUpdates(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s2">boolean </span><span class="s1">hasFinishedAnimations = </span><span class="s2">false;</span>
+
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; mUpdatedNodes.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">AnimatedNode node = mUpdatedNodes.valueAt(i)</span><span class="s2">;</span>
+      <span class="s1">mRunUpdateNodeList.add(node)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Clean mUpdatedNodes queue</span>
+    <span class="s1">mUpdatedNodes.clear()</span><span class="s2">;</span>
+
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; mActiveAnimations.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">AnimationDriver animation = mActiveAnimations.valueAt(i)</span><span class="s2">;</span>
+      <span class="s1">animation.runAnimationStep(frameTimeNanos)</span><span class="s2">;</span>
+      <span class="s1">AnimatedNode valueNode = animation.mAnimatedValue</span><span class="s2">;</span>
+      <span class="s1">mRunUpdateNodeList.add(valueNode)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(animation.mHasFinished) {</span>
+        <span class="s1">hasFinishedAnimations = </span><span class="s2">true;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">updateNodes(mRunUpdateNodeList)</span><span class="s2">;</span>
+    <span class="s1">mRunUpdateNodeList.clear()</span><span class="s2">;</span>
+
+    <span class="s0">// Cleanup finished animations. Iterate over the array of animations and override ones that has</span>
+    <span class="s0">// finished, then resize `mActiveAnimations`.</span>
+    <span class="s2">if </span><span class="s1">(hasFinishedAnimations) {</span>
+      <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = mActiveAnimations.size() - </span><span class="s6">1</span><span class="s2">; </span><span class="s1">i &gt;= </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i--) {</span>
+        <span class="s1">AnimationDriver animation = mActiveAnimations.valueAt(i)</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(animation.mHasFinished) {</span>
+          <span class="s2">if </span><span class="s1">(animation.mEndCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s1">WritableMap endCallbackResponse = Arguments.createMap()</span><span class="s2">;</span>
+            <span class="s1">endCallbackResponse.putBoolean(</span><span class="s5">&quot;finished&quot;</span><span class="s2">, true</span><span class="s1">)</span><span class="s2">;</span>
+            <span class="s1">animation.mEndCallback.invoke(endCallbackResponse)</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else if </span><span class="s1">(mReactApplicationContext != </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s0">// If no callback is passed in, this /may/ be an animation set up by the single-op</span>
+            <span class="s0">// instruction from JS, meaning that no jsi::functions are passed into native and</span>
+            <span class="s0">// we communicate via RCTDeviceEventEmitter instead of callbacks.</span>
+            <span class="s1">WritableMap params = Arguments.createMap()</span><span class="s2">;</span>
+            <span class="s1">params.putInt(</span><span class="s5">&quot;animationId&quot;</span><span class="s2">, </span><span class="s1">animation.mId)</span><span class="s2">;</span>
+            <span class="s1">params.putBoolean(</span><span class="s5">&quot;finished&quot;</span><span class="s2">, true</span><span class="s1">)</span><span class="s2">;</span>
+            <span class="s1">mReactApplicationContext.emitDeviceEvent(</span>
+                <span class="s5">&quot;onNativeAnimatedModuleAnimationFinished&quot;</span><span class="s2">, </span><span class="s1">params)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+          <span class="s1">mActiveAnimations.removeAt(i)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">private void </span><span class="s1">updateNodes(List&lt;AnimatedNode&gt; nodes) {</span>
+    <span class="s2">int </span><span class="s1">activeNodesCount = </span><span class="s6">0</span><span class="s2">;</span>
+    <span class="s2">int </span><span class="s1">updatedNodesCount = </span><span class="s6">0</span><span class="s2">;</span>
+
+    <span class="s0">// STEP 1.</span>
+    <span class="s0">// BFS over graph of nodes. Update `mIncomingNodes` attribute for each node during that BFS.</span>
+    <span class="s0">// Store number of visited nodes in `activeNodesCount`. We &quot;execute&quot; active animations as a part</span>
+    <span class="s0">// of this step.</span>
+
+    <span class="s1">mAnimatedGraphBFSColor++</span><span class="s2">; </span><span class="s0">/* use new color */</span>
+    <span class="s2">if </span><span class="s1">(mAnimatedGraphBFSColor == AnimatedNode.INITIAL_BFS_COLOR) {</span>
+      <span class="s0">// value &quot;0&quot; is used as an initial color for a new node, using it in BFS may cause some nodes</span>
+      <span class="s0">// to be skipped.</span>
+      <span class="s1">mAnimatedGraphBFSColor++</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Queue&lt;AnimatedNode&gt; nodesQueue = </span><span class="s2">new </span><span class="s1">ArrayDeque&lt;&gt;()</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(AnimatedNode node : nodes) {</span>
+      <span class="s2">if </span><span class="s1">(node.mBFSColor != mAnimatedGraphBFSColor) {</span>
+        <span class="s1">node.mBFSColor = mAnimatedGraphBFSColor</span><span class="s2">;</span>
+        <span class="s1">activeNodesCount++</span><span class="s2">;</span>
+        <span class="s1">nodesQueue.add(node)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">while </span><span class="s1">(!nodesQueue.isEmpty()) {</span>
+      <span class="s1">AnimatedNode nextNode = nodesQueue.poll()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(nextNode.mChildren != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; nextNode.mChildren.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+          <span class="s1">AnimatedNode child = nextNode.mChildren.get(i)</span><span class="s2">;</span>
+          <span class="s1">child.mActiveIncomingNodes++</span><span class="s2">;</span>
+          <span class="s2">if </span><span class="s1">(child.mBFSColor != mAnimatedGraphBFSColor) {</span>
+            <span class="s1">child.mBFSColor = mAnimatedGraphBFSColor</span><span class="s2">;</span>
+            <span class="s1">activeNodesCount++</span><span class="s2">;</span>
+            <span class="s1">nodesQueue.add(child)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// STEP 2</span>
+    <span class="s0">// BFS over the graph of active nodes in topological order -&gt; visit node only when all its</span>
+    <span class="s0">// &quot;predecessors&quot; in the graph have already been visited. It is important to visit nodes in that</span>
+    <span class="s0">// order as they may often use values of their predecessors in order to calculate &quot;next state&quot;</span>
+    <span class="s0">// of their own. We start by determining the starting set of nodes by looking for nodes with</span>
+    <span class="s0">// `mActiveIncomingNodes = 0` (those can only be the ones that we start BFS in the previous</span>
+    <span class="s0">// step). We store number of visited nodes in this step in `updatedNodesCount`</span>
+
+    <span class="s1">mAnimatedGraphBFSColor++</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mAnimatedGraphBFSColor == AnimatedNode.INITIAL_BFS_COLOR) {</span>
+      <span class="s0">// see reasoning for this check a few lines above</span>
+      <span class="s1">mAnimatedGraphBFSColor++</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// find nodes with zero &quot;incoming nodes&quot;, those can be either nodes from `mUpdatedNodes` or</span>
+    <span class="s0">// ones connected to active animations</span>
+    <span class="s2">for </span><span class="s1">(AnimatedNode node : nodes) {</span>
+      <span class="s2">if </span><span class="s1">(node.mActiveIncomingNodes == </span><span class="s6">0 </span><span class="s1">&amp;&amp; node.mBFSColor != mAnimatedGraphBFSColor) {</span>
+        <span class="s1">node.mBFSColor = mAnimatedGraphBFSColor</span><span class="s2">;</span>
+        <span class="s1">updatedNodesCount++</span><span class="s2">;</span>
+        <span class="s1">nodesQueue.add(node)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Run main &quot;update&quot; loop</span>
+    <span class="s2">int </span><span class="s1">cyclesDetected = </span><span class="s6">0</span><span class="s2">;</span>
+    <span class="s2">while </span><span class="s1">(!nodesQueue.isEmpty()) {</span>
+      <span class="s1">AnimatedNode nextNode = nodesQueue.poll()</span><span class="s2">;</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">nextNode.update()</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(nextNode </span><span class="s2">instanceof </span><span class="s1">PropsAnimatedNode) {</span>
+          <span class="s0">// Send property updates to native view manager</span>
+          <span class="s1">((PropsAnimatedNode) nextNode).updateView()</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(JSApplicationCausedNativeException e) {</span>
+        <span class="s0">// An exception is thrown if the view hasn't been created yet. This can happen because</span>
+        <span class="s0">// views are created in batches. If this particular view didn't make it into a batch yet,</span>
+        <span class="s0">// the view won't exist and an exception will be thrown when attempting to start an</span>
+        <span class="s0">// animation on it.</span>
+        <span class="s0">//</span>
+        <span class="s0">// Eat the exception rather than crashing. The impact is that we may drop one or more</span>
+        <span class="s0">// frames of the animation.</span>
+        <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s5">&quot;Native animation workaround, frame lost as result of race condition&quot;</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(nextNode </span><span class="s2">instanceof </span><span class="s1">ValueAnimatedNode) {</span>
+        <span class="s0">// Potentially send events to JS when the node's value is updated</span>
+        <span class="s1">((ValueAnimatedNode) nextNode).onValueUpdate()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(nextNode.mChildren != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; nextNode.mChildren.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+          <span class="s1">AnimatedNode child = nextNode.mChildren.get(i)</span><span class="s2">;</span>
+          <span class="s1">child.mActiveIncomingNodes--</span><span class="s2">;</span>
+          <span class="s2">if </span><span class="s1">(child.mBFSColor != mAnimatedGraphBFSColor &amp;&amp; child.mActiveIncomingNodes == </span><span class="s6">0</span><span class="s1">) {</span>
+            <span class="s1">child.mBFSColor = mAnimatedGraphBFSColor</span><span class="s2">;</span>
+            <span class="s1">updatedNodesCount++</span><span class="s2">;</span>
+            <span class="s1">nodesQueue.add(child)</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else if </span><span class="s1">(child.mBFSColor == mAnimatedGraphBFSColor) {</span>
+            <span class="s1">cyclesDetected++</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Verify that we've visited *all* active nodes. Throw otherwise as this could mean there is a</span>
+    <span class="s0">// cycle in animated node graph, or that the graph is only partially set up. We also take</span>
+    <span class="s0">// advantage of the fact that all active nodes are visited in the step above so that all the</span>
+    <span class="s0">// nodes properties `mActiveIncomingNodes` are set to zero.</span>
+    <span class="s0">// In Fabric there can be race conditions between the JS thread setting up or tearing down</span>
+    <span class="s0">// animated nodes, and Fabric executing them on the UI thread, leading to temporary inconsistent</span>
+    <span class="s0">// states.</span>
+    <span class="s2">if </span><span class="s1">(activeNodesCount != updatedNodesCount) {</span>
+      <span class="s2">if </span><span class="s1">(mWarnedAboutGraphTraversal) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+      <span class="s1">mWarnedAboutGraphTraversal = </span><span class="s2">true;</span>
+
+      <span class="s0">// Before crashing or logging soft exception, log details about current graph setup</span>
+      <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s5">&quot;Detected animation cycle or disconnected graph. &quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">for </span><span class="s1">(AnimatedNode node : nodes) {</span>
+        <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s1">node.prettyPrintWithChildren())</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// If we're running only in non-Fabric, we still throw an exception.</span>
+      <span class="s0">// In Fabric, it seems that animations enter an inconsistent state fairly often.</span>
+      <span class="s0">// We detect if the inconsistency is due to a cycle (a fatal error for which we must crash)</span>
+      <span class="s0">// or disconnected regions, indicating a partially-set-up animation graph, which is not</span>
+      <span class="s0">// fatal and can stay a warning.</span>
+      <span class="s1">String reason =</span>
+          <span class="s1">cyclesDetected &gt; </span><span class="s6">0 </span><span class="s1">? </span><span class="s5">&quot;cycles (&quot; </span><span class="s1">+ cyclesDetected + </span><span class="s5">&quot;)&quot; </span><span class="s1">: </span><span class="s5">&quot;disconnected regions&quot;</span><span class="s2">;</span>
+      <span class="s1">IllegalStateException ex =</span>
+          <span class="s2">new </span><span class="s1">IllegalStateException(</span>
+              <span class="s5">&quot;Looks like animated nodes graph has &quot;</span>
+                  <span class="s1">+ reason</span>
+                  <span class="s1">+ </span><span class="s5">&quot;, there are &quot;</span>
+                  <span class="s1">+ activeNodesCount</span>
+                  <span class="s1">+ </span><span class="s5">&quot; but toposort visited only &quot;</span>
+                  <span class="s1">+ updatedNodesCount)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(mEventListenerInitializedForFabric &amp;&amp; cyclesDetected == </span><span class="s6">0</span><span class="s1">) {</span>
+        <span class="s0">// TODO T71377544: investigate these SoftExceptions and see if we can remove entirely</span>
+        <span class="s0">// or fix the root cause</span>
+        <span class="s1">ReactSoftExceptionLogger.logSoftException(TAG</span><span class="s2">, new </span><span class="s1">ReactNoCrashSoftException(ex))</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else if </span><span class="s1">(mEventListenerInitializedForFabric) {</span>
+        <span class="s0">// TODO T71377544: investigate these SoftExceptions and see if we can remove entirely</span>
+        <span class="s0">// or fix the root cause</span>
+        <span class="s1">ReactSoftExceptionLogger.logSoftException(TAG</span><span class="s2">, new </span><span class="s1">ReactNoCrashSoftException(ex))</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s2">throw </span><span class="s1">ex</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">mWarnedAboutGraphTraversal = </span><span class="s2">false;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private </span><span class="s1">String normalizeEventName(String eventHandlerName) {</span>
+    <span class="s0">// Fabric UIManager also makes this assumption</span>
+    <span class="s1">String eventName = eventHandlerName</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(eventHandlerName.startsWith(</span><span class="s5">&quot;on&quot;</span><span class="s1">)) {</span>
+      <span class="s1">eventName = </span><span class="s5">&quot;top&quot; </span><span class="s1">+ eventHandlerName.substring(</span><span class="s6">2</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">eventName</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

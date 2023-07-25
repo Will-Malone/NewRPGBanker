@@ -1,0 +1,220 @@
+<html>
+<head>
+<title>InspectorProxy.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+InspectorProxy.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const Device = require(</span><span class="s2">&quot;./Device&quot;</span><span class="s1">);</span>
+<span class="s1">const debug = require(</span><span class="s2">&quot;debug&quot;</span><span class="s1">)(</span><span class="s2">&quot;Metro:InspectorProxy&quot;</span><span class="s1">);</span>
+<span class="s1">const url = require(</span><span class="s2">&quot;url&quot;</span><span class="s1">);</span>
+<span class="s1">const WS = require(</span><span class="s2">&quot;ws&quot;</span><span class="s1">);</span>
+<span class="s1">const WS_DEVICE_URL = </span><span class="s2">&quot;/inspector/device&quot;</span><span class="s1">;</span>
+<span class="s1">const WS_DEBUGGER_URL = </span><span class="s2">&quot;/inspector/debug&quot;</span><span class="s1">;</span>
+<span class="s1">const PAGES_LIST_JSON_URL = </span><span class="s2">&quot;/json&quot;</span><span class="s1">;</span>
+<span class="s1">const PAGES_LIST_JSON_URL_2 = </span><span class="s2">&quot;/json/list&quot;</span><span class="s1">;</span>
+<span class="s1">const PAGES_LIST_JSON_VERSION_URL = </span><span class="s2">&quot;/json/version&quot;</span><span class="s1">;</span>
+<span class="s1">const INTERNAL_ERROR_CODE = </span><span class="s3">1011</span><span class="s1">;</span>
+
+<span class="s0">/** 
+ * Main Inspector Proxy class that connects JavaScript VM inside Android/iOS apps and JS debugger. 
+ */</span>
+<span class="s1">class InspectorProxy {</span>
+  <span class="s0">// Root of the project used for relative to absolute source path conversion.</span>
+
+  <span class="s0">// Maps device ID to Device instance.</span>
+
+  <span class="s0">// Internal counter for device IDs -- just gets incremented for each new device.</span>
+  <span class="s1">_deviceCounter = </span><span class="s3">0</span><span class="s1">;</span>
+
+  <span class="s0">// We store server's address with port (like '127.0.0.1:8081') to be able to build URLs</span>
+  <span class="s0">// (devtoolsFrontendUrl and webSocketDebuggerUrl) for page descriptions. These URLs are used</span>
+  <span class="s0">// by debugger to know where to connect.</span>
+  <span class="s1">_serverAddressWithPort = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+  <span class="s1">constructor(projectRoot) {</span>
+    <span class="s4">this</span><span class="s1">._projectRoot = projectRoot;</span>
+    <span class="s4">this</span><span class="s1">._devices = </span><span class="s4">new </span><span class="s1">Map();</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Process HTTP request sent to server. We only respond to 2 HTTP requests:</span>
+  <span class="s0">// 1. /json/version returns Chrome debugger protocol version that we use</span>
+  <span class="s0">// 2. /json and /json/list returns list of page descriptions (list of inspectable apps).</span>
+  <span class="s0">// This list is combined from all the connected devices.</span>
+  <span class="s1">processRequest(request, response, next) {</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">request.url === PAGES_LIST_JSON_URL ||</span>
+      <span class="s1">request.url === PAGES_LIST_JSON_URL_2</span>
+    <span class="s1">) {</span>
+      <span class="s0">// Build list of pages from all devices.</span>
+      <span class="s1">let result = [];</span>
+      <span class="s1">Array.from(</span><span class="s4">this</span><span class="s1">._devices.entries()).forEach(([deviceId, device]) =&gt; {</span>
+        <span class="s1">result = result.concat(</span>
+          <span class="s1">device</span>
+            <span class="s1">.getPagesList()</span>
+            <span class="s1">.map((page) =&gt; </span><span class="s4">this</span><span class="s1">._buildPageDescription(deviceId, device, page))</span>
+        <span class="s1">);</span>
+      <span class="s1">});</span>
+      <span class="s4">this</span><span class="s1">._sendJsonResponse(response, result);</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(request.url === PAGES_LIST_JSON_VERSION_URL) {</span>
+      <span class="s4">this</span><span class="s1">._sendJsonResponse(response, {</span>
+        <span class="s1">Browser: </span><span class="s2">&quot;Mobile JavaScript&quot;</span><span class="s1">,</span>
+        <span class="s2">&quot;Protocol-Version&quot;</span><span class="s1">: </span><span class="s2">&quot;1.1&quot;</span><span class="s1">,</span>
+      <span class="s1">});</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">next();</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Adds websocket listeners to the provided HTTP/HTTPS server.</span>
+  <span class="s1">createWebSocketListeners(server) {</span>
+    <span class="s1">const { port } = server.address();</span>
+    <span class="s4">if </span><span class="s1">(server.address().family === </span><span class="s2">&quot;IPv6&quot;</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._serverAddressWithPort = `[::</span><span class="s3">1</span><span class="s1">]:${port}`;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._serverAddressWithPort = `localhost:${port}`;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">[WS_DEVICE_URL]: </span><span class="s4">this</span><span class="s1">._createDeviceConnectionWSServer(),</span>
+      <span class="s1">[WS_DEBUGGER_URL]: </span><span class="s4">this</span><span class="s1">._createDebuggerConnectionWSServer(),</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Converts page information received from device into PageDescription object</span>
+  <span class="s0">// that is sent to debugger.</span>
+  <span class="s1">_buildPageDescription(deviceId, device, page) {</span>
+    <span class="s1">const debuggerUrl = `${</span><span class="s4">this</span><span class="s1">._serverAddressWithPort}${WS_DEBUGGER_URL}?device=${deviceId}&amp;page=${page.id}`;</span>
+    <span class="s1">const webSocketDebuggerUrl = </span><span class="s2">&quot;ws://&quot; </span><span class="s1">+ debuggerUrl;</span>
+    <span class="s1">const devtoolsFrontendUrl =</span>
+      <span class="s2">&quot;devtools://devtools/bundled/js_app.html?experiments=true&amp;v8only=true&amp;ws=&quot; </span><span class="s1">+</span>
+      <span class="s1">encodeURIComponent(debuggerUrl);</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">id: `${deviceId}-${page.id}`,</span>
+      <span class="s1">description: page.app,</span>
+      <span class="s1">title: page.title,</span>
+      <span class="s1">faviconUrl: </span><span class="s2">&quot;https://reactjs.org/favicon.ico&quot;</span><span class="s1">,</span>
+      <span class="s1">devtoolsFrontendUrl,</span>
+      <span class="s1">type: </span><span class="s2">&quot;node&quot;</span><span class="s1">,</span>
+      <span class="s1">webSocketDebuggerUrl,</span>
+      <span class="s1">vm: page.vm,</span>
+      <span class="s1">deviceName: device.getName(),</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Sends object as response to HTTP request.</span>
+  <span class="s0">// Just serializes object using JSON and sets required headers.</span>
+  <span class="s1">_sendJsonResponse(response, object) {</span>
+    <span class="s1">const data = JSON.stringify(object, </span><span class="s4">null</span><span class="s1">, </span><span class="s3">2</span><span class="s1">);</span>
+    <span class="s1">response.writeHead(</span><span class="s3">200</span><span class="s1">, {</span>
+      <span class="s2">&quot;Content-Type&quot;</span><span class="s1">: </span><span class="s2">&quot;application/json; charset=UTF-8&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;Cache-Control&quot;</span><span class="s1">: </span><span class="s2">&quot;no-cache&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;Content-Length&quot;</span><span class="s1">: data.length.toString(),</span>
+      <span class="s1">Connection: </span><span class="s2">&quot;close&quot;</span><span class="s1">,</span>
+    <span class="s1">});</span>
+    <span class="s1">response.end(data);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Adds websocket handler for device connections.</span>
+  <span class="s0">// Device connects to /inspector/device and passes device and app names as</span>
+  <span class="s0">// HTTP GET params.</span>
+  <span class="s0">// For each new websocket connection we parse device and app names and create</span>
+  <span class="s0">// new instance of Device class.</span>
+  <span class="s1">_createDeviceConnectionWSServer() {</span>
+    <span class="s1">const wss = </span><span class="s4">new </span><span class="s1">WS.Server({</span>
+      <span class="s1">noServer: </span><span class="s4">true</span><span class="s1">,</span>
+      <span class="s1">perMessageDeflate: </span><span class="s4">true</span><span class="s1">,</span>
+    <span class="s1">});</span>
+    <span class="s0">// $FlowFixMe[value-as-type]</span>
+    <span class="s1">wss.on(</span><span class="s2">&quot;connection&quot;</span><span class="s1">, async (socket, req) =&gt; {</span>
+      <span class="s4">try </span><span class="s1">{</span>
+        <span class="s1">const fallbackDeviceId = String(</span><span class="s4">this</span><span class="s1">._deviceCounter++);</span>
+        <span class="s1">const query = url.parse(req.url || </span><span class="s2">&quot;&quot;</span><span class="s1">, </span><span class="s4">true</span><span class="s1">).query || {};</span>
+        <span class="s1">const deviceId = query.device || fallbackDeviceId;</span>
+        <span class="s1">const deviceName = query.name || </span><span class="s2">&quot;Unknown&quot;</span><span class="s1">;</span>
+        <span class="s1">const appName = query.app || </span><span class="s2">&quot;Unknown&quot;</span><span class="s1">;</span>
+        <span class="s1">const oldDevice = </span><span class="s4">this</span><span class="s1">._devices.get(deviceId);</span>
+        <span class="s1">const newDevice = </span><span class="s4">new </span><span class="s1">Device(</span>
+          <span class="s1">deviceId,</span>
+          <span class="s1">deviceName,</span>
+          <span class="s1">appName,</span>
+          <span class="s1">socket,</span>
+          <span class="s4">this</span><span class="s1">._projectRoot</span>
+        <span class="s1">);</span>
+        <span class="s4">if </span><span class="s1">(oldDevice) {</span>
+          <span class="s1">oldDevice.handleDuplicateDeviceConnection(newDevice);</span>
+        <span class="s1">}</span>
+        <span class="s4">this</span><span class="s1">._devices.set(deviceId, newDevice);</span>
+        <span class="s1">debug(</span>
+          <span class="s1">`Got </span><span class="s4">new </span><span class="s1">connection: name=${deviceName}, app=${appName}, device=${deviceId}`</span>
+        <span class="s1">);</span>
+        <span class="s1">socket.on(</span><span class="s2">&quot;close&quot;</span><span class="s1">, () =&gt; {</span>
+          <span class="s4">this</span><span class="s1">._devices.</span><span class="s4">delete</span><span class="s1">(deviceId);</span>
+          <span class="s1">debug(`Device ${deviceName} disconnected.`);</span>
+        <span class="s1">});</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(e) {</span>
+        <span class="s1">console.error(</span><span class="s2">&quot;error&quot;</span><span class="s1">, e);</span>
+        <span class="s1">socket.close(INTERNAL_ERROR_CODE, e?.toString() ?? </span><span class="s2">&quot;Unknown error&quot;</span><span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+    <span class="s4">return </span><span class="s1">wss;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Returns websocket handler for debugger connections.</span>
+  <span class="s0">// Debugger connects to webSocketDebuggerUrl that we return as part of page description</span>
+  <span class="s0">// in /json response.</span>
+  <span class="s0">// When debugger connects we try to parse device and page IDs from the query and pass</span>
+  <span class="s0">// websocket object to corresponding Device instance.</span>
+  <span class="s1">_createDebuggerConnectionWSServer() {</span>
+    <span class="s1">const wss = </span><span class="s4">new </span><span class="s1">WS.Server({</span>
+      <span class="s1">noServer: </span><span class="s4">true</span><span class="s1">,</span>
+      <span class="s1">perMessageDeflate: </span><span class="s4">false</span><span class="s1">,</span>
+    <span class="s1">});</span>
+    <span class="s0">// $FlowFixMe[value-as-type]</span>
+    <span class="s1">wss.on(</span><span class="s2">&quot;connection&quot;</span><span class="s1">, async (socket, req) =&gt; {</span>
+      <span class="s4">try </span><span class="s1">{</span>
+        <span class="s1">const query = url.parse(req.url || </span><span class="s2">&quot;&quot;</span><span class="s1">, </span><span class="s4">true</span><span class="s1">).query || {};</span>
+        <span class="s1">const deviceId = query.device;</span>
+        <span class="s1">const pageId = query.page;</span>
+        <span class="s4">if </span><span class="s1">(deviceId == </span><span class="s4">null </span><span class="s1">|| pageId == </span><span class="s4">null</span><span class="s1">) {</span>
+          <span class="s4">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Incorrect URL - must provide device and page IDs&quot;</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s1">const device = </span><span class="s4">this</span><span class="s1">._devices.get(deviceId);</span>
+        <span class="s4">if </span><span class="s1">(device == </span><span class="s4">null</span><span class="s1">) {</span>
+          <span class="s4">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Unknown device with ID &quot; </span><span class="s1">+ deviceId);</span>
+        <span class="s1">}</span>
+        <span class="s1">device.handleDebuggerConnection(socket, pageId);</span>
+      <span class="s1">} </span><span class="s4">catch </span><span class="s1">(e) {</span>
+        <span class="s1">console.error(e);</span>
+        <span class="s1">socket.close(INTERNAL_ERROR_CODE, e?.toString() ?? </span><span class="s2">&quot;Unknown error&quot;</span><span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+    <span class="s4">return </span><span class="s1">wss;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = InspectorProxy;</span>
+</pre>
+</body>
+</html>

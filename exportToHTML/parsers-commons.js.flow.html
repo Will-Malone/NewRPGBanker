@@ -1,0 +1,806 @@
+<html>
+<head>
+<title>parsers-commons.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+parsers-commons.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">Nullable,</span>
+  <span class="s0">NamedShape,</span>
+  <span class="s0">NativeModuleAliasMap,</span>
+  <span class="s0">NativeModuleBaseTypeAnnotation,</span>
+  <span class="s0">NativeModuleSchema,</span>
+  <span class="s0">NativeModuleTypeAnnotation,</span>
+  <span class="s0">NativeModuleFunctionTypeAnnotation,</span>
+  <span class="s0">NativeModuleParamTypeAnnotation,</span>
+  <span class="s0">NativeModulePropertyShape,</span>
+  <span class="s0">SchemaType,</span>
+  <span class="s0">NativeModuleEnumMap,</span>
+  <span class="s0">OptionsShape,</span>
+<span class="s0">} from '../CodegenSchema.js';</span>
+
+<span class="s0">import type {Parser} from './parser';</span>
+<span class="s0">import type {ParserType} from './errors';</span>
+<span class="s0">import type {ParserErrorCapturer, TypeDeclarationMap} from './utils';</span>
+<span class="s0">import type {ComponentSchemaBuilderConfig} from './schema.js';</span>
+
+<span class="s0">const {</span>
+  <span class="s0">getConfigType,</span>
+  <span class="s0">extractNativeModuleName,</span>
+  <span class="s0">createParserErrorCapturer,</span>
+  <span class="s0">visit,</span>
+  <span class="s0">isModuleRegistryCall,</span>
+  <span class="s0">verifyPlatforms,</span>
+<span class="s0">} = require('./utils');</span>
+<span class="s0">const {</span>
+  <span class="s0">throwIfPropertyValueTypeIsUnsupported,</span>
+  <span class="s0">throwIfUnsupportedFunctionParamTypeAnnotationParserError,</span>
+  <span class="s0">throwIfUnsupportedFunctionReturnTypeAnnotationParserError,</span>
+  <span class="s0">throwIfModuleTypeIsUnsupported,</span>
+  <span class="s0">throwIfUnusedModuleInterfaceParserError,</span>
+  <span class="s0">throwIfMoreThanOneModuleRegistryCalls,</span>
+  <span class="s0">throwIfWrongNumberOfCallExpressionArgs,</span>
+  <span class="s0">throwIfUntypedModule,</span>
+  <span class="s0">throwIfIncorrectModuleRegistryCallTypeParameterParserError,</span>
+  <span class="s0">throwIfIncorrectModuleRegistryCallArgument,</span>
+  <span class="s0">throwIfModuleInterfaceNotFound,</span>
+  <span class="s0">throwIfMoreThanOneModuleInterfaceParserError,</span>
+  <span class="s0">throwIfModuleInterfaceIsMisnamed,</span>
+<span class="s0">} = require('./error-utils');</span>
+
+<span class="s0">const {</span>
+  <span class="s0">MissingTypeParameterGenericParserError,</span>
+  <span class="s0">MoreThanOneTypeParameterGenericParserError,</span>
+  <span class="s0">UnnamedFunctionParamParserError,</span>
+<span class="s0">} = require('./errors');</span>
+
+<span class="s0">const invariant = require('invariant');</span>
+
+<span class="s0">export type CommandOptions = $ReadOnly&lt;{</span>
+  <span class="s0">supportedCommands: $ReadOnlyArray&lt;string&gt;,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">// $FlowFixMe[unclear-type] TODO(T108222691): Use flow-types for @babel/parser</span>
+<span class="s0">type OptionsAST = Object;</span>
+
+<span class="s0">function wrapModuleSchema(</span>
+  <span class="s0">nativeModuleSchema: NativeModuleSchema,</span>
+  <span class="s0">hasteModuleName: string,</span>
+<span class="s0">): SchemaType {</span>
+  <span class="s0">return {</span>
+    <span class="s0">modules: {</span>
+      <span class="s0">[hasteModuleName]: nativeModuleSchema,</span>
+    <span class="s0">},</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function unwrapNullable&lt;+T: NativeModuleTypeAnnotation&gt;(</span>
+  <span class="s0">x: Nullable&lt;T&gt;,</span>
+<span class="s0">): [T, boolean] {</span>
+  <span class="s0">if (x.type === 'NullableTypeAnnotation') {</span>
+    <span class="s0">return [x.typeAnnotation, true];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return [x, false];</span>
+<span class="s0">}</span>
+
+<span class="s0">function wrapNullable&lt;+T: NativeModuleTypeAnnotation&gt;(</span>
+  <span class="s0">nullable: boolean,</span>
+  <span class="s0">typeAnnotation: T,</span>
+<span class="s0">): Nullable&lt;T&gt; {</span>
+  <span class="s0">if (!nullable) {</span>
+    <span class="s0">return typeAnnotation;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">type: 'NullableTypeAnnotation',</span>
+    <span class="s0">typeAnnotation,</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function assertGenericTypeAnnotationHasExactlyOneTypeParameter(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">/**</span>
+   <span class="s0">* TODO(T108222691): Use flow-types for @babel/parser</span>
+   <span class="s0">*/</span>
+  <span class="s0">typeAnnotation: $FlowFixMe,</span>
+  <span class="s0">parser: Parser,</span>
+<span class="s0">) {</span>
+  <span class="s0">if (typeAnnotation.typeParameters == null) {</span>
+    <span class="s0">throw new MissingTypeParameterGenericParserError(</span>
+      <span class="s0">moduleName,</span>
+      <span class="s0">typeAnnotation,</span>
+      <span class="s0">parser,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const typeAnnotationType = parser.typeParameterInstantiation;</span>
+
+  <span class="s0">invariant(</span>
+    <span class="s0">typeAnnotation.typeParameters.type === typeAnnotationType,</span>
+    <span class="s0">`assertGenericTypeAnnotationHasExactlyOneTypeParameter: Type parameters must be an AST node of type '${typeAnnotationType}'`,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">if (typeAnnotation.typeParameters.params.length !== 1) {</span>
+    <span class="s0">throw new MoreThanOneTypeParameterGenericParserError(</span>
+      <span class="s0">moduleName,</span>
+      <span class="s0">typeAnnotation,</span>
+      <span class="s0">parser,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function isObjectProperty(property: $FlowFixMe, language: ParserType): boolean {</span>
+  <span class="s0">switch (language) {</span>
+    <span class="s0">case 'Flow':</span>
+      <span class="s0">return property.type === 'ObjectTypeProperty';</span>
+    <span class="s0">case 'TypeScript':</span>
+      <span class="s0">return property.type === 'TSPropertySignature';</span>
+    <span class="s0">default:</span>
+      <span class="s0">return false;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function parseObjectProperty(</span>
+  <span class="s0">property: $FlowFixMe,</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">types: TypeDeclarationMap,</span>
+  <span class="s0">aliasMap: {...NativeModuleAliasMap},</span>
+  <span class="s0">enumMap: {...NativeModuleEnumMap},</span>
+  <span class="s0">tryParse: ParserErrorCapturer,</span>
+  <span class="s0">cxxOnly: boolean,</span>
+  <span class="s0">nullable: boolean,</span>
+  <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">parser: Parser,</span>
+<span class="s0">): NamedShape&lt;Nullable&lt;NativeModuleBaseTypeAnnotation&gt;&gt; {</span>
+  <span class="s0">const language = parser.language();</span>
+
+  <span class="s0">const name = parser.getKeyName(property, hasteModuleName);</span>
+  <span class="s0">const {optional = false} = property;</span>
+  <span class="s0">const languageTypeAnnotation =</span>
+    <span class="s0">language === 'TypeScript'</span>
+      <span class="s0">? property.typeAnnotation.typeAnnotation</span>
+      <span class="s0">: property.value;</span>
+
+  <span class="s0">const [propertyTypeAnnotation, isPropertyNullable] =</span>
+    <span class="s0">unwrapNullable&lt;$FlowFixMe&gt;(</span>
+      <span class="s0">translateTypeAnnotation(</span>
+        <span class="s0">hasteModuleName,</span>
+        <span class="s0">languageTypeAnnotation,</span>
+        <span class="s0">types,</span>
+        <span class="s0">aliasMap,</span>
+        <span class="s0">enumMap,</span>
+        <span class="s0">tryParse,</span>
+        <span class="s0">cxxOnly,</span>
+        <span class="s0">parser,</span>
+      <span class="s0">),</span>
+    <span class="s0">);</span>
+
+  <span class="s0">if (</span>
+    <span class="s0">propertyTypeAnnotation.type === 'FunctionTypeAnnotation' ||</span>
+    <span class="s0">propertyTypeAnnotation.type === 'PromiseTypeAnnotation' ||</span>
+    <span class="s0">propertyTypeAnnotation.type === 'VoidTypeAnnotation'</span>
+  <span class="s0">) {</span>
+    <span class="s0">throwIfPropertyValueTypeIsUnsupported(</span>
+      <span class="s0">hasteModuleName,</span>
+      <span class="s0">languageTypeAnnotation,</span>
+      <span class="s0">property.key,</span>
+      <span class="s0">propertyTypeAnnotation.type,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">name,</span>
+    <span class="s0">optional,</span>
+    <span class="s0">typeAnnotation: wrapNullable(isPropertyNullable, propertyTypeAnnotation),</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function translateFunctionTypeAnnotation(</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">// TODO(T108222691): Use flow-types for @babel/parser</span>
+  <span class="s0">// TODO(T71778680): This is a FunctionTypeAnnotation. Type this.</span>
+  <span class="s0">functionTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">types: TypeDeclarationMap,</span>
+  <span class="s0">aliasMap: {...NativeModuleAliasMap},</span>
+  <span class="s0">enumMap: {...NativeModuleEnumMap},</span>
+  <span class="s0">tryParse: ParserErrorCapturer,</span>
+  <span class="s0">cxxOnly: boolean,</span>
+  <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">parser: Parser,</span>
+<span class="s0">): NativeModuleFunctionTypeAnnotation {</span>
+  <span class="s0">type Param = NamedShape&lt;Nullable&lt;NativeModuleParamTypeAnnotation&gt;&gt;;</span>
+  <span class="s0">const params: Array&lt;Param&gt; = [];</span>
+
+  <span class="s0">for (const param of parser.getFunctionTypeAnnotationParameters(</span>
+    <span class="s0">functionTypeAnnotation,</span>
+  <span class="s0">)) {</span>
+    <span class="s0">const parsedParam = tryParse(() =&gt; {</span>
+      <span class="s0">if (parser.getFunctionNameFromParameter(param) == null) {</span>
+        <span class="s0">throw new UnnamedFunctionParamParserError(param, hasteModuleName);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">const paramName = parser.getParameterName(param);</span>
+
+      <span class="s0">const [paramTypeAnnotation, isParamTypeAnnotationNullable] =</span>
+        <span class="s0">unwrapNullable&lt;$FlowFixMe&gt;(</span>
+          <span class="s0">translateTypeAnnotation(</span>
+            <span class="s0">hasteModuleName,</span>
+            <span class="s0">parser.getParameterTypeAnnotation(param),</span>
+            <span class="s0">types,</span>
+            <span class="s0">aliasMap,</span>
+            <span class="s0">enumMap,</span>
+            <span class="s0">tryParse,</span>
+            <span class="s0">cxxOnly,</span>
+            <span class="s0">parser,</span>
+          <span class="s0">),</span>
+        <span class="s0">);</span>
+
+      <span class="s0">if (</span>
+        <span class="s0">paramTypeAnnotation.type === 'VoidTypeAnnotation' ||</span>
+        <span class="s0">paramTypeAnnotation.type === 'PromiseTypeAnnotation'</span>
+      <span class="s0">) {</span>
+        <span class="s0">return throwIfUnsupportedFunctionParamTypeAnnotationParserError(</span>
+          <span class="s0">hasteModuleName,</span>
+          <span class="s0">param.typeAnnotation,</span>
+          <span class="s0">paramName,</span>
+          <span class="s0">paramTypeAnnotation.type,</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">return {</span>
+        <span class="s0">name: paramName,</span>
+        <span class="s0">optional: Boolean(param.optional),</span>
+        <span class="s0">typeAnnotation: wrapNullable(</span>
+          <span class="s0">isParamTypeAnnotationNullable,</span>
+          <span class="s0">paramTypeAnnotation,</span>
+        <span class="s0">),</span>
+      <span class="s0">};</span>
+    <span class="s0">});</span>
+
+    <span class="s0">if (parsedParam != null) {</span>
+      <span class="s0">params.push(parsedParam);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const [returnTypeAnnotation, isReturnTypeAnnotationNullable] =</span>
+    <span class="s0">unwrapNullable&lt;$FlowFixMe&gt;(</span>
+      <span class="s0">translateTypeAnnotation(</span>
+        <span class="s0">hasteModuleName,</span>
+        <span class="s0">parser.getFunctionTypeAnnotationReturnType(functionTypeAnnotation),</span>
+        <span class="s0">types,</span>
+        <span class="s0">aliasMap,</span>
+        <span class="s0">enumMap,</span>
+        <span class="s0">tryParse,</span>
+        <span class="s0">cxxOnly,</span>
+        <span class="s0">parser,</span>
+      <span class="s0">),</span>
+    <span class="s0">);</span>
+
+  <span class="s0">throwIfUnsupportedFunctionReturnTypeAnnotationParserError(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">functionTypeAnnotation,</span>
+    <span class="s0">'FunctionTypeAnnotation',</span>
+    <span class="s0">cxxOnly,</span>
+    <span class="s0">returnTypeAnnotation.type,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">type: 'FunctionTypeAnnotation',</span>
+    <span class="s0">returnTypeAnnotation: wrapNullable(</span>
+      <span class="s0">isReturnTypeAnnotationNullable,</span>
+      <span class="s0">returnTypeAnnotation,</span>
+    <span class="s0">),</span>
+    <span class="s0">params,</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function buildPropertySchema(</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">// TODO(T108222691): [TS] Use flow-types for @babel/parser</span>
+  <span class="s0">// TODO(T71778680): [Flow] This is an ObjectTypeProperty containing either:</span>
+  <span class="s0">// - a FunctionTypeAnnotation or GenericTypeAnnotation</span>
+  <span class="s0">// - a NullableTypeAnnoation containing a FunctionTypeAnnotation or GenericTypeAnnotation</span>
+  <span class="s0">// Flow type this node</span>
+  <span class="s0">property: $FlowFixMe,</span>
+  <span class="s0">types: TypeDeclarationMap,</span>
+  <span class="s0">aliasMap: {...NativeModuleAliasMap},</span>
+  <span class="s0">enumMap: {...NativeModuleEnumMap},</span>
+  <span class="s0">tryParse: ParserErrorCapturer,</span>
+  <span class="s0">cxxOnly: boolean,</span>
+  <span class="s0">resolveTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">parser: Parser,</span>
+<span class="s0">): NativeModulePropertyShape {</span>
+  <span class="s0">let nullable: boolean = false;</span>
+  <span class="s0">let {key, value} = property;</span>
+  <span class="s0">const methodName: string = key.name;</span>
+
+  <span class="s0">if (parser.language() === 'TypeScript') {</span>
+    <span class="s0">value =</span>
+      <span class="s0">property.type === 'TSMethodSignature'</span>
+        <span class="s0">? property</span>
+        <span class="s0">: property.typeAnnotation;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">({nullable, typeAnnotation: value} = resolveTypeAnnotation(value, types));</span>
+
+  <span class="s0">throwIfModuleTypeIsUnsupported(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">property.value,</span>
+    <span class="s0">key.name,</span>
+    <span class="s0">value.type,</span>
+    <span class="s0">parser,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">name: methodName,</span>
+    <span class="s0">optional: Boolean(property.optional),</span>
+    <span class="s0">typeAnnotation: wrapNullable(</span>
+      <span class="s0">nullable,</span>
+      <span class="s0">translateFunctionTypeAnnotation(</span>
+        <span class="s0">hasteModuleName,</span>
+        <span class="s0">value,</span>
+        <span class="s0">types,</span>
+        <span class="s0">aliasMap,</span>
+        <span class="s0">enumMap,</span>
+        <span class="s0">tryParse,</span>
+        <span class="s0">cxxOnly,</span>
+        <span class="s0">translateTypeAnnotation,</span>
+        <span class="s0">parser,</span>
+      <span class="s0">),</span>
+    <span class="s0">),</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function buildSchemaFromConfigType(</span>
+  <span class="s0">configType: 'module' | 'component' | 'none',</span>
+  <span class="s0">filename: ?string,</span>
+  <span class="s0">ast: $FlowFixMe,</span>
+  <span class="s0">wrapComponentSchema: (config: ComponentSchemaBuilderConfig) =&gt; SchemaType,</span>
+  <span class="s0">buildComponentSchema: (</span>
+    <span class="s0">ast: $FlowFixMe,</span>
+    <span class="s0">parser: Parser,</span>
+  <span class="s0">) =&gt; ComponentSchemaBuilderConfig,</span>
+  <span class="s0">buildModuleSchema: (</span>
+    <span class="s0">hasteModuleName: string,</span>
+    <span class="s0">ast: $FlowFixMe,</span>
+    <span class="s0">tryParse: ParserErrorCapturer,</span>
+    <span class="s0">parser: Parser,</span>
+    <span class="s0">resolveTypeAnnotation: $FlowFixMe,</span>
+    <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">) =&gt; NativeModuleSchema,</span>
+  <span class="s0">parser: Parser,</span>
+  <span class="s0">resolveTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+<span class="s0">): SchemaType {</span>
+  <span class="s0">switch (configType) {</span>
+    <span class="s0">case 'component': {</span>
+      <span class="s0">return wrapComponentSchema(buildComponentSchema(ast, parser));</span>
+    <span class="s0">}</span>
+    <span class="s0">case 'module': {</span>
+      <span class="s0">if (filename === undefined || filename === null) {</span>
+        <span class="s0">throw new Error('Filepath expected while parasing a module');</span>
+      <span class="s0">}</span>
+      <span class="s0">const nativeModuleName = extractNativeModuleName(filename);</span>
+
+      <span class="s0">const [parsingErrors, tryParse] = createParserErrorCapturer();</span>
+
+      <span class="s0">const schema = tryParse(() =&gt;</span>
+        <span class="s0">buildModuleSchema(</span>
+          <span class="s0">nativeModuleName,</span>
+          <span class="s0">ast,</span>
+          <span class="s0">tryParse,</span>
+          <span class="s0">parser,</span>
+          <span class="s0">resolveTypeAnnotation,</span>
+          <span class="s0">translateTypeAnnotation,</span>
+        <span class="s0">),</span>
+      <span class="s0">);</span>
+
+      <span class="s0">if (parsingErrors.length &gt; 0) {</span>
+        <span class="s0">/**</span>
+         <span class="s0">* TODO(T77968131): We have two options:</span>
+         <span class="s0">*  - Throw the first error, but indicate there are more then one errors.</span>
+         <span class="s0">*  - Display all errors, nicely formatted.</span>
+         <span class="s0">*</span>
+         <span class="s0">* For the time being, we're just throw the first error.</span>
+         <span class="s0">**/</span>
+
+        <span class="s0">throw parsingErrors[0];</span>
+      <span class="s0">}</span>
+
+      <span class="s0">invariant(</span>
+        <span class="s0">schema != null,</span>
+        <span class="s0">'When there are no parsing errors, the schema should not be null',</span>
+      <span class="s0">);</span>
+
+      <span class="s0">return wrapModuleSchema(schema, nativeModuleName);</span>
+    <span class="s0">}</span>
+    <span class="s0">default:</span>
+      <span class="s0">return {modules: {}};</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function buildSchema(</span>
+  <span class="s0">contents: string,</span>
+  <span class="s0">filename: ?string,</span>
+  <span class="s0">wrapComponentSchema: (config: ComponentSchemaBuilderConfig) =&gt; SchemaType,</span>
+  <span class="s0">buildComponentSchema: (</span>
+    <span class="s0">ast: $FlowFixMe,</span>
+    <span class="s0">parser: Parser,</span>
+  <span class="s0">) =&gt; ComponentSchemaBuilderConfig,</span>
+  <span class="s0">buildModuleSchema: (</span>
+    <span class="s0">hasteModuleName: string,</span>
+    <span class="s0">ast: $FlowFixMe,</span>
+    <span class="s0">tryParse: ParserErrorCapturer,</span>
+    <span class="s0">parser: Parser,</span>
+    <span class="s0">resolveTypeAnnotation: $FlowFixMe,</span>
+    <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">) =&gt; NativeModuleSchema,</span>
+  <span class="s0">Visitor: ({isComponent: boolean, isModule: boolean}) =&gt; {</span>
+    <span class="s0">[type: string]: (node: $FlowFixMe) =&gt; void,</span>
+  <span class="s0">},</span>
+  <span class="s0">parser: Parser,</span>
+  <span class="s0">resolveTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+<span class="s0">): SchemaType {</span>
+  <span class="s0">// Early return for non-Spec JavaScript files</span>
+  <span class="s0">if (</span>
+    <span class="s0">!contents.includes('codegenNativeComponent') &amp;&amp;</span>
+    <span class="s0">!contents.includes('TurboModule')</span>
+  <span class="s0">) {</span>
+    <span class="s0">return {modules: {}};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const ast = parser.getAst(contents);</span>
+  <span class="s0">const configType = getConfigType(ast, Visitor);</span>
+
+  <span class="s0">return buildSchemaFromConfigType(</span>
+    <span class="s0">configType,</span>
+    <span class="s0">filename,</span>
+    <span class="s0">ast,</span>
+    <span class="s0">wrapComponentSchema,</span>
+    <span class="s0">buildComponentSchema,</span>
+    <span class="s0">buildModuleSchema,</span>
+    <span class="s0">parser,</span>
+    <span class="s0">resolveTypeAnnotation,</span>
+    <span class="s0">translateTypeAnnotation,</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function createComponentConfig(</span>
+  <span class="s0">foundConfig: $FlowFixMe,</span>
+  <span class="s0">commandsTypeNames: $FlowFixMe,</span>
+<span class="s0">): $FlowFixMe {</span>
+  <span class="s0">return {</span>
+    <span class="s0">...foundConfig,</span>
+    <span class="s0">commandTypeName:</span>
+      <span class="s0">commandsTypeNames[0] == null</span>
+        <span class="s0">? null</span>
+        <span class="s0">: commandsTypeNames[0].commandTypeName,</span>
+    <span class="s0">commandOptionsExpression:</span>
+      <span class="s0">commandsTypeNames[0] == null</span>
+        <span class="s0">? null</span>
+        <span class="s0">: commandsTypeNames[0].commandOptionsExpression,</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">const parseModuleName = (</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">moduleSpec: $FlowFixMe,</span>
+  <span class="s0">ast: $FlowFixMe,</span>
+  <span class="s0">parser: Parser,</span>
+<span class="s0">): string =&gt; {</span>
+  <span class="s0">const callExpressions = [];</span>
+  <span class="s0">visit(ast, {</span>
+    <span class="s0">CallExpression(node) {</span>
+      <span class="s0">if (isModuleRegistryCall(node)) {</span>
+        <span class="s0">callExpressions.push(node);</span>
+      <span class="s0">}</span>
+    <span class="s0">},</span>
+  <span class="s0">});</span>
+
+  <span class="s0">throwIfUnusedModuleInterfaceParserError(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">moduleSpec,</span>
+    <span class="s0">callExpressions,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">throwIfMoreThanOneModuleRegistryCalls(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">callExpressions,</span>
+    <span class="s0">callExpressions.length,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const [callExpression] = callExpressions;</span>
+  <span class="s0">const typeParameters = parser.callExpressionTypeParameters(callExpression);</span>
+  <span class="s0">const methodName = callExpression.callee.property.name;</span>
+
+  <span class="s0">throwIfWrongNumberOfCallExpressionArgs(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">callExpression,</span>
+    <span class="s0">methodName,</span>
+    <span class="s0">callExpression.arguments.length,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">throwIfIncorrectModuleRegistryCallArgument(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">callExpression.arguments[0],</span>
+    <span class="s0">methodName,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const $moduleName = callExpression.arguments[0].value;</span>
+
+  <span class="s0">throwIfUntypedModule(</span>
+    <span class="s0">typeParameters,</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">callExpression,</span>
+    <span class="s0">methodName,</span>
+    <span class="s0">$moduleName,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">throwIfIncorrectModuleRegistryCallTypeParameterParserError(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">typeParameters,</span>
+    <span class="s0">methodName,</span>
+    <span class="s0">$moduleName,</span>
+    <span class="s0">parser,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">return $moduleName;</span>
+<span class="s0">};</span>
+
+<span class="s0">const buildModuleSchema = (</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">/**</span>
+   <span class="s0">* TODO(T71778680): Flow-type this node.</span>
+   <span class="s0">*/</span>
+  <span class="s0">ast: $FlowFixMe,</span>
+  <span class="s0">tryParse: ParserErrorCapturer,</span>
+  <span class="s0">parser: Parser,</span>
+  <span class="s0">resolveTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">translateTypeAnnotation: $FlowFixMe,</span>
+<span class="s0">): NativeModuleSchema =&gt; {</span>
+  <span class="s0">const language = parser.language();</span>
+  <span class="s0">const types = parser.getTypes(ast);</span>
+  <span class="s0">const moduleSpecs = (Object.values(types): $ReadOnlyArray&lt;$FlowFixMe&gt;).filter(</span>
+    <span class="s0">t =&gt; parser.isModuleInterface(t),</span>
+  <span class="s0">);</span>
+
+  <span class="s0">throwIfModuleInterfaceNotFound(</span>
+    <span class="s0">moduleSpecs.length,</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">ast,</span>
+    <span class="s0">language,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">throwIfMoreThanOneModuleInterfaceParserError(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">moduleSpecs,</span>
+    <span class="s0">language,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const [moduleSpec] = moduleSpecs;</span>
+
+  <span class="s0">throwIfModuleInterfaceIsMisnamed(hasteModuleName, moduleSpec.id, language);</span>
+
+  <span class="s0">// Parse Module Name</span>
+  <span class="s0">const moduleName = parseModuleName(hasteModuleName, moduleSpec, ast, parser);</span>
+
+  <span class="s0">// Some module names use platform suffix to indicate platform-exclusive modules.</span>
+  <span class="s0">// Eventually this should be made explicit in the Flow type itself.</span>
+  <span class="s0">// Also check the hasteModuleName for platform suffix.</span>
+  <span class="s0">// Note: this shape is consistent with ComponentSchema.</span>
+  <span class="s0">const {cxxOnly, excludedPlatforms} = verifyPlatforms(</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">moduleName,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const properties: $ReadOnlyArray&lt;$FlowFixMe&gt; =</span>
+    <span class="s0">language === 'Flow' ? moduleSpec.body.properties : moduleSpec.body.body;</span>
+
+  <span class="s0">// $FlowFixMe[missing-type-arg]</span>
+  <span class="s0">return properties</span>
+    <span class="s0">.filter(</span>
+      <span class="s0">property =&gt;</span>
+        <span class="s0">property.type === 'ObjectTypeProperty' ||</span>
+        <span class="s0">property.type === 'TSPropertySignature' ||</span>
+        <span class="s0">property.type === 'TSMethodSignature',</span>
+    <span class="s0">)</span>
+    <span class="s0">.map&lt;?{</span>
+      <span class="s0">aliasMap: NativeModuleAliasMap,</span>
+      <span class="s0">enumMap: NativeModuleEnumMap,</span>
+      <span class="s0">propertyShape: NativeModulePropertyShape,</span>
+    <span class="s0">}&gt;(property =&gt; {</span>
+      <span class="s0">const aliasMap: {...NativeModuleAliasMap} = {};</span>
+      <span class="s0">const enumMap: {...NativeModuleEnumMap} = {};</span>
+
+      <span class="s0">return tryParse(() =&gt; ({</span>
+        <span class="s0">aliasMap,</span>
+        <span class="s0">enumMap,</span>
+        <span class="s0">propertyShape: buildPropertySchema(</span>
+          <span class="s0">hasteModuleName,</span>
+          <span class="s0">property,</span>
+          <span class="s0">types,</span>
+          <span class="s0">aliasMap,</span>
+          <span class="s0">enumMap,</span>
+          <span class="s0">tryParse,</span>
+          <span class="s0">cxxOnly,</span>
+          <span class="s0">resolveTypeAnnotation,</span>
+          <span class="s0">translateTypeAnnotation,</span>
+          <span class="s0">parser,</span>
+        <span class="s0">),</span>
+      <span class="s0">}));</span>
+    <span class="s0">})</span>
+    <span class="s0">.filter(Boolean)</span>
+    <span class="s0">.reduce(</span>
+      <span class="s0">(</span>
+        <span class="s0">moduleSchema: NativeModuleSchema,</span>
+        <span class="s0">{aliasMap, enumMap, propertyShape},</span>
+      <span class="s0">) =&gt; ({</span>
+        <span class="s0">type: 'NativeModule',</span>
+        <span class="s0">aliasMap: {...moduleSchema.aliasMap, ...aliasMap},</span>
+        <span class="s0">enumMap: {...moduleSchema.enumMap, ...enumMap},</span>
+        <span class="s0">spec: {</span>
+          <span class="s0">properties: [...moduleSchema.spec.properties, propertyShape],</span>
+        <span class="s0">},</span>
+        <span class="s0">moduleName: moduleSchema.moduleName,</span>
+        <span class="s0">excludedPlatforms: moduleSchema.excludedPlatforms,</span>
+      <span class="s0">}),</span>
+      <span class="s0">{</span>
+        <span class="s0">type: 'NativeModule',</span>
+        <span class="s0">aliasMap: {},</span>
+        <span class="s0">enumMap: {},</span>
+        <span class="s0">spec: {properties: []},</span>
+        <span class="s0">moduleName,</span>
+        <span class="s0">excludedPlatforms:</span>
+          <span class="s0">excludedPlatforms.length !== 0 ? [...excludedPlatforms] : undefined,</span>
+      <span class="s0">},</span>
+    <span class="s0">);</span>
+<span class="s0">};</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* This function is used to find the type of a native component</span>
+ <span class="s0">* provided the default exports statement from generated AST.</span>
+ <span class="s0">* @param statement The statement to be parsed.</span>
+ <span class="s0">* @param foundConfigs The 'mutable' array of configs that have been found.</span>
+ <span class="s0">* @param parser The language parser to be used.</span>
+ <span class="s0">* @returns void</span>
+ <span class="s0">*/</span>
+<span class="s0">function findNativeComponentType(</span>
+  <span class="s0">statement: $FlowFixMe,</span>
+  <span class="s0">foundConfigs: Array&lt;{[string]: string}&gt;,</span>
+  <span class="s0">parser: Parser,</span>
+<span class="s0">): void {</span>
+  <span class="s0">let declaration = statement.declaration;</span>
+
+  <span class="s0">// codegenNativeComponent can be nested inside a cast</span>
+  <span class="s0">// expression so we need to go one level deeper</span>
+  <span class="s0">if (</span>
+    <span class="s0">declaration.type === 'TSAsExpression' ||</span>
+    <span class="s0">declaration.type === 'TypeCastExpression'</span>
+  <span class="s0">) {</span>
+    <span class="s0">declaration = declaration.expression;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">try {</span>
+    <span class="s0">if (declaration.callee.name === 'codegenNativeComponent') {</span>
+      <span class="s0">const typeArgumentParams =</span>
+        <span class="s0">parser.getTypeArgumentParamsFromDeclaration(declaration);</span>
+      <span class="s0">const funcArgumentParams = declaration.arguments;</span>
+
+      <span class="s0">const nativeComponentType: {[string]: string} =</span>
+        <span class="s0">parser.getNativeComponentType(typeArgumentParams, funcArgumentParams);</span>
+      <span class="s0">if (funcArgumentParams.length &gt; 1) {</span>
+        <span class="s0">nativeComponentType.optionsExpression = funcArgumentParams[1];</span>
+      <span class="s0">}</span>
+      <span class="s0">foundConfigs.push(nativeComponentType);</span>
+    <span class="s0">}</span>
+  <span class="s0">} catch (e) {</span>
+    <span class="s0">// ignore</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function getCommandOptions(</span>
+  <span class="s0">commandOptionsExpression: OptionsAST,</span>
+<span class="s0">): ?CommandOptions {</span>
+  <span class="s0">if (commandOptionsExpression == null) {</span>
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">let foundOptions;</span>
+  <span class="s0">try {</span>
+    <span class="s0">foundOptions = commandOptionsExpression.properties.reduce(</span>
+      <span class="s0">(options, prop) =&gt; {</span>
+        <span class="s0">options[prop.key.name] = (</span>
+          <span class="s0">(prop &amp;&amp; prop.value &amp;&amp; prop.value.elements) ||</span>
+          <span class="s0">[]</span>
+        <span class="s0">).map(element =&gt; element &amp;&amp; element.value);</span>
+        <span class="s0">return options;</span>
+      <span class="s0">},</span>
+      <span class="s0">{},</span>
+    <span class="s0">);</span>
+  <span class="s0">} catch (e) {</span>
+    <span class="s0">throw new Error(</span>
+      <span class="s0">'Failed to parse command options, please check that they are defined correctly',</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return foundOptions;</span>
+<span class="s0">}</span>
+
+<span class="s0">function getOptions(optionsExpression: OptionsAST): ?OptionsShape {</span>
+  <span class="s0">if (!optionsExpression) {</span>
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+  <span class="s0">let foundOptions;</span>
+  <span class="s0">try {</span>
+    <span class="s0">foundOptions = optionsExpression.properties.reduce((options, prop) =&gt; {</span>
+      <span class="s0">if (prop.value.type === 'ArrayExpression') {</span>
+        <span class="s0">options[prop.key.name] = prop.value.elements.map(</span>
+          <span class="s0">element =&gt; element.value,</span>
+        <span class="s0">);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">options[prop.key.name] = prop.value.value;</span>
+      <span class="s0">}</span>
+      <span class="s0">return options;</span>
+    <span class="s0">}, {});</span>
+  <span class="s0">} catch (e) {</span>
+    <span class="s0">throw new Error(</span>
+      <span class="s0">'Failed to parse codegen options, please check that they are defined correctly',</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (</span>
+    <span class="s0">foundOptions.paperComponentName &amp;&amp;</span>
+    <span class="s0">foundOptions.paperComponentNameDeprecated</span>
+  <span class="s0">) {</span>
+    <span class="s0">throw new Error(</span>
+      <span class="s0">'Failed to parse codegen options, cannot use both paperComponentName and paperComponentNameDeprecated',</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return foundOptions;</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">wrapModuleSchema,</span>
+  <span class="s0">unwrapNullable,</span>
+  <span class="s0">wrapNullable,</span>
+  <span class="s0">assertGenericTypeAnnotationHasExactlyOneTypeParameter,</span>
+  <span class="s0">isObjectProperty,</span>
+  <span class="s0">parseObjectProperty,</span>
+  <span class="s0">translateFunctionTypeAnnotation,</span>
+  <span class="s0">buildPropertySchema,</span>
+  <span class="s0">buildSchemaFromConfigType,</span>
+  <span class="s0">buildSchema,</span>
+  <span class="s0">createComponentConfig,</span>
+  <span class="s0">parseModuleName,</span>
+  <span class="s0">buildModuleSchema,</span>
+  <span class="s0">findNativeComponentType,</span>
+  <span class="s0">getCommandOptions,</span>
+  <span class="s0">getOptions,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

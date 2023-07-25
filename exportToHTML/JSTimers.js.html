@@ -1,0 +1,508 @@
+<html>
+<head>
+<title>JSTimers.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JSTimers.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @format 
+ * @flow 
+ */</span>
+
+<span class="s1">import NativeTiming from </span><span class="s2">'./NativeTiming'</span><span class="s1">;</span>
+
+<span class="s1">const BatchedBridge = require(</span><span class="s2">'../../BatchedBridge/BatchedBridge'</span><span class="s1">);</span>
+<span class="s1">const Systrace = require(</span><span class="s2">'../../Performance/Systrace'</span><span class="s1">);</span>
+<span class="s1">const invariant = require(</span><span class="s2">'invariant'</span><span class="s1">);</span>
+
+<span class="s0">/** 
+ * JS implementation of timer functions. Must be completely driven by an 
+ * external clock signal, all that's stored here is timerID, timer type, and 
+ * callback. 
+ */</span>
+
+<span class="s1">export type JSTimerType =</span>
+  <span class="s1">| </span><span class="s2">'setTimeout'</span>
+  <span class="s1">| </span><span class="s2">'setInterval'</span>
+  <span class="s1">| </span><span class="s2">'requestAnimationFrame'</span>
+  <span class="s1">| </span><span class="s2">'queueReactNativeMicrotask'</span>
+  <span class="s1">| </span><span class="s2">'requestIdleCallback'</span><span class="s1">;</span>
+
+<span class="s0">// These timing constants should be kept in sync with the ones in native ios and</span>
+<span class="s0">// android `RCTTiming` module.</span>
+<span class="s1">const FRAME_DURATION = </span><span class="s3">1000 </span><span class="s1">/ </span><span class="s3">60</span><span class="s1">;</span>
+<span class="s1">const IDLE_CALLBACK_FRAME_DEADLINE = </span><span class="s3">1</span><span class="s1">;</span>
+
+<span class="s0">// Parallel arrays</span>
+<span class="s1">const callbacks: Array&lt;?Function&gt; = [];</span>
+<span class="s1">const types: Array&lt;?JSTimerType&gt; = [];</span>
+<span class="s1">const timerIDs: Array&lt;?number&gt; = [];</span>
+<span class="s1">let reactNativeMicrotasks: Array&lt;number&gt; = [];</span>
+<span class="s1">let requestIdleCallbacks: Array&lt;number&gt; = [];</span>
+<span class="s1">const requestIdleCallbackTimeouts: {[number]: number, ...} = {};</span>
+
+<span class="s1">let GUID = </span><span class="s3">1</span><span class="s1">;</span>
+<span class="s1">const errors: Array&lt;Error&gt; = [];</span>
+
+<span class="s1">let hasEmittedTimeDriftWarning = </span><span class="s4">false</span><span class="s1">;</span>
+
+<span class="s0">// Returns a free index if one is available, and the next consecutive index otherwise.</span>
+<span class="s4">function </span><span class="s1">_getFreeIndex(): number {</span>
+  <span class="s1">let freeIndex = timerIDs.indexOf(</span><span class="s4">null</span><span class="s1">);</span>
+  <span class="s4">if </span><span class="s1">(freeIndex === -</span><span class="s3">1</span><span class="s1">) {</span>
+    <span class="s1">freeIndex = timerIDs.length;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">freeIndex;</span>
+<span class="s1">}</span>
+
+<span class="s4">function </span><span class="s1">_allocateCallback(func: Function, type: JSTimerType): number {</span>
+  <span class="s1">const id = GUID++;</span>
+  <span class="s1">const freeIndex = _getFreeIndex();</span>
+  <span class="s1">timerIDs[freeIndex] = id;</span>
+  <span class="s1">callbacks[freeIndex] = func;</span>
+  <span class="s1">types[freeIndex] = type;</span>
+  <span class="s4">return </span><span class="s1">id;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Calls the callback associated with the ID. Also unregister that callback 
+ * if it was a one time timer (setTimeout), and not unregister it if it was 
+ * recurring (setInterval). 
+ */</span>
+<span class="s4">function </span><span class="s1">_callTimer(timerID: number, frameTime: number, didTimeout: ?boolean) {</span>
+  <span class="s4">if </span><span class="s1">(timerID &gt; GUID) {</span>
+    <span class="s1">console.warn(</span>
+      <span class="s2">'Tried to call timer with ID %s but no such timer exists.'</span><span class="s1">,</span>
+      <span class="s1">timerID,</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// timerIndex of -1 means that no timer with that ID exists. There are</span>
+  <span class="s0">// two situations when this happens, when a garbage timer ID was given</span>
+  <span class="s0">// and when a previously existing timer was deleted before this callback</span>
+  <span class="s0">// fired. In both cases we want to ignore the timer id, but in the former</span>
+  <span class="s0">// case we warn as well.</span>
+  <span class="s1">const timerIndex = timerIDs.indexOf(timerID);</span>
+  <span class="s4">if </span><span class="s1">(timerIndex === -</span><span class="s3">1</span><span class="s1">) {</span>
+    <span class="s4">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const type = types[timerIndex];</span>
+  <span class="s1">const callback = callbacks[timerIndex];</span>
+  <span class="s4">if </span><span class="s1">(!callback || !type) {</span>
+    <span class="s1">console.error(</span><span class="s2">'No callback found for timerID ' </span><span class="s1">+ timerID);</span>
+    <span class="s4">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(__DEV__) {</span>
+    <span class="s1">Systrace.beginEvent(type + </span><span class="s2">' [invoke]'</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Clear the metadata</span>
+  <span class="s4">if </span><span class="s1">(type !== </span><span class="s2">'setInterval'</span><span class="s1">) {</span>
+    <span class="s1">_clearIndex(timerIndex);</span>
+  <span class="s1">}</span>
+
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">type === </span><span class="s2">'setTimeout' </span><span class="s1">||</span>
+      <span class="s1">type === </span><span class="s2">'setInterval' </span><span class="s1">||</span>
+      <span class="s1">type === </span><span class="s2">'queueReactNativeMicrotask'</span>
+    <span class="s1">) {</span>
+      <span class="s1">callback();</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type === </span><span class="s2">'requestAnimationFrame'</span><span class="s1">) {</span>
+      <span class="s1">callback(global.performance.now());</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(type === </span><span class="s2">'requestIdleCallback'</span><span class="s1">) {</span>
+      <span class="s1">callback({</span>
+        <span class="s1">timeRemaining: </span><span class="s4">function </span><span class="s1">() {</span>
+          <span class="s0">// TODO: Optimisation: allow running for longer than one frame if</span>
+          <span class="s0">// there are no pending JS calls on the bridge from native. This</span>
+          <span class="s0">// would require a way to check the bridge queue synchronously.</span>
+          <span class="s4">return </span><span class="s1">Math.max(</span>
+            <span class="s3">0</span><span class="s1">,</span>
+            <span class="s1">FRAME_DURATION - (global.performance.now() - frameTime),</span>
+          <span class="s1">);</span>
+        <span class="s1">},</span>
+        <span class="s1">didTimeout: !!didTimeout,</span>
+      <span class="s1">});</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">console.error(</span><span class="s2">'Tried to call a callback with invalid type: ' </span><span class="s1">+ type);</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(e) {</span>
+    <span class="s0">// Don't rethrow so that we can run all timers.</span>
+    <span class="s1">errors.push(e);</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(__DEV__) {</span>
+    <span class="s1">Systrace.endEvent();</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Performs a single pass over the enqueued reactNativeMicrotasks. Returns whether 
+ * more reactNativeMicrotasks are queued up (can be used as a condition a while loop). 
+ */</span>
+<span class="s4">function </span><span class="s1">_callReactNativeMicrotasksPass() {</span>
+  <span class="s4">if </span><span class="s1">(reactNativeMicrotasks.length === </span><span class="s3">0</span><span class="s1">) {</span>
+    <span class="s4">return false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(__DEV__) {</span>
+    <span class="s1">Systrace.beginEvent(</span><span class="s2">'callReactNativeMicrotasksPass()'</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// The main reason to extract a single pass is so that we can track</span>
+  <span class="s0">// in the system trace</span>
+  <span class="s1">const passReactNativeMicrotasks = reactNativeMicrotasks;</span>
+  <span class="s1">reactNativeMicrotasks = [];</span>
+
+  <span class="s0">// Use for loop rather than forEach as per @vjeux's advice</span>
+  <span class="s0">// https://github.com/facebook/react-native/commit/c8fd9f7588ad02d2293cac7224715f4af7b0f352#commitcomment-14570051</span>
+  <span class="s4">for </span><span class="s1">(let i = </span><span class="s3">0</span><span class="s1">; i &lt; passReactNativeMicrotasks.length; ++i) {</span>
+    <span class="s1">_callTimer(passReactNativeMicrotasks[i], </span><span class="s3">0</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(__DEV__) {</span>
+    <span class="s1">Systrace.endEvent();</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">reactNativeMicrotasks.length &gt; </span><span class="s3">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s4">function </span><span class="s1">_clearIndex(i: number) {</span>
+  <span class="s1">timerIDs[i] = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">callbacks[i] = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">types[i] = </span><span class="s4">null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s4">function </span><span class="s1">_freeCallback(timerID: number) {</span>
+  <span class="s0">// timerIDs contains nulls after timers have been removed;</span>
+  <span class="s0">// ignore nulls upfront so indexOf doesn't find them</span>
+  <span class="s4">if </span><span class="s1">(timerID == </span><span class="s4">null</span><span class="s1">) {</span>
+    <span class="s4">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const index = timerIDs.indexOf(timerID);</span>
+  <span class="s0">// See corresponding comment in `callTimers` for reasoning behind this</span>
+  <span class="s4">if </span><span class="s1">(index !== -</span><span class="s3">1</span><span class="s1">) {</span>
+    <span class="s1">const type = types[index];</span>
+    <span class="s1">_clearIndex(index);</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">type !== </span><span class="s2">'queueReactNativeMicrotask' </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">type !== </span><span class="s2">'requestIdleCallback'</span>
+    <span class="s1">) {</span>
+      <span class="s1">deleteTimer(timerID);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * JS implementation of timer functions. Must be completely driven by an 
+ * external clock signal, all that's stored here is timerID, timer type, and 
+ * callback. 
+ */</span>
+<span class="s1">const JSTimers = {</span>
+  <span class="s0">/** 
+   * @param {function} func Callback to be invoked after `duration` ms. 
+   * @param {number} duration Number of milliseconds. 
+   */</span>
+  <span class="s1">setTimeout: </span><span class="s4">function </span><span class="s1">(</span>
+    <span class="s1">func: Function,</span>
+    <span class="s1">duration: number,</span>
+    <span class="s1">...args: any</span>
+  <span class="s1">): number {</span>
+    <span class="s1">const id = _allocateCallback(</span>
+      <span class="s1">() =&gt; func.apply(undefined, args),</span>
+      <span class="s2">'setTimeout'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+    <span class="s1">createTimer(id, duration || </span><span class="s3">0</span><span class="s1">, Date.now(), </span><span class="s0">/* recurring */ </span><span class="s4">false</span><span class="s1">);</span>
+    <span class="s4">return </span><span class="s1">id;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * @param {function} func Callback to be invoked every `duration` ms. 
+   * @param {number} duration Number of milliseconds. 
+   */</span>
+  <span class="s1">setInterval: </span><span class="s4">function </span><span class="s1">(</span>
+    <span class="s1">func: Function,</span>
+    <span class="s1">duration: number,</span>
+    <span class="s1">...args: any</span>
+  <span class="s1">): number {</span>
+    <span class="s1">const id = _allocateCallback(</span>
+      <span class="s1">() =&gt; func.apply(undefined, args),</span>
+      <span class="s2">'setInterval'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+    <span class="s1">createTimer(id, duration || </span><span class="s3">0</span><span class="s1">, Date.now(), </span><span class="s0">/* recurring */ </span><span class="s4">true</span><span class="s1">);</span>
+    <span class="s4">return </span><span class="s1">id;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * The React Native microtask mechanism is used to back public APIs e.g. 
+   * `queueMicrotask`, `clearImmediate`, and `setImmediate` (which is used by 
+   * the Promise polyfill) when the JSVM microtask mechanism is not used. 
+   * 
+   * @param {function} func Callback to be invoked before the end of the 
+   * current JavaScript execution loop. 
+   */</span>
+  <span class="s1">queueReactNativeMicrotask: </span><span class="s4">function </span><span class="s1">(func: Function, ...args: any): number {</span>
+    <span class="s1">const id = _allocateCallback(</span>
+      <span class="s1">() =&gt; func.apply(undefined, args),</span>
+      <span class="s2">'queueReactNativeMicrotask'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+    <span class="s1">reactNativeMicrotasks.push(id);</span>
+    <span class="s4">return </span><span class="s1">id;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * @param {function} func Callback to be invoked every frame. 
+   */</span>
+  <span class="s1">requestAnimationFrame: </span><span class="s4">function </span><span class="s1">(func: Function): any | number {</span>
+    <span class="s1">const id = _allocateCallback(func, </span><span class="s2">'requestAnimationFrame'</span><span class="s1">);</span>
+    <span class="s1">createTimer(id, </span><span class="s3">1</span><span class="s1">, Date.now(), </span><span class="s0">/* recurring */ </span><span class="s4">false</span><span class="s1">);</span>
+    <span class="s4">return </span><span class="s1">id;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * @param {function} func Callback to be invoked every frame and provided 
+   * with time remaining in frame. 
+   * @param {?object} options 
+   */</span>
+  <span class="s1">requestIdleCallback: </span><span class="s4">function </span><span class="s1">(</span>
+    <span class="s1">func: Function,</span>
+    <span class="s1">options: ?Object,</span>
+  <span class="s1">): any | number {</span>
+    <span class="s4">if </span><span class="s1">(requestIdleCallbacks.length === </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">setSendIdleEvents(</span><span class="s4">true</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const timeout = options &amp;&amp; options.timeout;</span>
+    <span class="s1">const id: number = _allocateCallback(</span>
+      <span class="s1">timeout != </span><span class="s4">null</span>
+        <span class="s1">? (deadline: any) =&gt; {</span>
+            <span class="s1">const timeoutId: number = requestIdleCallbackTimeouts[id];</span>
+            <span class="s4">if </span><span class="s1">(timeoutId) {</span>
+              <span class="s1">JSTimers.clearTimeout(timeoutId);</span>
+              <span class="s4">delete </span><span class="s1">requestIdleCallbackTimeouts[id];</span>
+            <span class="s1">}</span>
+            <span class="s4">return </span><span class="s1">func(deadline);</span>
+          <span class="s1">}</span>
+        <span class="s1">: func,</span>
+      <span class="s2">'requestIdleCallback'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+    <span class="s1">requestIdleCallbacks.push(id);</span>
+
+    <span class="s4">if </span><span class="s1">(timeout != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">const timeoutId: number = JSTimers.setTimeout(() =&gt; {</span>
+        <span class="s1">const index: number = requestIdleCallbacks.indexOf(id);</span>
+        <span class="s4">if </span><span class="s1">(index &gt; -</span><span class="s3">1</span><span class="s1">) {</span>
+          <span class="s1">requestIdleCallbacks.splice(index, </span><span class="s3">1</span><span class="s1">);</span>
+          <span class="s1">_callTimer(id, global.performance.now(), </span><span class="s4">true</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s4">delete </span><span class="s1">requestIdleCallbackTimeouts[id];</span>
+        <span class="s4">if </span><span class="s1">(requestIdleCallbacks.length === </span><span class="s3">0</span><span class="s1">) {</span>
+          <span class="s1">setSendIdleEvents(</span><span class="s4">false</span><span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}, timeout);</span>
+      <span class="s1">requestIdleCallbackTimeouts[id] = timeoutId;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">id;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">cancelIdleCallback: </span><span class="s4">function </span><span class="s1">(timerID: number) {</span>
+    <span class="s1">_freeCallback(timerID);</span>
+    <span class="s1">const index = requestIdleCallbacks.indexOf(timerID);</span>
+    <span class="s4">if </span><span class="s1">(index !== -</span><span class="s3">1</span><span class="s1">) {</span>
+      <span class="s1">requestIdleCallbacks.splice(index, </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const timeoutId = requestIdleCallbackTimeouts[timerID];</span>
+    <span class="s4">if </span><span class="s1">(timeoutId) {</span>
+      <span class="s1">JSTimers.clearTimeout(timeoutId);</span>
+      <span class="s4">delete </span><span class="s1">requestIdleCallbackTimeouts[timerID];</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(requestIdleCallbacks.length === </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">setSendIdleEvents(</span><span class="s4">false</span><span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s1">clearTimeout: </span><span class="s4">function </span><span class="s1">(timerID: number) {</span>
+    <span class="s1">_freeCallback(timerID);</span>
+  <span class="s1">},</span>
+
+  <span class="s1">clearInterval: </span><span class="s4">function </span><span class="s1">(timerID: number) {</span>
+    <span class="s1">_freeCallback(timerID);</span>
+  <span class="s1">},</span>
+
+  <span class="s1">clearReactNativeMicrotask: </span><span class="s4">function </span><span class="s1">(timerID: number) {</span>
+    <span class="s1">_freeCallback(timerID);</span>
+    <span class="s1">const index = reactNativeMicrotasks.indexOf(timerID);</span>
+    <span class="s4">if </span><span class="s1">(index !== -</span><span class="s3">1</span><span class="s1">) {</span>
+      <span class="s1">reactNativeMicrotasks.splice(index, </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s1">cancelAnimationFrame: </span><span class="s4">function </span><span class="s1">(timerID: number) {</span>
+    <span class="s1">_freeCallback(timerID);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * This is called from the native side. We are passed an array of timerIDs, 
+   * and 
+   */</span>
+  <span class="s1">callTimers: </span><span class="s4">function </span><span class="s1">(timersToCall: Array&lt;number&gt;): any | </span><span class="s4">void </span><span class="s1">{</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">timersToCall.length !== </span><span class="s3">0</span><span class="s1">,</span>
+      <span class="s2">'Cannot call `callTimers` with an empty list of IDs.'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+
+    <span class="s1">errors.length = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s4">for </span><span class="s1">(let i = </span><span class="s3">0</span><span class="s1">; i &lt; timersToCall.length; i++) {</span>
+      <span class="s1">_callTimer(timersToCall[i], </span><span class="s3">0</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const errorCount = errors.length;</span>
+    <span class="s4">if </span><span class="s1">(errorCount &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(errorCount &gt; </span><span class="s3">1</span><span class="s1">) {</span>
+        <span class="s0">// Throw all the other errors in a setTimeout, which will throw each</span>
+        <span class="s0">// error one at a time</span>
+        <span class="s4">for </span><span class="s1">(let ii = </span><span class="s3">1</span><span class="s1">; ii &lt; errorCount; ii++) {</span>
+          <span class="s1">JSTimers.setTimeout(</span>
+            <span class="s1">((error: Error) =&gt; {</span>
+              <span class="s4">throw </span><span class="s1">error;</span>
+            <span class="s1">}).bind(</span><span class="s4">null</span><span class="s1">, errors[ii]),</span>
+            <span class="s3">0</span><span class="s1">,</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s4">throw </span><span class="s1">errors[</span><span class="s3">0</span><span class="s1">];</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s1">callIdleCallbacks: </span><span class="s4">function </span><span class="s1">(frameTime: number) {</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">FRAME_DURATION - (Date.now() - frameTime) &lt;</span>
+      <span class="s1">IDLE_CALLBACK_FRAME_DEADLINE</span>
+    <span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">errors.length = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s4">if </span><span class="s1">(requestIdleCallbacks.length &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">const passIdleCallbacks = requestIdleCallbacks;</span>
+      <span class="s1">requestIdleCallbacks = [];</span>
+
+      <span class="s4">for </span><span class="s1">(let i = </span><span class="s3">0</span><span class="s1">; i &lt; passIdleCallbacks.length; ++i) {</span>
+        <span class="s1">_callTimer(passIdleCallbacks[i], frameTime);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(requestIdleCallbacks.length === </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">setSendIdleEvents(</span><span class="s4">false</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">errors.forEach(error =&gt;</span>
+      <span class="s1">JSTimers.setTimeout(() =&gt; {</span>
+        <span class="s4">throw </span><span class="s1">error;</span>
+      <span class="s1">}, </span><span class="s3">0</span><span class="s1">),</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * This is called after we execute any command we receive from native but 
+   * before we hand control back to native. 
+   */</span>
+  <span class="s1">callReactNativeMicrotasks() {</span>
+    <span class="s1">errors.length = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s4">while </span><span class="s1">(_callReactNativeMicrotasksPass()) {}</span>
+    <span class="s1">errors.forEach(error =&gt;</span>
+      <span class="s1">JSTimers.setTimeout(() =&gt; {</span>
+        <span class="s4">throw </span><span class="s1">error;</span>
+      <span class="s1">}, </span><span class="s3">0</span><span class="s1">),</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Called from native (in development) when environment times are out-of-sync. 
+   */</span>
+  <span class="s1">emitTimeDriftWarning(warningMessage: string) {</span>
+    <span class="s4">if </span><span class="s1">(hasEmittedTimeDriftWarning) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">hasEmittedTimeDriftWarning = </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s1">console.warn(warningMessage);</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+
+<span class="s4">function </span><span class="s1">createTimer(</span>
+  <span class="s1">callbackID: number,</span>
+  <span class="s1">duration: number,</span>
+  <span class="s1">jsSchedulingTime: number,</span>
+  <span class="s1">repeats: boolean,</span>
+<span class="s1">): </span><span class="s4">void </span><span class="s1">{</span>
+  <span class="s1">invariant(NativeTiming, </span><span class="s2">'NativeTiming is available'</span><span class="s1">);</span>
+  <span class="s1">NativeTiming.createTimer(callbackID, duration, jsSchedulingTime, repeats);</span>
+<span class="s1">}</span>
+
+<span class="s4">function </span><span class="s1">deleteTimer(timerID: number): </span><span class="s4">void </span><span class="s1">{</span>
+  <span class="s1">invariant(NativeTiming, </span><span class="s2">'NativeTiming is available'</span><span class="s1">);</span>
+  <span class="s1">NativeTiming.deleteTimer(timerID);</span>
+<span class="s1">}</span>
+
+<span class="s4">function </span><span class="s1">setSendIdleEvents(sendIdleEvents: boolean): </span><span class="s4">void </span><span class="s1">{</span>
+  <span class="s1">invariant(NativeTiming, </span><span class="s2">'NativeTiming is available'</span><span class="s1">);</span>
+  <span class="s1">NativeTiming.setSendIdleEvents(sendIdleEvents);</span>
+<span class="s1">}</span>
+
+<span class="s1">let ExportedJSTimers: {|</span>
+  <span class="s1">callIdleCallbacks: (frameTime: number) =&gt; any | </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">callReactNativeMicrotasks: () =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">callTimers: (timersToCall: Array&lt;number&gt;) =&gt; any | </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">cancelAnimationFrame: (timerID: number) =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">cancelIdleCallback: (timerID: number) =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">clearReactNativeMicrotask: (timerID: number) =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">clearInterval: (timerID: number) =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">clearTimeout: (timerID: number) =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">emitTimeDriftWarning: (warningMessage: string) =&gt; any | </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">requestAnimationFrame: (func: any) =&gt; any | number,</span>
+  <span class="s1">requestIdleCallback: (func: any, options: ?any) =&gt; any | number,</span>
+  <span class="s1">queueReactNativeMicrotask: (func: any, ...args: any) =&gt; number,</span>
+  <span class="s1">setInterval: (func: any, duration: number, ...args: any) =&gt; number,</span>
+  <span class="s1">setTimeout: (func: any, duration: number, ...args: any) =&gt; number,</span>
+<span class="s1">|};</span>
+
+<span class="s4">if </span><span class="s1">(!NativeTiming) {</span>
+  <span class="s1">console.warn(</span><span class="s2">&quot;Timing native module is not available, can't set timers.&quot;</span><span class="s1">);</span>
+  <span class="s0">// $FlowFixMe[prop-missing] : we can assume timers are generally available</span>
+  <span class="s1">ExportedJSTimers = ({</span>
+    <span class="s1">callReactNativeMicrotasks: JSTimers.callReactNativeMicrotasks,</span>
+    <span class="s1">queueReactNativeMicrotask: JSTimers.queueReactNativeMicrotask,</span>
+  <span class="s1">}: </span><span class="s4">typeof </span><span class="s1">JSTimers);</span>
+<span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+  <span class="s1">ExportedJSTimers = JSTimers;</span>
+<span class="s1">}</span>
+
+<span class="s1">BatchedBridge.setReactNativeMicrotasksCallback(</span>
+  <span class="s1">JSTimers.callReactNativeMicrotasks,</span>
+<span class="s1">);</span>
+
+<span class="s1">module.exports = ExportedJSTimers;</span>
+</pre>
+</body>
+</html>

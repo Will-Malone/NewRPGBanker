@@ -1,0 +1,261 @@
+<html>
+<head>
+<title>JSDebuggerWebSocketClient.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JSDebuggerWebSocketClient.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.devsupport</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.util.JsonReader</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.util.JsonToken</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.util.JsonWriter</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.JavascriptException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.io.IOException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.io.StringReader</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.io.StringWriter</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.HashMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.ConcurrentHashMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.TimeUnit</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.atomic.AtomicInteger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.OkHttpClient</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.Request</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.Response</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.WebSocket</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">okhttp3.WebSocketListener</span><span class="s2">;</span>
+
+<span class="s3">/** A wrapper around WebSocketClient that recognizes RN debugging message format. */</span>
+<span class="s2">public class </span><span class="s1">JSDebuggerWebSocketClient </span><span class="s2">extends </span><span class="s1">WebSocketListener {</span>
+
+  <span class="s2">private static final </span><span class="s1">String TAG = </span><span class="s4">&quot;JSDebuggerWebSocketClient&quot;</span><span class="s2">;</span>
+
+  <span class="s2">public interface </span><span class="s1">JSDebuggerCallback {</span>
+    <span class="s2">void </span><span class="s1">onSuccess(@Nullable String response)</span><span class="s2">;</span>
+
+    <span class="s2">void </span><span class="s1">onFailure(Throwable cause)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private </span><span class="s1">@Nullable WebSocket mWebSocket</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable OkHttpClient mHttpClient</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable JSDebuggerCallback mConnectCallback</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">AtomicInteger mRequestID = </span><span class="s2">new </span><span class="s1">AtomicInteger()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ConcurrentHashMap&lt;Integer</span><span class="s2">, </span><span class="s1">JSDebuggerCallback&gt; mCallbacks =</span>
+      <span class="s2">new </span><span class="s1">ConcurrentHashMap&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s2">public void </span><span class="s1">connect(String url</span><span class="s2">, </span><span class="s1">JSDebuggerCallback callback) {</span>
+    <span class="s2">if </span><span class="s1">(mHttpClient != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s4">&quot;JSDebuggerWebSocketClient is already initialized.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mConnectCallback = callback</span><span class="s2">;</span>
+    <span class="s1">mHttpClient =</span>
+        <span class="s2">new </span><span class="s1">OkHttpClient.Builder()</span>
+            <span class="s1">.connectTimeout(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">TimeUnit.SECONDS)</span>
+            <span class="s1">.writeTimeout(</span><span class="s5">10</span><span class="s2">, </span><span class="s1">TimeUnit.SECONDS)</span>
+            <span class="s1">.readTimeout(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">TimeUnit.MINUTES) </span><span class="s0">// Disable timeouts for read</span>
+            <span class="s1">.build()</span><span class="s2">;</span>
+
+    <span class="s1">Request request = </span><span class="s2">new </span><span class="s1">Request.Builder().url(url).build()</span><span class="s2">;</span>
+    <span class="s1">mHttpClient.newWebSocket(request</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">prepareJSRuntime(JSDebuggerCallback callback) {</span>
+    <span class="s2">int </span><span class="s1">requestID = mRequestID.getAndIncrement()</span><span class="s2">;</span>
+    <span class="s1">mCallbacks.put(requestID</span><span class="s2">, </span><span class="s1">callback)</span><span class="s2">;</span>
+
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s1">StringWriter sw = </span><span class="s2">new </span><span class="s1">StringWriter()</span><span class="s2">;</span>
+      <span class="s1">JsonWriter js = </span><span class="s2">new </span><span class="s1">JsonWriter(sw)</span><span class="s2">;</span>
+      <span class="s1">js.beginObject()</span>
+          <span class="s1">.name(</span><span class="s4">&quot;id&quot;</span><span class="s1">)</span>
+          <span class="s1">.value(requestID)</span>
+          <span class="s1">.name(</span><span class="s4">&quot;method&quot;</span><span class="s1">)</span>
+          <span class="s1">.value(</span><span class="s4">&quot;prepareJSRuntime&quot;</span><span class="s1">)</span>
+          <span class="s1">.endObject()</span>
+          <span class="s1">.close()</span><span class="s2">;</span>
+      <span class="s1">sendMessage(requestID</span><span class="s2">, </span><span class="s1">sw.toString())</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(IOException e) {</span>
+      <span class="s1">triggerRequestFailure(requestID</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">loadBundle(</span>
+      <span class="s1">String sourceURL</span><span class="s2">, </span><span class="s1">HashMap&lt;String</span><span class="s2">, </span><span class="s1">String&gt; injectedObjects</span><span class="s2">, </span><span class="s1">JSDebuggerCallback callback) {</span>
+    <span class="s2">int </span><span class="s1">requestID = mRequestID.getAndIncrement()</span><span class="s2">;</span>
+    <span class="s1">mCallbacks.put(requestID</span><span class="s2">, </span><span class="s1">callback)</span><span class="s2">;</span>
+
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s1">StringWriter sw = </span><span class="s2">new </span><span class="s1">StringWriter()</span><span class="s2">;</span>
+      <span class="s1">JsonWriter js =</span>
+          <span class="s2">new </span><span class="s1">JsonWriter(sw)</span>
+              <span class="s1">.beginObject()</span>
+              <span class="s1">.name(</span><span class="s4">&quot;id&quot;</span><span class="s1">)</span>
+              <span class="s1">.value(requestID)</span>
+              <span class="s1">.name(</span><span class="s4">&quot;method&quot;</span><span class="s1">)</span>
+              <span class="s1">.value(</span><span class="s4">&quot;executeApplicationScript&quot;</span><span class="s1">)</span>
+              <span class="s1">.name(</span><span class="s4">&quot;url&quot;</span><span class="s1">)</span>
+              <span class="s1">.value(sourceURL)</span>
+              <span class="s1">.name(</span><span class="s4">&quot;inject&quot;</span><span class="s1">)</span>
+              <span class="s1">.beginObject()</span><span class="s2">;</span>
+      <span class="s2">for </span><span class="s1">(String key : injectedObjects.keySet()) {</span>
+        <span class="s1">js.name(key).value(injectedObjects.get(key))</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s1">js.endObject().endObject().close()</span><span class="s2">;</span>
+      <span class="s1">sendMessage(requestID</span><span class="s2">, </span><span class="s1">sw.toString())</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(IOException e) {</span>
+      <span class="s1">triggerRequestFailure(requestID</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">executeJSCall(String methodName</span><span class="s2">, </span><span class="s1">String jsonArgsArray</span><span class="s2">, </span><span class="s1">JSDebuggerCallback callback) {</span>
+    <span class="s2">int </span><span class="s1">requestID = mRequestID.getAndIncrement()</span><span class="s2">;</span>
+    <span class="s1">mCallbacks.put(requestID</span><span class="s2">, </span><span class="s1">callback)</span><span class="s2">;</span>
+
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s1">StringWriter sw = </span><span class="s2">new </span><span class="s1">StringWriter()</span><span class="s2">;</span>
+      <span class="s1">JsonWriter js = </span><span class="s2">new </span><span class="s1">JsonWriter(sw)</span><span class="s2">;</span>
+
+      <span class="s1">js.beginObject().name(</span><span class="s4">&quot;id&quot;</span><span class="s1">).value(requestID).name(</span><span class="s4">&quot;method&quot;</span><span class="s1">).value(methodName)</span><span class="s2">;</span>
+      <span class="s0">/* JsonWriter does not offer writing raw string (without quotes), that's why 
+      here we directly write to output string using the underlying StringWriter */</span>
+      <span class="s1">sw.append(</span><span class="s4">&quot;,</span><span class="s2">\&quot;</span><span class="s4">arguments</span><span class="s2">\&quot;</span><span class="s4">:&quot;</span><span class="s1">).append(jsonArgsArray)</span><span class="s2">;</span>
+      <span class="s1">js.endObject().close()</span><span class="s2">;</span>
+      <span class="s1">sendMessage(requestID</span><span class="s2">, </span><span class="s1">sw.toString())</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(IOException e) {</span>
+      <span class="s1">triggerRequestFailure(requestID</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">closeQuietly() {</span>
+    <span class="s2">if </span><span class="s1">(mWebSocket != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">mWebSocket.close(</span><span class="s5">1000</span><span class="s2">, </span><span class="s4">&quot;End of session&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+        <span class="s0">// swallow, no need to handle it here</span>
+      <span class="s1">}</span>
+      <span class="s1">mWebSocket = </span><span class="s2">null;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">sendMessage(</span><span class="s2">int </span><span class="s1">requestID</span><span class="s2">, </span><span class="s1">String message) {</span>
+    <span class="s2">if </span><span class="s1">(mWebSocket == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">triggerRequestFailure(</span>
+          <span class="s1">requestID</span><span class="s2">, new </span><span class="s1">IllegalStateException(</span><span class="s4">&quot;WebSocket connection no longer valid&quot;</span><span class="s1">))</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s1">mWebSocket.send(message)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+      <span class="s1">triggerRequestFailure(requestID</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">triggerRequestFailure(</span><span class="s2">int </span><span class="s1">requestID</span><span class="s2">, </span><span class="s1">Throwable cause) {</span>
+    <span class="s1">JSDebuggerCallback callback = mCallbacks.get(requestID)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(callback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mCallbacks.remove(requestID)</span><span class="s2">;</span>
+      <span class="s1">callback.onFailure(cause)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">triggerRequestSuccess(</span><span class="s2">int </span><span class="s1">requestID</span><span class="s2">, </span><span class="s1">@Nullable String response) {</span>
+    <span class="s1">JSDebuggerCallback callback = mCallbacks.get(requestID)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(callback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mCallbacks.remove(requestID)</span><span class="s2">;</span>
+      <span class="s1">callback.onSuccess(response)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onMessage(WebSocket webSocket</span><span class="s2">, </span><span class="s1">String text) {</span>
+    <span class="s1">Integer replyID = </span><span class="s2">null;</span>
+
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s1">JsonReader reader = </span><span class="s2">new </span><span class="s1">JsonReader(</span><span class="s2">new </span><span class="s1">StringReader(text))</span><span class="s2">;</span>
+      <span class="s1">String result = </span><span class="s2">null;</span>
+      <span class="s1">reader.beginObject()</span><span class="s2">;</span>
+      <span class="s2">while </span><span class="s1">(reader.hasNext()) {</span>
+        <span class="s1">String field = reader.nextName()</span><span class="s2">;</span>
+
+        <span class="s2">if </span><span class="s1">(JsonToken.NULL == reader.peek()) {</span>
+          <span class="s1">reader.skipValue()</span><span class="s2">;</span>
+          <span class="s2">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s2">if </span><span class="s1">(</span><span class="s4">&quot;replyID&quot;</span><span class="s1">.equals(field)) {</span>
+          <span class="s1">replyID = reader.nextInt()</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s4">&quot;result&quot;</span><span class="s1">.equals(field)) {</span>
+          <span class="s1">result = reader.nextString()</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s4">&quot;error&quot;</span><span class="s1">.equals(field)) {</span>
+          <span class="s1">String error = reader.nextString()</span><span class="s2">;</span>
+          <span class="s1">abort(error</span><span class="s2">, new </span><span class="s1">JavascriptException(error))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(replyID != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">triggerRequestSuccess(replyID</span><span class="s2">, </span><span class="s1">result)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(IOException e) {</span>
+      <span class="s2">if </span><span class="s1">(replyID != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">triggerRequestFailure(replyID</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">abort(</span><span class="s4">&quot;Parsing response message from websocket failed&quot;</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onFailure(WebSocket webSocket</span><span class="s2">, </span><span class="s1">Throwable t</span><span class="s2">, </span><span class="s1">Response response) {</span>
+    <span class="s1">abort(</span><span class="s4">&quot;Websocket exception&quot;</span><span class="s2">, </span><span class="s1">t)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onOpen(WebSocket webSocket</span><span class="s2">, </span><span class="s1">Response response) {</span>
+    <span class="s1">mWebSocket = webSocket</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertNotNull(mConnectCallback).onSuccess(</span><span class="s2">null</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">mConnectCallback = </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onClosed(WebSocket webSocket</span><span class="s2">, int </span><span class="s1">code</span><span class="s2">, </span><span class="s1">String reason) {</span>
+    <span class="s1">mWebSocket = </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">abort(String message</span><span class="s2">, </span><span class="s1">Throwable cause) {</span>
+    <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s4">&quot;Error occurred, shutting down websocket connection: &quot; </span><span class="s1">+ message</span><span class="s2">, </span><span class="s1">cause)</span><span class="s2">;</span>
+    <span class="s1">closeQuietly()</span><span class="s2">;</span>
+
+    <span class="s0">// Trigger failure callbacks</span>
+    <span class="s2">if </span><span class="s1">(mConnectCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mConnectCallback.onFailure(cause)</span><span class="s2">;</span>
+      <span class="s1">mConnectCallback = </span><span class="s2">null;</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">(JSDebuggerCallback callback : mCallbacks.values()) {</span>
+      <span class="s1">callback.onFailure(cause)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mCallbacks.clear()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

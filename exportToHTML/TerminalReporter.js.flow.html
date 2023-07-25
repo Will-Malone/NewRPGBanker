@@ -1,0 +1,549 @@
+<html>
+<head>
+<title>TerminalReporter.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+TerminalReporter.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">BundleDetails,</span>
+  <span class="s0">GlobalCacheDisabledReason,</span>
+  <span class="s0">ReportableEvent,</span>
+<span class="s0">} from './reporting';</span>
+<span class="s0">import type {Terminal} from 'metro-core';</span>
+<span class="s0">import type {HealthCheckResult, WatcherStatus} from 'metro-file-map';</span>
+
+<span class="s0">const logToConsole = require('./logToConsole');</span>
+<span class="s0">const reporting = require('./reporting');</span>
+<span class="s0">const chalk = require('chalk');</span>
+<span class="s0">const throttle = require('lodash.throttle');</span>
+<span class="s0">const {AmbiguousModuleResolutionError} = require('metro-core');</span>
+<span class="s0">const path = require('path');</span>
+
+<span class="s0">type BundleProgress = {</span>
+  <span class="s0">bundleDetails: BundleDetails,</span>
+  <span class="s0">transformedFileCount: number,</span>
+  <span class="s0">totalFileCount: number,</span>
+  <span class="s0">ratio: number,</span>
+  <span class="s0">isPrefetch?: boolean,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+
+<span class="s0">export type TerminalReportableEvent =</span>
+  <span class="s0">| ReportableEvent</span>
+  <span class="s0">| {</span>
+      <span class="s0">buildID: string,</span>
+      <span class="s0">type: 'bundle_transform_progressed_throttled',</span>
+      <span class="s0">transformedFileCount: number,</span>
+      <span class="s0">totalFileCount: number,</span>
+      <span class="s0">...</span>
+    <span class="s0">};</span>
+
+<span class="s0">type BuildPhase = 'in_progress' | 'done' | 'failed';</span>
+
+<span class="s0">type SnippetError = ErrnoError &amp;</span>
+  <span class="s0">interface {</span>
+    <span class="s0">filename?: string,</span>
+    <span class="s0">snippet?: string,</span>
+  <span class="s0">};</span>
+
+<span class="s0">const GLOBAL_CACHE_DISABLED_MESSAGE_FORMAT =</span>
+  <span class="s0">'The global cache is now disabled because %s';</span>
+
+<span class="s0">const DARK_BLOCK_CHAR = '\u2593';</span>
+<span class="s0">const LIGHT_BLOCK_CHAR = '\u2591';</span>
+<span class="s0">const MAX_PROGRESS_BAR_CHAR_WIDTH = 16;</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* We try to print useful information to the terminal for interactive builds.</span>
+ <span class="s0">* This implements the `Reporter` interface from the './reporting' module.</span>
+ <span class="s0">*/</span>
+<span class="s0">class TerminalReporter {</span>
+  <span class="s0">/**</span>
+   <span class="s0">* The bundle builds for which we are actively maintaining the status on the</span>
+   <span class="s0">* terminal, ie. showing a progress bar. There can be several bundles being</span>
+   <span class="s0">* built at the same time.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_activeBundles: Map&lt;string, BundleProgress&gt;;</span>
+
+  <span class="s0">_scheduleUpdateBundleProgress: {</span>
+    <span class="s0">(data: {</span>
+      <span class="s0">buildID: string,</span>
+      <span class="s0">transformedFileCount: number,</span>
+      <span class="s0">totalFileCount: number,</span>
+      <span class="s0">...</span>
+    <span class="s0">}): void,</span>
+    <span class="s0">cancel(): void,</span>
+  <span class="s0">};</span>
+  <span class="s0">_prevHealthCheckResult: ?HealthCheckResult;</span>
+
+  <span class="s0">+terminal: Terminal;</span>
+
+  <span class="s0">constructor(terminal: Terminal) {</span>
+    <span class="s0">this._activeBundles = new Map();</span>
+    <span class="s0">this._scheduleUpdateBundleProgress = throttle(data =&gt; {</span>
+      <span class="s0">this.update({...data, type: 'bundle_transform_progressed_throttled'});</span>
+    <span class="s0">}, 100);</span>
+    <span class="s0">this.terminal = terminal;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Construct a message that represents the progress of a</span>
+   <span class="s0">* single bundle build, for example:</span>
+   <span class="s0">*</span>
+   <span class="s0">*     BUNDLE path/to/bundle.js ▓▓▓▓▓░░░░░░░░░░░ 36.6% (4790/7922)</span>
+   <span class="s0">*/</span>
+  <span class="s0">_getBundleStatusMessage(</span>
+    <span class="s0">{</span>
+      <span class="s0">bundleDetails: {entryFile, bundleType},</span>
+      <span class="s0">transformedFileCount,</span>
+      <span class="s0">totalFileCount,</span>
+      <span class="s0">ratio,</span>
+      <span class="s0">isPrefetch,</span>
+    <span class="s0">}: BundleProgress,</span>
+    <span class="s0">phase: BuildPhase,</span>
+  <span class="s0">): string {</span>
+    <span class="s0">if (isPrefetch) {</span>
+      <span class="s0">bundleType = 'PREBUNDLE';</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const localPath = path.relative('.', entryFile);</span>
+    <span class="s0">const filledBar = Math.floor(ratio * MAX_PROGRESS_BAR_CHAR_WIDTH);</span>
+    <span class="s0">const bundleTypeColor =</span>
+      <span class="s0">phase === 'done'</span>
+        <span class="s0">? chalk.green</span>
+        <span class="s0">: phase === 'failed'</span>
+        <span class="s0">? chalk.red</span>
+        <span class="s0">: chalk.yellow;</span>
+    <span class="s0">const progress =</span>
+      <span class="s0">phase === 'in_progress'</span>
+        <span class="s0">? chalk.green.bgGreen(DARK_BLOCK_CHAR.repeat(filledBar)) +</span>
+          <span class="s0">chalk.bgWhite.white(</span>
+            <span class="s0">LIGHT_BLOCK_CHAR.repeat(MAX_PROGRESS_BAR_CHAR_WIDTH - filledBar),</span>
+          <span class="s0">) +</span>
+          <span class="s0">chalk.bold(` ${(100 * ratio).toFixed(1)}% `) +</span>
+          <span class="s0">chalk.dim(`(${transformedFileCount}/${totalFileCount})`)</span>
+        <span class="s0">: '';</span>
+
+    <span class="s0">return (</span>
+      <span class="s0">bundleTypeColor.inverse.bold(` ${bundleType.toUpperCase()} `) +</span>
+      <span class="s0">chalk.reset.dim(` ${path.dirname(localPath)}/`) +</span>
+      <span class="s0">chalk.bold(path.basename(localPath)) +</span>
+      <span class="s0">' ' +</span>
+      <span class="s0">progress +</span>
+      <span class="s0">'\n'</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logCacheDisabled(reason: GlobalCacheDisabledReason): void {</span>
+    <span class="s0">const format = GLOBAL_CACHE_DISABLED_MESSAGE_FORMAT;</span>
+    <span class="s0">switch (reason) {</span>
+      <span class="s0">case 'too_many_errors':</span>
+        <span class="s0">reporting.logWarning(</span>
+          <span class="s0">this.terminal,</span>
+          <span class="s0">format,</span>
+          <span class="s0">'it has been failing too many times.',</span>
+        <span class="s0">);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'too_many_misses':</span>
+        <span class="s0">reporting.logWarning(</span>
+          <span class="s0">this.terminal,</span>
+          <span class="s0">format,</span>
+          <span class="s0">'it has been missing too many consecutive keys.',</span>
+        <span class="s0">);</span>
+        <span class="s0">break;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logBundleBuildDone(buildID: string): void {</span>
+    <span class="s0">const progress = this._activeBundles.get(buildID);</span>
+    <span class="s0">if (progress != null) {</span>
+      <span class="s0">const msg = this._getBundleStatusMessage(</span>
+        <span class="s0">{</span>
+          <span class="s0">...progress,</span>
+          <span class="s0">ratio: 1,</span>
+          <span class="s0">transformedFileCount: progress.totalFileCount,</span>
+        <span class="s0">},</span>
+        <span class="s0">'done',</span>
+      <span class="s0">);</span>
+      <span class="s0">this.terminal.log(msg);</span>
+      <span class="s0">this._activeBundles.delete(buildID);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logBundleBuildFailed(buildID: string): void {</span>
+    <span class="s0">const progress = this._activeBundles.get(buildID);</span>
+    <span class="s0">if (progress != null) {</span>
+      <span class="s0">const msg = this._getBundleStatusMessage(progress, 'failed');</span>
+      <span class="s0">this.terminal.log(msg);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logInitializing(port: number, hasReducedPerformance: boolean): void {</span>
+    <span class="s0">const logo = [</span>
+      <span class="s0">'',</span>
+      <span class="s0">'                        ▒▒▓▓▓▓▒▒',</span>
+      <span class="s0">'                     ▒▓▓▓▒▒░░▒▒▓▓▓▒',</span>
+      <span class="s0">'                  ▒▓▓▓▓░░░▒▒▒▒░░░▓▓▓▓▒',</span>
+      <span class="s0">'                 ▓▓▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▓▓',</span>
+      <span class="s0">'                 ▓▓░░░░░▒▓▓▓▓▓▓▒░░░░░▓▓',</span>
+      <span class="s0">'                 ▓▓░░▓▓▒░░░▒▒░░░▒▓▒░░▓▓',</span>
+      <span class="s0">'                 ▓▓░░▓▓▓▓▓▒▒▒▒▓▓▓▓▒░░▓▓',</span>
+      <span class="s0">'                 ▓▓░░▓▓▓▓▓▓▓▓▓▓▓▓▓▒░░▓▓',</span>
+      <span class="s0">'                 ▓▓▒░░▒▒▓▓▓▓▓▓▓▓▒░░░▒▓▓',</span>
+      <span class="s0">'                  ▒▓▓▓▒░░░▒▓▓▒░░░▒▓▓▓▒',</span>
+      <span class="s0">'                     ▒▓▓▓▒░░░░▒▓▓▓▒',</span>
+      <span class="s0">'                        ▒▒▓▓▓▓▒▒',</span>
+      <span class="s0">'',</span>
+      <span class="s0">'',</span>
+    <span class="s0">];</span>
+
+    <span class="s0">const color = hasReducedPerformance ? chalk.red : chalk.blue;</span>
+    <span class="s0">this.terminal.log(color(logo.join('\n')));</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logInitializingFailed(port: number, error: SnippetError): void {</span>
+    <span class="s0">if (error.code === 'EADDRINUSE') {</span>
+      <span class="s0">this.terminal.log(</span>
+        <span class="s0">chalk.bgRed.bold(' ERROR '),</span>
+        <span class="s0">chalk.red(&quot;Metro can't listen on port&quot;, chalk.bold(String(port))),</span>
+      <span class="s0">);</span>
+      <span class="s0">this.terminal.log(</span>
+        <span class="s0">'Most likely another process is already using this port',</span>
+      <span class="s0">);</span>
+      <span class="s0">this.terminal.log('Run the following command to find out which process:');</span>
+      <span class="s0">this.terminal.log('\n  ', chalk.bold('lsof -i :' + port), '\n');</span>
+      <span class="s0">this.terminal.log('Then, you can either shut down the other process:');</span>
+      <span class="s0">this.terminal.log('\n  ', chalk.bold('kill -9 &lt;PID&gt;'), '\n');</span>
+      <span class="s0">this.terminal.log('or run Metro on different port.');</span>
+    <span class="s0">} else {</span>
+      <span class="s0">this.terminal.log(chalk.bgRed.bold(' ERROR '), chalk.red(error.message));</span>
+      <span class="s0">const errorAttributes = JSON.stringify(error);</span>
+      <span class="s0">if (errorAttributes !== '{}') {</span>
+        <span class="s0">this.terminal.log(chalk.red(errorAttributes));</span>
+      <span class="s0">}</span>
+      <span class="s0">this.terminal.log(chalk.red(error.stack));</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* This function is only concerned with logging and should not do state</span>
+   <span class="s0">* or terminal status updates.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_log(event: TerminalReportableEvent): void {</span>
+    <span class="s0">switch (event.type) {</span>
+      <span class="s0">case 'initialize_started':</span>
+        <span class="s0">this._logInitializing(event.port, event.hasReducedPerformance);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'initialize_failed':</span>
+        <span class="s0">this._logInitializingFailed(event.port, event.error);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'bundle_build_done':</span>
+        <span class="s0">this._logBundleBuildDone(event.buildID);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'bundle_build_failed':</span>
+        <span class="s0">this._logBundleBuildFailed(event.buildID);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'bundling_error':</span>
+        <span class="s0">this._logBundlingError(event.error);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'global_cache_disabled':</span>
+        <span class="s0">this._logCacheDisabled(event.reason);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'resolver_warning':</span>
+        <span class="s0">this._logWarning(event.message);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'transform_cache_reset':</span>
+        <span class="s0">reporting.logWarning(this.terminal, 'the transform cache was reset.');</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'worker_stdout_chunk':</span>
+        <span class="s0">this._logWorkerChunk('stdout', event.chunk);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'worker_stderr_chunk':</span>
+        <span class="s0">this._logWorkerChunk('stderr', event.chunk);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'hmr_client_error':</span>
+        <span class="s0">this._logHmrClientError(event.error);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'client_log':</span>
+        <span class="s0">logToConsole(this.terminal, event.level, event.mode, ...event.data);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'dep_graph_loading':</span>
+        <span class="s0">const color = event.hasReducedPerformance ? chalk.red : chalk.blue;</span>
+        <span class="s0">const version = 'v' + require('../../package.json').version;</span>
+        <span class="s0">this.terminal.log(</span>
+          <span class="s0">color.bold(</span>
+            <span class="s0">' '.repeat(19 - version.length / 2),</span>
+            <span class="s0">'Welcome to Metro ' + chalk.white(version) + '\n',</span>
+          <span class="s0">) + chalk.dim('              Fast - Scalable - Integrated\n\n'),</span>
+        <span class="s0">);</span>
+
+        <span class="s0">if (event.hasReducedPerformance) {</span>
+          <span class="s0">this.terminal.log(</span>
+            <span class="s0">chalk.red(</span>
+              <span class="s0">'Metro is operating with reduced performance.\n' +</span>
+                <span class="s0">'Please fix the problem above and restart Metro.\n\n',</span>
+            <span class="s0">),</span>
+          <span class="s0">);</span>
+        <span class="s0">}</span>
+
+        <span class="s0">break;</span>
+      <span class="s0">case 'watcher_health_check_result':</span>
+        <span class="s0">this._logWatcherHealthCheckResult(event.result);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'watcher_status':</span>
+        <span class="s0">this._logWatcherStatus(event.status);</span>
+        <span class="s0">break;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* We do not want to log the whole stacktrace for bundling error, because</span>
+   <span class="s0">* these are operational errors, not programming errors, and the stacktrace</span>
+   <span class="s0">* is not actionable to end users.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_logBundlingError(error: SnippetError): void {</span>
+    <span class="s0">if (error instanceof AmbiguousModuleResolutionError) {</span>
+      <span class="s0">const he = error.hasteError;</span>
+      <span class="s0">const message =</span>
+        <span class="s0">'ambiguous resolution: module `' +</span>
+        <span class="s0">`${error.fromModulePath}\` tries to require \`${he.hasteName}\`, ` +</span>
+        <span class="s0">'but there are several files providing this module. You can delete ' +</span>
+        <span class="s0">'or fix them: \n\n' +</span>
+        <span class="s0">Object.keys(he.duplicatesSet)</span>
+          <span class="s0">.sort()</span>
+          <span class="s0">.map(dupFilePath =&gt; `  * \`${dupFilePath}\`\n`)</span>
+          <span class="s0">.join('');</span>
+      <span class="s0">reporting.logError(this.terminal, message);</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">let {message} = error;</span>
+
+    <span class="s0">// Do not log the stack trace for SyntaxError (because it will always be in</span>
+    <span class="s0">// the parser, which is not helpful).</span>
+    <span class="s0">if (!(error instanceof SyntaxError)) {</span>
+      <span class="s0">if (error.snippet == null &amp;&amp; error.stack != null) {</span>
+        <span class="s0">message = error.stack;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (error.filename &amp;&amp; !message.includes(error.filename)) {</span>
+      <span class="s0">// $FlowFixMe[incompatible-type]</span>
+      <span class="s0">message += ` [${error.filename}]`;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (error.snippet != null) {</span>
+      <span class="s0">message += '\n' + error.snippet;</span>
+    <span class="s0">}</span>
+    <span class="s0">reporting.logError(this.terminal, message);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logWorkerChunk(origin: 'stdout' | 'stderr', chunk: string): void {</span>
+    <span class="s0">const lines = chunk.split('\n');</span>
+    <span class="s0">if (lines.length &gt;= 1 &amp;&amp; lines[lines.length - 1] === '') {</span>
+      <span class="s0">lines.splice(lines.length - 1, 1);</span>
+    <span class="s0">}</span>
+    <span class="s0">lines.forEach((line: string) =&gt; {</span>
+      <span class="s0">this.terminal.log(`transform[${origin}]: ${line}`);</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* We use Math.pow(ratio, 2) to as a conservative measure of progress because</span>
+   <span class="s0">* we know the `totalCount` is going to progressively increase as well. We</span>
+   <span class="s0">* also prevent the ratio from going backwards.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_updateBundleProgress({</span>
+    <span class="s0">buildID,</span>
+    <span class="s0">transformedFileCount,</span>
+    <span class="s0">totalFileCount,</span>
+  <span class="s0">}: {</span>
+    <span class="s0">buildID: string,</span>
+    <span class="s0">transformedFileCount: number,</span>
+    <span class="s0">totalFileCount: number,</span>
+    <span class="s0">...</span>
+  <span class="s0">}): void {</span>
+    <span class="s0">const currentProgress = this._activeBundles.get(buildID);</span>
+    <span class="s0">if (currentProgress == null) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+    <span class="s0">const rawRatio = transformedFileCount / totalFileCount;</span>
+    <span class="s0">const conservativeRatio = Math.pow(rawRatio, 2);</span>
+    <span class="s0">const ratio = Math.max(conservativeRatio, currentProgress.ratio);</span>
+    <span class="s0">Object.assign(currentProgress, {</span>
+      <span class="s0">ratio,</span>
+      <span class="s0">transformedFileCount,</span>
+      <span class="s0">totalFileCount,</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* This function is exclusively concerned with updating the internal state.</span>
+   <span class="s0">* No logging or status updates should be done at this point.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_updateState(event: TerminalReportableEvent): void {</span>
+    <span class="s0">switch (event.type) {</span>
+      <span class="s0">case 'bundle_build_done':</span>
+      <span class="s0">case 'bundle_build_failed':</span>
+        <span class="s0">this._activeBundles.delete(event.buildID);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'bundle_build_started':</span>
+        <span class="s0">const bundleProgress: BundleProgress = {</span>
+          <span class="s0">bundleDetails: event.bundleDetails,</span>
+          <span class="s0">transformedFileCount: 0,</span>
+          <span class="s0">totalFileCount: 1,</span>
+          <span class="s0">ratio: 0,</span>
+          <span class="s0">isPrefetch: event.isPrefetch,</span>
+        <span class="s0">};</span>
+        <span class="s0">this._activeBundles.set(event.buildID, bundleProgress);</span>
+        <span class="s0">break;</span>
+
+      <span class="s0">case 'bundle_transform_progressed_throttled':</span>
+        <span class="s0">this._updateBundleProgress(event);</span>
+        <span class="s0">break;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Return a status message that is always consistent with the current state</span>
+   <span class="s0">* of the application. Having this single function ensures we don't have</span>
+   <span class="s0">* different callsites overriding each other status messages.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_getStatusMessage(): string {</span>
+    <span class="s0">return Array.from(this._activeBundles.entries())</span>
+      <span class="s0">.map(([_, progress]: [string, BundleProgress]) =&gt;</span>
+        <span class="s0">this._getBundleStatusMessage(progress, 'in_progress'),</span>
+      <span class="s0">)</span>
+      <span class="s0">.filter((str: null | string) =&gt; str != null)</span>
+      <span class="s0">.join('\n');</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logHmrClientError(e: Error): void {</span>
+    <span class="s0">reporting.logError(</span>
+      <span class="s0">this.terminal,</span>
+      <span class="s0">'A WebSocket client got a connection error. Please reload your device ' +</span>
+        <span class="s0">'to get HMR working again: %s',</span>
+      <span class="s0">e,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logWarning(message: string): void {</span>
+    <span class="s0">reporting.logWarning(this.terminal, message);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logWatcherHealthCheckResult(result: HealthCheckResult) {</span>
+    <span class="s0">// Don't be spammy; only report changes in status.</span>
+    <span class="s0">if (</span>
+      <span class="s0">!this._prevHealthCheckResult ||</span>
+      <span class="s0">result.type !== this._prevHealthCheckResult.type ||</span>
+      <span class="s0">(result.type === 'timeout' &amp;&amp;</span>
+        <span class="s0">this._prevHealthCheckResult.type === 'timeout' &amp;&amp;</span>
+        <span class="s0">(result.pauseReason ?? null) !==</span>
+          <span class="s0">(this._prevHealthCheckResult.pauseReason ?? null))</span>
+    <span class="s0">) {</span>
+      <span class="s0">const watcherName = &quot;'&quot; + (result.watcher ?? 'unknown') + &quot;'&quot;;</span>
+      <span class="s0">switch (result.type) {</span>
+        <span class="s0">case 'success':</span>
+          <span class="s0">// Only report success after a prior failure.</span>
+          <span class="s0">if (this._prevHealthCheckResult) {</span>
+            <span class="s0">this.terminal.log(</span>
+              <span class="s0">chalk.green(`Watcher ${watcherName} is now healthy.`),</span>
+            <span class="s0">);</span>
+          <span class="s0">}</span>
+          <span class="s0">break;</span>
+        <span class="s0">case 'error':</span>
+          <span class="s0">reporting.logWarning(</span>
+            <span class="s0">this.terminal,</span>
+            <span class="s0">'Failed to perform watcher health check. Check whether the project root is writable.',</span>
+          <span class="s0">);</span>
+          <span class="s0">break;</span>
+        <span class="s0">case 'timeout':</span>
+          <span class="s0">const why =</span>
+            <span class="s0">result.pauseReason != null</span>
+              <span class="s0">? ` This may be because: ${result.pauseReason}`</span>
+              <span class="s0">: '';</span>
+          <span class="s0">reporting.logWarning(</span>
+            <span class="s0">this.terminal,</span>
+            <span class="s0">`Watcher ${watcherName} failed to detect a file change within ${result.timeout}ms.` +</span>
+              <span class="s0">why,</span>
+          <span class="s0">);</span>
+          <span class="s0">break;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">this._prevHealthCheckResult = result;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logWatcherStatus(status: WatcherStatus) {</span>
+    <span class="s0">switch (status.type) {</span>
+      <span class="s0">case 'watchman_warning':</span>
+        <span class="s0">const warning =</span>
+          <span class="s0">typeof status.warning === 'string'</span>
+            <span class="s0">? status.warning</span>
+            <span class="s0">: `unknown warning (type: ${typeof status.warning})`;</span>
+        <span class="s0">reporting.logWarning(</span>
+          <span class="s0">this.terminal,</span>
+          <span class="s0">`Watchman \`${status.command}\` returned a warning: ${warning}`,</span>
+        <span class="s0">);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'watchman_slow_command':</span>
+        <span class="s0">this.terminal.log(</span>
+          <span class="s0">chalk.dim(</span>
+            <span class="s0">`Waiting for Watchman \`${status.command}\` (${Math.round(</span>
+              <span class="s0">status.timeElapsed / 1000,</span>
+            <span class="s0">)}s)...`,</span>
+          <span class="s0">),</span>
+        <span class="s0">);</span>
+        <span class="s0">break;</span>
+      <span class="s0">case 'watchman_slow_command_complete':</span>
+        <span class="s0">this.terminal.log(</span>
+          <span class="s0">chalk.green(</span>
+            <span class="s0">`Watchman \`${status.command}\` finished after ${(</span>
+              <span class="s0">status.timeElapsed / 1000</span>
+            <span class="s0">).toFixed(1)}s.`,</span>
+          <span class="s0">),</span>
+        <span class="s0">);</span>
+        <span class="s0">break;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Single entry point for reporting events. That allows us to implement the</span>
+   <span class="s0">* corresponding JSON reporter easily and have a consistent reporting.</span>
+   <span class="s0">*/</span>
+  <span class="s0">update(event: TerminalReportableEvent): void {</span>
+    <span class="s0">if (event.type === 'bundle_transform_progressed') {</span>
+      <span class="s0">this._scheduleUpdateBundleProgress(event);</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">this._log(event);</span>
+    <span class="s0">this._updateState(event);</span>
+    <span class="s0">this.terminal.status(this._getStatusMessage());</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = TerminalReporter;</span>
+</pre>
+</body>
+</html>

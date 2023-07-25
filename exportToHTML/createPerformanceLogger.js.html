@@ -1,0 +1,361 @@
+<html>
+<head>
+<title>createPerformanceLogger.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+createPerformanceLogger.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow strict 
+ * @format 
+ */</span>
+
+<span class="s1">import type {</span>
+  <span class="s1">Extras,</span>
+  <span class="s1">ExtraValue,</span>
+  <span class="s1">IPerformanceLogger,</span>
+  <span class="s1">Timespan,</span>
+<span class="s1">} from </span><span class="s2">'./IPerformanceLogger'</span><span class="s1">;</span>
+
+<span class="s1">import * as Systrace from </span><span class="s2">'../Performance/Systrace'</span><span class="s1">;</span>
+<span class="s1">import Performance from </span><span class="s2">'../WebPerformance/Performance'</span><span class="s1">;</span>
+<span class="s1">import infoLog from </span><span class="s2">'./infoLog'</span><span class="s1">;</span>
+
+<span class="s1">const _cookies: {[key: string]: number, ...} = {};</span>
+
+<span class="s1">const PRINT_TO_CONSOLE: </span><span class="s3">false </span><span class="s1">= </span><span class="s3">false</span><span class="s1">; </span><span class="s0">// Type as false to prevent accidentally committing `true`;</span>
+
+<span class="s0">// This is the prefix for optional logging points/timespans as marks/measures via Performance API,</span>
+<span class="s0">// used to separate these internally from other marks/measures</span>
+<span class="s1">const WEB_PERFORMANCE_PREFIX = </span><span class="s2">'global_perf_'</span><span class="s1">;</span>
+
+<span class="s0">// TODO: Remove once T143070419 is done</span>
+<span class="s1">const performance = </span><span class="s3">new </span><span class="s1">Performance();</span>
+
+<span class="s1">export const getCurrentTimestamp: () =&gt; number =</span>
+  <span class="s1">global.nativeQPLTimestamp ?? global.performance.now.bind(global.performance);</span>
+
+<span class="s1">class PerformanceLogger implements IPerformanceLogger {</span>
+  <span class="s1">_timespans: {[key: string]: ?Timespan} = {};</span>
+  <span class="s1">_extras: {[key: string]: ?ExtraValue} = {};</span>
+  <span class="s1">_points: {[key: string]: ?number} = {};</span>
+  <span class="s1">_pointExtras: {[key: string]: ?Extras, ...} = {};</span>
+  <span class="s1">_closed: boolean = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s1">_isLoggingForWebPerformance: boolean = </span><span class="s3">false</span><span class="s1">;</span>
+
+  <span class="s1">constructor(isLoggingForWebPerformance?: boolean) {</span>
+    <span class="s3">this</span><span class="s1">._isLoggingForWebPerformance = isLoggingForWebPerformance === </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">addTimespan(</span>
+    <span class="s1">key: string,</span>
+    <span class="s1">startTime: number,</span>
+    <span class="s1">endTime: number,</span>
+    <span class="s1">startExtras?: Extras,</span>
+    <span class="s1">endExtras?: Extras,</span>
+  <span class="s1">) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._closed) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger: addTimespan - has closed ignoring: '</span><span class="s1">, key);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._timespans[key]) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span>
+          <span class="s2">'PerformanceLogger: Attempting to add a timespan that already exists '</span><span class="s1">,</span>
+          <span class="s1">key,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">this</span><span class="s1">._timespans[key] = {</span>
+      <span class="s1">startTime,</span>
+      <span class="s1">endTime,</span>
+      <span class="s1">totalTime: endTime - (startTime || </span><span class="s4">0</span><span class="s1">),</span>
+      <span class="s1">startExtras,</span>
+      <span class="s1">endExtras,</span>
+    <span class="s1">};</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._isLoggingForWebPerformance) {</span>
+      <span class="s1">performance.measure(`${WEB_PERFORMANCE_PREFIX}_${key}`, {</span>
+        <span class="s1">start: startTime,</span>
+        <span class="s1">end: endTime,</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">append(performanceLogger: IPerformanceLogger) {</span>
+    <span class="s3">this</span><span class="s1">._timespans = {</span>
+      <span class="s1">...performanceLogger.getTimespans(),</span>
+      <span class="s1">...</span><span class="s3">this</span><span class="s1">._timespans,</span>
+    <span class="s1">};</span>
+    <span class="s3">this</span><span class="s1">._extras = {...performanceLogger.getExtras(), ...</span><span class="s3">this</span><span class="s1">._extras};</span>
+    <span class="s3">this</span><span class="s1">._points = {...performanceLogger.getPoints(), ...</span><span class="s3">this</span><span class="s1">._points};</span>
+    <span class="s3">this</span><span class="s1">._pointExtras = {</span>
+      <span class="s1">...performanceLogger.getPointExtras(),</span>
+      <span class="s1">...</span><span class="s3">this</span><span class="s1">._pointExtras,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">clear() {</span>
+    <span class="s3">this</span><span class="s1">._timespans = {};</span>
+    <span class="s3">this</span><span class="s1">._extras = {};</span>
+    <span class="s3">this</span><span class="s1">._points = {};</span>
+    <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE) {</span>
+      <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger.js'</span><span class="s1">, </span><span class="s2">'clear'</span><span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">clearCompleted() {</span>
+    <span class="s3">for </span><span class="s1">(const key </span><span class="s3">in this</span><span class="s1">._timespans) {</span>
+      <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._timespans[key]?.totalTime != </span><span class="s3">null</span><span class="s1">) {</span>
+        <span class="s3">delete this</span><span class="s1">._timespans[key];</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._extras = {};</span>
+    <span class="s3">this</span><span class="s1">._points = {};</span>
+    <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE) {</span>
+      <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger.js'</span><span class="s1">, </span><span class="s2">'clearCompleted'</span><span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">close() {</span>
+    <span class="s3">this</span><span class="s1">._closed = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">currentTimestamp(): number {</span>
+    <span class="s3">return </span><span class="s1">getCurrentTimestamp();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getExtras(): {[key: string]: ?ExtraValue} {</span>
+    <span class="s3">return this</span><span class="s1">._extras;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getPoints(): {[key: string]: ?number} {</span>
+    <span class="s3">return this</span><span class="s1">._points;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getPointExtras(): {[key: string]: ?Extras} {</span>
+    <span class="s3">return this</span><span class="s1">._pointExtras;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getTimespans(): {[key: string]: ?Timespan} {</span>
+    <span class="s3">return this</span><span class="s1">._timespans;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">hasTimespan(key: string): boolean {</span>
+    <span class="s3">return </span><span class="s1">!!</span><span class="s3">this</span><span class="s1">._timespans[key];</span>
+  <span class="s1">}</span>
+
+  <span class="s1">isClosed(): boolean {</span>
+    <span class="s3">return this</span><span class="s1">._closed;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">logEverything() {</span>
+    <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE) {</span>
+      <span class="s0">// log timespans</span>
+      <span class="s3">for </span><span class="s1">(const key </span><span class="s3">in this</span><span class="s1">._timespans) {</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._timespans[key]?.totalTime != </span><span class="s3">null</span><span class="s1">) {</span>
+          <span class="s1">infoLog(key + </span><span class="s2">': ' </span><span class="s1">+ </span><span class="s3">this</span><span class="s1">._timespans[key].totalTime + </span><span class="s2">'ms'</span><span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// log extras</span>
+      <span class="s1">infoLog(</span><span class="s3">this</span><span class="s1">._extras);</span>
+
+      <span class="s0">// log points</span>
+      <span class="s3">for </span><span class="s1">(const key </span><span class="s3">in this</span><span class="s1">._points) {</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._points[key] != </span><span class="s3">null</span><span class="s1">) {</span>
+          <span class="s1">infoLog(key + </span><span class="s2">': ' </span><span class="s1">+ </span><span class="s3">this</span><span class="s1">._points[key] + </span><span class="s2">'ms'</span><span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">markPoint(</span>
+    <span class="s1">key: string,</span>
+    <span class="s1">timestamp?: number = getCurrentTimestamp(),</span>
+    <span class="s1">extras?: Extras,</span>
+  <span class="s1">) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._closed) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger: markPoint - has closed ignoring: '</span><span class="s1">, key);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._points[key] != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span>
+          <span class="s2">'PerformanceLogger: Attempting to mark a point that has been already logged '</span><span class="s1">,</span>
+          <span class="s1">key,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._points[key] = timestamp;</span>
+    <span class="s3">if </span><span class="s1">(extras) {</span>
+      <span class="s3">this</span><span class="s1">._pointExtras[key] = extras;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._isLoggingForWebPerformance) {</span>
+      <span class="s1">performance.mark(`${WEB_PERFORMANCE_PREFIX}_${key}`, {</span>
+        <span class="s1">startTime: timestamp,</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">removeExtra(key: string): ?ExtraValue {</span>
+    <span class="s1">const value = </span><span class="s3">this</span><span class="s1">._extras[key];</span>
+    <span class="s3">delete this</span><span class="s1">._extras[key];</span>
+    <span class="s3">return </span><span class="s1">value;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">setExtra(key: string, value: ExtraValue) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._closed) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger: setExtra - has closed ignoring: '</span><span class="s1">, key);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._extras.hasOwnProperty(key)) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span>
+          <span class="s2">'PerformanceLogger: Attempting to set an extra that already exists '</span><span class="s1">,</span>
+          <span class="s1">{key, currentValue: </span><span class="s3">this</span><span class="s1">._extras[key], attemptedValue: value},</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._extras[key] = value;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">startTimespan(</span>
+    <span class="s1">key: string,</span>
+    <span class="s1">timestamp?: number = getCurrentTimestamp(),</span>
+    <span class="s1">extras?: Extras,</span>
+  <span class="s1">) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._closed) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span>
+          <span class="s2">'PerformanceLogger: startTimespan - has closed ignoring: '</span><span class="s1">,</span>
+          <span class="s1">key,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._timespans[key]) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span>
+          <span class="s2">'PerformanceLogger: Attempting to start a timespan that already exists '</span><span class="s1">,</span>
+          <span class="s1">key,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">this</span><span class="s1">._timespans[key] = {</span>
+      <span class="s1">startTime: timestamp,</span>
+      <span class="s1">startExtras: extras,</span>
+    <span class="s1">};</span>
+    <span class="s1">_cookies[key] = Systrace.beginAsyncEvent(key);</span>
+    <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE) {</span>
+      <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger.js'</span><span class="s1">, </span><span class="s2">'start: ' </span><span class="s1">+ key);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._isLoggingForWebPerformance) {</span>
+      <span class="s1">performance.mark(`${WEB_PERFORMANCE_PREFIX}_timespan_start_${key}`, {</span>
+        <span class="s1">startTime: timestamp,</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">stopTimespan(</span>
+    <span class="s1">key: string,</span>
+    <span class="s1">timestamp?: number = getCurrentTimestamp(),</span>
+    <span class="s1">extras?: Extras,</span>
+  <span class="s1">) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._closed) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger: stopTimespan - has closed ignoring: '</span><span class="s1">, key);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const timespan = </span><span class="s3">this</span><span class="s1">._timespans[key];</span>
+    <span class="s3">if </span><span class="s1">(!timespan || timespan.startTime == </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span>
+          <span class="s2">'PerformanceLogger: Attempting to end a timespan that has not started '</span><span class="s1">,</span>
+          <span class="s1">key,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(timespan.endTime != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE &amp;&amp; __DEV__) {</span>
+        <span class="s1">infoLog(</span>
+          <span class="s2">'PerformanceLogger: Attempting to end a timespan that has already ended '</span><span class="s1">,</span>
+          <span class="s1">key,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">timespan.endExtras = extras;</span>
+    <span class="s1">timespan.endTime = timestamp;</span>
+    <span class="s1">timespan.totalTime = timespan.endTime - (timespan.startTime || </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(PRINT_TO_CONSOLE) {</span>
+      <span class="s1">infoLog(</span><span class="s2">'PerformanceLogger.js'</span><span class="s1">, </span><span class="s2">'end: ' </span><span class="s1">+ key);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(_cookies[key] != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s1">Systrace.endAsyncEvent(key, _cookies[key]);</span>
+      <span class="s3">delete </span><span class="s1">_cookies[key];</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._isLoggingForWebPerformance) {</span>
+      <span class="s1">performance.measure(`${WEB_PERFORMANCE_PREFIX}_${key}`, {</span>
+        <span class="s1">start: `${WEB_PERFORMANCE_PREFIX}_timespan_start_${key}`,</span>
+        <span class="s1">end: timestamp,</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// Re-exporting for backwards compatibility with all the clients that</span>
+<span class="s0">// may still import it from this module.</span>
+<span class="s1">export type {Extras, ExtraValue, IPerformanceLogger, Timespan};</span>
+
+<span class="s0">/** 
+ * This function creates performance loggers that can be used to collect and log 
+ * various performance data such as timespans, points and extras. 
+ * The loggers need to have minimal overhead since they're used in production. 
+ */</span>
+<span class="s1">export </span><span class="s3">default function </span><span class="s1">createPerformanceLogger(</span>
+  <span class="s1">isLoggingForWebPerformance?: boolean,</span>
+<span class="s1">): IPerformanceLogger {</span>
+  <span class="s3">return new </span><span class="s1">PerformanceLogger(isLoggingForWebPerformance);</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

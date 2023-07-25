@@ -1,0 +1,500 @@
+<html>
+<head>
+<title>LogBoxData.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+LogBoxData.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow strict 
+ * @format 
+ */</span>
+
+<span class="s1">(</span><span class="s2">'use strict'</span><span class="s1">);</span>
+
+<span class="s1">import type {ExtendedError} from </span><span class="s2">'../../Core/ExtendedError'</span><span class="s1">;</span>
+<span class="s1">import type {LogLevel} from </span><span class="s2">'./LogBoxLog'</span><span class="s1">;</span>
+<span class="s1">import type {</span>
+  <span class="s1">Category,</span>
+  <span class="s1">ComponentStack,</span>
+  <span class="s1">ExtendedExceptionData,</span>
+  <span class="s1">Message,</span>
+<span class="s1">} from </span><span class="s2">'./parseLogBoxLog'</span><span class="s1">;</span>
+
+<span class="s1">import parseErrorStack from </span><span class="s2">'../../Core/Devtools/parseErrorStack'</span><span class="s1">;</span>
+<span class="s1">import NativeLogBox from </span><span class="s2">'../../NativeModules/specs/NativeLogBox'</span><span class="s1">;</span>
+<span class="s1">import LogBoxLog from </span><span class="s2">'./LogBoxLog'</span><span class="s1">;</span>
+<span class="s1">import {parseLogBoxException} from </span><span class="s2">'./parseLogBoxLog'</span><span class="s1">;</span>
+<span class="s1">import * as React from </span><span class="s2">'react'</span><span class="s1">;</span>
+<span class="s1">export type LogBoxLogs = Set&lt;LogBoxLog&gt;;</span>
+<span class="s1">export type LogData = $ReadOnly&lt;{|</span>
+  <span class="s1">level: LogLevel,</span>
+  <span class="s1">message: Message,</span>
+  <span class="s1">category: Category,</span>
+  <span class="s1">componentStack: ComponentStack,</span>
+<span class="s1">|}&gt;;</span>
+
+<span class="s1">export type Observer = (</span>
+  <span class="s1">$ReadOnly&lt;{|</span>
+    <span class="s1">logs: LogBoxLogs,</span>
+    <span class="s1">isDisabled: boolean,</span>
+    <span class="s1">selectedLogIndex: number,</span>
+  <span class="s1">|}&gt;,</span>
+<span class="s1">) =&gt; </span><span class="s3">void</span><span class="s1">;</span>
+
+<span class="s1">export type IgnorePattern = string | RegExp;</span>
+
+<span class="s1">export type Subscription = $ReadOnly&lt;{|</span>
+  <span class="s1">unsubscribe: () =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+<span class="s1">|}&gt;;</span>
+
+<span class="s1">export type WarningInfo = {|</span>
+  <span class="s1">finalFormat: string,</span>
+  <span class="s1">forceDialogImmediately: boolean,</span>
+  <span class="s1">suppressDialog_LEGACY: boolean,</span>
+  <span class="s1">suppressCompletely: boolean,</span>
+  <span class="s1">monitorEvent: string | </span><span class="s3">null</span><span class="s1">,</span>
+  <span class="s1">monitorListVersion: number,</span>
+  <span class="s1">monitorSampleRate: number,</span>
+<span class="s1">|};</span>
+
+<span class="s1">export type WarningFilter = (format: string) =&gt; WarningInfo;</span>
+
+<span class="s1">type AppInfo = $ReadOnly&lt;{|</span>
+  <span class="s1">appVersion: string,</span>
+  <span class="s1">engine: string,</span>
+  <span class="s1">onPress?: ?() =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+<span class="s1">|}&gt;;</span>
+
+<span class="s1">const observers: Set&lt;{observer: Observer, ...}&gt; = </span><span class="s3">new </span><span class="s1">Set();</span>
+<span class="s1">const ignorePatterns: Set&lt;IgnorePattern&gt; = </span><span class="s3">new </span><span class="s1">Set();</span>
+<span class="s1">let appInfo: ?() =&gt; AppInfo = </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">let logs: LogBoxLogs = </span><span class="s3">new </span><span class="s1">Set();</span>
+<span class="s1">let updateTimeout: $FlowFixMe | </span><span class="s3">null </span><span class="s1">= </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">let _isDisabled = </span><span class="s3">false</span><span class="s1">;</span>
+<span class="s1">let _selectedIndex = -</span><span class="s4">1</span><span class="s1">;</span>
+
+<span class="s1">let warningFilter: WarningFilter = </span><span class="s3">function </span><span class="s1">(format) {</span>
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">finalFormat: format,</span>
+    <span class="s1">forceDialogImmediately: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">suppressDialog_LEGACY: </span><span class="s3">true</span><span class="s1">,</span>
+    <span class="s1">suppressCompletely: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">monitorEvent: </span><span class="s2">'unknown'</span><span class="s1">,</span>
+    <span class="s1">monitorListVersion: </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">monitorSampleRate: </span><span class="s4">1</span><span class="s1">,</span>
+  <span class="s1">};</span>
+<span class="s1">};</span>
+
+<span class="s1">const LOGBOX_ERROR_MESSAGE =</span>
+  <span class="s2">'An error was thrown when attempting to render log messages via LogBox.'</span><span class="s1">;</span>
+
+<span class="s3">function </span><span class="s1">getNextState() {</span>
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">logs,</span>
+    <span class="s1">isDisabled: _isDisabled,</span>
+    <span class="s1">selectedLogIndex: _selectedIndex,</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">reportLogBoxError(</span>
+  <span class="s1">error: ExtendedError,</span>
+  <span class="s1">componentStack?: string,</span>
+<span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">const ExceptionsManager = require(</span><span class="s2">'../../Core/ExceptionsManager'</span><span class="s1">);</span>
+
+  <span class="s1">error.message = `${LOGBOX_ERROR_MESSAGE}\n\n${error.message}`;</span>
+  <span class="s3">if </span><span class="s1">(componentStack != </span><span class="s3">null</span><span class="s1">) {</span>
+    <span class="s1">error.componentStack = componentStack;</span>
+  <span class="s1">}</span>
+  <span class="s1">ExceptionsManager.handleException(error, </span><span class="s0">/* isFatal */ </span><span class="s3">true</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">isLogBoxErrorMessage(message: string): boolean {</span>
+  <span class="s3">return typeof </span><span class="s1">message === </span><span class="s2">'string' </span><span class="s1">&amp;&amp; message.includes(LOGBOX_ERROR_MESSAGE);</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">isMessageIgnored(message: string): boolean {</span>
+  <span class="s3">for </span><span class="s1">(const pattern of ignorePatterns) {</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">(pattern </span><span class="s3">instanceof </span><span class="s1">RegExp &amp;&amp; pattern.test(message)) ||</span>
+      <span class="s1">(</span><span class="s3">typeof </span><span class="s1">pattern === </span><span class="s2">'string' </span><span class="s1">&amp;&amp; message.includes(pattern))</span>
+    <span class="s1">) {</span>
+      <span class="s3">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">handleUpdate(): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s3">if </span><span class="s1">(updateTimeout == </span><span class="s3">null</span><span class="s1">) {</span>
+    <span class="s1">updateTimeout = setImmediate(() =&gt; {</span>
+      <span class="s1">updateTimeout = </span><span class="s3">null</span><span class="s1">;</span>
+      <span class="s1">const nextState = getNextState();</span>
+      <span class="s1">observers.forEach(({observer}) =&gt; observer(nextState));</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">appendNewLog(newLog: LogBoxLog) {</span>
+  <span class="s0">// Don't want store these logs because they trigger a</span>
+  <span class="s0">// state update when we add them to the store.</span>
+  <span class="s3">if </span><span class="s1">(isMessageIgnored(newLog.message.content)) {</span>
+    <span class="s3">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// If the next log has the same category as the previous one</span>
+  <span class="s0">// then roll it up into the last log in the list by incrementing</span>
+  <span class="s0">// the count (similar to how Chrome does it).</span>
+  <span class="s1">const lastLog = Array.from(logs).pop();</span>
+  <span class="s3">if </span><span class="s1">(lastLog &amp;&amp; lastLog.category === newLog.category) {</span>
+    <span class="s1">lastLog.incrementCount();</span>
+    <span class="s1">handleUpdate();</span>
+    <span class="s3">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">if </span><span class="s1">(newLog.level === </span><span class="s2">'fatal'</span><span class="s1">) {</span>
+    <span class="s0">// If possible, to avoid jank, we don't want to open the error before</span>
+    <span class="s0">// it's symbolicated. To do that, we optimistically wait for</span>
+    <span class="s0">// symbolication for up to a second before adding the log.</span>
+    <span class="s1">const OPTIMISTIC_WAIT_TIME = </span><span class="s4">1000</span><span class="s1">;</span>
+
+    <span class="s1">let addPendingLog: ?() =&gt; </span><span class="s3">void </span><span class="s1">= () =&gt; {</span>
+      <span class="s1">logs.add(newLog);</span>
+      <span class="s3">if </span><span class="s1">(_selectedIndex &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">setSelectedLog(logs.size - </span><span class="s4">1</span><span class="s1">);</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">handleUpdate();</span>
+      <span class="s1">}</span>
+      <span class="s1">addPendingLog = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">};</span>
+
+    <span class="s1">const optimisticTimeout = setTimeout(() =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(addPendingLog) {</span>
+        <span class="s1">addPendingLog();</span>
+      <span class="s1">}</span>
+    <span class="s1">}, OPTIMISTIC_WAIT_TIME);</span>
+
+    <span class="s1">newLog.symbolicate(status =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(addPendingLog &amp;&amp; status !== </span><span class="s2">'PENDING'</span><span class="s1">) {</span>
+        <span class="s1">addPendingLog();</span>
+        <span class="s1">clearTimeout(optimisticTimeout);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(status !== </span><span class="s2">'PENDING'</span><span class="s1">) {</span>
+        <span class="s0">// The log has already been added but we need to trigger a render.</span>
+        <span class="s1">handleUpdate();</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+  <span class="s1">} </span><span class="s3">else if </span><span class="s1">(newLog.level === </span><span class="s2">'syntax'</span><span class="s1">) {</span>
+    <span class="s1">logs.add(newLog);</span>
+    <span class="s1">setSelectedLog(logs.size - </span><span class="s4">1</span><span class="s1">);</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s1">logs.add(newLog);</span>
+    <span class="s1">handleUpdate();</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">addLog(log: LogData): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">const errorForStackTrace = </span><span class="s3">new </span><span class="s1">Error();</span>
+
+  <span class="s0">// Parsing logs are expensive so we schedule this</span>
+  <span class="s0">// otherwise spammy logs would pause rendering.</span>
+  <span class="s1">setImmediate(() =&gt; {</span>
+    <span class="s3">try </span><span class="s1">{</span>
+      <span class="s1">const stack = parseErrorStack(errorForStackTrace?.stack);</span>
+
+      <span class="s1">appendNewLog(</span>
+        <span class="s3">new </span><span class="s1">LogBoxLog({</span>
+          <span class="s1">level: log.level,</span>
+          <span class="s1">message: log.message,</span>
+          <span class="s1">isComponentError: </span><span class="s3">false</span><span class="s1">,</span>
+          <span class="s1">stack,</span>
+          <span class="s1">category: log.category,</span>
+          <span class="s1">componentStack: log.componentStack,</span>
+        <span class="s1">}),</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+      <span class="s1">reportLogBoxError(error);</span>
+    <span class="s1">}</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">addException(error: ExtendedExceptionData): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s0">// Parsing logs are expensive so we schedule this</span>
+  <span class="s0">// otherwise spammy logs would pause rendering.</span>
+  <span class="s1">setImmediate(() =&gt; {</span>
+    <span class="s3">try </span><span class="s1">{</span>
+      <span class="s1">appendNewLog(</span><span class="s3">new </span><span class="s1">LogBoxLog(parseLogBoxException(error)));</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(loggingError) {</span>
+      <span class="s1">reportLogBoxError(loggingError);</span>
+    <span class="s1">}</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">symbolicateLogNow(log: LogBoxLog) {</span>
+  <span class="s1">log.symbolicate(() =&gt; {</span>
+    <span class="s1">handleUpdate();</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">retrySymbolicateLogNow(log: LogBoxLog) {</span>
+  <span class="s1">log.retrySymbolicate(() =&gt; {</span>
+    <span class="s1">handleUpdate();</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">symbolicateLogLazy(log: LogBoxLog) {</span>
+  <span class="s1">log.symbolicate();</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">clear(): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s3">if </span><span class="s1">(logs.size &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+    <span class="s1">logs = </span><span class="s3">new </span><span class="s1">Set();</span>
+    <span class="s1">setSelectedLog(-</span><span class="s4">1</span><span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">setSelectedLog(proposedNewIndex: number): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">const oldIndex = _selectedIndex;</span>
+  <span class="s1">let newIndex = proposedNewIndex;</span>
+
+  <span class="s1">const logArray = Array.from(logs);</span>
+  <span class="s1">let index = logArray.length - </span><span class="s4">1</span><span class="s1">;</span>
+  <span class="s3">while </span><span class="s1">(index &gt;= </span><span class="s4">0</span><span class="s1">) {</span>
+    <span class="s0">// The latest syntax error is selected and displayed before all other logs.</span>
+    <span class="s3">if </span><span class="s1">(logArray[index].level === </span><span class="s2">'syntax'</span><span class="s1">) {</span>
+      <span class="s1">newIndex = index;</span>
+      <span class="s3">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">index -= </span><span class="s4">1</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">_selectedIndex = newIndex;</span>
+  <span class="s1">handleUpdate();</span>
+  <span class="s3">if </span><span class="s1">(NativeLogBox) {</span>
+    <span class="s1">setTimeout(() =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(oldIndex &lt; </span><span class="s4">0 </span><span class="s1">&amp;&amp; newIndex &gt;= </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">NativeLogBox.show();</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(oldIndex &gt;= </span><span class="s4">0 </span><span class="s1">&amp;&amp; newIndex &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">NativeLogBox.hide();</span>
+      <span class="s1">}</span>
+    <span class="s1">}, </span><span class="s4">0</span><span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">clearWarnings(): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">const newLogs = Array.from(logs).filter(log =&gt; log.level !== </span><span class="s2">'warn'</span><span class="s1">);</span>
+  <span class="s3">if </span><span class="s1">(newLogs.length !== logs.size) {</span>
+    <span class="s1">logs = </span><span class="s3">new </span><span class="s1">Set(newLogs);</span>
+    <span class="s1">setSelectedLog(-</span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">handleUpdate();</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">clearErrors(): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">const newLogs = Array.from(logs).filter(</span>
+    <span class="s1">log =&gt; log.level !== </span><span class="s2">'error' </span><span class="s1">&amp;&amp; log.level !== </span><span class="s2">'fatal'</span><span class="s1">,</span>
+  <span class="s1">);</span>
+  <span class="s3">if </span><span class="s1">(newLogs.length !== logs.size) {</span>
+    <span class="s1">logs = </span><span class="s3">new </span><span class="s1">Set(newLogs);</span>
+    <span class="s1">setSelectedLog(-</span><span class="s4">1</span><span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">dismiss(log: LogBoxLog): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s3">if </span><span class="s1">(logs.has(log)) {</span>
+    <span class="s1">logs.</span><span class="s3">delete</span><span class="s1">(log);</span>
+    <span class="s1">handleUpdate();</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">setWarningFilter(filter: WarningFilter): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">warningFilter = filter;</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">setAppInfo(info: () =&gt; AppInfo): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">appInfo = info;</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">getAppInfo(): ?AppInfo {</span>
+  <span class="s3">return </span><span class="s1">appInfo != </span><span class="s3">null </span><span class="s1">? appInfo() : </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">checkWarningFilter(format: string): WarningInfo {</span>
+  <span class="s3">return </span><span class="s1">warningFilter(format);</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">getIgnorePatterns(): $ReadOnlyArray&lt;IgnorePattern&gt; {</span>
+  <span class="s3">return </span><span class="s1">Array.from(ignorePatterns);</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">addIgnorePatterns(</span>
+  <span class="s1">patterns: $ReadOnlyArray&lt;IgnorePattern&gt;,</span>
+<span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s1">const existingSize = ignorePatterns.size;</span>
+  <span class="s0">// The same pattern may be added multiple times, but adding a new pattern</span>
+  <span class="s0">// can be expensive so let's find only the ones that are new.</span>
+  <span class="s1">patterns.forEach((pattern: IgnorePattern) =&gt; {</span>
+    <span class="s3">if </span><span class="s1">(pattern </span><span class="s3">instanceof </span><span class="s1">RegExp) {</span>
+      <span class="s3">for </span><span class="s1">(const existingPattern of ignorePatterns) {</span>
+        <span class="s3">if </span><span class="s1">(</span>
+          <span class="s1">existingPattern </span><span class="s3">instanceof </span><span class="s1">RegExp &amp;&amp;</span>
+          <span class="s1">existingPattern.toString() === pattern.toString()</span>
+        <span class="s1">) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">ignorePatterns.add(pattern);</span>
+    <span class="s1">}</span>
+    <span class="s1">ignorePatterns.add(pattern);</span>
+  <span class="s1">});</span>
+  <span class="s3">if </span><span class="s1">(ignorePatterns.size === existingSize) {</span>
+    <span class="s3">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s0">// We need to recheck all of the existing logs.</span>
+  <span class="s0">// This allows adding an ignore pattern anywhere in the codebase.</span>
+  <span class="s0">// Without this, if you ignore a pattern after the a log is created,</span>
+  <span class="s0">// then we would keep showing the log.</span>
+  <span class="s1">logs = </span><span class="s3">new </span><span class="s1">Set(</span>
+    <span class="s1">Array.from(logs).filter(log =&gt; !isMessageIgnored(log.message.content)),</span>
+  <span class="s1">);</span>
+  <span class="s1">handleUpdate();</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">setDisabled(value: boolean): </span><span class="s3">void </span><span class="s1">{</span>
+  <span class="s3">if </span><span class="s1">(value === _isDisabled) {</span>
+    <span class="s3">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">_isDisabled = value;</span>
+  <span class="s1">handleUpdate();</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">isDisabled(): boolean {</span>
+  <span class="s3">return </span><span class="s1">_isDisabled;</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">observe(observer: Observer): Subscription {</span>
+  <span class="s1">const subscription = {observer};</span>
+  <span class="s1">observers.add(subscription);</span>
+
+  <span class="s1">observer(getNextState());</span>
+
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">unsubscribe(): </span><span class="s3">void </span><span class="s1">{</span>
+      <span class="s1">observers.</span><span class="s3">delete</span><span class="s1">(subscription);</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s1">type Props = $ReadOnly&lt;{||}&gt;;</span>
+<span class="s1">type State = $ReadOnly&lt;{|</span>
+  <span class="s1">logs: LogBoxLogs,</span>
+  <span class="s1">isDisabled: boolean,</span>
+  <span class="s1">hasError: boolean,</span>
+  <span class="s1">selectedLogIndex: number,</span>
+<span class="s1">|}&gt;;</span>
+
+<span class="s1">type SubscribedComponent = React.AbstractComponent&lt;</span>
+  <span class="s1">$ReadOnly&lt;{|</span>
+    <span class="s1">logs: $ReadOnlyArray&lt;LogBoxLog&gt;,</span>
+    <span class="s1">isDisabled: boolean,</span>
+    <span class="s1">selectedLogIndex: number,</span>
+  <span class="s1">|}&gt;,</span>
+<span class="s1">&gt;;</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">withSubscription(</span>
+  <span class="s1">WrappedComponent: SubscribedComponent,</span>
+<span class="s1">): React.AbstractComponent&lt;{||}&gt; {</span>
+  <span class="s1">class LogBoxStateSubscription extends React.Component&lt;Props, State&gt; {</span>
+    <span class="s1">static getDerivedStateFromError(): {hasError: boolean} {</span>
+      <span class="s3">return </span><span class="s1">{hasError: </span><span class="s3">true</span><span class="s1">};</span>
+    <span class="s1">}</span>
+
+    <span class="s1">componentDidCatch(err: Error, errorInfo: {componentStack: string, ...}) {</span>
+      <span class="s0">/* $FlowFixMe[class-object-subtyping] added when improving typing for 
+       * this parameters */</span>
+      <span class="s1">reportLogBoxError(err, errorInfo.componentStack);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_subscription: ?Subscription;</span>
+
+    <span class="s1">state: State = {</span>
+      <span class="s1">logs: </span><span class="s3">new </span><span class="s1">Set(),</span>
+      <span class="s1">isDisabled: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">hasError: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">selectedLogIndex: -</span><span class="s4">1</span><span class="s1">,</span>
+    <span class="s1">};</span>
+
+    <span class="s1">render(): React.Node {</span>
+      <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.state.hasError) {</span>
+        <span class="s0">// This happens when the component failed to render, in which case we delegate to the native redbox.</span>
+        <span class="s0">// We can't show anyback fallback UI here, because the error may be with &lt;View&gt; or &lt;Text&gt;.</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s3">return </span><span class="s1">(</span>
+        <span class="s1">&lt;WrappedComponent</span>
+          <span class="s1">logs={Array.from(</span><span class="s3">this</span><span class="s1">.state.logs)}</span>
+          <span class="s1">isDisabled={</span><span class="s3">this</span><span class="s1">.state.isDisabled}</span>
+          <span class="s1">selectedLogIndex={</span><span class="s3">this</span><span class="s1">.state.selectedLogIndex}</span>
+        <span class="s1">/&gt;</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">componentDidMount(): </span><span class="s3">void </span><span class="s1">{</span>
+      <span class="s3">this</span><span class="s1">._subscription = observe(data =&gt; {</span>
+        <span class="s3">this</span><span class="s1">.setState(data);</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+
+    <span class="s1">componentWillUnmount(): </span><span class="s3">void </span><span class="s1">{</span>
+      <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._subscription != </span><span class="s3">null</span><span class="s1">) {</span>
+        <span class="s3">this</span><span class="s1">._subscription.unsubscribe();</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_handleDismiss = (): </span><span class="s3">void </span><span class="s1">=&gt; {</span>
+      <span class="s0">// Here we handle the cases when the log is dismissed and it</span>
+      <span class="s0">// was either the last log, or when the current index</span>
+      <span class="s0">// is now outside the bounds of the log array.</span>
+      <span class="s1">const {selectedLogIndex, logs: stateLogs} = </span><span class="s3">this</span><span class="s1">.state;</span>
+      <span class="s1">const logsArray = Array.from(stateLogs);</span>
+      <span class="s3">if </span><span class="s1">(selectedLogIndex != </span><span class="s3">null</span><span class="s1">) {</span>
+        <span class="s3">if </span><span class="s1">(logsArray.length - </span><span class="s4">1 </span><span class="s1">&lt;= </span><span class="s4">0</span><span class="s1">) {</span>
+          <span class="s1">setSelectedLog(-</span><span class="s4">1</span><span class="s1">);</span>
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(selectedLogIndex &gt;= logsArray.length - </span><span class="s4">1</span><span class="s1">) {</span>
+          <span class="s1">setSelectedLog(selectedLogIndex - </span><span class="s4">1</span><span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s1">dismiss(logsArray[selectedLogIndex]);</span>
+      <span class="s1">}</span>
+    <span class="s1">};</span>
+
+    <span class="s1">_handleMinimize = (): </span><span class="s3">void </span><span class="s1">=&gt; {</span>
+      <span class="s1">setSelectedLog(-</span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">};</span>
+
+    <span class="s1">_handleSetSelectedLog = (index: number): </span><span class="s3">void </span><span class="s1">=&gt; {</span>
+      <span class="s1">setSelectedLog(index);</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">LogBoxStateSubscription;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,415 @@
+<html>
+<head>
+<title>RCTJavaScriptLoader.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTJavaScriptLoader.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTJavaScriptLoader.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;sys/stat.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;cxxreact/JSBundleType.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTConvert.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTMultipartDataTask.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTPerformanceLogger.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUtils.h&quot;</span>
+
+<span class="s1">NSString *</span><span class="s4">const </span><span class="s1">RCTJavaScriptLoaderErrorDomain = </span><span class="s4">@</span><span class="s3">&quot;RCTJavaScriptLoaderErrorDomain&quot;</span><span class="s4">;</span>
+
+<span class="s4">const </span><span class="s1">uint32_t RCT_BYTECODE_ALIGNMENT = </span><span class="s5">4</span><span class="s4">;</span>
+
+<span class="s4">@interface </span><span class="s1">RCTSource () {</span>
+ <span class="s4">@public</span>
+  <span class="s1">NSURL *_url</span><span class="s4">;</span>
+  <span class="s1">NSData *_data</span><span class="s4">;</span>
+  <span class="s1">NSUInteger _length</span><span class="s4">;</span>
+  <span class="s1">NSInteger _filesChangedCount</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTSource</span>
+
+<span class="s4">static </span><span class="s1">RCTSource *RCTSourceCreate(NSURL *url</span><span class="s4">, </span><span class="s1">NSData *data</span><span class="s4">, </span><span class="s1">int64_t length) NS_RETURNS_RETAINED</span>
+<span class="s1">{</span>
+  <span class="s4">using </span><span class="s1">facebook::react::ScriptTag</span><span class="s4">;</span>
+  <span class="s1">facebook::react::BundleHeader header</span><span class="s4">;</span>
+  <span class="s1">[data getBytes:&amp;header length:</span><span class="s4">sizeof</span><span class="s1">(header)]</span><span class="s4">;</span>
+
+  <span class="s1">RCTSource *source = [RCTSource </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">source-&gt;_url = url</span><span class="s4">;</span>
+  <span class="s0">// Multipart responses may give us an unaligned view into the buffer. This ensures memory is aligned.</span>
+  <span class="s4">if </span><span class="s1">(parseTypeFromHeader(header) == ScriptTag::MetroHBCBundle &amp;&amp; ((</span><span class="s4">long</span><span class="s1">)[data bytes] % RCT_BYTECODE_ALIGNMENT)) {</span>
+    <span class="s1">source-&gt;_data = [[NSData alloc] initWithData:data]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">source-&gt;_data = data</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">source-&gt;_length = length</span><span class="s4">;</span>
+  <span class="s1">source-&gt;_filesChangedCount = RCTSourceFilesChangedCountNotBuiltByBundler</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">source</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTLoadingProgress</span>
+
+<span class="s1">- (NSString *)description</span>
+<span class="s1">{</span>
+  <span class="s1">NSMutableString *desc = [NSMutableString </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">[desc appendString:_status ?: </span><span class="s4">@</span><span class="s3">&quot;Bundling&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">([_total integerValue] &gt; </span><span class="s5">0 </span><span class="s1">&amp;&amp; [_done integerValue] &gt; [_total integerValue]) {</span>
+    <span class="s1">[desc appendFormat:</span><span class="s4">@</span><span class="s3">&quot; %ld%%&quot;</span><span class="s4">, </span><span class="s1">(</span><span class="s4">long</span><span class="s1">)</span><span class="s5">100</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">([_total integerValue] &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">[desc appendFormat:</span><span class="s4">@</span><span class="s3">&quot; %ld%%&quot;</span><span class="s4">, </span><span class="s1">(</span><span class="s4">long</span><span class="s1">)(</span><span class="s5">100 </span><span class="s1">* [_done integerValue] / [_total integerValue])]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">[desc appendFormat:</span><span class="s4">@</span><span class="s3">&quot; %ld%%&quot;</span><span class="s4">, </span><span class="s1">(</span><span class="s4">long</span><span class="s1">)</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">[desc appendString:</span><span class="s4">@</span><span class="s3">&quot;</span><span class="s4">\u2026</span><span class="s3">&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">desc</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTJavaScriptLoader</span>
+
+<span class="s1">RCT_NOT_IMPLEMENTED(-(instancetype)init)</span>
+
+<span class="s1">+ (</span><span class="s4">void</span><span class="s1">)loadBundleAtURL:(NSURL *)scriptURL</span>
+             <span class="s1">onProgress:(RCTSourceLoadProgressBlock)onProgress</span>
+             <span class="s1">onComplete:(RCTSourceLoadBlock)onComplete</span>
+<span class="s1">{</span>
+  <span class="s1">int64_t sourceLength</span><span class="s4">;</span>
+  <span class="s1">NSError *error</span><span class="s4">;</span>
+  <span class="s1">NSData *data = [self attemptSynchronousLoadOfBundleAtURL:scriptURL sourceLength:&amp;sourceLength error:&amp;error]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(data) {</span>
+    <span class="s1">onComplete(nil</span><span class="s4">, </span><span class="s1">RCTSourceCreate(scriptURL</span><span class="s4">, </span><span class="s1">data</span><span class="s4">, </span><span class="s1">sourceLength))</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const </span><span class="s1">BOOL isCannotLoadSyncError = [error.domain isEqualToString:RCTJavaScriptLoaderErrorDomain] &amp;&amp;</span>
+      <span class="s1">error.code == RCTJavaScriptLoaderErrorCannotBeLoadedSynchronously</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(isCannotLoadSyncError) {</span>
+    <span class="s1">attemptAsynchronousLoadOfBundleAtURL(scriptURL</span><span class="s4">, </span><span class="s1">onProgress</span><span class="s4">, </span><span class="s1">onComplete)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">onComplete(error</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (NSData *)attemptSynchronousLoadOfBundleAtURL:(NSURL *)scriptURL</span>
+                                   <span class="s1">sourceLength:(int64_t *)sourceLength</span>
+                                          <span class="s1">error:(NSError **)error</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *unsanitizedScriptURLString = scriptURL.absoluteString</span><span class="s4">;</span>
+  <span class="s0">// Sanitize the script URL</span>
+  <span class="s1">scriptURL = sanitizeURL(scriptURL)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!scriptURL) {</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">*error = [NSError</span>
+          <span class="s1">errorWithDomain:RCTJavaScriptLoaderErrorDomain</span>
+                     <span class="s1">code:RCTJavaScriptLoaderErrorNoScriptURL</span>
+                 <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{</span>
+                   <span class="s1">NSLocalizedDescriptionKey : [NSString</span>
+                       <span class="s1">stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;No script URL provided. Make sure the packager is &quot;</span>
+                                        <span class="s4">@</span><span class="s3">&quot;running or you have embedded a JS bundle in your application bundle.</span><span class="s4">\n\n</span><span class="s3">&quot;</span>
+                                        <span class="s4">@</span><span class="s3">&quot;unsanitizedScriptURLString = %@&quot;</span><span class="s4">,</span>
+                                        <span class="s1">unsanitizedScriptURLString]</span>
+                 <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Load local script file</span>
+  <span class="s4">if </span><span class="s1">(!scriptURL.fileURL) {</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">*error = [NSError errorWithDomain:RCTJavaScriptLoaderErrorDomain</span>
+                                   <span class="s1">code:RCTJavaScriptLoaderErrorCannotBeLoadedSynchronously</span>
+                               <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{</span>
+                                 <span class="s1">NSLocalizedDescriptionKey :</span>
+                                     <span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Cannot load %@ URLs synchronously&quot;</span><span class="s4">, </span><span class="s1">scriptURL.scheme]</span>
+                               <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Load the first 4 bytes to check if the bundle is regular or RAM (&quot;Random Access Modules&quot; bundle).</span>
+  <span class="s0">// The RAM bundle has a magic number in the 4 first bytes `(0xFB0BD1E5)`.</span>
+  <span class="s0">// The benefit of RAM bundle over a regular bundle is that we can lazily inject</span>
+  <span class="s0">// modules into JSC as they're required.</span>
+  <span class="s1">FILE *bundle = fopen(scriptURL.path.UTF8String</span><span class="s4">, </span><span class="s3">&quot;r&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!bundle) {</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">*error = [NSError</span>
+          <span class="s1">errorWithDomain:RCTJavaScriptLoaderErrorDomain</span>
+                     <span class="s1">code:RCTJavaScriptLoaderErrorFailedOpeningFile</span>
+                 <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{</span>
+                   <span class="s1">NSLocalizedDescriptionKey : [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Error opening bundle %@&quot;</span><span class="s4">, </span><span class="s1">scriptURL.path]</span>
+                 <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">facebook::react::BundleHeader header</span><span class="s4">;</span>
+  <span class="s1">size_t readResult = fread(&amp;header</span><span class="s4">, sizeof</span><span class="s1">(header)</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">bundle)</span><span class="s4">;</span>
+  <span class="s1">fclose(bundle)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(readResult != </span><span class="s5">1</span><span class="s1">) {</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">*error = [NSError</span>
+          <span class="s1">errorWithDomain:RCTJavaScriptLoaderErrorDomain</span>
+                     <span class="s1">code:RCTJavaScriptLoaderErrorFailedReadingFile</span>
+                 <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{</span>
+                   <span class="s1">NSLocalizedDescriptionKey : [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Error reading bundle %@&quot;</span><span class="s4">, </span><span class="s1">scriptURL.path]</span>
+                 <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">facebook::react::ScriptTag tag = facebook::react::parseTypeFromHeader(header)</span><span class="s4">;</span>
+  <span class="s4">switch </span><span class="s1">(tag) {</span>
+    <span class="s4">case </span><span class="s1">facebook::react::ScriptTag::MetroHBCBundle:</span>
+    <span class="s4">case </span><span class="s1">facebook::react::ScriptTag::RAMBundle:</span>
+      <span class="s4">break;</span>
+
+    <span class="s4">case </span><span class="s1">facebook::react::ScriptTag::String: {</span>
+<span class="s2">#if </span><span class="s1">RCT_ENABLE_INSPECTOR</span>
+      <span class="s1">NSData *source = [NSData dataWithContentsOfFile:scriptURL.path options:NSDataReadingMappedIfSafe error:error]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(sourceLength &amp;&amp; source != nil) {</span>
+        <span class="s1">*sourceLength = source.length</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">return </span><span class="s1">source</span><span class="s4">;</span>
+<span class="s2">#else</span>
+      <span class="s4">if </span><span class="s1">(error) {</span>
+        <span class="s1">*error =</span>
+            <span class="s1">[NSError errorWithDomain:RCTJavaScriptLoaderErrorDomain</span>
+                                <span class="s1">code:RCTJavaScriptLoaderErrorCannotBeLoadedSynchronously</span>
+                            <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{NSLocalizedDescriptionKey : </span><span class="s4">@</span><span class="s3">&quot;Cannot load text/javascript files synchronously&quot;</span><span class="s1">}]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">struct </span><span class="s1">stat statInfo</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(stat(scriptURL.path.UTF8String</span><span class="s4">, </span><span class="s1">&amp;statInfo) != </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">*error = [NSError</span>
+          <span class="s1">errorWithDomain:RCTJavaScriptLoaderErrorDomain</span>
+                     <span class="s1">code:RCTJavaScriptLoaderErrorFailedStatingFile</span>
+                 <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{</span>
+                   <span class="s1">NSLocalizedDescriptionKey : [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Error stating bundle %@&quot;</span><span class="s4">, </span><span class="s1">scriptURL.path]</span>
+                 <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(sourceLength) {</span>
+    <span class="s1">*sourceLength = statInfo.st_size</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">[NSData dataWithBytes:&amp;header length:</span><span class="s4">sizeof</span><span class="s1">(header)]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static void </span><span class="s1">parseHeaders(NSDictionary *headers</span><span class="s4">, </span><span class="s1">RCTSource *source)</span>
+<span class="s1">{</span>
+  <span class="s1">source-&gt;_filesChangedCount = [headers[</span><span class="s4">@</span><span class="s3">&quot;X-Metro-Files-Changed-Count&quot;</span><span class="s1">] integerValue]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static void </span><span class="s1">attemptAsynchronousLoadOfBundleAtURL(</span>
+    <span class="s1">NSURL *scriptURL</span><span class="s4">,</span>
+    <span class="s1">RCTSourceLoadProgressBlock onProgress</span><span class="s4">,</span>
+    <span class="s1">RCTSourceLoadBlock onComplete)</span>
+<span class="s1">{</span>
+  <span class="s1">scriptURL = sanitizeURL(scriptURL)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(scriptURL.fileURL) {</span>
+    <span class="s0">// Reading in a large bundle can be slow. Dispatch to the background queue to do it.</span>
+    <span class="s1">dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">NSError *error = nil</span><span class="s4">;</span>
+      <span class="s1">NSData *source = [NSData dataWithContentsOfFile:scriptURL.path options:NSDataReadingMappedIfSafe error:&amp;error]</span><span class="s4">;</span>
+      <span class="s1">onComplete(error</span><span class="s4">, </span><span class="s1">RCTSourceCreate(scriptURL</span><span class="s4">, </span><span class="s1">source</span><span class="s4">, </span><span class="s1">source.length))</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTMultipartDataTask *task = [[RCTMultipartDataTask alloc] initWithURL:scriptURL</span>
+      <span class="s1">partHandler:^(NSInteger statusCode</span><span class="s4">, </span><span class="s1">NSDictionary *headers</span><span class="s4">, </span><span class="s1">NSData *data</span><span class="s4">, </span><span class="s1">NSError *error</span><span class="s4">, </span><span class="s1">BOOL done) {</span>
+        <span class="s4">if </span><span class="s1">(!done) {</span>
+          <span class="s4">if </span><span class="s1">(onProgress) {</span>
+            <span class="s1">onProgress(progressEventFromData(data))</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Handle general request errors</span>
+        <span class="s4">if </span><span class="s1">(error) {</span>
+          <span class="s4">if </span><span class="s1">([error.domain isEqualToString:NSURLErrorDomain]) {</span>
+            <span class="s1">error = [NSError</span>
+                <span class="s1">errorWithDomain:RCTJavaScriptLoaderErrorDomain</span>
+                           <span class="s1">code:RCTJavaScriptLoaderErrorURLLoadFailed</span>
+                       <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{</span>
+                         <span class="s1">NSLocalizedDescriptionKey :</span>
+                             <span class="s1">[</span><span class="s4">@</span><span class="s3">&quot;Could not connect to development server.</span><span class="s4">\n\n</span><span class="s3">&quot;</span>
+                               <span class="s3">&quot;Ensure the following:</span><span class="s4">\n</span><span class="s3">&quot;</span>
+                               <span class="s3">&quot;- Node server is running and available on the same network - run 'npm start' from react-native root</span><span class="s4">\n</span><span class="s3">&quot;</span>
+                               <span class="s3">&quot;- Node server URL is correctly set in AppDelegate</span><span class="s4">\n</span><span class="s3">&quot;</span>
+                               <span class="s3">&quot;- WiFi is enabled and connected to the same network as the Node Server</span><span class="s4">\n\n</span><span class="s3">&quot;</span>
+                               <span class="s3">&quot;URL: &quot; </span><span class="s1">stringByAppendingString:scriptURL.absoluteString]</span><span class="s4">,</span>
+                         <span class="s1">NSLocalizedFailureReasonErrorKey : error.localizedDescription</span><span class="s4">,</span>
+                         <span class="s1">NSUnderlyingErrorKey : error</span><span class="s4">,</span>
+                       <span class="s1">}]</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s1">onComplete(error</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// For multipart responses packager sets X-Http-Status header in case HTTP status code</span>
+        <span class="s0">// is different from 200 OK</span>
+        <span class="s1">NSString *statusCodeHeader = headers[</span><span class="s4">@</span><span class="s3">&quot;X-Http-Status&quot;</span><span class="s1">]</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(statusCodeHeader) {</span>
+          <span class="s1">statusCode = [statusCodeHeader integerValue]</span><span class="s4">;</span>
+        <span class="s1">}</span>
+
+        <span class="s4">if </span><span class="s1">(statusCode != </span><span class="s5">200</span><span class="s1">) {</span>
+          <span class="s1">error =</span>
+              <span class="s1">[NSError errorWithDomain:</span><span class="s4">@</span><span class="s3">&quot;JSServer&quot;</span>
+                                  <span class="s1">code:statusCode</span>
+                              <span class="s1">userInfo:userInfoForRawResponse([[NSString alloc] initWithData:data</span>
+                                                                                    <span class="s1">encoding:NSUTF8StringEncoding])]</span><span class="s4">;</span>
+          <span class="s1">onComplete(error</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Validate that the packager actually returned javascript.</span>
+        <span class="s1">NSString *contentType = headers[</span><span class="s4">@</span><span class="s3">&quot;Content-Type&quot;</span><span class="s1">]</span><span class="s4">;</span>
+        <span class="s1">NSString *mimeType = [[contentType componentsSeparatedByString:</span><span class="s4">@</span><span class="s3">&quot;;&quot;</span><span class="s1">] firstObject]</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(![mimeType isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;application/javascript&quot;</span><span class="s1">] &amp;&amp; ![mimeType isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;text/javascript&quot;</span><span class="s1">] &amp;&amp;</span>
+            <span class="s1">![mimeType isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;application/x-metro-bytecode-bundle&quot;</span><span class="s1">]) {</span>
+          <span class="s1">NSString *description</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">([mimeType isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;application/json&quot;</span><span class="s1">]) {</span>
+            <span class="s1">NSError *parseError</span><span class="s4">;</span>
+            <span class="s1">NSDictionary *jsonError = [NSJSONSerialization JSONObjectWithData:data options:</span><span class="s5">0 </span><span class="s1">error:&amp;parseError]</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">(!parseError &amp;&amp; [jsonError isKindOfClass:[NSDictionary </span><span class="s4">class</span><span class="s1">]] &amp;&amp;</span>
+                <span class="s1">[[jsonError objectForKey:</span><span class="s4">@</span><span class="s3">&quot;message&quot;</span><span class="s1">] isKindOfClass:[NSString </span><span class="s4">class</span><span class="s1">]] &amp;&amp;</span>
+                <span class="s1">[[jsonError objectForKey:</span><span class="s4">@</span><span class="s3">&quot;message&quot;</span><span class="s1">] length]) {</span>
+              <span class="s1">description = [jsonError objectForKey:</span><span class="s4">@</span><span class="s3">&quot;message&quot;</span><span class="s1">]</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+              <span class="s1">description = [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Unknown error fetching '%@'.&quot;</span><span class="s4">, </span><span class="s1">scriptURL.absoluteString]</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+            <span class="s1">description = [NSString</span>
+                <span class="s1">stringWithFormat:</span>
+                    <span class="s4">@</span><span class="s3">&quot;Expected MIME-Type to be 'application/javascript' or 'text/javascript', but got '%@'.&quot;</span><span class="s4">, </span><span class="s1">mimeType]</span><span class="s4">;</span>
+          <span class="s1">}</span>
+
+          <span class="s1">error = [NSError</span>
+              <span class="s1">errorWithDomain:</span><span class="s4">@</span><span class="s3">&quot;JSServer&quot;</span>
+                         <span class="s1">code:NSURLErrorCannotParseResponse</span>
+                     <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{NSLocalizedDescriptionKey : description</span><span class="s4">, @</span><span class="s3">&quot;headers&quot; </span><span class="s1">: headers</span><span class="s4">, @</span><span class="s3">&quot;data&quot; </span><span class="s1">: data}]</span><span class="s4">;</span>
+          <span class="s1">onComplete(error</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Prefer `Content-Location` as the canonical source URL, if given, or fall back to scriptURL.</span>
+        <span class="s1">NSURL *sourceURL = scriptURL</span><span class="s4">;</span>
+        <span class="s1">NSString *contentLocationHeader = headers[</span><span class="s4">@</span><span class="s3">&quot;Content-Location&quot;</span><span class="s1">]</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(contentLocationHeader) {</span>
+          <span class="s1">NSURL *contentLocationURL = [NSURL URLWithString:contentLocationHeader relativeToURL:scriptURL]</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">(contentLocationURL) {</span>
+            <span class="s1">sourceURL = contentLocationURL</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s1">RCTSource *source = RCTSourceCreate(sourceURL</span><span class="s4">, </span><span class="s1">data</span><span class="s4">, </span><span class="s1">data.length)</span><span class="s4">;</span>
+        <span class="s1">parseHeaders(headers</span><span class="s4">, </span><span class="s1">source)</span><span class="s4">;</span>
+        <span class="s1">onComplete(nil</span><span class="s4">, </span><span class="s1">source)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">progressHandler:^(NSDictionary *headers</span><span class="s4">, </span><span class="s1">NSNumber *loaded</span><span class="s4">, </span><span class="s1">NSNumber *total) {</span>
+        <span class="s0">// Only care about download progress events for the javascript bundle part.</span>
+        <span class="s4">if </span><span class="s1">([headers[</span><span class="s4">@</span><span class="s3">&quot;Content-Type&quot;</span><span class="s1">] isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;application/javascript&quot;</span><span class="s1">] ||</span>
+            <span class="s1">[headers[</span><span class="s4">@</span><span class="s3">&quot;Content-Type&quot;</span><span class="s1">] isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;application/x-metro-bytecode-bundle&quot;</span><span class="s1">]) {</span>
+          <span class="s1">onProgress(progressEventFromDownloadProgress(loaded</span><span class="s4">, </span><span class="s1">total))</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s1">[task startTask]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSURL *sanitizeURL(NSURL *url)</span>
+<span class="s1">{</span>
+  <span class="s0">// Why we do this is lost to time. We probably shouldn't; passing a valid URL is the caller's responsibility not ours.</span>
+  <span class="s4">return </span><span class="s1">[RCTConvert NSURL:url.absoluteString]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">RCTLoadingProgress *progressEventFromData(NSData *rawData)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *text = [[NSString alloc] initWithData:rawData encoding:NSUTF8StringEncoding]</span><span class="s4">;</span>
+  <span class="s1">id info = RCTJSONParse(text</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!info || ![info isKindOfClass:[NSDictionary </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTLoadingProgress *progress = [RCTLoadingProgress </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">progress.status = info[</span><span class="s4">@</span><span class="s3">&quot;status&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">progress.done = info[</span><span class="s4">@</span><span class="s3">&quot;done&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">progress.total = info[</span><span class="s4">@</span><span class="s3">&quot;total&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">progress</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">RCTLoadingProgress *progressEventFromDownloadProgress(NSNumber *total</span><span class="s4">, </span><span class="s1">NSNumber *done)</span>
+<span class="s1">{</span>
+  <span class="s1">RCTLoadingProgress *progress = [RCTLoadingProgress </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">progress.status = </span><span class="s4">@</span><span class="s3">&quot;Downloading&quot;</span><span class="s4">;</span>
+  <span class="s0">// Progress values are in bytes transform them to kilobytes for smaller numbers.</span>
+  <span class="s1">progress.done = done != nil ? </span><span class="s4">@</span><span class="s1">([done integerValue] / </span><span class="s5">1024</span><span class="s1">) : nil</span><span class="s4">;</span>
+  <span class="s1">progress.total = total != nil ? </span><span class="s4">@</span><span class="s1">([total integerValue] / </span><span class="s5">1024</span><span class="s1">) : nil</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">progress</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSDictionary *userInfoForRawResponse(NSString *rawText)</span>
+<span class="s1">{</span>
+  <span class="s1">NSDictionary *parsedResponse = RCTJSONParse(rawText</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(![parsedResponse isKindOfClass:[NSDictionary </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s4">return @</span><span class="s1">{NSLocalizedDescriptionKey : rawText}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">NSArray *errors = parsedResponse[</span><span class="s4">@</span><span class="s3">&quot;errors&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(![errors isKindOfClass:[NSArray </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s4">return @</span><span class="s1">{NSLocalizedDescriptionKey : rawText}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">NSMutableArray&lt;NSDictionary *&gt; *fakeStack = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(NSDictionary *err in errors) {</span>
+    <span class="s1">[fakeStack addObject:</span><span class="s4">@</span><span class="s1">{</span>
+      <span class="s4">@</span><span class="s3">&quot;methodName&quot; </span><span class="s1">: err[</span><span class="s4">@</span><span class="s3">&quot;description&quot;</span><span class="s1">] ?: </span><span class="s4">@</span><span class="s3">&quot;&quot;</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;file&quot; </span><span class="s1">: err[</span><span class="s4">@</span><span class="s3">&quot;filename&quot;</span><span class="s1">] ?: </span><span class="s4">@</span><span class="s3">&quot;&quot;</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;lineNumber&quot; </span><span class="s1">: err[</span><span class="s4">@</span><span class="s3">&quot;lineNumber&quot;</span><span class="s1">] ?: </span><span class="s4">@</span><span class="s5">0</span>
+    <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return</span>
+      <span class="s4">@</span><span class="s1">{NSLocalizedDescriptionKey : parsedResponse[</span><span class="s4">@</span><span class="s3">&quot;message&quot;</span><span class="s1">] ?: </span><span class="s4">@</span><span class="s3">&quot;No message provided&quot;</span><span class="s4">, @</span><span class="s3">&quot;stack&quot; </span><span class="s1">: [fakeStack copy]}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

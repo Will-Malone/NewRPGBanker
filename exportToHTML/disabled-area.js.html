@@ -1,0 +1,232 @@
+<html>
+<head>
+<title>disabled-area.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+disabled-area.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @author Toru Nagashima &lt;https://github.com/mysticatea&gt; 
+ * See LICENSE file in root directory for full license. 
+ */</span>
+<span class="s2">&quot;use strict&quot;</span>
+
+<span class="s1">const utils = require(</span><span class="s2">&quot;./utils&quot;</span><span class="s1">)</span>
+<span class="s1">const DELIMITER = /[\s,]+/gu</span>
+<span class="s1">const pool = </span><span class="s3">new </span><span class="s1">WeakMap()</span>
+
+<span class="s1">module.exports = class DisabledArea {</span>
+    <span class="s0">/** 
+     * Get singleton instance for the given source code. 
+     * 
+     * @param {eslint.SourceCode} sourceCode - The source code to get. 
+     * @returns {DisabledArea} The singleton object for the source code. 
+     */</span>
+    <span class="s1">static get(sourceCode) {</span>
+        <span class="s1">let retv = pool.get(sourceCode.ast)</span>
+
+        <span class="s3">if </span><span class="s1">(retv == </span><span class="s3">null</span><span class="s1">) {</span>
+            <span class="s1">retv = </span><span class="s3">new </span><span class="s1">DisabledArea()</span>
+            <span class="s1">retv._scan(sourceCode)</span>
+            <span class="s1">pool.set(sourceCode.ast, retv)</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">retv</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Constructor. 
+     */</span>
+    <span class="s1">constructor() {</span>
+        <span class="s3">this</span><span class="s1">.areas = []</span>
+        <span class="s3">this</span><span class="s1">.duplicateDisableDirectives = []</span>
+        <span class="s3">this</span><span class="s1">.unusedEnableDirectives = []</span>
+        <span class="s3">this</span><span class="s1">.numberOfRelatedDisableDirectives = </span><span class="s3">new </span><span class="s1">Map()</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Make disabled area. 
+     * 
+     * @param {Token} comment - The comment token to disable. 
+     * @param {object} location - The start location to disable. 
+     * @param {string[]|null} ruleIds - The ruleId names to disable. 
+     * @param {string} kind - The kind of disable-comments. 
+     * @returns {void} 
+     * @private 
+     */</span>
+    <span class="s1">_disable(comment, location, ruleIds, kind) {</span>
+        <span class="s3">if </span><span class="s1">(ruleIds) {</span>
+            <span class="s3">for </span><span class="s1">(const ruleId of ruleIds) {</span>
+                <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._getArea(ruleId, location) != </span><span class="s3">null</span><span class="s1">) {</span>
+                    <span class="s3">this</span><span class="s1">.duplicateDisableDirectives.push({ comment, ruleId })</span>
+                <span class="s1">}</span>
+
+                <span class="s3">this</span><span class="s1">.areas.push({</span>
+                    <span class="s1">comment,</span>
+                    <span class="s1">ruleId,</span>
+                    <span class="s1">kind,</span>
+                    <span class="s1">start: location,</span>
+                    <span class="s1">end: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">})</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._getArea(</span><span class="s3">null</span><span class="s1">, location) != </span><span class="s3">null</span><span class="s1">) {</span>
+                <span class="s3">this</span><span class="s1">.duplicateDisableDirectives.push({ comment, ruleId: </span><span class="s3">null </span><span class="s1">})</span>
+            <span class="s1">}</span>
+
+            <span class="s3">this</span><span class="s1">.areas.push({</span>
+                <span class="s1">comment,</span>
+                <span class="s1">ruleId: </span><span class="s3">null</span><span class="s1">,</span>
+                <span class="s1">kind,</span>
+                <span class="s1">start: location,</span>
+                <span class="s1">end: </span><span class="s3">null</span><span class="s1">,</span>
+            <span class="s1">})</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Close disabled area. 
+     * 
+     * @param {Token} comment - The comment token to enable. 
+     * @param {object} location - The start location to enable. 
+     * @param {string[]|null} ruleIds - The ruleId names to enable. 
+     * @param {string} kind - The kind of disable-comments. 
+     * @returns {void} 
+     * @private 
+     */</span>
+    <span class="s1">_enable(comment, location, ruleIds, kind) {</span>
+        <span class="s1">const relatedDisableDirectives = </span><span class="s3">new </span><span class="s1">Set()</span>
+
+        <span class="s3">if </span><span class="s1">(ruleIds) {</span>
+            <span class="s3">for </span><span class="s1">(const ruleId of ruleIds) {</span>
+                <span class="s1">let used = </span><span class="s3">false</span>
+
+                <span class="s3">for </span><span class="s1">(let i = </span><span class="s3">this</span><span class="s1">.areas.length - </span><span class="s4">1</span><span class="s1">; i &gt;= </span><span class="s4">0</span><span class="s1">; --i) {</span>
+                    <span class="s1">const area = </span><span class="s3">this</span><span class="s1">.areas[i]</span>
+
+                    <span class="s3">if </span><span class="s1">(</span>
+                        <span class="s1">area.end === </span><span class="s3">null </span><span class="s1">&amp;&amp;</span>
+                        <span class="s1">area.kind === kind &amp;&amp;</span>
+                        <span class="s1">area.ruleId === ruleId</span>
+                    <span class="s1">) {</span>
+                        <span class="s1">relatedDisableDirectives.add(area.comment)</span>
+                        <span class="s1">area.end = location</span>
+                        <span class="s1">used = </span><span class="s3">true</span>
+                    <span class="s1">}</span>
+                <span class="s1">}</span>
+
+                <span class="s3">if </span><span class="s1">(!used) {</span>
+                    <span class="s3">this</span><span class="s1">.unusedEnableDirectives.push({ comment, ruleId })</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">let used = </span><span class="s3">false</span>
+
+            <span class="s3">for </span><span class="s1">(let i = </span><span class="s3">this</span><span class="s1">.areas.length - </span><span class="s4">1</span><span class="s1">; i &gt;= </span><span class="s4">0</span><span class="s1">; --i) {</span>
+                <span class="s1">const area = </span><span class="s3">this</span><span class="s1">.areas[i]</span>
+
+                <span class="s3">if </span><span class="s1">(area.end === </span><span class="s3">null </span><span class="s1">&amp;&amp; area.kind === kind) {</span>
+                    <span class="s1">relatedDisableDirectives.add(area.comment)</span>
+                    <span class="s1">area.end = location</span>
+                    <span class="s1">used = </span><span class="s3">true</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s3">if </span><span class="s1">(!used) {</span>
+                <span class="s3">this</span><span class="s1">.unusedEnableDirectives.push({ comment, ruleId: </span><span class="s3">null </span><span class="s1">})</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s3">this</span><span class="s1">.numberOfRelatedDisableDirectives.set(</span>
+            <span class="s1">comment,</span>
+            <span class="s1">relatedDisableDirectives.size</span>
+        <span class="s1">)</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Gets the area of the given ruleId and location. 
+     * 
+     * @param {string|null} ruleId - The ruleId name to get. 
+     * @param {object} location - The location to get. 
+     * @returns {object|null} The area of the given ruleId and location. 
+     * @private 
+     */</span>
+    <span class="s1">_getArea(ruleId, location) {</span>
+        <span class="s3">for </span><span class="s1">(let i = </span><span class="s3">this</span><span class="s1">.areas.length - </span><span class="s4">1</span><span class="s1">; i &gt;= </span><span class="s4">0</span><span class="s1">; --i) {</span>
+            <span class="s1">const area = </span><span class="s3">this</span><span class="s1">.areas[i]</span>
+
+            <span class="s3">if </span><span class="s1">(</span>
+                <span class="s1">(area.ruleId === </span><span class="s3">null </span><span class="s1">|| area.ruleId === ruleId) &amp;&amp;</span>
+                <span class="s1">utils.lte(area.start, location) &amp;&amp;</span>
+                <span class="s1">(area.end === </span><span class="s3">null </span><span class="s1">|| utils.lte(location, area.end))</span>
+            <span class="s1">) {</span>
+                <span class="s3">return </span><span class="s1">area</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return null</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Scan the source code and setup disabled area list. 
+     * 
+     * @param {eslint.SourceCode} sourceCode - The source code to scan. 
+     * @returns {void} 
+     * @private 
+     */</span>
+    <span class="s1">_scan(sourceCode) {</span>
+        <span class="s3">for </span><span class="s1">(const comment of sourceCode.getAllComments()) {</span>
+            <span class="s1">const directiveComment = utils.parseDirectiveComment(comment)</span>
+            <span class="s3">if </span><span class="s1">(directiveComment == </span><span class="s3">null</span><span class="s1">) {</span>
+                <span class="s3">continue</span>
+            <span class="s1">}</span>
+
+            <span class="s1">const kind = directiveComment.kind</span>
+            <span class="s3">if </span><span class="s1">(</span>
+                <span class="s1">kind !== </span><span class="s2">&quot;eslint-disable&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">kind !== </span><span class="s2">&quot;eslint-enable&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">kind !== </span><span class="s2">&quot;eslint-disable-line&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">kind !== </span><span class="s2">&quot;eslint-disable-next-line&quot;</span>
+            <span class="s1">) {</span>
+                <span class="s3">continue</span>
+            <span class="s1">}</span>
+            <span class="s1">const ruleIds = directiveComment.value</span>
+                <span class="s1">? directiveComment.value.split(DELIMITER)</span>
+                <span class="s1">: </span><span class="s3">null</span>
+
+            <span class="s3">if </span><span class="s1">(kind === </span><span class="s2">&quot;eslint-disable&quot;</span><span class="s1">) {</span>
+                <span class="s3">this</span><span class="s1">._disable(comment, comment.loc.start, ruleIds, </span><span class="s2">&quot;block&quot;</span><span class="s1">)</span>
+            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(kind === </span><span class="s2">&quot;eslint-enable&quot;</span><span class="s1">) {</span>
+                <span class="s3">this</span><span class="s1">._enable(comment, comment.loc.start, ruleIds, </span><span class="s2">&quot;block&quot;</span><span class="s1">)</span>
+            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(kind === </span><span class="s2">&quot;eslint-disable-line&quot;</span><span class="s1">) {</span>
+                <span class="s1">const line = comment.loc.start.line</span>
+                <span class="s1">const start = { line, column: </span><span class="s4">0 </span><span class="s1">}</span>
+                <span class="s1">const end = { line: line + </span><span class="s4">1</span><span class="s1">, column: -</span><span class="s4">1 </span><span class="s1">}</span>
+
+                <span class="s3">this</span><span class="s1">._disable(comment, start, ruleIds, </span><span class="s2">&quot;line&quot;</span><span class="s1">)</span>
+                <span class="s3">this</span><span class="s1">._enable(comment, end, ruleIds, </span><span class="s2">&quot;line&quot;</span><span class="s1">)</span>
+            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(kind === </span><span class="s2">&quot;eslint-disable-next-line&quot;</span><span class="s1">) {</span>
+                <span class="s1">const line = comment.loc.start.line</span>
+                <span class="s1">const start = { line: line + </span><span class="s4">1</span><span class="s1">, column: </span><span class="s4">0 </span><span class="s1">}</span>
+                <span class="s1">const end = { line: line + </span><span class="s4">2</span><span class="s1">, column: -</span><span class="s4">1 </span><span class="s1">}</span>
+
+                <span class="s3">this</span><span class="s1">._disable(comment, start, ruleIds, </span><span class="s2">&quot;line&quot;</span><span class="s1">)</span>
+                <span class="s3">this</span><span class="s1">._enable(comment, end, ruleIds, </span><span class="s2">&quot;line&quot;</span><span class="s1">)</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,262 @@
+<html>
+<head>
+<title>ModuleRegistry.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ModuleRegistry.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ModuleRegistry.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;reactperflogger/BridgeNativeModulePerfLogger.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;NativeModule.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;SystraceSection.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s1">std::string normalizeName(std::string name) {</span>
+  <span class="s0">// TODO mhorowitz #10487027: This is super ugly.  We should just</span>
+  <span class="s0">// change iOS to emit normalized names, drop the &quot;RK...&quot; from</span>
+  <span class="s0">// names hardcoded in Android, and then delete this and the</span>
+  <span class="s0">// similar hacks in js.</span>
+  <span class="s4">if </span><span class="s1">(name.compare(</span><span class="s5">0</span><span class="s4">, </span><span class="s5">3</span><span class="s4">, </span><span class="s3">&quot;RCT&quot;</span><span class="s1">) == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">name.substr(</span><span class="s5">3</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(name.compare(</span><span class="s5">0</span><span class="s4">, </span><span class="s5">2</span><span class="s4">, </span><span class="s3">&quot;RK&quot;</span><span class="s1">) == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">name.substr(</span><span class="s5">2</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">name</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">ModuleRegistry::ModuleRegistry(</span>
+    <span class="s1">std::vector&lt;std::unique_ptr&lt;NativeModule&gt;&gt; modules</span><span class="s4">,</span>
+    <span class="s1">ModuleNotFoundCallback callback)</span>
+    <span class="s1">: modules_{std::move(modules)}</span><span class="s4">, </span><span class="s1">moduleNotFoundCallback_{callback} {}</span>
+
+<span class="s4">void </span><span class="s1">ModuleRegistry::updateModuleNamesFromIndex(size_t index) {</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">; </span><span class="s1">index &lt; modules_.size()</span><span class="s4">; </span><span class="s1">index++) {</span>
+    <span class="s1">std::string name = normalizeName(modules_[index]-&gt;getName())</span><span class="s4">;</span>
+    <span class="s1">modulesByName_[name] = index</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ModuleRegistry::registerModules(</span>
+    <span class="s1">std::vector&lt;std::unique_ptr&lt;NativeModule&gt;&gt; modules) {</span>
+  <span class="s1">SystraceSection s_(</span><span class="s3">&quot;ModuleRegistry::registerModules&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s0">// Noop if there are no NativeModules to add</span>
+  <span class="s4">if </span><span class="s1">(modules.empty()) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(modules_.empty() &amp;&amp; unknownModules_.empty()) {</span>
+    <span class="s1">modules_ = std::move(modules)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">size_t modulesSize = modules_.size()</span><span class="s4">;</span>
+    <span class="s1">size_t addModulesSize = modules.size()</span><span class="s4">;</span>
+    <span class="s4">bool </span><span class="s1">addToNames = !modulesByName_.empty()</span><span class="s4">;</span>
+    <span class="s1">modules_.reserve(modulesSize + addModulesSize)</span><span class="s4">;</span>
+    <span class="s1">std::move(modules.begin()</span><span class="s4">, </span><span class="s1">modules.end()</span><span class="s4">, </span><span class="s1">std::back_inserter(modules_))</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!unknownModules_.empty()) {</span>
+      <span class="s4">for </span><span class="s1">(size_t index = modulesSize</span><span class="s4">; </span><span class="s1">index &lt; modulesSize + addModulesSize</span><span class="s4">;</span>
+           <span class="s1">index++) {</span>
+        <span class="s1">std::string name = normalizeName(modules_[index]-&gt;getName())</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">it = unknownModules_.find(name)</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(it != unknownModules_.end()) {</span>
+          <span class="s4">throw </span><span class="s1">std::runtime_error(folly::to&lt;std::string&gt;(</span>
+              <span class="s3">&quot;module &quot;</span><span class="s4">,</span>
+              <span class="s1">name</span><span class="s4">,</span>
+              <span class="s3">&quot; was required without being registered and is now being registered.&quot;</span><span class="s1">))</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">else if </span><span class="s1">(addToNames) {</span>
+          <span class="s1">modulesByName_[name] = index</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(addToNames) {</span>
+      <span class="s1">updateModuleNamesFromIndex(modulesSize)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">std::vector&lt;std::string&gt; ModuleRegistry::moduleNames() {</span>
+  <span class="s1">SystraceSection s_(</span><span class="s3">&quot;ModuleRegistry::moduleNames&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;std::string&gt; names</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(size_t i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; modules_.size()</span><span class="s4">; </span><span class="s1">i++) {</span>
+    <span class="s1">std::string name = normalizeName(modules_[i]-&gt;getName())</span><span class="s4">;</span>
+    <span class="s1">modulesByName_[name] = i</span><span class="s4">;</span>
+    <span class="s1">names.push_back(std::move(name))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">names</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::optional&lt;ModuleConfig&gt; ModuleRegistry::getConfig(</span><span class="s4">const </span><span class="s1">std::string &amp;name) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;ModuleRegistry::getConfig&quot;</span><span class="s4">, </span><span class="s3">&quot;module&quot;</span><span class="s4">, </span><span class="s1">name)</span><span class="s4">;</span>
+
+  <span class="s0">// Initialize modulesByName_</span>
+  <span class="s4">if </span><span class="s1">(modulesByName_.empty() &amp;&amp; !modules_.empty()) {</span>
+    <span class="s1">moduleNames()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">it = modulesByName_.find(name)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(it == modulesByName_.end()) {</span>
+    <span class="s4">if </span><span class="s1">(unknownModules_.find(name) != unknownModules_.end()) {</span>
+      <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireBeginningFail(name.c_str())</span><span class="s4">;</span>
+      <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireEndingStart(name.c_str())</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">std::nullopt</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(!moduleNotFoundCallback_) {</span>
+      <span class="s1">unknownModules_.insert(name)</span><span class="s4">;</span>
+      <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireBeginningFail(name.c_str())</span><span class="s4">;</span>
+      <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireEndingStart(name.c_str())</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">std::nullopt</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireBeginningEnd(name.c_str())</span><span class="s4">;</span>
+
+    <span class="s4">bool </span><span class="s1">wasModuleLazilyLoaded = moduleNotFoundCallback_(name)</span><span class="s4">;</span>
+    <span class="s1">it = modulesByName_.find(name)</span><span class="s4">;</span>
+
+    <span class="s4">bool </span><span class="s1">wasModuleRegisteredWithRegistry =</span>
+        <span class="s1">wasModuleLazilyLoaded &amp;&amp; it != modulesByName_.end()</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!wasModuleRegisteredWithRegistry) {</span>
+      <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireEndingStart(name.c_str())</span><span class="s4">;</span>
+      <span class="s1">unknownModules_.insert(name)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">std::nullopt</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireBeginningEnd(name.c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// If we've gotten this far, then we've signaled moduleJSRequireBeginningEnd</span>
+
+  <span class="s1">size_t index = it-&gt;second</span><span class="s4">;</span>
+
+  <span class="s1">CHECK(index &lt; modules_.size())</span><span class="s4">;</span>
+  <span class="s1">NativeModule *module = modules_[index].get()</span><span class="s4">;</span>
+
+  <span class="s0">// string name, object constants, array methodNames (methodId is index),</span>
+  <span class="s0">// [array promiseMethodIds], [array syncMethodIds]</span>
+  <span class="s1">folly::dynamic config = folly::dynamic::array(name)</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">SystraceSection s_(</span><span class="s3">&quot;ModuleRegistry::getConstants&quot;</span><span class="s4">, </span><span class="s3">&quot;module&quot;</span><span class="s4">, </span><span class="s1">name)</span><span class="s4">;</span>
+    <span class="s0">/** 
+     * In the case that there are constants, we'll initialize the NativeModule, 
+     * and signal moduleJSRequireEndingStart. Otherwise, we'll simply signal the 
+     * event. The Module will be initialized when we invoke one of its 
+     * NativeModule methods. 
+     */</span>
+    <span class="s1">config.push_back(module-&gt;getConstants())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">{</span>
+    <span class="s1">SystraceSection s_(</span><span class="s3">&quot;ModuleRegistry::getMethods&quot;</span><span class="s4">, </span><span class="s3">&quot;module&quot;</span><span class="s4">, </span><span class="s1">name)</span><span class="s4">;</span>
+    <span class="s1">std::vector&lt;MethodDescriptor&gt; methods = module-&gt;getMethods()</span><span class="s4">;</span>
+
+    <span class="s1">folly::dynamic methodNames = folly::dynamic::array</span><span class="s4">;</span>
+    <span class="s1">folly::dynamic promiseMethodIds = folly::dynamic::array</span><span class="s4">;</span>
+    <span class="s1">folly::dynamic syncMethodIds = folly::dynamic::array</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;descriptor : methods) {</span>
+      <span class="s0">// TODO: #10487027 compare tags instead of doing string comparison?</span>
+      <span class="s1">methodNames.push_back(std::move(descriptor.name))</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(descriptor.type == </span><span class="s3">&quot;promise&quot;</span><span class="s1">) {</span>
+        <span class="s1">promiseMethodIds.push_back(methodNames.size() - </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else if </span><span class="s1">(descriptor.type == </span><span class="s3">&quot;sync&quot;</span><span class="s1">) {</span>
+        <span class="s1">syncMethodIds.push_back(methodNames.size() - </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(!methodNames.empty()) {</span>
+      <span class="s1">config.push_back(std::move(methodNames))</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(!promiseMethodIds.empty() || !syncMethodIds.empty()) {</span>
+        <span class="s1">config.push_back(std::move(promiseMethodIds))</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(!syncMethodIds.empty()) {</span>
+          <span class="s1">config.push_back(std::move(syncMethodIds))</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(config.size() == </span><span class="s5">2 </span><span class="s1">&amp;&amp; config[</span><span class="s5">1</span><span class="s1">].empty()) {</span>
+    <span class="s0">// no constants or methods</span>
+    <span class="s4">return </span><span class="s1">std::nullopt</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">ModuleConfig{index</span><span class="s4">, </span><span class="s1">std::move(config)}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string ModuleRegistry::getModuleName(</span><span class="s4">unsigned int </span><span class="s1">moduleId) {</span>
+  <span class="s4">if </span><span class="s1">(moduleId &gt;= modules_.size()) {</span>
+    <span class="s4">throw </span><span class="s1">std::runtime_error(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;moduleId &quot;</span><span class="s4">, </span><span class="s1">moduleId</span><span class="s4">, </span><span class="s3">&quot; out of range [0..&quot;</span><span class="s4">, </span><span class="s1">modules_.size()</span><span class="s4">, </span><span class="s3">&quot;)&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">modules_[moduleId]-&gt;getName()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string ModuleRegistry::getModuleSyncMethodName(</span>
+    <span class="s4">unsigned int </span><span class="s1">moduleId</span><span class="s4">,</span>
+    <span class="s4">unsigned int </span><span class="s1">methodId) {</span>
+  <span class="s4">if </span><span class="s1">(moduleId &gt;= modules_.size()) {</span>
+    <span class="s4">throw </span><span class="s1">std::runtime_error(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;moduleId &quot;</span><span class="s4">, </span><span class="s1">moduleId</span><span class="s4">, </span><span class="s3">&quot; out of range [0..&quot;</span><span class="s4">, </span><span class="s1">modules_.size()</span><span class="s4">, </span><span class="s3">&quot;)&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">modules_[moduleId]-&gt;getSyncMethodName(methodId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ModuleRegistry::callNativeMethod(</span>
+    <span class="s4">unsigned int </span><span class="s1">moduleId</span><span class="s4">,</span>
+    <span class="s4">unsigned int </span><span class="s1">methodId</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic &amp;&amp;params</span><span class="s4">,</span>
+    <span class="s4">int </span><span class="s1">callId) {</span>
+  <span class="s4">if </span><span class="s1">(moduleId &gt;= modules_.size()) {</span>
+    <span class="s4">throw </span><span class="s1">std::runtime_error(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;moduleId &quot;</span><span class="s4">, </span><span class="s1">moduleId</span><span class="s4">, </span><span class="s3">&quot; out of range [0..&quot;</span><span class="s4">, </span><span class="s1">modules_.size()</span><span class="s4">, </span><span class="s3">&quot;)&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">modules_[moduleId]-&gt;invoke(methodId</span><span class="s4">, </span><span class="s1">std::move(params)</span><span class="s4">, </span><span class="s1">callId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">MethodCallResult ModuleRegistry::callSerializableNativeHook(</span>
+    <span class="s4">unsigned int </span><span class="s1">moduleId</span><span class="s4">,</span>
+    <span class="s4">unsigned int </span><span class="s1">methodId</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic &amp;&amp;params) {</span>
+  <span class="s4">if </span><span class="s1">(moduleId &gt;= modules_.size()) {</span>
+    <span class="s4">throw </span><span class="s1">std::runtime_error(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;moduleId &quot;</span><span class="s4">, </span><span class="s1">moduleId</span><span class="s4">, </span><span class="s3">&quot;out of range [0..&quot;</span><span class="s4">, </span><span class="s1">modules_.size()</span><span class="s4">, </span><span class="s3">&quot;)&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">modules_[moduleId]-&gt;callSerializableNativeHook(</span>
+      <span class="s1">methodId</span><span class="s4">, </span><span class="s1">std::move(params))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

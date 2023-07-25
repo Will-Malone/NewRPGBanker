@@ -1,0 +1,489 @@
+<html>
+<head>
+<title>TreeFS.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+TreeFS.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @flow strict-local</span>
+ <span class="s0">*/</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">FileData,</span>
+  <span class="s0">FileMetaData,</span>
+  <span class="s0">FileStats,</span>
+  <span class="s0">MutableFileSystem,</span>
+  <span class="s0">Path,</span>
+<span class="s0">} from '../flow-types';</span>
+
+<span class="s0">import H from '../constants';</span>
+<span class="s0">import * as fastPath from '../lib/fast_path';</span>
+<span class="s0">import invariant from 'invariant';</span>
+<span class="s0">import path from 'path';</span>
+
+<span class="s0">type DirectoryNode = Map&lt;string, AnyNode&gt;;</span>
+<span class="s0">type FileNode = FileMetaData;</span>
+<span class="s0">type LinkNode = string;</span>
+<span class="s0">type AnyNode = FileNode | DirectoryNode | LinkNode;</span>
+
+<span class="s0">// Terminology:</span>
+<span class="s0">//</span>
+<span class="s0">// mixedPath - a root-relative or absolute path</span>
+<span class="s0">// relativePath - a root-relative path</span>
+<span class="s0">// normalPath - a root-relative, normalised path (no extraneous '.' or '..')</span>
+<span class="s0">// canonicalPath - a root-relative, normalised, real path (no symlinks in dirname)</span>
+
+<span class="s0">export default class TreeFS implements MutableFileSystem {</span>
+  <span class="s0">+#rootDir: Path;</span>
+  <span class="s0">+#files: FileData;</span>
+  <span class="s0">+#rootNode: DirectoryNode = new Map();</span>
+
+  <span class="s0">constructor({rootDir, files}: {rootDir: Path, files: FileData}) {</span>
+    <span class="s0">this.#rootDir = rootDir;</span>
+    <span class="s0">this.#files = files;</span>
+    <span class="s0">this.bulkAddOrModify(files);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getSerializableSnapshot(): FileData {</span>
+    <span class="s0">return new Map(</span>
+      <span class="s0">Array.from(this.#files.entries(), ([k, v]: [Path, FileMetaData]) =&gt; [</span>
+        <span class="s0">k,</span>
+        <span class="s0">[...v],</span>
+      <span class="s0">]),</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getModuleName(mixedPath: Path): ?string {</span>
+    <span class="s0">const fileMetadata = this._getFileData(mixedPath);</span>
+    <span class="s0">return (fileMetadata &amp;&amp; fileMetadata[H.ID]) ?? null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getSize(mixedPath: Path): ?number {</span>
+    <span class="s0">const fileMetadata = this._getFileData(mixedPath);</span>
+    <span class="s0">return (fileMetadata &amp;&amp; fileMetadata[H.SIZE]) ?? null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getDependencies(mixedPath: Path): ?Array&lt;string&gt; {</span>
+    <span class="s0">const fileMetadata = this._getFileData(mixedPath);</span>
+
+    <span class="s0">if (fileMetadata) {</span>
+      <span class="s0">return fileMetadata[H.DEPENDENCIES]</span>
+        <span class="s0">? fileMetadata[H.DEPENDENCIES].split(H.DEPENDENCY_DELIM)</span>
+        <span class="s0">: [];</span>
+    <span class="s0">} else {</span>
+      <span class="s0">return null;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getSha1(mixedPath: Path): ?string {</span>
+    <span class="s0">const fileMetadata = this._getFileData(mixedPath);</span>
+    <span class="s0">return (fileMetadata &amp;&amp; fileMetadata[H.SHA1]) ?? null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">exists(mixedPath: Path): boolean {</span>
+    <span class="s0">const result = this._getFileData(mixedPath);</span>
+    <span class="s0">return result != null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getAllFiles(): Array&lt;Path&gt; {</span>
+    <span class="s0">return Array.from(this._regularFileIterator(), normalPath =&gt;</span>
+      <span class="s0">this._normalToAbsolutePath(normalPath),</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">linkStats(mixedPath: Path): ?FileStats {</span>
+    <span class="s0">const fileMetadata = this._getFileData(mixedPath, {followLeaf: false});</span>
+    <span class="s0">if (fileMetadata == null) {</span>
+      <span class="s0">return null;</span>
+    <span class="s0">}</span>
+    <span class="s0">const fileType = fileMetadata[H.SYMLINK] === 0 ? 'f' : 'l';</span>
+    <span class="s0">const modifiedTime = fileMetadata[H.MTIME];</span>
+    <span class="s0">return {</span>
+      <span class="s0">fileType,</span>
+      <span class="s0">modifiedTime,</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">matchFiles(pattern: RegExp | string): Array&lt;Path&gt; {</span>
+    <span class="s0">const regexpPattern =</span>
+      <span class="s0">pattern instanceof RegExp ? pattern : new RegExp(pattern);</span>
+    <span class="s0">const files = [];</span>
+    <span class="s0">for (const filePath of this._pathIterator()) {</span>
+      <span class="s0">const absolutePath = this._normalToAbsolutePath(filePath);</span>
+      <span class="s0">if (regexpPattern.test(absolutePath)) {</span>
+        <span class="s0">files.push(absolutePath);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">return files;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Given a search context, return a list of file paths matching the query.</span>
+   <span class="s0">* The query matches against normalized paths which start with `./`,</span>
+   <span class="s0">* for example: `a/b.js` -&gt; `./a/b.js`</span>
+   <span class="s0">*/</span>
+  <span class="s0">matchFilesWithContext(</span>
+    <span class="s0">root: Path,</span>
+    <span class="s0">context: $ReadOnly&lt;{</span>
+      <span class="s0">/* Should search for files recursively. */</span>
+      <span class="s0">recursive: boolean,</span>
+      <span class="s0">/* Filter relative paths against a pattern. */</span>
+      <span class="s0">filter: RegExp,</span>
+    <span class="s0">}&gt;,</span>
+  <span class="s0">): Array&lt;Path&gt; {</span>
+    <span class="s0">const normalRoot = this._normalizePath(root);</span>
+    <span class="s0">const contextRootResult = this._lookupByNormalPath(normalRoot);</span>
+    <span class="s0">if (!contextRootResult) {</span>
+      <span class="s0">return [];</span>
+    <span class="s0">}</span>
+    <span class="s0">const {canonicalPath: rootRealPath, node: contextRoot} = contextRootResult;</span>
+    <span class="s0">if (!(contextRoot instanceof Map)) {</span>
+      <span class="s0">return [];</span>
+    <span class="s0">}</span>
+    <span class="s0">const contextRootAbsolutePath =</span>
+      <span class="s0">rootRealPath === ''</span>
+        <span class="s0">? this.#rootDir</span>
+        <span class="s0">: path.join(this.#rootDir, rootRealPath);</span>
+
+    <span class="s0">const files = [];</span>
+    <span class="s0">const prefix = './';</span>
+
+    <span class="s0">for (const relativePosixPath of this._pathIterator({</span>
+      <span class="s0">pathSep: '/',</span>
+      <span class="s0">recursive: context.recursive,</span>
+      <span class="s0">rootNode: contextRoot,</span>
+      <span class="s0">subtreeOnly: true,</span>
+    <span class="s0">})) {</span>
+      <span class="s0">if (</span>
+        <span class="s0">context.filter.test(</span>
+          <span class="s0">// NOTE(EvanBacon): Ensure files start with `./` for matching purposes</span>
+          <span class="s0">// this ensures packages work across Metro and Webpack (ex: Storybook for React DOM / React Native).</span>
+          <span class="s0">// `a/b.js` -&gt; `./a/b.js`</span>
+          <span class="s0">prefix + relativePosixPath,</span>
+        <span class="s0">)</span>
+      <span class="s0">) {</span>
+        <span class="s0">const relativePath =</span>
+          <span class="s0">path.sep === '/'</span>
+            <span class="s0">? relativePosixPath</span>
+            <span class="s0">: relativePosixPath.replaceAll('/', path.sep);</span>
+
+        <span class="s0">files.push(contextRootAbsolutePath + path.sep + relativePath);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return files;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getRealPath(mixedPath: Path): ?string {</span>
+    <span class="s0">const normalPath = this._normalizePath(mixedPath);</span>
+    <span class="s0">const metadata = this.#files.get(normalPath);</span>
+    <span class="s0">if (metadata &amp;&amp; metadata[H.SYMLINK] === 0) {</span>
+      <span class="s0">return fastPath.resolve(this.#rootDir, normalPath);</span>
+    <span class="s0">}</span>
+    <span class="s0">const result = this._lookupByNormalPath(normalPath, {followLeaf: true});</span>
+    <span class="s0">if (!result || result.node instanceof Map) {</span>
+      <span class="s0">return null;</span>
+    <span class="s0">}</span>
+    <span class="s0">return fastPath.resolve(this.#rootDir, result.canonicalPath);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">addOrModify(mixedPath: Path, metadata: FileMetaData): void {</span>
+    <span class="s0">const normalPath = this._normalizePath(mixedPath);</span>
+    <span class="s0">// Walk the tree to find the *real* path of the parent node, creating</span>
+    <span class="s0">// directories as we need.</span>
+    <span class="s0">const parentDirNode = this._lookupByNormalPath(path.dirname(normalPath), {</span>
+      <span class="s0">makeDirectories: true,</span>
+    <span class="s0">});</span>
+    <span class="s0">if (!parentDirNode) {</span>
+      <span class="s0">throw new Error(</span>
+        <span class="s0">`TreeFS: Failed to make parent directory entry for ${mixedPath}`,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s0">// Normalize the resulting path to account for the parent node being root.</span>
+    <span class="s0">const canonicalPath = this._normalizePath(</span>
+      <span class="s0">parentDirNode.canonicalPath + path.sep + path.basename(normalPath),</span>
+    <span class="s0">);</span>
+    <span class="s0">this.bulkAddOrModify(new Map([[canonicalPath, metadata]]));</span>
+  <span class="s0">}</span>
+
+  <span class="s0">bulkAddOrModify(addedOrModifiedFiles: FileData): void {</span>
+    <span class="s0">const files = this.#files;</span>
+
+    <span class="s0">// Optimisation: Bulk FileData are typically clustered by directory, so we</span>
+    <span class="s0">// optimise for that case by remembering the last directory we looked up.</span>
+    <span class="s0">// Experiments with large result sets show this to be significantly (~30%)</span>
+    <span class="s0">// faster than caching all lookups in a Map, and 70% faster than no cache.</span>
+    <span class="s0">let lastDir: ?string;</span>
+    <span class="s0">let directoryNode: DirectoryNode;</span>
+
+    <span class="s0">for (const [normalPath, metadata] of addedOrModifiedFiles) {</span>
+      <span class="s0">if (addedOrModifiedFiles !== files) {</span>
+        <span class="s0">files.set(normalPath, metadata);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">const lastSepIdx = normalPath.lastIndexOf(path.sep);</span>
+      <span class="s0">const dirname = lastSepIdx === -1 ? '' : normalPath.slice(0, lastSepIdx);</span>
+      <span class="s0">const basename =</span>
+        <span class="s0">lastSepIdx === -1 ? normalPath : normalPath.slice(lastSepIdx + 1);</span>
+
+      <span class="s0">if (directoryNode == null || dirname !== lastDir) {</span>
+        <span class="s0">const lookup = this._lookupByNormalPath(dirname, {</span>
+          <span class="s0">followLeaf: false,</span>
+          <span class="s0">makeDirectories: true,</span>
+        <span class="s0">});</span>
+        <span class="s0">if (!(lookup?.node instanceof Map)) {</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`TreeFS: Could not add directory ${dirname} when adding files`,</span>
+          <span class="s0">);</span>
+        <span class="s0">}</span>
+        <span class="s0">lastDir = dirname;</span>
+        <span class="s0">directoryNode = lookup.node;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">if (metadata[H.SYMLINK] !== 0) {</span>
+        <span class="s0">const symlinkTarget = metadata[H.SYMLINK];</span>
+        <span class="s0">invariant(</span>
+          <span class="s0">typeof symlinkTarget === 'string',</span>
+          <span class="s0">'expected symlink targets to be populated',</span>
+        <span class="s0">);</span>
+        <span class="s0">let rootRelativeSymlinkTarget;</span>
+        <span class="s0">if (path.isAbsolute(symlinkTarget)) {</span>
+          <span class="s0">rootRelativeSymlinkTarget = fastPath.relative(</span>
+            <span class="s0">this.#rootDir,</span>
+            <span class="s0">symlinkTarget,</span>
+          <span class="s0">);</span>
+        <span class="s0">} else {</span>
+          <span class="s0">rootRelativeSymlinkTarget = path.normalize(</span>
+            <span class="s0">path.join(path.dirname(normalPath), symlinkTarget),</span>
+          <span class="s0">);</span>
+        <span class="s0">}</span>
+        <span class="s0">directoryNode.set(basename, rootRelativeSymlinkTarget);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">directoryNode.set(basename, metadata);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">remove(mixedPath: Path): ?FileMetaData {</span>
+    <span class="s0">const normalPath = this._normalizePath(mixedPath);</span>
+    <span class="s0">const result = this._lookupByNormalPath(normalPath, {followLeaf: false});</span>
+    <span class="s0">if (!result || result.node instanceof Map) {</span>
+      <span class="s0">return null;</span>
+    <span class="s0">}</span>
+    <span class="s0">const {parentNode, canonicalPath, node} = result;</span>
+
+    <span class="s0">// If node is a symlink, get its metadata from the file map. Otherwise, we</span>
+    <span class="s0">// already have it in the lookup result.</span>
+    <span class="s0">const fileMetadata =</span>
+      <span class="s0">typeof node === 'string' ? this.#files.get(canonicalPath) : node;</span>
+    <span class="s0">if (fileMetadata == null) {</span>
+      <span class="s0">throw new Error(`TreeFS: Missing metadata for ${mixedPath}`);</span>
+    <span class="s0">}</span>
+    <span class="s0">if (parentNode == null) {</span>
+      <span class="s0">throw new Error(`TreeFS: Missing parent node for ${mixedPath}`);</span>
+    <span class="s0">}</span>
+    <span class="s0">this.#files.delete(canonicalPath);</span>
+    <span class="s0">parentNode.delete(path.basename(canonicalPath));</span>
+    <span class="s0">return fileMetadata;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_lookupByNormalPath(</span>
+    <span class="s0">requestedNormalPath: string,</span>
+    <span class="s0">opts: {</span>
+      <span class="s0">// Like lstat vs stat, whether to follow a symlink at the basename of</span>
+      <span class="s0">// the given path, or return the details of the symlink itself.</span>
+      <span class="s0">followLeaf?: boolean,</span>
+      <span class="s0">makeDirectories?: boolean,</span>
+    <span class="s0">} = {followLeaf: true, makeDirectories: false},</span>
+  <span class="s0">): ?(</span>
+    <span class="s0">| {canonicalPath: string, node: AnyNode, parentNode: DirectoryNode}</span>
+    <span class="s0">| {canonicalPath: string, node: DirectoryNode, parentNode: null}</span>
+  <span class="s0">) {</span>
+    <span class="s0">// We'll update the target if we hit a symlink.</span>
+    <span class="s0">let targetNormalPath = requestedNormalPath;</span>
+    <span class="s0">// Lazy-initialised set of seen target paths, to detect symlink cycles.</span>
+    <span class="s0">let seen: ?Set&lt;string&gt;;</span>
+    <span class="s0">// Pointer to the first character of the current path segment in</span>
+    <span class="s0">// targetNormalPath.</span>
+    <span class="s0">let fromIdx = 0;</span>
+    <span class="s0">// The parent of the current segment</span>
+    <span class="s0">let parentNode = this.#rootNode;</span>
+
+    <span class="s0">while (targetNormalPath.length &gt; fromIdx) {</span>
+      <span class="s0">const nextSepIdx = targetNormalPath.indexOf(path.sep, fromIdx);</span>
+      <span class="s0">const isLastSegment = nextSepIdx === -1;</span>
+      <span class="s0">const segmentName = isLastSegment</span>
+        <span class="s0">? targetNormalPath.slice(fromIdx)</span>
+        <span class="s0">: targetNormalPath.slice(fromIdx, nextSepIdx);</span>
+      <span class="s0">fromIdx = !isLastSegment ? nextSepIdx + 1 : targetNormalPath.length;</span>
+
+      <span class="s0">if (segmentName === '.') {</span>
+        <span class="s0">continue;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">let segmentNode = parentNode.get(segmentName);</span>
+      <span class="s0">if (segmentNode == null) {</span>
+        <span class="s0">if (opts.makeDirectories !== true) {</span>
+          <span class="s0">return null;</span>
+        <span class="s0">}</span>
+        <span class="s0">segmentNode = new Map();</span>
+        <span class="s0">parentNode.set(segmentName, segmentNode);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">// If there are no more '/' to come, we're done unless this is a symlink</span>
+      <span class="s0">// we must follow.</span>
+      <span class="s0">if (</span>
+        <span class="s0">isLastSegment &amp;&amp;</span>
+        <span class="s0">(typeof segmentNode !== 'string' || opts.followLeaf === false)</span>
+      <span class="s0">) {</span>
+        <span class="s0">return {</span>
+          <span class="s0">canonicalPath: targetNormalPath,</span>
+          <span class="s0">node: segmentNode,</span>
+          <span class="s0">parentNode,</span>
+        <span class="s0">};</span>
+      <span class="s0">}</span>
+
+      <span class="s0">// If the next node is a directory, go into it</span>
+      <span class="s0">if (segmentNode instanceof Map) {</span>
+        <span class="s0">parentNode = segmentNode;</span>
+      <span class="s0">} else if (Array.isArray(segmentNode)) {</span>
+        <span class="s0">// Regular file in a directory path</span>
+        <span class="s0">return null;</span>
+      <span class="s0">} else if (typeof segmentNode === 'string') {</span>
+        <span class="s0">// segmentNode is a normalised symlink target. Append any subsequent</span>
+        <span class="s0">// path segments to the symlink target, and reset with our new target.</span>
+        <span class="s0">targetNormalPath = isLastSegment</span>
+          <span class="s0">? segmentNode</span>
+          <span class="s0">: segmentNode + path.sep + targetNormalPath.slice(fromIdx);</span>
+        <span class="s0">if (seen == null) {</span>
+          <span class="s0">// Optimisation: set this lazily only when we've encountered a symlink</span>
+          <span class="s0">seen = new Set([requestedNormalPath]);</span>
+        <span class="s0">}</span>
+        <span class="s0">if (seen.has(targetNormalPath)) {</span>
+          <span class="s0">// TODO: Warn `Symlink cycle detected: ${[...seen, node].join(' -&gt; ')}`</span>
+          <span class="s0">return null;</span>
+        <span class="s0">}</span>
+        <span class="s0">seen.add(targetNormalPath);</span>
+        <span class="s0">fromIdx = 0;</span>
+        <span class="s0">parentNode = this.#rootNode;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">invariant(parentNode === this.#rootNode, 'Unexpectedly escaped traversal');</span>
+    <span class="s0">return {</span>
+      <span class="s0">canonicalPath: targetNormalPath,</span>
+      <span class="s0">node: this.#rootNode,</span>
+      <span class="s0">parentNode: null,</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_normalizePath(relativeOrAbsolutePath: Path): string {</span>
+    <span class="s0">return path.isAbsolute(relativeOrAbsolutePath)</span>
+      <span class="s0">? fastPath.relative(this.#rootDir, relativeOrAbsolutePath)</span>
+      <span class="s0">: path.normalize(relativeOrAbsolutePath);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_normalToAbsolutePath(normalPath: Path): Path {</span>
+    <span class="s0">if (normalPath[0] === '.') {</span>
+      <span class="s0">return path.normalize(this.#rootDir + path.sep + normalPath);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">return this.#rootDir + path.sep + normalPath;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">*_regularFileIterator(): Iterator&lt;Path&gt; {</span>
+    <span class="s0">for (const [normalPath, metadata] of this.#files) {</span>
+      <span class="s0">if (metadata[H.SYMLINK] !== 0) {</span>
+        <span class="s0">continue;</span>
+      <span class="s0">}</span>
+      <span class="s0">yield normalPath;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">*_pathIterator({</span>
+    <span class="s0">pathSep = path.sep,</span>
+    <span class="s0">recursive = true,</span>
+    <span class="s0">rootNode,</span>
+    <span class="s0">subtreeOnly = false,</span>
+  <span class="s0">}: {</span>
+    <span class="s0">pathSep?: string,</span>
+    <span class="s0">recursive?: boolean,</span>
+    <span class="s0">rootNode?: DirectoryNode,</span>
+    <span class="s0">subtreeOnly?: boolean,</span>
+  <span class="s0">} = {}): Iterable&lt;Path&gt; {</span>
+    <span class="s0">for (const [name, node] of rootNode ?? this.#rootNode) {</span>
+      <span class="s0">if (subtreeOnly &amp;&amp; name === '..') {</span>
+        <span class="s0">continue;</span>
+      <span class="s0">}</span>
+      <span class="s0">if (Array.isArray(node)) {</span>
+        <span class="s0">yield name;</span>
+      <span class="s0">} else if (typeof node === 'string') {</span>
+        <span class="s0">const resolved = this._lookupByNormalPath(node);</span>
+        <span class="s0">if (resolved == null) {</span>
+          <span class="s0">continue;</span>
+        <span class="s0">}</span>
+        <span class="s0">const target = resolved.node;</span>
+        <span class="s0">if (target instanceof Map) {</span>
+          <span class="s0">if (!recursive) {</span>
+            <span class="s0">continue;</span>
+          <span class="s0">}</span>
+          <span class="s0">// symlink points to a directory - iterate over its contents</span>
+          <span class="s0">for (const file of this._pathIterator({</span>
+            <span class="s0">pathSep,</span>
+            <span class="s0">recursive,</span>
+            <span class="s0">rootNode: target,</span>
+            <span class="s0">subtreeOnly,</span>
+          <span class="s0">})) {</span>
+            <span class="s0">yield name + pathSep + file;</span>
+          <span class="s0">}</span>
+        <span class="s0">} else {</span>
+          <span class="s0">// symlink points to a file - report it</span>
+          <span class="s0">yield name;</span>
+        <span class="s0">}</span>
+      <span class="s0">} else if (recursive) {</span>
+        <span class="s0">for (const file of this._pathIterator({</span>
+          <span class="s0">pathSep,</span>
+          <span class="s0">recursive,</span>
+          <span class="s0">rootNode: node,</span>
+          <span class="s0">subtreeOnly,</span>
+        <span class="s0">})) {</span>
+          <span class="s0">yield name + pathSep + file;</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_getFileData(</span>
+    <span class="s0">filePath: Path,</span>
+    <span class="s0">opts: {followLeaf: boolean} = {followLeaf: true},</span>
+  <span class="s0">): ?FileMetaData {</span>
+    <span class="s0">const normalPath = this._normalizePath(filePath);</span>
+    <span class="s0">const metadata = this.#files.get(normalPath);</span>
+    <span class="s0">if (metadata &amp;&amp; (!opts.followLeaf || metadata[H.SYMLINK] === 0)) {</span>
+      <span class="s0">return metadata;</span>
+    <span class="s0">}</span>
+    <span class="s0">const result = this._lookupByNormalPath(normalPath, {</span>
+      <span class="s0">followLeaf: opts.followLeaf,</span>
+    <span class="s0">});</span>
+    <span class="s0">if (!result || result.node instanceof Map) {</span>
+      <span class="s0">return null;</span>
+    <span class="s0">}</span>
+    <span class="s0">return this.#files.get(result.canonicalPath);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+</pre>
+</body>
+</html>

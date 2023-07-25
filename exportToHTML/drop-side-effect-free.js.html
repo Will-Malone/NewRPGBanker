@@ -1,0 +1,392 @@
+<html>
+<head>
+<title>drop-side-effect-free.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+drop-side-effect-free.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/*********************************************************************** 
+ 
+  A JavaScript tokenizer / parser / beautifier / compressor. 
+  https://github.com/mishoo/UglifyJS2 
+ 
+  -------------------------------- (C) --------------------------------- 
+ 
+                           Author: Mihai Bazon 
+                         &lt;mihai.bazon@gmail.com&gt; 
+                       http://mihai.bazon.net/blog 
+ 
+  Distributed under the BSD license: 
+ 
+    Copyright 2012 (c) Mihai Bazon &lt;mihai.bazon@gmail.com&gt; 
+ 
+    Redistribution and use in source and binary forms, with or without 
+    modification, are permitted provided that the following conditions 
+    are met: 
+ 
+        * Redistributions of source code must retain the above 
+          copyright notice, this list of conditions and the following 
+          disclaimer. 
+ 
+        * Redistributions in binary form must reproduce the above 
+          copyright notice, this list of conditions and the following 
+          disclaimer in the documentation and/or other materials 
+          provided with the distribution. 
+ 
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER “AS IS” AND ANY 
+    EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR 
+    PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE 
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, 
+    OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, 
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR 
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR 
+    TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF 
+    THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF 
+    SUCH DAMAGE. 
+ 
+ ***********************************************************************/</span>
+
+<span class="s1">import {</span>
+    <span class="s1">AST_Accessor,</span>
+    <span class="s1">AST_Array,</span>
+    <span class="s1">AST_Arrow,</span>
+    <span class="s1">AST_Assign,</span>
+    <span class="s1">AST_Binary,</span>
+    <span class="s1">AST_Call,</span>
+    <span class="s1">AST_Chain,</span>
+    <span class="s1">AST_Class,</span>
+    <span class="s1">AST_ClassStaticBlock,</span>
+    <span class="s1">AST_ClassProperty,</span>
+    <span class="s1">AST_ConciseMethod,</span>
+    <span class="s1">AST_Conditional,</span>
+    <span class="s1">AST_Constant,</span>
+    <span class="s1">AST_DefClass,</span>
+    <span class="s1">AST_Dot,</span>
+    <span class="s1">AST_Expansion,</span>
+    <span class="s1">AST_Function,</span>
+    <span class="s1">AST_Node,</span>
+    <span class="s1">AST_Number,</span>
+    <span class="s1">AST_Object,</span>
+    <span class="s1">AST_ObjectGetter,</span>
+    <span class="s1">AST_ObjectKeyVal,</span>
+    <span class="s1">AST_ObjectProperty,</span>
+    <span class="s1">AST_ObjectSetter,</span>
+    <span class="s1">AST_PropAccess,</span>
+    <span class="s1">AST_Scope,</span>
+    <span class="s1">AST_Sequence,</span>
+    <span class="s1">AST_SimpleStatement,</span>
+    <span class="s1">AST_Sub,</span>
+    <span class="s1">AST_SymbolRef,</span>
+    <span class="s1">AST_TemplateSegment,</span>
+    <span class="s1">AST_TemplateString,</span>
+    <span class="s1">AST_This,</span>
+    <span class="s1">AST_Unary,</span>
+<span class="s1">} from </span><span class="s2">&quot;../ast.js&quot;</span><span class="s1">;</span>
+<span class="s1">import { make_node, return_null, return_this } from </span><span class="s2">&quot;../utils/index.js&quot;</span><span class="s1">;</span>
+<span class="s1">import { first_in_statement } from </span><span class="s2">&quot;../utils/first_in_statement.js&quot;</span><span class="s1">;</span>
+
+<span class="s1">import { pure_prop_access_globals } from </span><span class="s2">&quot;./native-objects.js&quot;</span><span class="s1">;</span>
+<span class="s1">import { lazy_op, unary_side_effects, is_nullish_shortcircuited } from </span><span class="s2">&quot;./inference.js&quot;</span><span class="s1">;</span>
+<span class="s1">import { WRITE_ONLY, set_flag, clear_flag } from </span><span class="s2">&quot;./compressor-flags.js&quot;</span><span class="s1">;</span>
+<span class="s1">import { make_sequence, is_func_expr, is_iife_call } from </span><span class="s2">&quot;./common.js&quot;</span><span class="s1">;</span>
+
+<span class="s0">// AST_Node#drop_side_effect_free() gets called when we don't care about the value,</span>
+<span class="s0">// only about side effects. We'll be defining this method for each node type in this module</span>
+<span class="s0">//</span>
+<span class="s0">// Examples:</span>
+<span class="s0">// foo++ -&gt; foo++</span>
+<span class="s0">// 1 + func() -&gt; func()</span>
+<span class="s0">// 10 -&gt; (nothing)</span>
+<span class="s0">// knownPureFunc(foo++) -&gt; foo++</span>
+
+<span class="s3">function </span><span class="s1">def_drop_side_effect_free(node, func) {</span>
+    <span class="s1">node.DEFMETHOD(</span><span class="s2">&quot;drop_side_effect_free&quot;</span><span class="s1">, func);</span>
+<span class="s1">}</span>
+
+<span class="s0">// Drop side-effect-free elements from an array of expressions.</span>
+<span class="s0">// Returns an array of expressions with side-effects or null</span>
+<span class="s0">// if all elements were dropped. Note: original array may be</span>
+<span class="s0">// returned if nothing changed.</span>
+<span class="s3">function </span><span class="s1">trim(nodes, compressor, first_in_statement) {</span>
+    <span class="s3">var </span><span class="s1">len = nodes.length;</span>
+    <span class="s3">if </span><span class="s1">(!len)  </span><span class="s3">return null</span><span class="s1">;</span>
+
+    <span class="s3">var </span><span class="s1">ret = [], changed = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s3">for </span><span class="s1">(</span><span class="s3">var </span><span class="s1">i = </span><span class="s4">0</span><span class="s1">; i &lt; len; i++) {</span>
+        <span class="s3">var </span><span class="s1">node = nodes[i].drop_side_effect_free(compressor, first_in_statement);</span>
+        <span class="s1">changed |= node !== nodes[i];</span>
+        <span class="s3">if </span><span class="s1">(node) {</span>
+            <span class="s1">ret.push(node);</span>
+            <span class="s1">first_in_statement = </span><span class="s3">false</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">changed ? ret.length ? ret : </span><span class="s3">null </span><span class="s1">: nodes;</span>
+<span class="s1">}</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Node, return_this);</span>
+<span class="s1">def_drop_side_effect_free(AST_Constant, return_null);</span>
+<span class="s1">def_drop_side_effect_free(AST_This, return_null);</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Call, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">if </span><span class="s1">(is_nullish_shortcircuited(</span><span class="s3">this</span><span class="s1">, compressor)) {</span>
+        <span class="s3">return this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(!</span><span class="s3">this</span><span class="s1">.is_callee_pure(compressor)) {</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.expression.is_call_pure(compressor)) {</span>
+            <span class="s3">var </span><span class="s1">exprs = </span><span class="s3">this</span><span class="s1">.args.slice();</span>
+            <span class="s1">exprs.unshift(</span><span class="s3">this</span><span class="s1">.expression.expression);</span>
+            <span class="s1">exprs = trim(exprs, compressor, first_in_statement);</span>
+            <span class="s3">return </span><span class="s1">exprs &amp;&amp; make_sequence(</span><span class="s3">this</span><span class="s1">, exprs);</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(is_func_expr(</span><span class="s3">this</span><span class="s1">.expression)</span>
+            <span class="s1">&amp;&amp; (!</span><span class="s3">this</span><span class="s1">.expression.name || !</span><span class="s3">this</span><span class="s1">.expression.name.definition().references.length)) {</span>
+            <span class="s3">var </span><span class="s1">node = </span><span class="s3">this</span><span class="s1">.clone();</span>
+            <span class="s1">node.expression.process_expression(</span><span class="s3">false</span><span class="s1">, compressor);</span>
+            <span class="s3">return </span><span class="s1">node;</span>
+        <span class="s1">}</span>
+        <span class="s3">return this</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">var </span><span class="s1">args = trim(</span><span class="s3">this</span><span class="s1">.args, compressor, first_in_statement);</span>
+    <span class="s3">return </span><span class="s1">args &amp;&amp; make_sequence(</span><span class="s3">this</span><span class="s1">, args);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Accessor, return_null);</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Function, return_null);</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Arrow, return_null);</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Class, </span><span class="s3">function </span><span class="s1">(compressor) {</span>
+    <span class="s1">const with_effects = [];</span>
+    <span class="s1">const trimmed_extends = </span><span class="s3">this</span><span class="s1">.extends &amp;&amp; </span><span class="s3">this</span><span class="s1">.extends.drop_side_effect_free(compressor);</span>
+    <span class="s3">if </span><span class="s1">(trimmed_extends)</span>
+        <span class="s1">with_effects.push(trimmed_extends);</span>
+
+    <span class="s3">for </span><span class="s1">(const prop of </span><span class="s3">this</span><span class="s1">.properties) {</span>
+        <span class="s3">if </span><span class="s1">(prop </span><span class="s3">instanceof </span><span class="s1">AST_ClassStaticBlock) {</span>
+            <span class="s3">if </span><span class="s1">(prop.has_side_effects(compressor)) {</span>
+                <span class="s3">return this</span><span class="s1">; </span><span class="s0">// Be cautious about these</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">const trimmed_prop = prop.drop_side_effect_free(compressor);</span>
+            <span class="s3">if </span><span class="s1">(trimmed_prop) {</span>
+                <span class="s3">if </span><span class="s1">(trimmed_prop.contains_this()) </span><span class="s3">return this</span><span class="s1">;</span>
+
+                <span class="s1">with_effects.push(trimmed_prop);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(!with_effects.length)</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+
+    <span class="s1">const exprs = make_sequence(</span><span class="s3">this</span><span class="s1">, with_effects);</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this instanceof </span><span class="s1">AST_DefClass) {</span>
+        <span class="s0">// We want a statement</span>
+        <span class="s3">return </span><span class="s1">make_node(AST_SimpleStatement, </span><span class="s3">this</span><span class="s1">, { body: exprs });</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s3">return </span><span class="s1">exprs;</span>
+    <span class="s1">}</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_ClassProperty, </span><span class="s3">function </span><span class="s1">(compressor) {</span>
+    <span class="s1">const key = </span><span class="s3">this</span><span class="s1">.computed_key() &amp;&amp; </span><span class="s3">this</span><span class="s1">.key.drop_side_effect_free(compressor);</span>
+
+    <span class="s1">const value = </span><span class="s3">this</span><span class="s1">.static &amp;&amp; </span><span class="s3">this</span><span class="s1">.value</span>
+        <span class="s1">&amp;&amp; </span><span class="s3">this</span><span class="s1">.value.drop_side_effect_free(compressor);</span>
+
+    <span class="s3">if </span><span class="s1">(key &amp;&amp; value)</span>
+        <span class="s3">return </span><span class="s1">make_sequence(</span><span class="s3">this</span><span class="s1">, [key, value]);</span>
+    <span class="s3">return </span><span class="s1">key || value || </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Binary, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">var </span><span class="s1">right = </span><span class="s3">this</span><span class="s1">.right.drop_side_effect_free(compressor);</span>
+    <span class="s3">if </span><span class="s1">(!right)</span>
+        <span class="s3">return this</span><span class="s1">.left.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s3">if </span><span class="s1">(lazy_op.has(</span><span class="s3">this</span><span class="s1">.operator)) {</span>
+        <span class="s3">if </span><span class="s1">(right === </span><span class="s3">this</span><span class="s1">.right)</span>
+            <span class="s3">return this</span><span class="s1">;</span>
+        <span class="s3">var </span><span class="s1">node = </span><span class="s3">this</span><span class="s1">.clone();</span>
+        <span class="s1">node.right = right;</span>
+        <span class="s3">return </span><span class="s1">node;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s3">var </span><span class="s1">left = </span><span class="s3">this</span><span class="s1">.left.drop_side_effect_free(compressor, first_in_statement);</span>
+        <span class="s3">if </span><span class="s1">(!left)</span>
+            <span class="s3">return this</span><span class="s1">.right.drop_side_effect_free(compressor, first_in_statement);</span>
+        <span class="s3">return </span><span class="s1">make_sequence(</span><span class="s3">this</span><span class="s1">, [left, right]);</span>
+    <span class="s1">}</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Assign, </span><span class="s3">function </span><span class="s1">(compressor) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.logical)</span>
+        <span class="s3">return this</span><span class="s1">;</span>
+
+    <span class="s3">var </span><span class="s1">left = </span><span class="s3">this</span><span class="s1">.left;</span>
+    <span class="s3">if </span><span class="s1">(left.has_side_effects(compressor)</span>
+        <span class="s1">|| compressor.has_directive(</span><span class="s2">&quot;use strict&quot;</span><span class="s1">)</span>
+        <span class="s1">&amp;&amp; left </span><span class="s3">instanceof </span><span class="s1">AST_PropAccess</span>
+        <span class="s1">&amp;&amp; left.expression.is_constant()) {</span>
+        <span class="s3">return this</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">set_flag(</span><span class="s3">this</span><span class="s1">, WRITE_ONLY);</span>
+    <span class="s3">while </span><span class="s1">(left </span><span class="s3">instanceof </span><span class="s1">AST_PropAccess) {</span>
+        <span class="s1">left = left.expression;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(left.is_constant_expression(compressor.find_parent(AST_Scope))) {</span>
+        <span class="s3">return this</span><span class="s1">.right.drop_side_effect_free(compressor);</span>
+    <span class="s1">}</span>
+    <span class="s3">return this</span><span class="s1">;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Conditional, </span><span class="s3">function </span><span class="s1">(compressor) {</span>
+    <span class="s3">var </span><span class="s1">consequent = </span><span class="s3">this</span><span class="s1">.consequent.drop_side_effect_free(compressor);</span>
+    <span class="s3">var </span><span class="s1">alternative = </span><span class="s3">this</span><span class="s1">.alternative.drop_side_effect_free(compressor);</span>
+    <span class="s3">if </span><span class="s1">(consequent === </span><span class="s3">this</span><span class="s1">.consequent &amp;&amp; alternative === </span><span class="s3">this</span><span class="s1">.alternative)</span>
+        <span class="s3">return this</span><span class="s1">;</span>
+    <span class="s3">if </span><span class="s1">(!consequent)</span>
+        <span class="s3">return </span><span class="s1">alternative ? make_node(AST_Binary, </span><span class="s3">this</span><span class="s1">, {</span>
+            <span class="s1">operator: </span><span class="s2">&quot;||&quot;</span><span class="s1">,</span>
+            <span class="s1">left: </span><span class="s3">this</span><span class="s1">.condition,</span>
+            <span class="s1">right: alternative</span>
+        <span class="s1">}) : </span><span class="s3">this</span><span class="s1">.condition.drop_side_effect_free(compressor);</span>
+    <span class="s3">if </span><span class="s1">(!alternative)</span>
+        <span class="s3">return </span><span class="s1">make_node(AST_Binary, </span><span class="s3">this</span><span class="s1">, {</span>
+            <span class="s1">operator: </span><span class="s2">&quot;&amp;&amp;&quot;</span><span class="s1">,</span>
+            <span class="s1">left: </span><span class="s3">this</span><span class="s1">.condition,</span>
+            <span class="s1">right: consequent</span>
+        <span class="s1">});</span>
+    <span class="s3">var </span><span class="s1">node = </span><span class="s3">this</span><span class="s1">.clone();</span>
+    <span class="s1">node.consequent = consequent;</span>
+    <span class="s1">node.alternative = alternative;</span>
+    <span class="s3">return </span><span class="s1">node;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Unary, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">if </span><span class="s1">(unary_side_effects.has(</span><span class="s3">this</span><span class="s1">.operator)) {</span>
+        <span class="s3">if </span><span class="s1">(!</span><span class="s3">this</span><span class="s1">.expression.has_side_effects(compressor)) {</span>
+            <span class="s1">set_flag(</span><span class="s3">this</span><span class="s1">, WRITE_ONLY);</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">clear_flag(</span><span class="s3">this</span><span class="s1">, WRITE_ONLY);</span>
+        <span class="s1">}</span>
+        <span class="s3">return this</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.operator == </span><span class="s2">&quot;typeof&quot; </span><span class="s1">&amp;&amp; </span><span class="s3">this</span><span class="s1">.expression </span><span class="s3">instanceof </span><span class="s1">AST_SymbolRef)</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s3">var </span><span class="s1">expression = </span><span class="s3">this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s3">if </span><span class="s1">(first_in_statement &amp;&amp; expression &amp;&amp; is_iife_call(expression)) {</span>
+        <span class="s3">if </span><span class="s1">(expression === </span><span class="s3">this</span><span class="s1">.expression &amp;&amp; </span><span class="s3">this</span><span class="s1">.operator == </span><span class="s2">&quot;!&quot;</span><span class="s1">)</span>
+            <span class="s3">return this</span><span class="s1">;</span>
+        <span class="s3">return </span><span class="s1">expression.negate(compressor, first_in_statement);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">expression;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_SymbolRef, </span><span class="s3">function </span><span class="s1">(compressor) {</span>
+    <span class="s1">const safe_access = </span><span class="s3">this</span><span class="s1">.is_declared(compressor)</span>
+        <span class="s1">|| pure_prop_access_globals.has(</span><span class="s3">this</span><span class="s1">.name);</span>
+    <span class="s3">return </span><span class="s1">safe_access ? </span><span class="s3">null </span><span class="s1">: </span><span class="s3">this</span><span class="s1">;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Object, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">var </span><span class="s1">values = trim(</span><span class="s3">this</span><span class="s1">.properties, compressor, first_in_statement);</span>
+    <span class="s3">return </span><span class="s1">values &amp;&amp; make_sequence(</span><span class="s3">this</span><span class="s1">, values);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_ObjectProperty, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s1">const computed_key = </span><span class="s3">this instanceof </span><span class="s1">AST_ObjectKeyVal &amp;&amp; </span><span class="s3">this</span><span class="s1">.key </span><span class="s3">instanceof </span><span class="s1">AST_Node;</span>
+    <span class="s1">const key = computed_key &amp;&amp; </span><span class="s3">this</span><span class="s1">.key.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s1">const value = </span><span class="s3">this</span><span class="s1">.value &amp;&amp; </span><span class="s3">this</span><span class="s1">.value.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s3">if </span><span class="s1">(key &amp;&amp; value) {</span>
+        <span class="s3">return </span><span class="s1">make_sequence(</span><span class="s3">this</span><span class="s1">, [key, value]);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">key || value;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_ConciseMethod, </span><span class="s3">function </span><span class="s1">() {</span>
+    <span class="s3">return this</span><span class="s1">.computed_key() ? </span><span class="s3">this</span><span class="s1">.key : </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_ObjectGetter, </span><span class="s3">function </span><span class="s1">() {</span>
+    <span class="s3">return this</span><span class="s1">.computed_key() ? </span><span class="s3">this</span><span class="s1">.key : </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_ObjectSetter, </span><span class="s3">function </span><span class="s1">() {</span>
+    <span class="s3">return this</span><span class="s1">.computed_key() ? </span><span class="s3">this</span><span class="s1">.key : </span><span class="s3">null</span><span class="s1">;</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Array, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">var </span><span class="s1">values = trim(</span><span class="s3">this</span><span class="s1">.elements, compressor, first_in_statement);</span>
+    <span class="s3">return </span><span class="s1">values &amp;&amp; make_sequence(</span><span class="s3">this</span><span class="s1">, values);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Dot, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">if </span><span class="s1">(is_nullish_shortcircuited(</span><span class="s3">this</span><span class="s1">, compressor)) {</span>
+        <span class="s3">return this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.expression.may_throw_on_access(compressor)) </span><span class="s3">return this</span><span class="s1">;</span>
+
+    <span class="s3">return this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Sub, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">if </span><span class="s1">(is_nullish_shortcircuited(</span><span class="s3">this</span><span class="s1">, compressor)) {</span>
+        <span class="s3">return this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.expression.may_throw_on_access(compressor)) </span><span class="s3">return this</span><span class="s1">;</span>
+
+    <span class="s3">var </span><span class="s1">expression = </span><span class="s3">this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s3">if </span><span class="s1">(!expression)</span>
+        <span class="s3">return this</span><span class="s1">.property.drop_side_effect_free(compressor, first_in_statement);</span>
+    <span class="s3">var </span><span class="s1">property = </span><span class="s3">this</span><span class="s1">.property.drop_side_effect_free(compressor);</span>
+    <span class="s3">if </span><span class="s1">(!property)</span>
+        <span class="s3">return </span><span class="s1">expression;</span>
+    <span class="s3">return </span><span class="s1">make_sequence(</span><span class="s3">this</span><span class="s1">, [expression, property]);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Chain, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">return this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Sequence, </span><span class="s3">function </span><span class="s1">(compressor) {</span>
+    <span class="s3">var </span><span class="s1">last = </span><span class="s3">this</span><span class="s1">.tail_node();</span>
+    <span class="s3">var </span><span class="s1">expr = last.drop_side_effect_free(compressor);</span>
+    <span class="s3">if </span><span class="s1">(expr === last)</span>
+        <span class="s3">return this</span><span class="s1">;</span>
+    <span class="s3">var </span><span class="s1">expressions = </span><span class="s3">this</span><span class="s1">.expressions.slice(</span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(expr)</span>
+        <span class="s1">expressions.push(expr);</span>
+    <span class="s3">if </span><span class="s1">(!expressions.length) {</span>
+        <span class="s3">return </span><span class="s1">make_node(AST_Number, </span><span class="s3">this</span><span class="s1">, { value: </span><span class="s4">0 </span><span class="s1">});</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">make_sequence(</span><span class="s3">this</span><span class="s1">, expressions);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_Expansion, </span><span class="s3">function </span><span class="s1">(compressor, first_in_statement) {</span>
+    <span class="s3">return this</span><span class="s1">.expression.drop_side_effect_free(compressor, first_in_statement);</span>
+<span class="s1">});</span>
+
+<span class="s1">def_drop_side_effect_free(AST_TemplateSegment, return_null);</span>
+
+<span class="s1">def_drop_side_effect_free(AST_TemplateString, </span><span class="s3">function </span><span class="s1">(compressor) {</span>
+    <span class="s3">var </span><span class="s1">values = trim(</span><span class="s3">this</span><span class="s1">.segments, compressor, first_in_statement);</span>
+    <span class="s3">return </span><span class="s1">values &amp;&amp; make_sequence(</span><span class="s3">this</span><span class="s1">, values);</span>
+<span class="s1">});</span>
+</pre>
+</body>
+</html>

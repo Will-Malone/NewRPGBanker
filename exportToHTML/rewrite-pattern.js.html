@@ -1,0 +1,926 @@
+<html>
+<head>
+<title>rewrite-pattern.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #6a8759;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+rewrite-pattern.js</font>
+</center></td></tr></table>
+<pre><span class="s0">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const generate = require(</span><span class="s0">'@babel/regjsgen'</span><span class="s1">).generate;</span>
+<span class="s1">const parse = require(</span><span class="s0">'regjsparser'</span><span class="s1">).parse;</span>
+<span class="s1">const regenerate = require(</span><span class="s0">'regenerate'</span><span class="s1">);</span>
+<span class="s1">const unicodeMatchProperty = require(</span><span class="s0">'unicode-match-property-ecmascript'</span><span class="s1">);</span>
+<span class="s1">const unicodeMatchPropertyValue = require(</span><span class="s0">'unicode-match-property-value-ecmascript'</span><span class="s1">);</span>
+<span class="s1">const iuMappings = require(</span><span class="s0">'./data/iu-mappings.js'</span><span class="s1">);</span>
+<span class="s1">const ESCAPE_SETS = require(</span><span class="s0">'./data/character-class-escape-sets.js'</span><span class="s1">);</span>
+
+<span class="s2">function </span><span class="s1">flatMap(array, callback) {</span>
+	<span class="s1">const result = [];</span>
+	<span class="s1">array.forEach(item =&gt; {</span>
+		<span class="s1">const res = callback(item);</span>
+		<span class="s2">if </span><span class="s1">(Array.isArray(res)) {</span>
+			<span class="s1">result.push.apply(result, res);</span>
+		<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+			<span class="s1">result.push(res);</span>
+		<span class="s1">}</span>
+	<span class="s1">});</span>
+	<span class="s2">return </span><span class="s1">result;</span>
+<span class="s1">}</span>
+
+<span class="s1">const SPECIAL_CHARS = /([\\^$.*+?()[\]{}|])/g;</span>
+
+<span class="s3">// Prepare a Regenerate set containing all code points, used for negative</span>
+<span class="s3">// character classes (if any).</span>
+<span class="s1">const UNICODE_SET = regenerate().addRange(</span><span class="s4">0</span><span class="s1">x0, </span><span class="s4">0</span><span class="s1">x10FFFF);</span>
+
+<span class="s1">const ASTRAL_SET = regenerate().addRange(</span><span class="s4">0</span><span class="s1">x10000, </span><span class="s4">0</span><span class="s1">x10FFFF);</span>
+
+<span class="s1">const NEWLINE_SET = regenerate().add(</span>
+	<span class="s3">// `LineTerminator`s (https://mths.be/es6#sec-line-terminators):</span>
+	<span class="s4">0</span><span class="s1">x000A, </span><span class="s3">// Line Feed &lt;LF&gt;</span>
+	<span class="s4">0</span><span class="s1">x000D, </span><span class="s3">// Carriage Return &lt;CR&gt;</span>
+	<span class="s4">0</span><span class="s1">x2028, </span><span class="s3">// Line Separator &lt;LS&gt;</span>
+	<span class="s4">0</span><span class="s1">x2029  </span><span class="s3">// Paragraph Separator &lt;PS&gt;</span>
+<span class="s1">);</span>
+
+<span class="s3">// Prepare a Regenerate set containing all code points that are supposed to be</span>
+<span class="s3">// matched by `/./u`. https://mths.be/es6#sec-atom</span>
+<span class="s1">const DOT_SET_UNICODE = UNICODE_SET.clone() </span><span class="s3">// all Unicode code points</span>
+	<span class="s1">.remove(NEWLINE_SET);</span>
+
+<span class="s1">const getCharacterClassEscapeSet = (character, unicode, ignoreCase) =&gt; {</span>
+	<span class="s2">if </span><span class="s1">(unicode) {</span>
+		<span class="s2">if </span><span class="s1">(ignoreCase) {</span>
+			<span class="s2">return </span><span class="s1">ESCAPE_SETS.UNICODE_IGNORE_CASE.get(character);</span>
+		<span class="s1">}</span>
+		<span class="s2">return </span><span class="s1">ESCAPE_SETS.UNICODE.get(character);</span>
+	<span class="s1">}</span>
+	<span class="s2">return </span><span class="s1">ESCAPE_SETS.REGULAR.get(character);</span>
+<span class="s1">};</span>
+
+<span class="s1">const getUnicodeDotSet = (dotAll) =&gt; {</span>
+	<span class="s2">return </span><span class="s1">dotAll ? UNICODE_SET : DOT_SET_UNICODE;</span>
+<span class="s1">};</span>
+
+<span class="s1">const getUnicodePropertyValueSet = (property, value) =&gt; {</span>
+	<span class="s1">const path = value ?</span>
+		<span class="s1">`${ property }/${ value }` :</span>
+		<span class="s1">`Binary_Property/${ property }`;</span>
+	<span class="s2">try </span><span class="s1">{</span>
+		<span class="s2">return </span><span class="s1">require(`regenerate-unicode-properties/${ path }.js`);</span>
+	<span class="s1">} </span><span class="s2">catch </span><span class="s1">(exception) {</span>
+		<span class="s2">throw new </span><span class="s1">Error(</span>
+			<span class="s1">`Failed to recognize value \`${ value }\` </span><span class="s2">for </span><span class="s1">property ` +</span>
+			<span class="s1">`\`${ property }\`.`</span>
+		<span class="s1">);</span>
+	<span class="s1">}</span>
+<span class="s1">};</span>
+
+<span class="s1">const handleLoneUnicodePropertyNameOrValue = (value) =&gt; {</span>
+	<span class="s3">// It could be a `General_Category` value or a binary property.</span>
+	<span class="s3">// Note: `unicodeMatchPropertyValue` throws on invalid values.</span>
+	<span class="s2">try </span><span class="s1">{</span>
+		<span class="s1">const property = </span><span class="s0">'General_Category'</span><span class="s1">;</span>
+		<span class="s1">const category = unicodeMatchPropertyValue(property, value);</span>
+		<span class="s2">return </span><span class="s1">getUnicodePropertyValueSet(property, category);</span>
+	<span class="s1">} </span><span class="s2">catch </span><span class="s1">(exception) {}</span>
+	<span class="s3">// It’s not a `General_Category` value, so check if it’s a property</span>
+	<span class="s3">// of strings.</span>
+	<span class="s2">try </span><span class="s1">{</span>
+		<span class="s2">return </span><span class="s1">getUnicodePropertyValueSet(</span><span class="s0">'Property_of_Strings'</span><span class="s1">, value);</span>
+	<span class="s1">} </span><span class="s2">catch </span><span class="s1">(exception) {}</span>
+	<span class="s3">// Lastly, check if it’s a binary property of single code points.</span>
+	<span class="s3">// Note: `unicodeMatchProperty` throws on invalid properties.</span>
+	<span class="s1">const property = unicodeMatchProperty(value);</span>
+	<span class="s2">return </span><span class="s1">getUnicodePropertyValueSet(property);</span>
+<span class="s1">};</span>
+
+<span class="s1">const getUnicodePropertyEscapeSet = (value, isNegative) =&gt; {</span>
+	<span class="s1">const parts = value.split(</span><span class="s0">'='</span><span class="s1">);</span>
+	<span class="s1">const firstPart = parts[</span><span class="s4">0</span><span class="s1">];</span>
+	<span class="s1">let set;</span>
+	<span class="s2">if </span><span class="s1">(parts.length == </span><span class="s4">1</span><span class="s1">) {</span>
+		<span class="s1">set = handleLoneUnicodePropertyNameOrValue(firstPart);</span>
+	<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+		<span class="s3">// The pattern consists of two parts, i.e. `Property=Value`.</span>
+		<span class="s1">const property = unicodeMatchProperty(firstPart);</span>
+		<span class="s1">const value = unicodeMatchPropertyValue(property, parts[</span><span class="s4">1</span><span class="s1">]);</span>
+		<span class="s1">set = getUnicodePropertyValueSet(property, value);</span>
+	<span class="s1">}</span>
+	<span class="s2">if </span><span class="s1">(isNegative) {</span>
+		<span class="s2">if </span><span class="s1">(set.strings) {</span>
+			<span class="s2">throw new </span><span class="s1">Error(</span><span class="s0">'Cannot negate Unicode property of strings'</span><span class="s1">);</span>
+		<span class="s1">}</span>
+		<span class="s2">return </span><span class="s1">{</span>
+			<span class="s1">characters: UNICODE_SET.clone().remove(set.characters),</span>
+			<span class="s1">strings: </span><span class="s2">new </span><span class="s1">Set()</span>
+		<span class="s1">};</span>
+	<span class="s1">}</span>
+	<span class="s2">return </span><span class="s1">{</span>
+		<span class="s1">characters: set.characters.clone(),</span>
+		<span class="s1">strings: set.strings</span>
+			<span class="s3">// We need to escape strings like *️⃣ to make sure that they can be safely used in unions.</span>
+			<span class="s1">? </span><span class="s2">new </span><span class="s1">Set(set.strings.map(str =&gt; str.replace(SPECIAL_CHARS, </span><span class="s0">'</span><span class="s5">\\</span><span class="s0">$1'</span><span class="s1">)))</span>
+			<span class="s1">: </span><span class="s2">new </span><span class="s1">Set()</span>
+	<span class="s1">};</span>
+<span class="s1">};</span>
+
+<span class="s1">const getUnicodePropertyEscapeCharacterClassData = (property, isNegative) =&gt; {</span>
+	<span class="s1">const set = getUnicodePropertyEscapeSet(property, isNegative);</span>
+	<span class="s1">const data = getCharacterClassEmptyData();</span>
+	<span class="s1">data.singleChars = set.characters;</span>
+	<span class="s2">if </span><span class="s1">(set.strings.size &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+		<span class="s1">data.longStrings = set.strings;</span>
+		<span class="s1">data.maybeIncludesStrings = </span><span class="s2">true</span><span class="s1">;</span>
+	<span class="s1">}</span>
+	<span class="s2">return </span><span class="s1">data;</span>
+<span class="s1">};</span>
+
+<span class="s2">function </span><span class="s1">configNeedCaseFoldAscii() {</span>
+	<span class="s2">return </span><span class="s1">!!config.modifiersData.i;</span>
+<span class="s1">}</span>
+
+<span class="s2">function </span><span class="s1">configNeedCaseFoldUnicode() {</span>
+	<span class="s3">// config.modifiersData.i : undefined | false</span>
+	<span class="s2">if </span><span class="s1">(config.modifiersData.i === </span><span class="s2">false</span><span class="s1">) </span><span class="s2">return false</span><span class="s1">;</span>
+	<span class="s2">if </span><span class="s1">(!config.transform.unicodeFlag) </span><span class="s2">return false</span><span class="s1">;</span>
+	<span class="s2">return </span><span class="s1">Boolean(config.modifiersData.i || config.flags.ignoreCase);</span>
+<span class="s1">}</span>
+
+<span class="s3">// Given a range of code points, add any case-folded code points in that range</span>
+<span class="s3">// to a set.</span>
+<span class="s1">regenerate.prototype.iuAddRange = </span><span class="s2">function</span><span class="s1">(min, max) {</span>
+	<span class="s1">const $this = </span><span class="s2">this</span><span class="s1">;</span>
+	<span class="s2">do </span><span class="s1">{</span>
+		<span class="s1">const folded = caseFold(min, configNeedCaseFoldAscii(), configNeedCaseFoldUnicode());</span>
+		<span class="s2">if </span><span class="s1">(folded) {</span>
+			<span class="s1">$this.add(folded);</span>
+		<span class="s1">}</span>
+	<span class="s1">} </span><span class="s2">while </span><span class="s1">(++min &lt;= max);</span>
+	<span class="s2">return </span><span class="s1">$this;</span>
+<span class="s1">};</span>
+<span class="s1">regenerate.prototype.iuRemoveRange = </span><span class="s2">function</span><span class="s1">(min, max) {</span>
+	<span class="s1">const $this = </span><span class="s2">this</span><span class="s1">;</span>
+	<span class="s2">do </span><span class="s1">{</span>
+		<span class="s1">const folded = caseFold(min, configNeedCaseFoldAscii(), configNeedCaseFoldUnicode());</span>
+		<span class="s2">if </span><span class="s1">(folded) {</span>
+			<span class="s1">$this.remove(folded);</span>
+		<span class="s1">}</span>
+	<span class="s1">} </span><span class="s2">while </span><span class="s1">(++min &lt;= max);</span>
+	<span class="s2">return </span><span class="s1">$this;</span>
+<span class="s1">};</span>
+
+<span class="s1">const update = (item, pattern) =&gt; {</span>
+	<span class="s1">let tree = parse(pattern, config.useUnicodeFlag ? </span><span class="s0">'u' </span><span class="s1">: </span><span class="s0">''</span><span class="s1">, {</span>
+		<span class="s1">lookbehind: </span><span class="s2">true</span><span class="s1">,</span>
+		<span class="s1">namedGroups: </span><span class="s2">true</span><span class="s1">,</span>
+		<span class="s1">unicodePropertyEscape: </span><span class="s2">true</span><span class="s1">,</span>
+		<span class="s1">unicodeSet: </span><span class="s2">true</span><span class="s1">,</span>
+		<span class="s1">modifiers: </span><span class="s2">true</span><span class="s1">,</span>
+	<span class="s1">});</span>
+	<span class="s2">switch </span><span class="s1">(tree.type) {</span>
+		<span class="s2">case </span><span class="s0">'characterClass'</span><span class="s1">:</span>
+		<span class="s2">case </span><span class="s0">'group'</span><span class="s1">:</span>
+		<span class="s2">case </span><span class="s0">'value'</span><span class="s1">:</span>
+			<span class="s3">// No wrapping needed.</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">default</span><span class="s1">:</span>
+			<span class="s3">// Wrap the pattern in a non-capturing group.</span>
+			<span class="s1">tree = wrap(tree, pattern);</span>
+	<span class="s1">}</span>
+	<span class="s1">Object.assign(item, tree);</span>
+<span class="s1">};</span>
+
+<span class="s1">const wrap = (tree, pattern) =&gt; {</span>
+	<span class="s3">// Wrap the pattern in a non-capturing group.</span>
+	<span class="s2">return </span><span class="s1">{</span>
+		<span class="s0">'type'</span><span class="s1">: </span><span class="s0">'group'</span><span class="s1">,</span>
+		<span class="s0">'behavior'</span><span class="s1">: </span><span class="s0">'ignore'</span><span class="s1">,</span>
+		<span class="s0">'body'</span><span class="s1">: [tree],</span>
+		<span class="s0">'raw'</span><span class="s1">: `(?:${ pattern })`</span>
+	<span class="s1">};</span>
+<span class="s1">};</span>
+
+<span class="s1">const caseFold = (codePoint, includeAscii, includeUnicode) =&gt; {</span>
+	<span class="s1">let folded = (includeUnicode ? iuMappings.get(codePoint) : undefined) || [];</span>
+	<span class="s2">if </span><span class="s1">(</span><span class="s2">typeof </span><span class="s1">folded === </span><span class="s0">'number'</span><span class="s1">) folded = [folded];</span>
+	<span class="s2">if </span><span class="s1">(includeAscii) {</span>
+		<span class="s2">if </span><span class="s1">(codePoint &gt;= </span><span class="s4">0</span><span class="s1">x41 &amp;&amp; codePoint &lt;= </span><span class="s4">0</span><span class="s1">x5A) {</span>
+			<span class="s1">folded.push(codePoint + </span><span class="s4">0</span><span class="s1">x20);</span>
+		<span class="s1">} </span><span class="s2">else if </span><span class="s1">(codePoint &gt;= </span><span class="s4">0</span><span class="s1">x61 &amp;&amp; codePoint &lt;= </span><span class="s4">0</span><span class="s1">x7A) {</span>
+			<span class="s1">folded.push(codePoint - </span><span class="s4">0</span><span class="s1">x20);</span>
+		<span class="s1">}</span>
+	<span class="s1">}</span>
+	<span class="s2">return </span><span class="s1">folded.length == </span><span class="s4">0 </span><span class="s1">? </span><span class="s2">false </span><span class="s1">: folded;</span>
+<span class="s1">};</span>
+
+<span class="s1">const buildHandler = (action) =&gt; {</span>
+	<span class="s2">switch </span><span class="s1">(action) {</span>
+		<span class="s2">case </span><span class="s0">'union'</span><span class="s1">:</span>
+			<span class="s2">return </span><span class="s1">{</span>
+				<span class="s1">single: (data, cp) =&gt; {</span>
+					<span class="s1">data.singleChars.add(cp);</span>
+				<span class="s1">},</span>
+				<span class="s1">regSet: (data, set2) =&gt; {</span>
+					<span class="s1">data.singleChars.add(set2);</span>
+				<span class="s1">},</span>
+				<span class="s1">range: (data, start, end) =&gt; {</span>
+					<span class="s1">data.singleChars.addRange(start, end);</span>
+				<span class="s1">},</span>
+				<span class="s1">iuRange: (data, start, end) =&gt; {</span>
+					<span class="s1">data.singleChars.iuAddRange(start, end);</span>
+				<span class="s1">},</span>
+				<span class="s1">nested: (data, nestedData) =&gt; {</span>
+					<span class="s1">data.singleChars.add(nestedData.singleChars);</span>
+					<span class="s2">for </span><span class="s1">(const str of nestedData.longStrings) data.longStrings.add(str);</span>
+					<span class="s2">if </span><span class="s1">(nestedData.maybeIncludesStrings) data.maybeIncludesStrings = </span><span class="s2">true</span><span class="s1">;</span>
+				<span class="s1">}</span>
+			<span class="s1">};</span>
+		<span class="s2">case </span><span class="s0">'union-negative'</span><span class="s1">: {</span>
+			<span class="s1">const regSet = (data, set2) =&gt; {</span>
+				<span class="s1">data.singleChars = UNICODE_SET.clone().remove(set2).add(data.singleChars);</span>
+			<span class="s1">};</span>
+			<span class="s2">return </span><span class="s1">{</span>
+				<span class="s1">single: (data, cp) =&gt; {</span>
+					<span class="s1">const unicode = UNICODE_SET.clone();</span>
+					<span class="s1">data.singleChars = data.singleChars.contains(cp) ? unicode : unicode.remove(cp);</span>
+				<span class="s1">},</span>
+				<span class="s1">regSet: regSet,</span>
+				<span class="s1">range: (data, start, end) =&gt; {</span>
+					<span class="s1">data.singleChars = UNICODE_SET.clone().removeRange(start, end).add(data.singleChars);</span>
+				<span class="s1">},</span>
+				<span class="s1">iuRange: (data, start, end) =&gt; {</span>
+					<span class="s1">data.singleChars = UNICODE_SET.clone().iuRemoveRange(start, end).add(data.singleChars);</span>
+				<span class="s1">},</span>
+				<span class="s1">nested: (data, nestedData) =&gt; {</span>
+					<span class="s1">regSet(data, nestedData.singleChars);</span>
+					<span class="s2">if </span><span class="s1">(nestedData.maybeIncludesStrings) </span><span class="s2">throw new </span><span class="s1">Error(</span><span class="s0">'ASSERTION ERROR'</span><span class="s1">);</span>
+				<span class="s1">}</span>
+			<span class="s1">};</span>
+		<span class="s1">}</span>
+		<span class="s2">case </span><span class="s0">'intersection'</span><span class="s1">: {</span>
+			<span class="s1">const regSet = (data, set2) =&gt; {</span>
+				<span class="s2">if </span><span class="s1">(data.first) data.singleChars = set2;</span>
+				<span class="s2">else </span><span class="s1">data.singleChars.intersection(set2);</span>
+			<span class="s1">};</span>
+			<span class="s2">return </span><span class="s1">{</span>
+				<span class="s1">single: (data, cp) =&gt; {</span>
+					<span class="s1">data.singleChars = data.first || data.singleChars.contains(cp) ? regenerate(cp) : regenerate();</span>
+					<span class="s1">data.longStrings.clear();</span>
+					<span class="s1">data.maybeIncludesStrings = </span><span class="s2">false</span><span class="s1">;</span>
+				<span class="s1">},</span>
+				<span class="s1">regSet: (data, set) =&gt; {</span>
+					<span class="s1">regSet(data, set);</span>
+					<span class="s1">data.longStrings.clear();</span>
+					<span class="s1">data.maybeIncludesStrings = </span><span class="s2">false</span><span class="s1">;</span>
+				<span class="s1">},</span>
+				<span class="s1">range: (data, start, end) =&gt; {</span>
+					<span class="s2">if </span><span class="s1">(data.first) data.singleChars.addRange(start, end);</span>
+					<span class="s2">else </span><span class="s1">data.singleChars.intersection(regenerate().addRange(start, end));</span>
+					<span class="s1">data.longStrings.clear();</span>
+					<span class="s1">data.maybeIncludesStrings = </span><span class="s2">false</span><span class="s1">;</span>
+				<span class="s1">},</span>
+				<span class="s1">iuRange: (data, start, end) =&gt; {</span>
+					<span class="s2">if </span><span class="s1">(data.first) data.singleChars.iuAddRange(start, end);</span>
+					<span class="s2">else </span><span class="s1">data.singleChars.intersection(regenerate().iuAddRange(start, end));</span>
+					<span class="s1">data.longStrings.clear();</span>
+					<span class="s1">data.maybeIncludesStrings = </span><span class="s2">false</span><span class="s1">;</span>
+				<span class="s1">},</span>
+				<span class="s1">nested: (data, nestedData) =&gt; {</span>
+					<span class="s1">regSet(data, nestedData.singleChars);</span>
+
+					<span class="s2">if </span><span class="s1">(data.first) {</span>
+						<span class="s1">data.longStrings = nestedData.longStrings;</span>
+						<span class="s1">data.maybeIncludesStrings = nestedData.maybeIncludesStrings;</span>
+					<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+						<span class="s2">for </span><span class="s1">(const str of data.longStrings) {</span>
+							<span class="s2">if </span><span class="s1">(!nestedData.longStrings.has(str)) data.longStrings.</span><span class="s2">delete</span><span class="s1">(str);</span>
+						<span class="s1">}</span>
+						<span class="s2">if </span><span class="s1">(!nestedData.maybeIncludesStrings) data.maybeIncludesStrings = </span><span class="s2">false</span><span class="s1">;</span>
+					<span class="s1">}</span>
+				<span class="s1">}</span>
+			<span class="s1">};</span>
+		<span class="s1">}</span>
+		<span class="s2">case </span><span class="s0">'subtraction'</span><span class="s1">: {</span>
+			<span class="s1">const regSet = (data, set2) =&gt; {</span>
+				<span class="s2">if </span><span class="s1">(data.first) data.singleChars.add(set2);</span>
+				<span class="s2">else </span><span class="s1">data.singleChars.remove(set2);</span>
+			<span class="s1">};</span>
+			<span class="s2">return </span><span class="s1">{</span>
+				<span class="s1">single: (data, cp) =&gt; {</span>
+					<span class="s2">if </span><span class="s1">(data.first) data.singleChars.add(cp);</span>
+					<span class="s2">else </span><span class="s1">data.singleChars.remove(cp);</span>
+				<span class="s1">},</span>
+				<span class="s1">regSet: regSet,</span>
+				<span class="s1">range: (data, start, end) =&gt; {</span>
+					<span class="s2">if </span><span class="s1">(data.first) data.singleChars.addRange(start, end);</span>
+					<span class="s2">else </span><span class="s1">data.singleChars.removeRange(start, end);</span>
+				<span class="s1">},</span>
+				<span class="s1">iuRange: (data, start, end) =&gt; {</span>
+					<span class="s2">if </span><span class="s1">(data.first) data.singleChars.iuAddRange(start, end);</span>
+					<span class="s2">else </span><span class="s1">data.singleChars.iuRemoveRange(start, end);</span>
+				<span class="s1">},</span>
+				<span class="s1">nested: (data, nestedData) =&gt; {</span>
+					<span class="s1">regSet(data, nestedData.singleChars);</span>
+
+					<span class="s2">if </span><span class="s1">(data.first) {</span>
+						<span class="s1">data.longStrings = nestedData.longStrings;</span>
+						<span class="s1">data.maybeIncludesStrings = nestedData.maybeIncludesStrings;</span>
+					<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+						<span class="s2">for </span><span class="s1">(const str of data.longStrings) {</span>
+							<span class="s2">if </span><span class="s1">(nestedData.longStrings.has(str)) data.longStrings.</span><span class="s2">delete</span><span class="s1">(str);</span>
+						<span class="s1">}</span>
+					<span class="s1">}</span>
+				<span class="s1">}</span>
+			<span class="s1">};</span>
+		<span class="s1">}</span>
+		<span class="s3">// The `default` clause is only here as a safeguard; it should never be</span>
+		<span class="s3">// reached. Code coverage tools should ignore it.</span>
+		<span class="s3">/* istanbul ignore next */</span>
+		<span class="s2">default</span><span class="s1">:</span>
+			<span class="s2">throw new </span><span class="s1">Error(`Unknown set action: ${ characterClassItem.kind }`);</span>
+	<span class="s1">}</span>
+<span class="s1">};</span>
+
+<span class="s1">const getCharacterClassEmptyData = () =&gt; ({</span>
+	<span class="s1">transformed: config.transform.unicodeFlag,</span>
+	<span class="s1">singleChars: regenerate(),</span>
+	<span class="s1">longStrings: </span><span class="s2">new </span><span class="s1">Set(),</span>
+	<span class="s1">hasEmptyString: </span><span class="s2">false</span><span class="s1">,</span>
+	<span class="s1">first: </span><span class="s2">true</span><span class="s1">,</span>
+	<span class="s1">maybeIncludesStrings: </span><span class="s2">false</span>
+<span class="s1">});</span>
+
+<span class="s1">const maybeFold = (codePoint) =&gt; {</span>
+	<span class="s1">const caseFoldAscii = configNeedCaseFoldAscii();</span>
+	<span class="s1">const caseFoldUnicode = configNeedCaseFoldUnicode();</span>
+
+	<span class="s2">if </span><span class="s1">(caseFoldAscii || caseFoldUnicode) {</span>
+		<span class="s1">const folded = caseFold(codePoint, caseFoldAscii, caseFoldUnicode);</span>
+		<span class="s2">if </span><span class="s1">(folded) {</span>
+			<span class="s2">return </span><span class="s1">[codePoint, folded];</span>
+		<span class="s1">}</span>
+	<span class="s1">}</span>
+	<span class="s2">return </span><span class="s1">[codePoint];</span>
+<span class="s1">};</span>
+
+<span class="s1">const computeClassStrings = (classStrings, regenerateOptions) =&gt; {</span>
+	<span class="s1">let data = getCharacterClassEmptyData();</span>
+
+	<span class="s1">const caseFoldAscii = configNeedCaseFoldAscii();</span>
+	<span class="s1">const caseFoldUnicode = configNeedCaseFoldUnicode();</span>
+
+	<span class="s2">for </span><span class="s1">(const string of classStrings.strings) {</span>
+		<span class="s2">if </span><span class="s1">(string.characters.length === </span><span class="s4">1</span><span class="s1">) {</span>
+			<span class="s1">maybeFold(string.characters[</span><span class="s4">0</span><span class="s1">].codePoint).forEach((cp) =&gt; {</span>
+				<span class="s1">data.singleChars.add(cp);</span>
+			<span class="s1">});</span>
+		<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+			<span class="s1">let stringifiedString;</span>
+			<span class="s2">if </span><span class="s1">(caseFoldUnicode || caseFoldAscii) {</span>
+				<span class="s1">stringifiedString = </span><span class="s0">''</span><span class="s1">;</span>
+				<span class="s2">for </span><span class="s1">(const ch of string.characters) {</span>
+					<span class="s1">let set = regenerate(ch.codePoint);</span>
+					<span class="s1">const folded = maybeFold(ch.codePoint);</span>
+					<span class="s2">if </span><span class="s1">(folded) set.add(folded);</span>
+					<span class="s1">stringifiedString += set.toString(regenerateOptions);</span>
+				<span class="s1">}</span>
+			<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+				<span class="s1">stringifiedString = string.characters.map(ch =&gt; generate(ch)).join(</span><span class="s0">''</span><span class="s1">)</span>
+			<span class="s1">}</span>
+
+			<span class="s1">data.longStrings.add(stringifiedString);</span>
+			<span class="s1">data.maybeIncludesStrings = </span><span class="s2">true</span><span class="s1">;</span>
+		<span class="s1">}</span>
+	<span class="s1">}</span>
+
+	<span class="s2">return </span><span class="s1">data;</span>
+<span class="s1">}</span>
+
+<span class="s1">const computeCharacterClass = (characterClassItem, regenerateOptions) =&gt; {</span>
+	<span class="s1">let data = getCharacterClassEmptyData();</span>
+
+	<span class="s1">let handlePositive;</span>
+	<span class="s1">let handleNegative;</span>
+
+	<span class="s2">switch </span><span class="s1">(characterClassItem.kind) {</span>
+		<span class="s2">case </span><span class="s0">'union'</span><span class="s1">:</span>
+			<span class="s1">handlePositive = buildHandler(</span><span class="s0">'union'</span><span class="s1">);</span>
+			<span class="s1">handleNegative = buildHandler(</span><span class="s0">'union-negative'</span><span class="s1">);</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'intersection'</span><span class="s1">:</span>
+			<span class="s1">handlePositive = buildHandler(</span><span class="s0">'intersection'</span><span class="s1">);</span>
+			<span class="s1">handleNegative = buildHandler(</span><span class="s0">'subtraction'</span><span class="s1">);</span>
+			<span class="s2">if </span><span class="s1">(config.transform.unicodeSetsFlag) data.transformed = </span><span class="s2">true</span><span class="s1">;</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'subtraction'</span><span class="s1">:</span>
+			<span class="s1">handlePositive = buildHandler(</span><span class="s0">'subtraction'</span><span class="s1">);</span>
+			<span class="s1">handleNegative = buildHandler(</span><span class="s0">'intersection'</span><span class="s1">);</span>
+			<span class="s2">if </span><span class="s1">(config.transform.unicodeSetsFlag) data.transformed = </span><span class="s2">true</span><span class="s1">;</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s3">// The `default` clause is only here as a safeguard; it should never be</span>
+		<span class="s3">// reached. Code coverage tools should ignore it.</span>
+		<span class="s3">/* istanbul ignore next */</span>
+		<span class="s2">default</span><span class="s1">:</span>
+			<span class="s2">throw new </span><span class="s1">Error(`Unknown character class kind: ${ characterClassItem.kind }`);</span>
+	<span class="s1">}</span>
+
+	<span class="s1">const caseFoldAscii = configNeedCaseFoldAscii();</span>
+	<span class="s1">const caseFoldUnicode = configNeedCaseFoldUnicode();</span>
+
+	<span class="s2">for </span><span class="s1">(const item of characterClassItem.body) {</span>
+		<span class="s2">switch </span><span class="s1">(item.type) {</span>
+			<span class="s2">case </span><span class="s0">'value'</span><span class="s1">:</span>
+				<span class="s1">maybeFold(item.codePoint).forEach((cp) =&gt; {</span>
+					<span class="s1">handlePositive.single(data, cp);</span>
+				<span class="s1">});</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">case </span><span class="s0">'characterClassRange'</span><span class="s1">:</span>
+				<span class="s1">const min = item.min.codePoint;</span>
+				<span class="s1">const max = item.max.codePoint;</span>
+				<span class="s1">handlePositive.range(data, min, max);</span>
+				<span class="s2">if </span><span class="s1">(caseFoldAscii || caseFoldUnicode) {</span>
+					<span class="s1">handlePositive.iuRange(data, min, max);</span>
+					<span class="s1">data.transformed = </span><span class="s2">true</span><span class="s1">;</span>
+				<span class="s1">}</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">case </span><span class="s0">'characterClassEscape'</span><span class="s1">:</span>
+				<span class="s1">handlePositive.regSet(data, getCharacterClassEscapeSet(</span>
+					<span class="s1">item.value,</span>
+					<span class="s1">config.flags.unicode,</span>
+					<span class="s1">config.flags.ignoreCase</span>
+				<span class="s1">));</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">case </span><span class="s0">'unicodePropertyEscape'</span><span class="s1">:</span>
+				<span class="s1">const nestedData = getUnicodePropertyEscapeCharacterClassData(item.value, item.negative);</span>
+				<span class="s1">handlePositive.nested(data, nestedData);</span>
+				<span class="s1">data.transformed =</span>
+					<span class="s1">data.transformed ||</span>
+					<span class="s1">config.transform.unicodePropertyEscapes ||</span>
+					<span class="s1">(config.transform.unicodeSetsFlag &amp;&amp; nestedData.maybeIncludesStrings);</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">case </span><span class="s0">'characterClass'</span><span class="s1">:</span>
+				<span class="s1">const handler = item.negative ? handleNegative : handlePositive;</span>
+				<span class="s1">const res = computeCharacterClass(item, regenerateOptions);</span>
+				<span class="s1">handler.nested(data, res);</span>
+				<span class="s1">data.transformed = </span><span class="s2">true</span><span class="s1">;</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">case </span><span class="s0">'classStrings'</span><span class="s1">:</span>
+				<span class="s1">handlePositive.nested(data, computeClassStrings(item, regenerateOptions));</span>
+				<span class="s1">data.transformed = </span><span class="s2">true</span><span class="s1">;</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s3">// The `default` clause is only here as a safeguard; it should never be</span>
+			<span class="s3">// reached. Code coverage tools should ignore it.</span>
+			<span class="s3">/* istanbul ignore next */</span>
+			<span class="s2">default</span><span class="s1">:</span>
+				<span class="s2">throw new </span><span class="s1">Error(`Unknown term type: ${ item.type }`);</span>
+		<span class="s1">}</span>
+
+		<span class="s1">data.first = </span><span class="s2">false</span><span class="s1">;</span>
+	<span class="s1">}</span>
+
+	<span class="s2">if </span><span class="s1">(characterClassItem.negative &amp;&amp; data.maybeIncludesStrings) {</span>
+		<span class="s2">throw new </span><span class="s1">SyntaxError(</span><span class="s0">'Cannot negate set containing strings'</span><span class="s1">);</span>
+	<span class="s1">}</span>
+
+	<span class="s2">return </span><span class="s1">data;</span>
+<span class="s1">}</span>
+
+<span class="s1">const processCharacterClass = (</span>
+	<span class="s1">characterClassItem,</span>
+	<span class="s1">regenerateOptions,</span>
+	<span class="s1">computed = computeCharacterClass(characterClassItem, regenerateOptions)</span>
+<span class="s1">) =&gt; {</span>
+	<span class="s1">const negative = characterClassItem.negative;</span>
+	<span class="s1">const { singleChars, transformed, longStrings } = computed;</span>
+	<span class="s2">if </span><span class="s1">(transformed) {</span>
+		<span class="s1">const setStr = singleChars.toString(regenerateOptions);</span>
+
+		<span class="s2">if </span><span class="s1">(negative) {</span>
+			<span class="s2">if </span><span class="s1">(config.useUnicodeFlag) {</span>
+				<span class="s1">update(characterClassItem, `[^${setStr[</span><span class="s4">0</span><span class="s1">] === </span><span class="s0">'[' </span><span class="s1">? setStr.slice(</span><span class="s4">1</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">) : setStr}]`)</span>
+			<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+				<span class="s2">if </span><span class="s1">(config.flags.unicode) {</span>
+					<span class="s2">if </span><span class="s1">(config.flags.ignoreCase) {</span>
+						<span class="s1">const astralCharsSet = singleChars.clone().intersection(ASTRAL_SET);</span>
+						<span class="s3">// Assumption: singleChars do not contain lone surrogates.</span>
+						<span class="s3">// Regex like /[^\ud800]/u is not supported</span>
+						<span class="s1">const surrogateOrBMPSetStr = singleChars</span>
+							<span class="s1">.clone()</span>
+							<span class="s1">.remove(astralCharsSet)</span>
+							<span class="s1">.addRange(</span><span class="s4">0</span><span class="s1">xd800, </span><span class="s4">0</span><span class="s1">xdfff)</span>
+							<span class="s1">.toString({ bmpOnly: </span><span class="s2">true </span><span class="s1">});</span>
+						<span class="s3">// Don't generate negative lookahead for astral characters</span>
+						<span class="s3">// because the case folding is not working anyway as we break</span>
+						<span class="s3">// code points into surrogate pairs.</span>
+						<span class="s1">const astralNegativeSetStr = ASTRAL_SET</span>
+							<span class="s1">.clone()</span>
+							<span class="s1">.remove(astralCharsSet)</span>
+							<span class="s1">.toString(regenerateOptions);</span>
+						<span class="s3">// The transform here does not support lone surrogates.</span>
+						<span class="s1">update(</span>
+							<span class="s1">characterClassItem,</span>
+							<span class="s1">`(?!${surrogateOrBMPSetStr})[\\s\\S]|${astralNegativeSetStr}`</span>
+						<span class="s1">);</span>
+					<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+						<span class="s3">// Generate negative set directly when case folding is not involved.</span>
+						<span class="s1">update(</span>
+							<span class="s1">characterClassItem,</span>
+							<span class="s1">UNICODE_SET.clone().remove(singleChars).toString(regenerateOptions)</span>
+						<span class="s1">);</span>
+					<span class="s1">}</span>
+				<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+					<span class="s1">update(characterClassItem, `(?!${setStr})[\\s\\S]`);</span>
+				<span class="s1">}</span>
+			<span class="s1">}</span>
+		<span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+			<span class="s1">const hasEmptyString = longStrings.has(</span><span class="s0">''</span><span class="s1">);</span>
+			<span class="s1">const pieces = Array.from(longStrings).sort((a, b) =&gt; b.length - a.length);</span>
+
+			<span class="s2">if </span><span class="s1">(setStr !== </span><span class="s0">'[]' </span><span class="s1">|| longStrings.size === </span><span class="s4">0</span><span class="s1">) {</span>
+				<span class="s1">pieces.splice(pieces.length - (hasEmptyString ? </span><span class="s4">1 </span><span class="s1">: </span><span class="s4">0</span><span class="s1">), </span><span class="s4">0</span><span class="s1">, setStr);</span>
+			<span class="s1">}</span>
+
+			<span class="s1">update(characterClassItem, pieces.join(</span><span class="s0">'|'</span><span class="s1">));</span>
+		<span class="s1">}</span>
+	<span class="s1">}</span>
+	<span class="s2">return </span><span class="s1">characterClassItem;</span>
+<span class="s1">};</span>
+
+<span class="s1">const assertNoUnmatchedReferences = (groups) =&gt; {</span>
+	<span class="s1">const unmatchedReferencesNames = Object.keys(groups.unmatchedReferences);</span>
+	<span class="s2">if </span><span class="s1">(unmatchedReferencesNames.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+		<span class="s2">throw new </span><span class="s1">Error(`Unknown group names: ${unmatchedReferencesNames}`);</span>
+	<span class="s1">}</span>
+<span class="s1">};</span>
+
+<span class="s1">const processModifiers = (item, regenerateOptions, groups) =&gt; {</span>
+	<span class="s1">const enabling = item.modifierFlags.enabling;</span>
+	<span class="s1">const disabling = item.modifierFlags.disabling;</span>
+
+	<span class="s2">delete </span><span class="s1">item.modifierFlags;</span>
+	<span class="s1">item.behavior = </span><span class="s0">'ignore'</span><span class="s1">;</span>
+
+	<span class="s1">const oldData = Object.assign({}, config.modifiersData);</span>
+
+	<span class="s1">enabling.split(</span><span class="s0">''</span><span class="s1">).forEach(flag =&gt; {</span>
+		<span class="s1">config.modifiersData[flag] = </span><span class="s2">true</span><span class="s1">;</span>
+	<span class="s1">});</span>
+	<span class="s1">disabling.split(</span><span class="s0">''</span><span class="s1">).forEach(flag =&gt; {</span>
+		<span class="s1">config.modifiersData[flag] = </span><span class="s2">false</span><span class="s1">;</span>
+	<span class="s1">});</span>
+
+	<span class="s1">item.body = item.body.map(term =&gt; {</span>
+		<span class="s2">return </span><span class="s1">processTerm(term, regenerateOptions, groups);</span>
+	<span class="s1">});</span>
+
+	<span class="s1">config.modifiersData = oldData;</span>
+
+	<span class="s2">return </span><span class="s1">item;</span>
+<span class="s1">}</span>
+
+<span class="s1">const processTerm = (item, regenerateOptions, groups) =&gt; {</span>
+	<span class="s2">switch </span><span class="s1">(item.type) {</span>
+		<span class="s2">case </span><span class="s0">'dot'</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">(config.transform.unicodeFlag) {</span>
+				<span class="s1">update(</span>
+					<span class="s1">item,</span>
+					<span class="s1">getUnicodeDotSet(config.flags.dotAll || config.modifiersData.s).toString(regenerateOptions)</span>
+				<span class="s1">);</span>
+			<span class="s1">} </span><span class="s2">else if </span><span class="s1">(config.transform.dotAllFlag || config.modifiersData.s) {</span>
+				<span class="s3">// TODO: consider changing this at the regenerate level.</span>
+				<span class="s1">update(item, </span><span class="s0">'[</span><span class="s5">\\</span><span class="s0">s</span><span class="s5">\\</span><span class="s0">S]'</span><span class="s1">);</span>
+			<span class="s1">}</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'characterClass'</span><span class="s1">:</span>
+			<span class="s1">item = processCharacterClass(item, regenerateOptions);</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'unicodePropertyEscape'</span><span class="s1">:</span>
+			<span class="s1">const data = getUnicodePropertyEscapeCharacterClassData(item.value, item.negative);</span>
+			<span class="s2">if </span><span class="s1">(data.maybeIncludesStrings) {</span>
+				<span class="s2">if </span><span class="s1">(!config.flags.unicodeSets) {</span>
+					<span class="s2">throw new </span><span class="s1">Error(</span>
+						<span class="s0">'Properties of strings are only supported when using the unicodeSets (v) flag.'</span>
+					<span class="s1">);</span>
+				<span class="s1">}</span>
+				<span class="s2">if </span><span class="s1">(config.transform.unicodeSetsFlag) {</span>
+					<span class="s1">data.transformed = </span><span class="s2">true</span><span class="s1">;</span>
+					<span class="s1">item = processCharacterClass(item, regenerateOptions, data);</span>
+				<span class="s1">}</span>
+			<span class="s1">} </span><span class="s2">else if </span><span class="s1">(config.transform.unicodePropertyEscapes) {</span>
+				<span class="s1">update(</span>
+					<span class="s1">item,</span>
+					<span class="s1">data.singleChars.toString(regenerateOptions)</span>
+				<span class="s1">);</span>
+			<span class="s1">}</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'characterClassEscape'</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">(config.transform.unicodeFlag) {</span>
+				<span class="s1">update(</span>
+					<span class="s1">item,</span>
+					<span class="s1">getCharacterClassEscapeSet(</span>
+						<span class="s1">item.value,</span>
+						<span class="s3">/* config.transform.unicodeFlag implies config.flags.unicode */ </span><span class="s2">true</span><span class="s1">,</span>
+						<span class="s1">config.flags.ignoreCase</span>
+					<span class="s1">).toString(regenerateOptions)</span>
+				<span class="s1">);</span>
+			<span class="s1">}</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'group'</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">(item.behavior == </span><span class="s0">'normal'</span><span class="s1">) {</span>
+				<span class="s1">groups.lastIndex++;</span>
+			<span class="s1">}</span>
+			<span class="s2">if </span><span class="s1">(item.name) {</span>
+				<span class="s1">const name = item.name.value;</span>
+
+				<span class="s2">if </span><span class="s1">(groups.namesConflicts[name]) {</span>
+					<span class="s2">throw new </span><span class="s1">Error(</span>
+						<span class="s1">`Group </span><span class="s0">'${ name }' </span><span class="s1">has already been defined </span><span class="s2">in this </span><span class="s1">context.`</span>
+					<span class="s1">);</span>
+				<span class="s1">}</span>
+				<span class="s1">groups.namesConflicts[name] = </span><span class="s2">true</span><span class="s1">;</span>
+
+				<span class="s2">if </span><span class="s1">(config.transform.namedGroups) {</span>
+					<span class="s2">delete </span><span class="s1">item.name;</span>
+				<span class="s1">}</span>
+
+				<span class="s1">const index = groups.lastIndex;</span>
+				<span class="s2">if </span><span class="s1">(!groups.names[name]) {</span>
+					<span class="s1">groups.names[name] = [];</span>
+				<span class="s1">}</span>
+				<span class="s1">groups.names[name].push(index);</span>
+
+				<span class="s2">if </span><span class="s1">(groups.onNamedGroup) {</span>
+					<span class="s1">groups.onNamedGroup.call(</span><span class="s2">null</span><span class="s1">, name, index);</span>
+				<span class="s1">}</span>
+
+				<span class="s2">if </span><span class="s1">(groups.unmatchedReferences[name]) {</span>
+					<span class="s2">delete </span><span class="s1">groups.unmatchedReferences[name];</span>
+				<span class="s1">}</span>
+			<span class="s1">}</span>
+			<span class="s2">if </span><span class="s1">(item.modifierFlags &amp;&amp; config.transform.modifiers) {</span>
+				<span class="s2">return </span><span class="s1">processModifiers(item, regenerateOptions, groups);</span>
+			<span class="s1">}</span>
+			<span class="s3">/* falls through */</span>
+		<span class="s2">case </span><span class="s0">'quantifier'</span><span class="s1">:</span>
+			<span class="s1">item.body = item.body.map(term =&gt; {</span>
+				<span class="s2">return </span><span class="s1">processTerm(term, regenerateOptions, groups);</span>
+			<span class="s1">});</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'disjunction'</span><span class="s1">:</span>
+			<span class="s1">const outerNamesConflicts = groups.namesConflicts;</span>
+			<span class="s1">item.body = item.body.map(term =&gt; {</span>
+				<span class="s1">groups.namesConflicts = Object.create(outerNamesConflicts);</span>
+				<span class="s2">return </span><span class="s1">processTerm(term, regenerateOptions, groups);</span>
+			<span class="s1">});</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'alternative'</span><span class="s1">:</span>
+			<span class="s1">item.body = flatMap(item.body, term =&gt; {</span>
+				<span class="s1">const res = processTerm(term, regenerateOptions, groups);</span>
+				<span class="s3">// Alternatives cannot contain alternatives; flatten them.</span>
+				<span class="s2">return </span><span class="s1">res.type === </span><span class="s0">'alternative' </span><span class="s1">? res.body : res;</span>
+			<span class="s1">});</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'value'</span><span class="s1">:</span>
+			<span class="s1">const codePoint = item.codePoint;</span>
+			<span class="s1">const set = regenerate(codePoint);</span>
+			<span class="s1">const folded = maybeFold(codePoint);</span>
+			<span class="s1">set.add(folded);</span>
+			<span class="s1">update(item, set.toString(regenerateOptions));</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'reference'</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">(item.name) {</span>
+				<span class="s1">const name = item.name.value;</span>
+				<span class="s1">const indexes = groups.names[name];</span>
+				<span class="s2">if </span><span class="s1">(!indexes) {</span>
+					<span class="s1">groups.unmatchedReferences[name] = </span><span class="s2">true</span><span class="s1">;</span>
+				<span class="s1">}</span>
+
+				<span class="s2">if </span><span class="s1">(config.transform.namedGroups) {</span>
+					<span class="s2">if </span><span class="s1">(indexes) {</span>
+						<span class="s1">const body = indexes.map(index =&gt; ({</span>
+							<span class="s0">'type'</span><span class="s1">: </span><span class="s0">'reference'</span><span class="s1">,</span>
+							<span class="s0">'matchIndex'</span><span class="s1">: index,</span>
+							<span class="s0">'raw'</span><span class="s1">: </span><span class="s0">'</span><span class="s5">\\</span><span class="s0">' </span><span class="s1">+ index,</span>
+						<span class="s1">}));</span>
+						<span class="s2">if </span><span class="s1">(body.length === </span><span class="s4">1</span><span class="s1">) {</span>
+							<span class="s2">return </span><span class="s1">body[</span><span class="s4">0</span><span class="s1">];</span>
+						<span class="s1">}</span>
+						<span class="s2">return </span><span class="s1">{</span>
+							<span class="s0">'type'</span><span class="s1">: </span><span class="s0">'alternative'</span><span class="s1">,</span>
+							<span class="s0">'body'</span><span class="s1">: body,</span>
+							<span class="s0">'raw'</span><span class="s1">: body.map(term =&gt; term.raw).join(</span><span class="s0">''</span><span class="s1">),</span>
+						<span class="s1">};</span>
+					<span class="s1">}</span>
+
+					<span class="s3">// This named reference comes before the group where it’s defined,</span>
+					<span class="s3">// so it’s always an empty match.</span>
+					<span class="s2">return </span><span class="s1">{</span>
+						<span class="s0">'type'</span><span class="s1">: </span><span class="s0">'group'</span><span class="s1">,</span>
+						<span class="s0">'behavior'</span><span class="s1">: </span><span class="s0">'ignore'</span><span class="s1">,</span>
+						<span class="s0">'body'</span><span class="s1">: [],</span>
+						<span class="s0">'raw'</span><span class="s1">: </span><span class="s0">'(?:)'</span><span class="s1">,</span>
+					<span class="s1">};</span>
+				<span class="s1">}</span>
+			<span class="s1">}</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s2">case </span><span class="s0">'anchor'</span><span class="s1">:</span>
+			<span class="s2">if </span><span class="s1">(config.modifiersData.m) {</span>
+				<span class="s2">if </span><span class="s1">(item.kind == </span><span class="s0">'start'</span><span class="s1">) {</span>
+					<span class="s1">update(item, `(?:^|(?&lt;=${NEWLINE_SET.toString()}))`);</span>
+				<span class="s1">} </span><span class="s2">else if </span><span class="s1">(item.kind == </span><span class="s0">'end'</span><span class="s1">) {</span>
+					<span class="s1">update(item, `(?:$|(?=${NEWLINE_SET.toString()}))`);</span>
+				<span class="s1">}</span>
+			<span class="s1">}</span>
+		<span class="s2">case </span><span class="s0">'empty'</span><span class="s1">:</span>
+			<span class="s3">// Nothing to do here.</span>
+			<span class="s2">break</span><span class="s1">;</span>
+		<span class="s3">// The `default` clause is only here as a safeguard; it should never be</span>
+		<span class="s3">// reached. Code coverage tools should ignore it.</span>
+		<span class="s3">/* istanbul ignore next */</span>
+		<span class="s2">default</span><span class="s1">:</span>
+			<span class="s2">throw new </span><span class="s1">Error(`Unknown term type: ${ item.type }`);</span>
+	<span class="s1">}</span>
+	<span class="s2">return </span><span class="s1">item;</span>
+<span class="s1">};</span>
+
+<span class="s1">const config = {</span>
+	<span class="s0">'flags'</span><span class="s1">: {</span>
+		<span class="s0">'ignoreCase'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'unicode'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'unicodeSets'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'dotAll'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'multiline'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+	<span class="s1">},</span>
+	<span class="s0">'transform'</span><span class="s1">: {</span>
+		<span class="s0">'dotAllFlag'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'unicodeFlag'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'unicodeSetsFlag'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'unicodePropertyEscapes'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'namedGroups'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+		<span class="s0">'modifiers'</span><span class="s1">: </span><span class="s2">false</span><span class="s1">,</span>
+	<span class="s1">},</span>
+	<span class="s0">'modifiersData'</span><span class="s1">: {</span>
+		<span class="s0">'i'</span><span class="s1">: undefined,</span>
+		<span class="s0">'s'</span><span class="s1">: undefined,</span>
+		<span class="s0">'m'</span><span class="s1">: undefined,</span>
+	<span class="s1">},</span>
+	<span class="s1">get useUnicodeFlag() {</span>
+		<span class="s2">return </span><span class="s1">(</span><span class="s2">this</span><span class="s1">.flags.unicode || </span><span class="s2">this</span><span class="s1">.flags.unicodeSets) &amp;&amp; !</span><span class="s2">this</span><span class="s1">.transform.unicodeFlag;</span>
+	<span class="s1">}</span>
+<span class="s1">};</span>
+
+<span class="s1">const validateOptions = (options) =&gt; {</span>
+	<span class="s2">if </span><span class="s1">(!options) </span><span class="s2">return</span><span class="s1">;</span>
+
+	<span class="s2">for </span><span class="s1">(const key of Object.keys(options)) {</span>
+		<span class="s1">const value = options[key];</span>
+		<span class="s2">switch </span><span class="s1">(key) {</span>
+			<span class="s2">case </span><span class="s0">'dotAllFlag'</span><span class="s1">:</span>
+			<span class="s2">case </span><span class="s0">'unicodeFlag'</span><span class="s1">:</span>
+			<span class="s2">case </span><span class="s0">'unicodePropertyEscapes'</span><span class="s1">:</span>
+			<span class="s2">case </span><span class="s0">'namedGroups'</span><span class="s1">:</span>
+				<span class="s2">if </span><span class="s1">(value != </span><span class="s2">null </span><span class="s1">&amp;&amp; value !== </span><span class="s2">false </span><span class="s1">&amp;&amp; value !== </span><span class="s0">'transform'</span><span class="s1">) {</span>
+					<span class="s2">throw new </span><span class="s1">Error(`.${key} must be </span><span class="s2">false </span><span class="s1">(</span><span class="s2">default</span><span class="s1">) or </span><span class="s0">'transform'</span><span class="s1">.`);</span>
+				<span class="s1">}</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">case </span><span class="s0">'modifiers'</span><span class="s1">:</span>
+			<span class="s2">case </span><span class="s0">'unicodeSetsFlag'</span><span class="s1">:</span>
+				<span class="s2">if </span><span class="s1">(value != </span><span class="s2">null </span><span class="s1">&amp;&amp; value !== </span><span class="s2">false </span><span class="s1">&amp;&amp; value !== </span><span class="s0">'parse' </span><span class="s1">&amp;&amp; value !== </span><span class="s0">'transform'</span><span class="s1">) {</span>
+					<span class="s2">throw new </span><span class="s1">Error(`.${key} must be </span><span class="s2">false </span><span class="s1">(</span><span class="s2">default</span><span class="s1">), </span><span class="s0">'parse' </span><span class="s1">or </span><span class="s0">'transform'</span><span class="s1">.`);</span>
+				<span class="s1">}</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">case </span><span class="s0">'onNamedGroup'</span><span class="s1">:</span>
+			<span class="s2">case </span><span class="s0">'onNewFlags'</span><span class="s1">:</span>
+				<span class="s2">if </span><span class="s1">(value != </span><span class="s2">null </span><span class="s1">&amp;&amp; </span><span class="s2">typeof </span><span class="s1">value !== </span><span class="s0">'function'</span><span class="s1">) {</span>
+					<span class="s2">throw new </span><span class="s1">Error(`.${key} must be a </span><span class="s2">function</span><span class="s1">.`);</span>
+				<span class="s1">}</span>
+				<span class="s2">break</span><span class="s1">;</span>
+			<span class="s2">default</span><span class="s1">:</span>
+				<span class="s2">throw new </span><span class="s1">Error(`.${key} is not a valid regexpu-core option.`);</span>
+		<span class="s1">}</span>
+	<span class="s1">}</span>
+<span class="s1">};</span>
+
+<span class="s1">const hasFlag = (flags, flag) =&gt; flags ? flags.includes(flag) : </span><span class="s2">false</span><span class="s1">;</span>
+<span class="s1">const transform = (options, name) =&gt; options ? options[name] === </span><span class="s0">'transform' </span><span class="s1">: </span><span class="s2">false</span><span class="s1">;</span>
+
+<span class="s1">const rewritePattern = (pattern, flags, options) =&gt; {</span>
+	<span class="s1">validateOptions(options);</span>
+
+	<span class="s1">config.flags.unicode = hasFlag(flags, </span><span class="s0">'u'</span><span class="s1">);</span>
+	<span class="s1">config.flags.unicodeSets = hasFlag(flags, </span><span class="s0">'v'</span><span class="s1">);</span>
+	<span class="s1">config.flags.ignoreCase = hasFlag(flags, </span><span class="s0">'i'</span><span class="s1">);</span>
+	<span class="s1">config.flags.dotAll = hasFlag(flags, </span><span class="s0">'s'</span><span class="s1">);</span>
+	<span class="s1">config.flags.multiline = hasFlag(flags, </span><span class="s0">'m'</span><span class="s1">);</span>
+
+	<span class="s1">config.transform.dotAllFlag = config.flags.dotAll &amp;&amp; transform(options, </span><span class="s0">'dotAllFlag'</span><span class="s1">);</span>
+	<span class="s1">config.transform.unicodeFlag = (config.flags.unicode || config.flags.unicodeSets) &amp;&amp; transform(options, </span><span class="s0">'unicodeFlag'</span><span class="s1">);</span>
+	<span class="s1">config.transform.unicodeSetsFlag = config.flags.unicodeSets &amp;&amp; transform(options, </span><span class="s0">'unicodeSetsFlag'</span><span class="s1">);</span>
+
+	<span class="s3">// unicodeFlag: 'transform' implies unicodePropertyEscapes: 'transform'</span>
+	<span class="s1">config.transform.unicodePropertyEscapes = config.flags.unicode &amp;&amp; (</span>
+		<span class="s1">transform(options, </span><span class="s0">'unicodeFlag'</span><span class="s1">) || transform(options, </span><span class="s0">'unicodePropertyEscapes'</span><span class="s1">)</span>
+	<span class="s1">);</span>
+	<span class="s1">config.transform.namedGroups = transform(options, </span><span class="s0">'namedGroups'</span><span class="s1">);</span>
+	<span class="s1">config.transform.modifiers = transform(options, </span><span class="s0">'modifiers'</span><span class="s1">);</span>
+
+	<span class="s1">config.modifiersData.i = undefined;</span>
+	<span class="s1">config.modifiersData.s = undefined;</span>
+	<span class="s1">config.modifiersData.m = undefined;</span>
+
+	<span class="s1">const regjsparserFeatures = {</span>
+		<span class="s0">'unicodeSet'</span><span class="s1">: Boolean(options &amp;&amp; options.unicodeSetsFlag),</span>
+		<span class="s0">'modifiers'</span><span class="s1">: Boolean(options &amp;&amp; options.modifiers),</span>
+
+		<span class="s3">// Enable every stable RegExp feature by default</span>
+		<span class="s0">'unicodePropertyEscape'</span><span class="s1">: </span><span class="s2">true</span><span class="s1">,</span>
+		<span class="s0">'namedGroups'</span><span class="s1">: </span><span class="s2">true</span><span class="s1">,</span>
+		<span class="s0">'lookbehind'</span><span class="s1">: </span><span class="s2">true</span><span class="s1">,</span>
+	<span class="s1">};</span>
+
+	<span class="s1">const regenerateOptions = {</span>
+		<span class="s0">'hasUnicodeFlag'</span><span class="s1">: config.useUnicodeFlag,</span>
+		<span class="s0">'bmpOnly'</span><span class="s1">: !config.flags.unicode</span>
+	<span class="s1">};</span>
+
+	<span class="s1">const groups = {</span>
+		<span class="s0">'onNamedGroup'</span><span class="s1">: options &amp;&amp; options.onNamedGroup,</span>
+		<span class="s0">'lastIndex'</span><span class="s1">: </span><span class="s4">0</span><span class="s1">,</span>
+		<span class="s0">'names'</span><span class="s1">: Object.create(</span><span class="s2">null</span><span class="s1">), </span><span class="s3">// { [name]: Array&lt;index&gt; }</span>
+		<span class="s0">'namesConflicts'</span><span class="s1">: Object.create(</span><span class="s2">null</span><span class="s1">), </span><span class="s3">// { [name]: true }</span>
+		<span class="s0">'unmatchedReferences'</span><span class="s1">: Object.create(</span><span class="s2">null</span><span class="s1">) </span><span class="s3">// { [name]: true }</span>
+	<span class="s1">};</span>
+
+	<span class="s1">const tree = parse(pattern, flags, regjsparserFeatures);</span>
+
+	<span class="s2">if </span><span class="s1">(config.transform.modifiers) {</span>
+		<span class="s2">if </span><span class="s1">(/\(\?[a-z]*-[a-z]+:/.test(pattern)) {</span>
+			<span class="s3">// the pattern _likely_ contain inline disabled modifiers</span>
+			<span class="s3">// we need to traverse to make sure that they are actually modifiers and to collect them</span>
+			<span class="s1">const allDisabledModifiers = Object.create(</span><span class="s2">null</span><span class="s1">)</span>
+			<span class="s1">const itemStack = [tree];</span>
+			<span class="s1">let node;</span>
+			<span class="s2">while </span><span class="s1">(node = itemStack.pop(), node != undefined) {</span>
+				<span class="s2">if </span><span class="s1">(Array.isArray(node)) {</span>
+					<span class="s1">Array.prototype.push.apply(itemStack, node);</span>
+				<span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s2">typeof </span><span class="s1">node == </span><span class="s0">'object' </span><span class="s1">&amp;&amp; node != </span><span class="s2">null</span><span class="s1">) {</span>
+					<span class="s2">for </span><span class="s1">(const key of Object.keys(node)) {</span>
+						<span class="s1">const value = node[key];</span>
+						<span class="s2">if </span><span class="s1">(key == </span><span class="s0">'modifierFlags'</span><span class="s1">) {</span>
+							<span class="s2">if </span><span class="s1">(value.disabling.length &gt; </span><span class="s4">0</span><span class="s1">){</span>
+								<span class="s1">value.disabling.split(</span><span class="s0">''</span><span class="s1">).forEach((flag)=&gt;{</span>
+									<span class="s1">allDisabledModifiers[flag] = </span><span class="s2">true</span>
+								<span class="s1">});</span>
+							<span class="s1">}</span>
+						<span class="s1">} </span><span class="s2">else if </span><span class="s1">(</span><span class="s2">typeof </span><span class="s1">value == </span><span class="s0">'object' </span><span class="s1">&amp;&amp; value != </span><span class="s2">null</span><span class="s1">) {</span>
+							<span class="s1">itemStack.push(value);</span>
+						<span class="s1">}</span>
+					<span class="s1">}</span>
+				<span class="s1">}</span>
+			<span class="s1">}</span>
+			<span class="s2">for </span><span class="s1">(const flag of Object.keys(allDisabledModifiers)) {</span>
+				<span class="s1">config.modifiersData[flag] = </span><span class="s2">true</span><span class="s1">;</span>
+			<span class="s1">}</span>
+		<span class="s1">}</span>
+	<span class="s1">}</span>
+
+	<span class="s3">// Note: `processTerm` mutates `tree` and `groups`.</span>
+	<span class="s1">processTerm(tree, regenerateOptions, groups);</span>
+	<span class="s1">assertNoUnmatchedReferences(groups);</span>
+
+	<span class="s1">const onNewFlags = options &amp;&amp; options.onNewFlags;</span>
+	<span class="s2">if </span><span class="s1">(onNewFlags) {</span>
+		<span class="s1">let newFlags = flags.split(</span><span class="s0">''</span><span class="s1">).filter((flag) =&gt; !config.modifiersData[flag]).join(</span><span class="s0">''</span><span class="s1">);</span>
+		<span class="s2">if </span><span class="s1">(config.transform.unicodeSetsFlag) {</span>
+			<span class="s1">newFlags = newFlags.replace(</span><span class="s0">'v'</span><span class="s1">, </span><span class="s0">'u'</span><span class="s1">);</span>
+		<span class="s1">}</span>
+		<span class="s2">if </span><span class="s1">(config.transform.unicodeFlag) {</span>
+			<span class="s1">newFlags = newFlags.replace(</span><span class="s0">'u'</span><span class="s1">, </span><span class="s0">''</span><span class="s1">);</span>
+		<span class="s1">}</span>
+		<span class="s2">if </span><span class="s1">(config.transform.dotAllFlag === </span><span class="s0">'transform'</span><span class="s1">) {</span>
+			<span class="s1">newFlags = newFlags.replace(</span><span class="s0">'s'</span><span class="s1">, </span><span class="s0">''</span><span class="s1">);</span>
+		<span class="s1">}</span>
+		<span class="s1">onNewFlags(newFlags);</span>
+	<span class="s1">}</span>
+
+	<span class="s2">return </span><span class="s1">generate(tree);</span>
+<span class="s1">};</span>
+
+<span class="s1">module.exports = rewritePattern;</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,456 @@
+<html>
+<head>
+<title>MountingManager.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #629755; font-weight: bold; font-style: italic;}
+.s5 { color: #6897bb;}
+.s6 { color: #6a8759;}
+.s7 { color: #77b767; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+MountingManager.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.fabric.mounting</span><span class="s2">;</span>
+
+<span class="s2">import static </span><span class="s1">com.facebook.infer.annotation.ThreadConfined.ANY</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.infer.annotation.ThreadConfined.UI</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.view.View</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.AnyThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.NonNull</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.UiThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.ThreadConfined</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactSoftExceptionLogger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.RetryableMountingLayerException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.UiThreadUtil</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.mapbuffer.MapBuffer</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.fabric.FabricUIManager</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.fabric.events.EventEmitterWrapper</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.fabric.mounting.SurfaceMountingManager.ViewEvent</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.fabric.mounting.mountitems.MountItem</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.touch.JSResponderHandler</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.RootViewManager</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.ThemedReactContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.ViewManagerRegistry</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.yoga.YogaMeasureMode</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Map</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Queue</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.ConcurrentHashMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.CopyOnWriteArrayList</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* Class responsible for actually dispatching view updates enqueued via {</span><span class="s4">@link</span>
+ <span class="s3">* FabricUIManager#scheduleMountItem} on the UI thread.</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">MountingManager {</span>
+  <span class="s2">public static final </span><span class="s1">String TAG = MountingManager.</span><span class="s2">class</span><span class="s1">.getSimpleName()</span><span class="s2">;</span>
+  <span class="s2">private static final int </span><span class="s1">MAX_STOPPED_SURFACE_IDS_LENGTH = </span><span class="s5">15</span><span class="s2">;</span>
+
+  <span class="s1">@NonNull</span>
+  <span class="s2">private final </span><span class="s1">ConcurrentHashMap&lt;Integer</span><span class="s2">, </span><span class="s1">SurfaceMountingManager&gt; mSurfaceIdToManager =</span>
+      <span class="s2">new </span><span class="s1">ConcurrentHashMap&lt;&gt;()</span><span class="s2">; </span><span class="s0">// any thread</span>
+
+  <span class="s2">private final </span><span class="s1">CopyOnWriteArrayList&lt;Integer&gt; mStoppedSurfaceIds = </span><span class="s2">new </span><span class="s1">CopyOnWriteArrayList&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s1">@Nullable </span><span class="s2">private </span><span class="s1">SurfaceMountingManager mMostRecentSurfaceMountingManager</span><span class="s2">;</span>
+  <span class="s1">@Nullable </span><span class="s2">private </span><span class="s1">SurfaceMountingManager mLastQueriedSurfaceMountingManager</span><span class="s2">;</span>
+
+  <span class="s1">@NonNull </span><span class="s2">private final </span><span class="s1">JSResponderHandler mJSResponderHandler = </span><span class="s2">new </span><span class="s1">JSResponderHandler()</span><span class="s2">;</span>
+  <span class="s1">@NonNull </span><span class="s2">private final </span><span class="s1">ViewManagerRegistry mViewManagerRegistry</span><span class="s2">;</span>
+  <span class="s1">@NonNull </span><span class="s2">private final </span><span class="s1">MountItemExecutor mMountItemExecutor</span><span class="s2">;</span>
+  <span class="s1">@NonNull </span><span class="s2">private final </span><span class="s1">RootViewManager mRootViewManager = </span><span class="s2">new </span><span class="s1">RootViewManager()</span><span class="s2">;</span>
+
+  <span class="s2">public interface </span><span class="s1">MountItemExecutor {</span>
+    <span class="s1">@UiThread</span>
+    <span class="s1">@ThreadConfined(UI)</span>
+    <span class="s2">void </span><span class="s1">executeItems(Queue&lt;MountItem&gt; items)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">MountingManager(</span>
+      <span class="s1">@NonNull ViewManagerRegistry viewManagerRegistry</span><span class="s2">,</span>
+      <span class="s1">@NonNull MountItemExecutor mountItemExecutor) {</span>
+    <span class="s1">mViewManagerRegistry = viewManagerRegistry</span><span class="s2">;</span>
+    <span class="s1">mMountItemExecutor = mountItemExecutor</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Starts surface without attaching the view. All view operations executed against that surface</span>
+   <span class="s3">* will be queued until the view is attached.</span>
+   <span class="s3">*/</span>
+  <span class="s1">@AnyThread</span>
+  <span class="s2">public </span><span class="s1">SurfaceMountingManager startSurface(</span>
+      <span class="s2">final int </span><span class="s1">surfaceId</span><span class="s2">, </span><span class="s1">ThemedReactContext reactContext</span><span class="s2">, </span><span class="s1">@Nullable View rootView) {</span>
+    <span class="s1">SurfaceMountingManager surfaceMountingManager =</span>
+        <span class="s2">new </span><span class="s1">SurfaceMountingManager(</span>
+            <span class="s1">surfaceId</span><span class="s2">,</span>
+            <span class="s1">mJSResponderHandler</span><span class="s2">,</span>
+            <span class="s1">mViewManagerRegistry</span><span class="s2">,</span>
+            <span class="s1">mRootViewManager</span><span class="s2">,</span>
+            <span class="s1">mMountItemExecutor</span><span class="s2">,</span>
+            <span class="s1">reactContext)</span><span class="s2">;</span>
+
+    <span class="s0">// There could technically be a race condition here if addRootView is called twice from</span>
+    <span class="s0">// different threads, though this is (probably) extremely unlikely, and likely an error.</span>
+    <span class="s0">// This logic to protect against race conditions is a holdover from older code, and we don't</span>
+    <span class="s0">// know if it actually happens in practice - so, we're logging soft exceptions for now.</span>
+    <span class="s0">// This *will* crash in Debug mode, but not in production.</span>
+    <span class="s1">mSurfaceIdToManager.putIfAbsent(surfaceId</span><span class="s2">, </span><span class="s1">surfaceMountingManager)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mSurfaceIdToManager.get(surfaceId) != surfaceMountingManager) {</span>
+      <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+          <span class="s1">TAG</span><span class="s2">,</span>
+          <span class="s2">new </span><span class="s1">IllegalStateException(</span>
+              <span class="s6">&quot;Called startSurface more than once for the SurfaceId [&quot; </span><span class="s1">+ surfaceId + </span><span class="s6">&quot;]&quot;</span><span class="s1">))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mMostRecentSurfaceMountingManager = mSurfaceIdToManager.get(surfaceId)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(rootView != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">surfaceMountingManager.attachRootView(rootView</span><span class="s2">, </span><span class="s1">reactContext)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">surfaceMountingManager</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@AnyThread</span>
+  <span class="s2">public void </span><span class="s1">attachRootView(</span>
+      <span class="s2">final int </span><span class="s1">surfaceId</span><span class="s2">, </span><span class="s1">@NonNull </span><span class="s2">final </span><span class="s1">View rootView</span><span class="s2">, </span><span class="s1">ThemedReactContext themedReactContext) {</span>
+    <span class="s1">SurfaceMountingManager surfaceMountingManager =</span>
+        <span class="s1">getSurfaceManagerEnforced(surfaceId</span><span class="s2">, </span><span class="s6">&quot;attachView&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(surfaceMountingManager.isStopped()) {</span>
+      <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+          <span class="s1">TAG</span><span class="s2">, new </span><span class="s1">IllegalStateException(</span><span class="s6">&quot;Trying to attach a view to a stopped surface&quot;</span><span class="s1">))</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">surfaceMountingManager.attachRootView(rootView</span><span class="s2">, </span><span class="s1">themedReactContext)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@AnyThread</span>
+  <span class="s2">public void </span><span class="s1">stopSurface(</span><span class="s2">final int </span><span class="s1">surfaceId) {</span>
+    <span class="s1">SurfaceMountingManager surfaceMountingManager = mSurfaceIdToManager.get(surfaceId)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(surfaceMountingManager != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s0">// Maximum number of stopped surfaces to keep track of</span>
+      <span class="s2">while </span><span class="s1">(mStoppedSurfaceIds.size() &gt;= MAX_STOPPED_SURFACE_IDS_LENGTH) {</span>
+        <span class="s1">Integer staleStoppedId = mStoppedSurfaceIds.get(</span><span class="s5">0</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s1">mSurfaceIdToManager.remove(staleStoppedId.intValue())</span><span class="s2">;</span>
+        <span class="s1">mStoppedSurfaceIds.remove(staleStoppedId)</span><span class="s2">;</span>
+        <span class="s1">FLog.d(TAG</span><span class="s2">, </span><span class="s6">&quot;Removing stale SurfaceMountingManager: [%d]&quot;</span><span class="s2">, </span><span class="s1">staleStoppedId.intValue())</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s1">mStoppedSurfaceIds.add(surfaceId)</span><span class="s2">;</span>
+
+      <span class="s1">surfaceMountingManager.stopSurface()</span><span class="s2">;</span>
+
+      <span class="s2">if </span><span class="s1">(surfaceMountingManager == mMostRecentSurfaceMountingManager) {</span>
+        <span class="s1">mMostRecentSurfaceMountingManager = </span><span class="s2">null;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+          <span class="s1">TAG</span><span class="s2">,</span>
+          <span class="s2">new </span><span class="s1">IllegalStateException(</span>
+              <span class="s6">&quot;Cannot call stopSurface on non-existent surface: [&quot; </span><span class="s1">+ surfaceId + </span><span class="s6">&quot;]&quot;</span><span class="s1">))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Nullable</span>
+  <span class="s2">public </span><span class="s1">SurfaceMountingManager getSurfaceManager(</span><span class="s2">int </span><span class="s1">surfaceId) {</span>
+    <span class="s2">if </span><span class="s1">(mLastQueriedSurfaceMountingManager != </span><span class="s2">null</span>
+        <span class="s1">&amp;&amp; mLastQueriedSurfaceMountingManager.getSurfaceId() == surfaceId) {</span>
+      <span class="s2">return </span><span class="s1">mLastQueriedSurfaceMountingManager</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(mMostRecentSurfaceMountingManager != </span><span class="s2">null</span>
+        <span class="s1">&amp;&amp; mMostRecentSurfaceMountingManager.getSurfaceId() == surfaceId) {</span>
+      <span class="s2">return </span><span class="s1">mMostRecentSurfaceMountingManager</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">SurfaceMountingManager surfaceMountingManager = mSurfaceIdToManager.get(surfaceId)</span><span class="s2">;</span>
+    <span class="s1">mLastQueriedSurfaceMountingManager = surfaceMountingManager</span><span class="s2">;</span>
+    <span class="s2">return </span><span class="s1">surfaceMountingManager</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@NonNull</span>
+  <span class="s2">public </span><span class="s1">SurfaceMountingManager getSurfaceManagerEnforced(</span><span class="s2">int </span><span class="s1">surfaceId</span><span class="s2">, </span><span class="s1">String context) {</span>
+    <span class="s1">SurfaceMountingManager surfaceMountingManager = getSurfaceManager(surfaceId)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(surfaceMountingManager == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">RetryableMountingLayerException(</span>
+          <span class="s6">&quot;Unable to find SurfaceMountingManager for surfaceId: [&quot;</span>
+              <span class="s1">+ surfaceId</span>
+              <span class="s1">+ </span><span class="s6">&quot;]. Context: &quot;</span>
+              <span class="s1">+ context)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">surfaceMountingManager</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">surfaceIsStopped(</span><span class="s2">int </span><span class="s1">surfaceId) {</span>
+    <span class="s2">if </span><span class="s1">(mStoppedSurfaceIds.contains(surfaceId)) {</span>
+      <span class="s2">return true;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">SurfaceMountingManager surfaceMountingManager = getSurfaceManager(surfaceId)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(surfaceMountingManager != </span><span class="s2">null </span><span class="s1">&amp;&amp; surfaceMountingManager.isStopped()) {</span>
+      <span class="s2">return true;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return false;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">isWaitingForViewAttach(</span><span class="s2">int </span><span class="s1">surfaceId) {</span>
+    <span class="s1">SurfaceMountingManager mountingManager = getSurfaceManager(surfaceId)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mountingManager == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(mountingManager.isStopped()) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">!mountingManager.isRootViewAttached()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Get SurfaceMountingManager associated with a ReactTag. Unfortunately, this requires lookups</span>
+   <span class="s3">* over N maps, where N is the number of active or recently-stopped Surfaces. Each lookup will</span>
+   <span class="s3">* cost `log(M)` operations where M is the number of reactTags in the surface, so the total cost</span>
+   <span class="s3">* per lookup is `O(N * log(M))`.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s7">&lt;p&gt;</span><span class="s3">To mitigate this cost, we attempt to keep track of the &quot;most recent&quot; SurfaceMountingManager</span>
+   <span class="s3">* and do lookups in it first. For the vast majority of use-cases, except for events or operations</span>
+   <span class="s3">* sent to off-screen surfaces, or use-cases where multiple surfaces are visible and interactable,</span>
+   <span class="s3">* this will reduce the lookup time to `O(log(M))`. Someone smarter than me could probably figure</span>
+   <span class="s3">* out an amortized time.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">reactTag</span>
+   <span class="s3">* </span><span class="s4">@return</span>
+   <span class="s3">*/</span>
+  <span class="s1">@Nullable</span>
+  <span class="s2">public </span><span class="s1">SurfaceMountingManager getSurfaceManagerForView(</span><span class="s2">int </span><span class="s1">reactTag) {</span>
+    <span class="s2">if </span><span class="s1">(mMostRecentSurfaceMountingManager != </span><span class="s2">null</span>
+        <span class="s1">&amp;&amp; mMostRecentSurfaceMountingManager.getViewExists(reactTag)) {</span>
+      <span class="s2">return </span><span class="s1">mMostRecentSurfaceMountingManager</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">for </span><span class="s1">(Map.Entry&lt;Integer</span><span class="s2">, </span><span class="s1">SurfaceMountingManager&gt; entry : mSurfaceIdToManager.entrySet()) {</span>
+      <span class="s1">SurfaceMountingManager smm = entry.getValue()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(smm != mMostRecentSurfaceMountingManager &amp;&amp; smm.getViewExists(reactTag)) {</span>
+        <span class="s2">if </span><span class="s1">(mMostRecentSurfaceMountingManager == </span><span class="s2">null</span><span class="s1">) {</span>
+          <span class="s1">mMostRecentSurfaceMountingManager = smm</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">smm</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return null;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@NonNull</span>
+  <span class="s1">@AnyThread</span>
+  <span class="s2">public </span><span class="s1">SurfaceMountingManager getSurfaceManagerForViewEnforced(</span><span class="s2">int </span><span class="s1">reactTag) {</span>
+    <span class="s1">SurfaceMountingManager surfaceMountingManager = getSurfaceManagerForView(reactTag)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(surfaceMountingManager == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">RetryableMountingLayerException(</span>
+          <span class="s6">&quot;Unable to find SurfaceMountingManager for tag: [&quot; </span><span class="s1">+ reactTag + </span><span class="s6">&quot;]&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">surfaceMountingManager</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">getViewExists(</span><span class="s2">int </span><span class="s1">reactTag) {</span>
+    <span class="s2">return </span><span class="s1">getSurfaceManagerForView(reactTag) != </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Deprecated</span>
+  <span class="s2">public void </span><span class="s1">receiveCommand(</span>
+      <span class="s2">int </span><span class="s1">surfaceId</span><span class="s2">, int </span><span class="s1">reactTag</span><span class="s2">, int </span><span class="s1">commandId</span><span class="s2">, </span><span class="s1">@Nullable ReadableArray commandArgs) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s1">getSurfaceManagerEnforced(surfaceId</span><span class="s2">, </span><span class="s6">&quot;receiveCommand:int&quot;</span><span class="s1">)</span>
+        <span class="s1">.receiveCommand(reactTag</span><span class="s2">, </span><span class="s1">commandId</span><span class="s2">, </span><span class="s1">commandArgs)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">receiveCommand(</span>
+      <span class="s2">int </span><span class="s1">surfaceId</span><span class="s2">, int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">@NonNull String commandId</span><span class="s2">, </span><span class="s1">@Nullable ReadableArray commandArgs) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s1">getSurfaceManagerEnforced(surfaceId</span><span class="s2">, </span><span class="s6">&quot;receiveCommand:string&quot;</span><span class="s1">)</span>
+        <span class="s1">.receiveCommand(reactTag</span><span class="s2">, </span><span class="s1">commandId</span><span class="s2">, </span><span class="s1">commandArgs)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Send an accessibility eventType to a Native View. eventType is any valid `AccessibilityEvent.X`</span>
+   <span class="s3">* value.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s7">&lt;p&gt;</span><span class="s3">Why accept `-1` SurfaceId? Currently there are calls to UIManager.sendAccessibilityEvent</span>
+   <span class="s3">* which is a legacy API and accepts only reactTag. We will have to investigate and migrate away</span>
+   <span class="s3">* from those calls over time.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">surfaceId {</span><span class="s4">@link </span><span class="s3">int} that identifies the surface or -1 to temporarily support backward</span>
+   <span class="s3">*     compatibility.</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">reactTag {</span><span class="s4">@link </span><span class="s3">int} that identifies the react Tag of the view.</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">eventType {</span><span class="s4">@link </span><span class="s3">int} that identifies Android eventType. see {</span><span class="s4">@link</span>
+   <span class="s3">*     View#sendAccessibilityEvent}</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">sendAccessibilityEvent(</span><span class="s2">int </span><span class="s1">surfaceId</span><span class="s2">, int </span><span class="s1">reactTag</span><span class="s2">, int </span><span class="s1">eventType) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(surfaceId == View.NO_ID) {</span>
+      <span class="s1">getSurfaceManagerForViewEnforced(reactTag).sendAccessibilityEvent(reactTag</span><span class="s2">, </span><span class="s1">eventType)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">getSurfaceManagerEnforced(surfaceId</span><span class="s2">, </span><span class="s6">&quot;sendAccessibilityEvent&quot;</span><span class="s1">)</span>
+          <span class="s1">.sendAccessibilityEvent(reactTag</span><span class="s2">, </span><span class="s1">eventType)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">updateProps(</span><span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">@Nullable ReadableMap props) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(props == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">getSurfaceManagerForViewEnforced(reactTag).updateProps(reactTag</span><span class="s2">, </span><span class="s1">props)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Clears the JS Responder specified by {</span><span class="s4">@link </span><span class="s3">SurfaceMountingManager#setJSResponder}. After this</span>
+   <span class="s3">* method is called, all the touch events are going to be handled by JS.</span>
+   <span class="s3">*/</span>
+  <span class="s1">@UiThread</span>
+  <span class="s2">public void </span><span class="s1">clearJSResponder() {</span>
+    <span class="s0">// MountingManager and SurfaceMountingManagers all share the same JSResponderHandler.</span>
+    <span class="s0">// Must be called on MountingManager instead of SurfaceMountingManager, because we don't</span>
+    <span class="s0">// know what surfaceId it's being called for.</span>
+    <span class="s1">mJSResponderHandler.clearJSResponder()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@AnyThread</span>
+  <span class="s1">@ThreadConfined(ANY)</span>
+  <span class="s2">public </span><span class="s1">@Nullable EventEmitterWrapper getEventEmitter(</span><span class="s2">int </span><span class="s1">surfaceId</span><span class="s2">, int </span><span class="s1">reactTag) {</span>
+    <span class="s1">SurfaceMountingManager surfaceMountingManager =</span>
+        <span class="s1">(surfaceId == -</span><span class="s5">1 </span><span class="s1">? getSurfaceManagerForView(reactTag) : getSurfaceManager(surfaceId))</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(surfaceMountingManager == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return null;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">surfaceMountingManager.getEventEmitter(reactTag)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Measure a component, given localData, props, state, and measurement information. This needs to</span>
+   <span class="s3">* remain here for now - and not in SurfaceMountingManager - because sometimes measures are made</span>
+   <span class="s3">* outside of the context of a Surface; especially from C++ before StartSurface is called.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">context</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">componentName</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">localData</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">props</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">state</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">width</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">widthMode</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">height</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">heightMode</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">attachmentsPositions</span>
+   <span class="s3">* </span><span class="s4">@return</span>
+   <span class="s3">*/</span>
+  <span class="s1">@AnyThread</span>
+  <span class="s2">public long </span><span class="s1">measure(</span>
+      <span class="s1">@NonNull ReactContext context</span><span class="s2">,</span>
+      <span class="s1">@NonNull String componentName</span><span class="s2">,</span>
+      <span class="s1">@NonNull ReadableMap localData</span><span class="s2">,</span>
+      <span class="s1">@NonNull ReadableMap props</span><span class="s2">,</span>
+      <span class="s1">@NonNull ReadableMap state</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">width</span><span class="s2">,</span>
+      <span class="s1">@NonNull YogaMeasureMode widthMode</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">height</span><span class="s2">,</span>
+      <span class="s1">@NonNull YogaMeasureMode heightMode</span><span class="s2">,</span>
+      <span class="s1">@Nullable </span><span class="s2">float</span><span class="s1">[] attachmentsPositions) {</span>
+
+    <span class="s2">return </span><span class="s1">mViewManagerRegistry</span>
+        <span class="s1">.get(componentName)</span>
+        <span class="s1">.measure(</span>
+            <span class="s1">context</span><span class="s2">,</span>
+            <span class="s1">localData</span><span class="s2">,</span>
+            <span class="s1">props</span><span class="s2">,</span>
+            <span class="s1">state</span><span class="s2">,</span>
+            <span class="s1">width</span><span class="s2">,</span>
+            <span class="s1">widthMode</span><span class="s2">,</span>
+            <span class="s1">height</span><span class="s2">,</span>
+            <span class="s1">heightMode</span><span class="s2">,</span>
+            <span class="s1">attachmentsPositions)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Measure a component, given localData, props, state, and measurement information. This needs to</span>
+   <span class="s3">* remain here for now - and not in SurfaceMountingManager - because sometimes measures are made</span>
+   <span class="s3">* outside of the context of a Surface; especially from C++ before StartSurface is called.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">context</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">componentName</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">localData</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">props</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">width</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">widthMode</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">height</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">heightMode</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">attachmentsPositions</span>
+   <span class="s3">* </span><span class="s4">@return</span>
+   <span class="s3">*/</span>
+  <span class="s1">@AnyThread</span>
+  <span class="s2">public long </span><span class="s1">measureMapBuffer(</span>
+      <span class="s1">@NonNull ReactContext context</span><span class="s2">,</span>
+      <span class="s1">@NonNull String componentName</span><span class="s2">,</span>
+      <span class="s1">@NonNull MapBuffer localData</span><span class="s2">,</span>
+      <span class="s1">@NonNull MapBuffer props</span><span class="s2">,</span>
+      <span class="s1">@Nullable MapBuffer state</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">width</span><span class="s2">,</span>
+      <span class="s1">@NonNull YogaMeasureMode widthMode</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">height</span><span class="s2">,</span>
+      <span class="s1">@NonNull YogaMeasureMode heightMode</span><span class="s2">,</span>
+      <span class="s1">@Nullable </span><span class="s2">float</span><span class="s1">[] attachmentsPositions) {</span>
+
+    <span class="s2">return </span><span class="s1">mViewManagerRegistry</span>
+        <span class="s1">.get(componentName)</span>
+        <span class="s1">.measure(</span>
+            <span class="s1">context</span><span class="s2">,</span>
+            <span class="s1">localData</span><span class="s2">,</span>
+            <span class="s1">props</span><span class="s2">,</span>
+            <span class="s1">state</span><span class="s2">,</span>
+            <span class="s1">width</span><span class="s2">,</span>
+            <span class="s1">widthMode</span><span class="s2">,</span>
+            <span class="s1">height</span><span class="s2">,</span>
+            <span class="s1">heightMode</span><span class="s2">,</span>
+            <span class="s1">attachmentsPositions)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">enqueuePendingEvent(</span><span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">ViewEvent viewEvent) {</span>
+    <span class="s1">@Nullable SurfaceMountingManager smm = getSurfaceManagerForView(reactTag)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(smm == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s0">// Cannot queue event without valid surface mountng manager. Do nothing here.</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">smm.enqueuePendingEvent(reactTag</span><span class="s2">, </span><span class="s1">viewEvent)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,1269 @@
+<html>
+<head>
+<title>propTypes.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+propTypes.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Common propTypes detection functionality. 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const flatMap = require(</span><span class="s2">'array.prototype.flatmap'</span><span class="s1">);</span>
+
+<span class="s1">const annotations = require(</span><span class="s2">'./annotations'</span><span class="s1">);</span>
+<span class="s1">const propsUtil = require(</span><span class="s2">'./props'</span><span class="s1">);</span>
+<span class="s1">const variableUtil = require(</span><span class="s2">'./variable'</span><span class="s1">);</span>
+<span class="s1">const testFlowVersion = require(</span><span class="s2">'./version'</span><span class="s1">).testFlowVersion;</span>
+<span class="s1">const propWrapperUtil = require(</span><span class="s2">'./propWrapper'</span><span class="s1">);</span>
+<span class="s1">const astUtil = require(</span><span class="s2">'./ast'</span><span class="s1">);</span>
+<span class="s1">const isFirstLetterCapitalized = require(</span><span class="s2">'./isFirstLetterCapitalized'</span><span class="s1">);</span>
+
+<span class="s0">/** 
+ * Check if node is function type. 
+ * @param {ASTNode} node 
+ * @returns {Boolean} 
+ */</span>
+<span class="s3">function </span><span class="s1">isFunctionType(node) {</span>
+  <span class="s3">if </span><span class="s1">(!node) </span><span class="s3">return false</span><span class="s1">;</span>
+  <span class="s1">const nodeType = node.type;</span>
+  <span class="s3">return </span><span class="s1">nodeType === </span><span class="s2">'FunctionDeclaration'</span>
+    <span class="s1">|| nodeType === </span><span class="s2">'FunctionExpression'</span>
+    <span class="s1">|| nodeType === </span><span class="s2">'ArrowFunctionExpression'</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if we are declaring a props as a generic type in a flow-annotated class. 
+ * 
+ * @param {ASTNode} node  the AST node being checked. 
+ * @returns {Boolean} True if the node is a class with generic prop types, false if not. 
+ */</span>
+<span class="s3">function </span><span class="s1">isSuperTypeParameterPropsDeclaration(node) {</span>
+  <span class="s3">if </span><span class="s1">(node &amp;&amp; (node.type === </span><span class="s2">'ClassDeclaration' </span><span class="s1">|| node.type === </span><span class="s2">'ClassExpression'</span><span class="s1">)) {</span>
+    <span class="s3">if </span><span class="s1">(node.superTypeParameters &amp;&amp; node.superTypeParameters.params.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s3">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Iterates through a properties node, like a customized forEach. 
+ * @param {Object} context Array of properties to iterate. 
+ * @param {Object[]} properties Array of properties to iterate. 
+ * @param {Function} fn Function to call on each property, receives property key 
+    and property value. (key, value) =&gt; void 
+  * @param {Function} [handleSpreadFn] Function to call on each ObjectTypeSpreadProperty, receives the 
+    argument 
+ */</span>
+<span class="s3">function </span><span class="s1">iterateProperties(context, properties, fn, handleSpreadFn) {</span>
+  <span class="s3">if </span><span class="s1">(properties &amp;&amp; properties.length &amp;&amp; </span><span class="s3">typeof </span><span class="s1">fn === </span><span class="s2">'function'</span><span class="s1">) {</span>
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">, j = properties.length; i &lt; j; i++) {</span>
+      <span class="s1">const node = properties[i];</span>
+      <span class="s1">const key = astUtil.getKeyValue(context, node);</span>
+
+      <span class="s3">if </span><span class="s1">(node.type === </span><span class="s2">'ObjectTypeSpreadProperty' </span><span class="s1">&amp;&amp; </span><span class="s3">typeof </span><span class="s1">handleSpreadFn === </span><span class="s2">'function'</span><span class="s1">) {</span>
+        <span class="s1">handleSpreadFn(node.argument);</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const value = node.value;</span>
+      <span class="s1">fn(key, value, node);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if a node is inside a class body. 
+ * 
+ * @param {ASTNode} node  the AST node being checked. 
+ * @returns {Boolean} True if the node has a ClassBody ancestor, false if not. 
+ */</span>
+<span class="s3">function </span><span class="s1">isInsideClassBody(node) {</span>
+  <span class="s1">let parent = node.parent;</span>
+  <span class="s3">while </span><span class="s1">(parent) {</span>
+    <span class="s3">if </span><span class="s1">(parent.type === </span><span class="s2">'ClassBody'</span><span class="s1">) {</span>
+      <span class="s3">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">parent = parent.parent;</span>
+  <span class="s1">}</span>
+  <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">startWithCapitalizedLetter(node) {</span>
+  <span class="s3">return </span><span class="s1">(</span>
+    <span class="s1">node.parent.type === </span><span class="s2">'VariableDeclarator'</span>
+    <span class="s1">&amp;&amp; !isFirstLetterCapitalized(node.parent.id.name)</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = </span><span class="s3">function </span><span class="s1">propTypesInstructions(context, components, utils) {</span>
+  <span class="s0">// Used to track the type annotations in scope.</span>
+  <span class="s0">// Necessary because babel's scopes do not track type annotations.</span>
+  <span class="s1">let stack = </span><span class="s3">null</span><span class="s1">;</span>
+
+  <span class="s1">const classExpressions = [];</span>
+  <span class="s1">const defaults = { customValidators: [] };</span>
+  <span class="s1">const configuration = Object.assign({}, defaults, context.options[</span><span class="s4">0</span><span class="s1">] || {});</span>
+  <span class="s1">const customValidators = configuration.customValidators;</span>
+  <span class="s1">const allowedGenericTypes = </span><span class="s3">new </span><span class="s1">Set([</span><span class="s2">'forwardRef'</span><span class="s1">, </span><span class="s2">'ForwardRefRenderFunction'</span><span class="s1">, </span><span class="s2">'VFC'</span><span class="s1">, </span><span class="s2">'VoidFunctionComponent'</span><span class="s1">, </span><span class="s2">'PropsWithChildren'</span><span class="s1">, </span><span class="s2">'SFC'</span><span class="s1">, </span><span class="s2">'StatelessComponent'</span><span class="s1">, </span><span class="s2">'FunctionComponent'</span><span class="s1">, </span><span class="s2">'FC'</span><span class="s1">]);</span>
+  <span class="s1">const genericTypeParamIndexWherePropsArePresent = {</span>
+    <span class="s1">ForwardRefRenderFunction: </span><span class="s4">1</span><span class="s1">,</span>
+    <span class="s1">forwardRef: </span><span class="s4">1</span><span class="s1">,</span>
+    <span class="s1">VoidFunctionComponent: </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">VFC: </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">PropsWithChildren: </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">SFC: </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">StatelessComponent: </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">FunctionComponent: </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">FC: </span><span class="s4">0</span><span class="s1">,</span>
+  <span class="s1">};</span>
+  <span class="s1">const genericReactTypesImport = </span><span class="s3">new </span><span class="s1">Set();</span>
+  <span class="s0">// import { FC as X } from 'react' -&gt; localToImportedMap = { x: FC }</span>
+  <span class="s1">const localToImportedMap = {};</span>
+
+  <span class="s0">/** 
+   * Returns the full scope. 
+   * @returns {Object} The whole scope. 
+   */</span>
+  <span class="s3">function </span><span class="s1">typeScope() {</span>
+    <span class="s3">return </span><span class="s1">stack[stack.length - </span><span class="s4">1</span><span class="s1">];</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Gets a node from the scope. 
+   * @param {string} key The name of the identifier to access. 
+   * @returns {ASTNode} The ASTNode associated with the given identifier. 
+   */</span>
+  <span class="s3">function </span><span class="s1">getInTypeScope(key) {</span>
+    <span class="s3">return </span><span class="s1">stack[stack.length - </span><span class="s4">1</span><span class="s1">][key];</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Sets the new value in the scope. 
+   * @param {string} key The name of the identifier to access 
+   * @param {ASTNode} value The new value for the identifier. 
+   * @returns {ASTNode} The ASTNode associated with the given identifier. 
+   */</span>
+  <span class="s3">function </span><span class="s1">setInTypeScope(key, value) {</span>
+    <span class="s1">stack[stack.length - </span><span class="s4">1</span><span class="s1">][key] = value;</span>
+    <span class="s3">return </span><span class="s1">value;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Checks if prop should be validated by plugin-react-proptypes 
+   * @param {String} validator Name of validator to check. 
+   * @returns {Boolean} True if validator should be checked by custom validator. 
+   */</span>
+  <span class="s3">function </span><span class="s1">hasCustomValidator(validator) {</span>
+    <span class="s3">return </span><span class="s1">customValidators.indexOf(validator) !== -</span><span class="s4">1</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* eslint-disable no-use-before-define */</span>
+  <span class="s0">/** @type {TypeDeclarationBuilders} */</span>
+  <span class="s1">const typeDeclarationBuilders = {</span>
+    <span class="s1">GenericTypeAnnotation(annotation, parentName, seen) {</span>
+      <span class="s3">if </span><span class="s1">(getInTypeScope(annotation.id.name)) {</span>
+        <span class="s3">return </span><span class="s1">buildTypeAnnotationDeclarationTypes(getInTypeScope(annotation.id.name), parentName, seen);</span>
+      <span class="s1">}</span>
+      <span class="s3">return </span><span class="s1">{};</span>
+    <span class="s1">},</span>
+
+    <span class="s1">ObjectTypeAnnotation(annotation, parentName, seen) {</span>
+      <span class="s1">let containsUnresolvedObjectTypeSpread = </span><span class="s3">false</span><span class="s1">;</span>
+      <span class="s1">let containsSpread = </span><span class="s3">false</span><span class="s1">;</span>
+      <span class="s1">const containsIndexers = Boolean(annotation.indexers &amp;&amp; annotation.indexers.length);</span>
+      <span class="s1">const shapeTypeDefinition = {</span>
+        <span class="s1">type: </span><span class="s2">'shape'</span><span class="s1">,</span>
+        <span class="s1">children: {},</span>
+      <span class="s1">};</span>
+      <span class="s1">iterateProperties(</span>
+        <span class="s1">context,</span>
+        <span class="s1">annotation.properties,</span>
+        <span class="s1">(childKey, childValue, propNode) =&gt; {</span>
+          <span class="s1">const fullName = [parentName, childKey].join(</span><span class="s2">'.'</span><span class="s1">);</span>
+          <span class="s3">if </span><span class="s1">(childKey || childValue) {</span>
+            <span class="s1">const types = buildTypeAnnotationDeclarationTypes(childValue, fullName, seen);</span>
+            <span class="s1">types.fullName = fullName;</span>
+            <span class="s1">types.name = childKey;</span>
+            <span class="s1">types.node = propNode;</span>
+            <span class="s1">types.isRequired = !childValue.optional;</span>
+            <span class="s1">shapeTypeDefinition.children[childKey] = types;</span>
+          <span class="s1">}</span>
+        <span class="s1">},</span>
+        <span class="s1">(spreadNode) =&gt; {</span>
+          <span class="s1">const key = astUtil.getKeyValue(context, spreadNode);</span>
+          <span class="s1">const types = buildTypeAnnotationDeclarationTypes(spreadNode, key, seen);</span>
+          <span class="s3">if </span><span class="s1">(!types.children) {</span>
+            <span class="s1">containsUnresolvedObjectTypeSpread = </span><span class="s3">true</span><span class="s1">;</span>
+          <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">Object.assign(shapeTypeDefinition, types.children);</span>
+          <span class="s1">}</span>
+          <span class="s1">containsSpread = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+      <span class="s1">);</span>
+
+      <span class="s0">// Mark if this shape has spread or an indexer. We will know to consider all props from this shape as having propTypes,</span>
+      <span class="s0">// but still have the ability to detect unused children of this shape.</span>
+      <span class="s1">shapeTypeDefinition.containsUnresolvedSpread = containsUnresolvedObjectTypeSpread;</span>
+      <span class="s1">shapeTypeDefinition.containsIndexers = containsIndexers;</span>
+      <span class="s0">// Deprecated: containsSpread is not used anymore in the codebase, ensure to keep API backward compatibility</span>
+      <span class="s1">shapeTypeDefinition.containsSpread = containsSpread;</span>
+
+      <span class="s3">return </span><span class="s1">shapeTypeDefinition;</span>
+    <span class="s1">},</span>
+
+    <span class="s1">UnionTypeAnnotation(annotation, parentName, seen) {</span>
+      <span class="s0">/** @type {UnionTypeDefinition} */</span>
+      <span class="s1">const unionTypeDefinition = {</span>
+        <span class="s1">type: </span><span class="s2">'union'</span><span class="s1">,</span>
+        <span class="s1">children: annotation.types.map((type) =&gt; buildTypeAnnotationDeclarationTypes(type, parentName, seen)),</span>
+      <span class="s1">};</span>
+      <span class="s3">if </span><span class="s1">(unionTypeDefinition.children.length === </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s0">// no complex type found, simply accept everything</span>
+        <span class="s3">return </span><span class="s1">{};</span>
+      <span class="s1">}</span>
+      <span class="s3">return </span><span class="s1">unionTypeDefinition;</span>
+    <span class="s1">},</span>
+
+    <span class="s1">ArrayTypeAnnotation(annotation, parentName, seen) {</span>
+      <span class="s1">const fullName = [parentName, </span><span class="s2">'*'</span><span class="s1">].join(</span><span class="s2">'.'</span><span class="s1">);</span>
+      <span class="s1">const child = buildTypeAnnotationDeclarationTypes(annotation.elementType, fullName, seen);</span>
+      <span class="s1">child.fullName = fullName;</span>
+      <span class="s1">child.name = </span><span class="s2">'__ANY_KEY__'</span><span class="s1">;</span>
+      <span class="s1">child.node = annotation;</span>
+      <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">type: </span><span class="s2">'object'</span><span class="s1">,</span>
+        <span class="s1">children: {</span>
+          <span class="s1">__ANY_KEY__: child,</span>
+        <span class="s1">},</span>
+      <span class="s1">};</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+  <span class="s0">/* eslint-enable no-use-before-define */</span>
+
+  <span class="s0">/** 
+   * Resolve the type annotation for a given node. 
+   * Flow annotations are sometimes wrapped in outer `TypeAnnotation` 
+   * and `NullableTypeAnnotation` nodes which obscure the annotation we're 
+   * interested in. 
+   * This method also resolves type aliases where possible. 
+   * 
+   * @param {ASTNode} node The annotation or a node containing the type annotation. 
+   * @returns {ASTNode} The resolved type annotation for the node. 
+   */</span>
+  <span class="s3">function </span><span class="s1">resolveTypeAnnotation(node) {</span>
+    <span class="s1">let annotation = (node.left &amp;&amp; node.left.typeAnnotation) || node.typeAnnotation || node;</span>
+    <span class="s3">while </span><span class="s1">(annotation &amp;&amp; (annotation.type === </span><span class="s2">'TypeAnnotation' </span><span class="s1">|| annotation.type === </span><span class="s2">'NullableTypeAnnotation'</span><span class="s1">)) {</span>
+      <span class="s1">annotation = annotation.typeAnnotation;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(annotation.type === </span><span class="s2">'GenericTypeAnnotation' </span><span class="s1">&amp;&amp; getInTypeScope(annotation.id.name)) {</span>
+      <span class="s3">return </span><span class="s1">getInTypeScope(annotation.id.name);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">annotation;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Creates the representation of the React props type annotation for the component. 
+   * The representation is used to verify nested used properties. 
+   * @param {ASTNode} annotation Type annotation for the props class property. 
+   * @param {String} parentName 
+   * @param {Set&lt;ASTNode&gt;} [seen] 
+   * @return {Object} The representation of the declaration, empty object means 
+   *    the property is declared without the need for further analysis. 
+   */</span>
+  <span class="s3">function </span><span class="s1">buildTypeAnnotationDeclarationTypes(annotation, parentName, seen) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">seen === </span><span class="s2">'undefined'</span><span class="s1">) {</span>
+      <span class="s0">// Keeps track of annotations we've already seen to</span>
+      <span class="s0">// prevent problems with recursive types.</span>
+      <span class="s1">seen = </span><span class="s3">new </span><span class="s1">Set();</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(seen.has(annotation)) {</span>
+      <span class="s0">// This must be a recursive type annotation, so just accept anything.</span>
+      <span class="s3">return </span><span class="s1">{};</span>
+    <span class="s1">}</span>
+    <span class="s1">seen.add(annotation);</span>
+
+    <span class="s3">if </span><span class="s1">(annotation.type </span><span class="s3">in </span><span class="s1">typeDeclarationBuilders) {</span>
+      <span class="s3">return </span><span class="s1">typeDeclarationBuilders[annotation.type](annotation, parentName, seen);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">{};</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Marks all props found inside ObjectTypeAnnotation as declared. 
+   * 
+   * Modifies the declaredProperties object 
+   * @param {ASTNode} propTypes 
+   * @param {Object} declaredPropTypes 
+   * @returns {Boolean} True if propTypes should be ignored (e.g. when a type can't be resolved, when it is imported) 
+   */</span>
+  <span class="s3">function </span><span class="s1">declarePropTypesForObjectTypeAnnotation(propTypes, declaredPropTypes) {</span>
+    <span class="s1">let ignorePropsValidation = </span><span class="s3">false</span><span class="s1">;</span>
+
+    <span class="s1">iterateProperties(context, propTypes.properties, (key, value, propNode) =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(!value) {</span>
+        <span class="s1">ignorePropsValidation = ignorePropsValidation || propNode.type !== </span><span class="s2">'ObjectTypeSpreadProperty'</span><span class="s1">;</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const types = buildTypeAnnotationDeclarationTypes(value, key);</span>
+      <span class="s1">types.fullName = key;</span>
+      <span class="s1">types.name = key;</span>
+      <span class="s1">types.node = propNode;</span>
+      <span class="s1">types.isRequired = !propNode.optional;</span>
+      <span class="s1">declaredPropTypes[key] = types;</span>
+    <span class="s1">}, (spreadNode) =&gt; {</span>
+      <span class="s1">const key = astUtil.getKeyValue(context, spreadNode);</span>
+      <span class="s1">const spreadAnnotation = getInTypeScope(key);</span>
+      <span class="s3">if </span><span class="s1">(!spreadAnnotation) {</span>
+        <span class="s1">ignorePropsValidation = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">const spreadIgnoreValidation = declarePropTypesForObjectTypeAnnotation(spreadAnnotation, declaredPropTypes);</span>
+        <span class="s1">ignorePropsValidation = ignorePropsValidation || spreadIgnoreValidation;</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+
+    <span class="s3">return </span><span class="s1">ignorePropsValidation;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Marks all props found inside IntersectionTypeAnnotation as declared. 
+   * Since InterSectionTypeAnnotations can be nested, this handles recursively. 
+   * 
+   * Modifies the declaredPropTypes object 
+   * @param {ASTNode} propTypes 
+   * @param {Object} declaredPropTypes 
+   * @returns {Boolean} True if propTypes should be ignored (e.g. when a type can't be resolved, when it is imported) 
+   */</span>
+  <span class="s3">function </span><span class="s1">declarePropTypesForIntersectionTypeAnnotation(propTypes, declaredPropTypes) {</span>
+    <span class="s3">return </span><span class="s1">propTypes.types.some((annotation) =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(annotation.type === </span><span class="s2">'ObjectTypeAnnotation'</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">declarePropTypesForObjectTypeAnnotation(annotation, declaredPropTypes);</span>
+      <span class="s1">}</span>
+
+      <span class="s3">if </span><span class="s1">(annotation.type === </span><span class="s2">'UnionTypeAnnotation'</span><span class="s1">) {</span>
+        <span class="s3">return true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Type can't be resolved</span>
+      <span class="s3">if </span><span class="s1">(!annotation.id) {</span>
+        <span class="s3">return true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const typeNode = getInTypeScope(annotation.id.name);</span>
+
+      <span class="s3">if </span><span class="s1">(!typeNode) {</span>
+        <span class="s3">return true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">(typeNode.type === </span><span class="s2">'IntersectionTypeAnnotation'</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">declarePropTypesForIntersectionTypeAnnotation(typeNode, declaredPropTypes);</span>
+      <span class="s1">}</span>
+
+      <span class="s3">return </span><span class="s1">declarePropTypesForObjectTypeAnnotation(typeNode, declaredPropTypes);</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Resolve node of type Identifier when building declaration types. 
+   * @param {ASTNode} node 
+   * @param {Function} callback called with the resolved value only if resolved. 
+   */</span>
+  <span class="s3">function </span><span class="s1">resolveValueForIdentifierNode(node, callback) {</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">node</span>
+      <span class="s1">&amp;&amp; node.type === </span><span class="s2">'Identifier'</span>
+    <span class="s1">) {</span>
+      <span class="s1">const scope = context.getScope();</span>
+      <span class="s1">const identVariable = scope.variableScope.variables.find(</span>
+        <span class="s1">(variable) =&gt; variable.name === node.name</span>
+      <span class="s1">);</span>
+      <span class="s3">if </span><span class="s1">(identVariable) {</span>
+        <span class="s1">const definition = identVariable.defs[identVariable.defs.length - </span><span class="s4">1</span><span class="s1">];</span>
+        <span class="s1">callback(definition.node.init);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Creates the representation of the React propTypes for the component. 
+   * The representation is used to verify nested used properties. 
+   * @param {ASTNode} value Node of the PropTypes for the desired property 
+   * @param {string} parentName 
+   * @return {Object} The representation of the declaration, empty object means 
+   *    the property is declared without the need for further analysis. 
+   */</span>
+  <span class="s3">function </span><span class="s1">buildReactDeclarationTypes(value, parentName) {</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">value</span>
+      <span class="s1">&amp;&amp; value.callee</span>
+      <span class="s1">&amp;&amp; value.callee.object</span>
+      <span class="s1">&amp;&amp; hasCustomValidator(value.callee.object.name)</span>
+    <span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">{};</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let identNodeResolved = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s0">// Resolve identifier node for cases where isRequired is set in</span>
+    <span class="s0">// the variable declaration or not at all.</span>
+    <span class="s0">// const variableType = PropTypes.shape({ foo: ... }).isRequired</span>
+    <span class="s0">// propTypes = {</span>
+    <span class="s0">//   example: variableType</span>
+    <span class="s0">// }</span>
+    <span class="s0">// --------</span>
+    <span class="s0">// const variableType = PropTypes.shape({ foo: ... })</span>
+    <span class="s0">// propTypes = {</span>
+    <span class="s0">//   example: variableType</span>
+    <span class="s0">// }</span>
+    <span class="s1">resolveValueForIdentifierNode(value, (newValue) =&gt; {</span>
+      <span class="s1">identNodeResolved = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">value = newValue;</span>
+    <span class="s1">});</span>
+
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">value</span>
+      <span class="s1">&amp;&amp; value.type === </span><span class="s2">'MemberExpression'</span>
+      <span class="s1">&amp;&amp; value.property</span>
+      <span class="s1">&amp;&amp; value.property.name</span>
+      <span class="s1">&amp;&amp; value.property.name === </span><span class="s2">'isRequired'</span>
+    <span class="s1">) {</span>
+      <span class="s1">value = value.object;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Resolve identifier node for cases where isRequired is set in</span>
+    <span class="s0">// the prop types.</span>
+    <span class="s0">// const variableType = PropTypes.shape({ foo: ... })</span>
+    <span class="s0">// propTypes = {</span>
+    <span class="s0">//   example: variableType.isRequired</span>
+    <span class="s0">// }</span>
+    <span class="s3">if </span><span class="s1">(!identNodeResolved) {</span>
+      <span class="s1">resolveValueForIdentifierNode(value, (newValue) =&gt; {</span>
+        <span class="s1">value = newValue;</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Verify PropTypes that are functions</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">value</span>
+      <span class="s1">&amp;&amp; value.type === </span><span class="s2">'CallExpression'</span>
+      <span class="s1">&amp;&amp; value.callee</span>
+      <span class="s1">&amp;&amp; value.callee.property</span>
+      <span class="s1">&amp;&amp; value.callee.property.name</span>
+      <span class="s1">&amp;&amp; value.arguments</span>
+      <span class="s1">&amp;&amp; value.arguments.length &gt; </span><span class="s4">0</span>
+    <span class="s1">) {</span>
+      <span class="s1">const callName = value.callee.property.name;</span>
+      <span class="s1">const argument = value.arguments[</span><span class="s4">0</span><span class="s1">];</span>
+      <span class="s3">switch </span><span class="s1">(callName) {</span>
+        <span class="s3">case </span><span class="s2">'shape'</span><span class="s1">:</span>
+        <span class="s3">case </span><span class="s2">'exact'</span><span class="s1">: {</span>
+          <span class="s3">if </span><span class="s1">(argument.type !== </span><span class="s2">'ObjectExpression'</span><span class="s1">) {</span>
+            <span class="s0">// Invalid proptype or cannot analyse statically</span>
+            <span class="s3">return </span><span class="s1">{};</span>
+          <span class="s1">}</span>
+          <span class="s1">const shapeTypeDefinition = {</span>
+            <span class="s1">type: callName,</span>
+            <span class="s1">children: {},</span>
+          <span class="s1">};</span>
+          <span class="s1">iterateProperties(context, argument.properties, (childKey, childValue, propNode) =&gt; {</span>
+            <span class="s3">if </span><span class="s1">(childValue) { </span><span class="s0">// skip spread propTypes</span>
+              <span class="s1">const fullName = [parentName, childKey].join(</span><span class="s2">'.'</span><span class="s1">);</span>
+              <span class="s1">const types = buildReactDeclarationTypes(childValue, fullName);</span>
+              <span class="s1">types.fullName = fullName;</span>
+              <span class="s1">types.name = childKey;</span>
+              <span class="s1">types.node = propNode;</span>
+              <span class="s1">shapeTypeDefinition.children[childKey] = types;</span>
+            <span class="s1">}</span>
+          <span class="s1">});</span>
+          <span class="s3">return </span><span class="s1">shapeTypeDefinition;</span>
+        <span class="s1">}</span>
+        <span class="s3">case </span><span class="s2">'arrayOf'</span><span class="s1">:</span>
+        <span class="s3">case </span><span class="s2">'objectOf'</span><span class="s1">: {</span>
+          <span class="s1">const fullName = [parentName, </span><span class="s2">'*'</span><span class="s1">].join(</span><span class="s2">'.'</span><span class="s1">);</span>
+          <span class="s1">const child = buildReactDeclarationTypes(argument, fullName);</span>
+          <span class="s1">child.fullName = fullName;</span>
+          <span class="s1">child.name = </span><span class="s2">'__ANY_KEY__'</span><span class="s1">;</span>
+          <span class="s1">child.node = argument;</span>
+          <span class="s3">return </span><span class="s1">{</span>
+            <span class="s1">type: </span><span class="s2">'object'</span><span class="s1">,</span>
+            <span class="s1">children: {</span>
+              <span class="s1">__ANY_KEY__: child,</span>
+            <span class="s1">},</span>
+          <span class="s1">};</span>
+        <span class="s1">}</span>
+        <span class="s3">case </span><span class="s2">'oneOfType'</span><span class="s1">: {</span>
+          <span class="s3">if </span><span class="s1">(</span>
+            <span class="s1">!argument.elements</span>
+            <span class="s1">|| !argument.elements.length</span>
+          <span class="s1">) {</span>
+            <span class="s0">// Invalid proptype or cannot analyse statically</span>
+            <span class="s3">return </span><span class="s1">{};</span>
+          <span class="s1">}</span>
+
+          <span class="s0">/** @type {UnionTypeDefinition} */</span>
+          <span class="s1">const unionTypeDefinition = {</span>
+            <span class="s1">type: </span><span class="s2">'union'</span><span class="s1">,</span>
+            <span class="s1">children: argument.elements.map((element) =&gt; buildReactDeclarationTypes(element, parentName)),</span>
+          <span class="s1">};</span>
+          <span class="s3">if </span><span class="s1">(unionTypeDefinition.children.length === </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s0">// no complex type found, simply accept everything</span>
+            <span class="s3">return </span><span class="s1">{};</span>
+          <span class="s1">}</span>
+          <span class="s3">return </span><span class="s1">unionTypeDefinition;</span>
+        <span class="s1">}</span>
+        <span class="s3">default</span><span class="s1">:</span>
+          <span class="s3">return </span><span class="s1">{};</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">// Unknown property or accepts everything (any, object, ...)</span>
+    <span class="s3">return </span><span class="s1">{};</span>
+  <span class="s1">}</span>
+
+  <span class="s3">function </span><span class="s1">isValidReactGenericTypeAnnotation(annotation) {</span>
+    <span class="s3">if </span><span class="s1">(annotation.typeName) {</span>
+      <span class="s3">if </span><span class="s1">(annotation.typeName.name) { </span><span class="s0">// if FC&lt;Props&gt;</span>
+        <span class="s1">const typeName = annotation.typeName.name;</span>
+        <span class="s3">if </span><span class="s1">(!genericReactTypesImport.has(typeName)) {</span>
+          <span class="s3">return false</span><span class="s1">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(annotation.typeName.right.name) { </span><span class="s0">// if React.FC&lt;Props&gt;</span>
+        <span class="s1">const right = annotation.typeName.right.name;</span>
+        <span class="s1">const left = annotation.typeName.left.name;</span>
+
+        <span class="s3">if </span><span class="s1">(!genericReactTypesImport.has(left) || !allowedGenericTypes.has(right)) {</span>
+          <span class="s3">return false</span><span class="s1">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">return true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Returns the left most typeName of a node, e.g: FC&lt;Props&gt;, React.FC&lt;Props&gt; 
+   * The representation is used to verify nested used properties. 
+   * @param {ASTNode} node 
+   * @return {string | undefined} 
+   */</span>
+  <span class="s3">function </span><span class="s1">getLeftMostTypeName(node) {</span>
+    <span class="s3">if </span><span class="s1">(node.name) </span><span class="s3">return </span><span class="s1">node.name;</span>
+    <span class="s3">if </span><span class="s1">(node.left) </span><span class="s3">return </span><span class="s1">getLeftMostTypeName(node.left);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">function </span><span class="s1">getRightMostTypeName(node) {</span>
+    <span class="s3">if </span><span class="s1">(node.name) </span><span class="s3">return </span><span class="s1">node.name;</span>
+    <span class="s3">if </span><span class="s1">(node.right) </span><span class="s3">return </span><span class="s1">getRightMostTypeName(node.right);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Returns true if the node is either a interface or type alias declaration 
+   * @param {ASTNode} node 
+   * @return {boolean} 
+   */</span>
+  <span class="s3">function </span><span class="s1">filterInterfaceOrTypeAlias(node) {</span>
+    <span class="s3">return </span><span class="s1">(</span>
+      <span class="s1">astUtil.isTSInterfaceDeclaration(node) || astUtil.isTSTypeAliasDeclaration(node)</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Returns true if the interface or type alias declaration node name matches the type-name str 
+   * @param {ASTNode} node 
+   * @param {string} typeName 
+   * @return {boolean} 
+   */</span>
+  <span class="s3">function </span><span class="s1">filterInterfaceOrAliasByName(node, typeName) {</span>
+    <span class="s3">return </span><span class="s1">(</span>
+      <span class="s1">(node.id &amp;&amp; node.id.name === typeName)</span>
+      <span class="s1">|| (node.declaration &amp;&amp; node.declaration.id &amp;&amp; node.declaration.id.name === typeName)</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">class DeclarePropTypesForTSTypeAnnotation {</span>
+    <span class="s1">constructor(propTypes, declaredPropTypes) {</span>
+      <span class="s3">this</span><span class="s1">.propTypes = propTypes;</span>
+      <span class="s3">this</span><span class="s1">.declaredPropTypes = declaredPropTypes;</span>
+      <span class="s3">this</span><span class="s1">.foundDeclaredPropertiesList = [];</span>
+      <span class="s3">this</span><span class="s1">.referenceNameMap = </span><span class="s3">new </span><span class="s1">Set();</span>
+      <span class="s3">this</span><span class="s1">.sourceCode = context.getSourceCode();</span>
+      <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">false</span><span class="s1">;</span>
+      <span class="s3">this</span><span class="s1">.visitTSNode(</span><span class="s3">this</span><span class="s1">.propTypes);</span>
+      <span class="s3">this</span><span class="s1">.endAndStructDeclaredPropTypes();</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * The node will be distribute to different function. 
+     * @param {ASTNode} node 
+     */</span>
+    <span class="s1">visitTSNode(node) {</span>
+      <span class="s3">if </span><span class="s1">(!node) </span><span class="s3">return</span><span class="s1">;</span>
+      <span class="s3">if </span><span class="s1">(astUtil.isTSTypeAnnotation(node)) {</span>
+        <span class="s1">const typeAnnotation = node.typeAnnotation;</span>
+        <span class="s3">this</span><span class="s1">.visitTSNode(typeAnnotation);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(astUtil.isTSTypeReference(node)) {</span>
+        <span class="s3">this</span><span class="s1">.searchDeclarationByName(node);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(astUtil.isTSInterfaceHeritage(node)) {</span>
+        <span class="s3">this</span><span class="s1">.searchDeclarationByName(node);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(astUtil.isTSTypeLiteral(node)) {</span>
+        <span class="s0">// Check node is an object literal</span>
+        <span class="s3">if </span><span class="s1">(Array.isArray(node.members)) {</span>
+          <span class="s3">this</span><span class="s1">.foundDeclaredPropertiesList = </span><span class="s3">this</span><span class="s1">.foundDeclaredPropertiesList.concat(node.members);</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(astUtil.isTSIntersectionType(node)) {</span>
+        <span class="s3">this</span><span class="s1">.convertIntersectionTypeToPropTypes(node);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(astUtil.isTSParenthesizedType(node)) {</span>
+        <span class="s1">const typeAnnotation = node.typeAnnotation;</span>
+        <span class="s3">this</span><span class="s1">.visitTSNode(typeAnnotation);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(astUtil.isTSTypeParameterInstantiation(node)) {</span>
+        <span class="s3">if </span><span class="s1">(Array.isArray(node.params)) {</span>
+          <span class="s1">node.params.forEach(</span><span class="s3">this</span><span class="s1">.visitTSNode, </span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Search TSInterfaceDeclaration or TSTypeAliasDeclaration, 
+     * by using TSTypeReference and TSInterfaceHeritage name. 
+     * @param {ASTNode} node 
+     */</span>
+    <span class="s1">searchDeclarationByName(node) {</span>
+      <span class="s1">let typeName;</span>
+      <span class="s3">if </span><span class="s1">(astUtil.isTSTypeReference(node)) {</span>
+        <span class="s1">typeName = node.typeName.name;</span>
+        <span class="s1">const leftMostName = getLeftMostTypeName(node.typeName);</span>
+        <span class="s1">const shouldTraverseTypeParams = genericReactTypesImport.has(leftMostName);</span>
+        <span class="s3">if </span><span class="s1">(shouldTraverseTypeParams &amp;&amp; node.typeParameters &amp;&amp; node.typeParameters.length !== </span><span class="s4">0</span><span class="s1">) {</span>
+          <span class="s0">// All react Generic types are derived from:</span>
+          <span class="s0">// type PropsWithChildren&lt;P&gt; = P &amp; { children?: ReactNode | undefined }</span>
+          <span class="s0">// So we should construct an optional children prop</span>
+          <span class="s3">this</span><span class="s1">.shouldSpecifyOptionalChildrenProps = </span><span class="s3">true</span><span class="s1">;</span>
+
+          <span class="s1">const rightMostName = getRightMostTypeName(node.typeName);</span>
+          <span class="s1">const importedName = localToImportedMap[rightMostName];</span>
+          <span class="s1">const idx = genericTypeParamIndexWherePropsArePresent[</span>
+            <span class="s1">leftMostName !== rightMostName ? rightMostName : importedName</span>
+          <span class="s1">];</span>
+          <span class="s1">const nextNode = node.typeParameters.params[idx];</span>
+          <span class="s3">this</span><span class="s1">.visitTSNode(nextNode);</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(astUtil.isTSInterfaceHeritage(node)) {</span>
+        <span class="s3">if </span><span class="s1">(!node.expression &amp;&amp; node.id) {</span>
+          <span class="s1">typeName = node.id.name;</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s1">typeName = node.expression.name;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">(!typeName) {</span>
+        <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">(typeName === </span><span class="s2">'ReturnType'</span><span class="s1">) {</span>
+        <span class="s3">this</span><span class="s1">.convertReturnTypeToPropTypes(node);</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s0">// Prevent recursive inheritance will cause maximum callstack.</span>
+      <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.referenceNameMap.has(typeName)) {</span>
+        <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s0">// Add typeName to Set and consider it as traversed.</span>
+      <span class="s3">this</span><span class="s1">.referenceNameMap.add(typeName);</span>
+
+      <span class="s0">/** 
+       * From line 577 to line 581, and line 588 to line 590 are trying to handle typescript-eslint-parser 
+       * Need to be deprecated after remove typescript-eslint-parser support. 
+       */</span>
+      <span class="s1">const candidateTypes = </span><span class="s3">this</span><span class="s1">.sourceCode.ast.body.filter((item) =&gt; astUtil.isTSTypeDeclaration(item));</span>
+
+      <span class="s1">const declarations = flatMap(</span>
+        <span class="s1">candidateTypes,</span>
+        <span class="s1">(type) =&gt; type.declarations || (type.declaration &amp;&amp; type.declaration.declarations) || type.declaration);</span>
+
+      <span class="s0">// we tried to find either an interface or a type with the TypeReference name</span>
+      <span class="s1">const typeDeclaration = declarations.filter((dec) =&gt; dec.id.name === typeName);</span>
+
+      <span class="s1">const interfaceDeclarations = </span><span class="s3">this</span><span class="s1">.sourceCode.ast.body</span>
+        <span class="s1">.filter(filterInterfaceOrTypeAlias)</span>
+        <span class="s1">.filter((item) =&gt; filterInterfaceOrAliasByName(item, typeName))</span>
+        <span class="s1">.map((item) =&gt; (item.declaration || item));</span>
+
+      <span class="s3">if </span><span class="s1">(typeDeclaration.length !== </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">typeDeclaration.map((t) =&gt; t.init || t.typeAnnotation).forEach(</span><span class="s3">this</span><span class="s1">.visitTSNode, </span><span class="s3">this</span><span class="s1">);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(interfaceDeclarations.length !== </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">interfaceDeclarations.forEach(</span><span class="s3">this</span><span class="s1">.traverseDeclaredInterfaceOrTypeAlias, </span><span class="s3">this</span><span class="s1">);</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Traverse TSInterfaceDeclaration and TSTypeAliasDeclaration 
+     * which retrieve from function searchDeclarationByName; 
+     * @param {ASTNode} node 
+     */</span>
+    <span class="s1">traverseDeclaredInterfaceOrTypeAlias(node) {</span>
+      <span class="s3">if </span><span class="s1">(astUtil.isTSInterfaceDeclaration(node)) {</span>
+        <span class="s0">// Handle TSInterfaceDeclaration interface Props { name: string, id: number}, should put in properties list directly;</span>
+        <span class="s3">this</span><span class="s1">.foundDeclaredPropertiesList = </span><span class="s3">this</span><span class="s1">.foundDeclaredPropertiesList.concat(node.body.body);</span>
+      <span class="s1">}</span>
+      <span class="s0">// Handle TSTypeAliasDeclaration type Props = {name:string}</span>
+      <span class="s3">if </span><span class="s1">(astUtil.isTSTypeAliasDeclaration(node)) {</span>
+        <span class="s1">const typeAnnotation = node.typeAnnotation;</span>
+        <span class="s3">this</span><span class="s1">.visitTSNode(typeAnnotation);</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">(Array.isArray(node.extends)) {</span>
+        <span class="s1">node.extends.forEach(</span><span class="s3">this</span><span class="s1">.visitTSNode, </span><span class="s3">this</span><span class="s1">);</span>
+        <span class="s0">// This line is trying to handle typescript-eslint-parser</span>
+        <span class="s0">// typescript-eslint-parser extension is name as heritage</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(Array.isArray(node.heritage)) {</span>
+        <span class="s1">node.heritage.forEach(</span><span class="s3">this</span><span class="s1">.visitTSNode, </span><span class="s3">this</span><span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">convertIntersectionTypeToPropTypes(node) {</span>
+      <span class="s3">if </span><span class="s1">(!node) </span><span class="s3">return</span><span class="s1">;</span>
+      <span class="s3">if </span><span class="s1">(Array.isArray(node.types)) {</span>
+        <span class="s1">node.types.forEach(</span><span class="s3">this</span><span class="s1">.visitTSNode, </span><span class="s3">this</span><span class="s1">);</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">convertReturnTypeToPropTypes(node) {</span>
+      <span class="s0">// ReturnType&lt;T&gt; should always have one parameter</span>
+      <span class="s3">if </span><span class="s1">(node.typeParameters) {</span>
+        <span class="s3">if </span><span class="s1">(node.typeParameters.params.length === </span><span class="s4">1</span><span class="s1">) {</span>
+          <span class="s1">let returnType = node.typeParameters.params[</span><span class="s4">0</span><span class="s1">];</span>
+          <span class="s0">// This line is trying to handle typescript-eslint-parser</span>
+          <span class="s0">// typescript-eslint-parser TSTypeQuery is wrapped by TSTypeReference</span>
+          <span class="s3">if </span><span class="s1">(astUtil.isTSTypeReference(returnType)) {</span>
+            <span class="s1">returnType = returnType.typeName;</span>
+          <span class="s1">}</span>
+          <span class="s0">// Handle ReturnType&lt;typeof mapStateToProps&gt;</span>
+          <span class="s3">if </span><span class="s1">(astUtil.isTSTypeQuery(returnType)) {</span>
+            <span class="s1">const returnTypeFunction = flatMap(</span><span class="s3">this</span><span class="s1">.sourceCode.ast.body</span>
+              <span class="s1">.filter((item) =&gt; item.type === </span><span class="s2">'VariableDeclaration'</span>
+                <span class="s1">&amp;&amp; item.declarations.find((dec) =&gt; dec.id.name === returnType.exprName.name)</span>
+              <span class="s1">), (type) =&gt; type.declarations).map((dec) =&gt; dec.init);</span>
+
+            <span class="s3">if </span><span class="s1">(Array.isArray(returnTypeFunction)) {</span>
+              <span class="s3">if </span><span class="s1">(returnTypeFunction.length === </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s0">// Cannot find identifier in current scope. It might be an exported type.</span>
+                <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+                <span class="s3">return</span><span class="s1">;</span>
+              <span class="s1">}</span>
+              <span class="s1">returnTypeFunction.forEach((func) =&gt; {</span>
+                <span class="s3">if </span><span class="s1">(isFunctionType(func)) {</span>
+                  <span class="s1">let res = func.body;</span>
+                  <span class="s3">if </span><span class="s1">(res.type === </span><span class="s2">'BlockStatement'</span><span class="s1">) {</span>
+                    <span class="s1">res = astUtil.findReturnStatement(func);</span>
+                    <span class="s3">if </span><span class="s1">(res) {</span>
+                      <span class="s1">res = res.argument;</span>
+                    <span class="s1">}</span>
+                  <span class="s1">}</span>
+                  <span class="s3">switch </span><span class="s1">(res.type) {</span>
+                    <span class="s3">case </span><span class="s2">'ObjectExpression'</span><span class="s1">:</span>
+                      <span class="s1">iterateProperties(context, res.properties, (key, value, propNode) =&gt; {</span>
+                        <span class="s3">if </span><span class="s1">(propNode &amp;&amp; propNode.argument &amp;&amp; propNode.argument.type === </span><span class="s2">'CallExpression'</span><span class="s1">) {</span>
+                          <span class="s3">if </span><span class="s1">(propNode.argument.typeParameters) {</span>
+                            <span class="s3">this</span><span class="s1">.visitTSNode(propNode.argument.typeParameters);</span>
+                          <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                            <span class="s0">// Ignore this CallExpression return value since it doesn't have any typeParameters to let us know it's types.</span>
+                            <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+                            <span class="s3">return</span><span class="s1">;</span>
+                          <span class="s1">}</span>
+                        <span class="s1">}</span>
+                        <span class="s3">if </span><span class="s1">(!value) {</span>
+                          <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+                          <span class="s3">return</span><span class="s1">;</span>
+                        <span class="s1">}</span>
+                        <span class="s1">const types = buildReactDeclarationTypes(value, key);</span>
+                        <span class="s1">types.fullName = key;</span>
+                        <span class="s1">types.name = key;</span>
+                        <span class="s1">types.node = propNode;</span>
+                        <span class="s1">types.isRequired = propsUtil.isRequiredPropType(value);</span>
+                        <span class="s3">this</span><span class="s1">.declaredPropTypes[key] = types;</span>
+                      <span class="s1">});</span>
+                      <span class="s3">break</span><span class="s1">;</span>
+                    <span class="s3">case </span><span class="s2">'CallExpression'</span><span class="s1">:</span>
+                      <span class="s3">if </span><span class="s1">(res.typeParameters) {</span>
+                        <span class="s3">this</span><span class="s1">.visitTSNode(res.typeParameters);</span>
+                      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                        <span class="s0">// Ignore this CallExpression return value since it doesn't have any typeParameters to let us know it's types.</span>
+                        <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+                      <span class="s1">}</span>
+                      <span class="s3">break</span><span class="s1">;</span>
+                    <span class="s3">default</span><span class="s1">:</span>
+                  <span class="s1">}</span>
+                <span class="s1">}</span>
+              <span class="s1">});</span>
+              <span class="s3">return</span><span class="s1">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+          <span class="s0">// Handle ReturnType&lt;()=&gt;returnType&gt;</span>
+          <span class="s3">if </span><span class="s1">(astUtil.isTSFunctionType(returnType)) {</span>
+            <span class="s3">if </span><span class="s1">(astUtil.isTSTypeAnnotation(returnType.returnType)) {</span>
+              <span class="s3">this</span><span class="s1">.visitTSNode(returnType.returnType);</span>
+              <span class="s3">return</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s0">// This line is trying to handle typescript-eslint-parser</span>
+            <span class="s0">// typescript-eslint-parser TSFunction name returnType as typeAnnotation</span>
+            <span class="s3">if </span><span class="s1">(astUtil.isTSTypeAnnotation(returnType.typeAnnotation)) {</span>
+              <span class="s3">this</span><span class="s1">.visitTSNode(returnType.typeAnnotation);</span>
+              <span class="s3">return</span><span class="s1">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s3">this</span><span class="s1">.shouldIgnorePropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">endAndStructDeclaredPropTypes() {</span>
+      <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.shouldSpecifyOptionalChildrenProps) {</span>
+        <span class="s3">this</span><span class="s1">.declaredPropTypes.children = {</span>
+          <span class="s1">fullName: </span><span class="s2">'children'</span><span class="s1">,</span>
+          <span class="s1">name: </span><span class="s2">'children'</span><span class="s1">,</span>
+          <span class="s1">isRequired: </span><span class="s3">false</span><span class="s1">,</span>
+        <span class="s1">};</span>
+      <span class="s1">}</span>
+      <span class="s3">this</span><span class="s1">.foundDeclaredPropertiesList.forEach((tsInterfaceBody) =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(tsInterfaceBody &amp;&amp; (tsInterfaceBody.type === </span><span class="s2">'TSPropertySignature' </span><span class="s1">|| tsInterfaceBody.type === </span><span class="s2">'TSMethodSignature'</span><span class="s1">)) {</span>
+          <span class="s1">let accessor = </span><span class="s2">'name'</span><span class="s1">;</span>
+          <span class="s3">if </span><span class="s1">(tsInterfaceBody.key.type === </span><span class="s2">'Literal'</span><span class="s1">) {</span>
+            <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">tsInterfaceBody.key.value === </span><span class="s2">'number'</span><span class="s1">) {</span>
+              <span class="s1">accessor = </span><span class="s2">'raw'</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+              <span class="s1">accessor = </span><span class="s2">'value'</span><span class="s1">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+          <span class="s3">this</span><span class="s1">.declaredPropTypes[tsInterfaceBody.key[accessor]] = {</span>
+            <span class="s1">fullName: tsInterfaceBody.key[accessor],</span>
+            <span class="s1">name: tsInterfaceBody.key[accessor],</span>
+            <span class="s1">node: tsInterfaceBody,</span>
+            <span class="s1">isRequired: !tsInterfaceBody.optional,</span>
+          <span class="s1">};</span>
+        <span class="s1">}</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Mark a prop type as declared 
+   * @param {ASTNode} node The AST node being checked. 
+   * @param {ASTNode} propTypes The AST node containing the proptypes 
+   */</span>
+  <span class="s3">function </span><span class="s1">markPropTypesAsDeclared(node, propTypes) {</span>
+    <span class="s1">let componentNode = node;</span>
+    <span class="s3">while </span><span class="s1">(componentNode &amp;&amp; !components.get(componentNode)) {</span>
+      <span class="s1">componentNode = componentNode.parent;</span>
+    <span class="s1">}</span>
+    <span class="s1">const component = components.get(componentNode);</span>
+    <span class="s1">let declaredPropTypes = (component &amp;&amp; component.declaredPropTypes) || {};</span>
+    <span class="s1">let ignorePropsValidation = (component &amp;&amp; component.ignorePropsValidation) || </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s3">switch </span><span class="s1">(propTypes &amp;&amp; propTypes.type) {</span>
+      <span class="s3">case </span><span class="s2">'ObjectTypeAnnotation'</span><span class="s1">:</span>
+        <span class="s1">ignorePropsValidation = declarePropTypesForObjectTypeAnnotation(propTypes, declaredPropTypes);</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">'ObjectExpression'</span><span class="s1">:</span>
+        <span class="s1">iterateProperties(context, propTypes.properties, (key, value, propNode) =&gt; {</span>
+          <span class="s3">if </span><span class="s1">(!value) {</span>
+            <span class="s1">ignorePropsValidation = </span><span class="s3">true</span><span class="s1">;</span>
+            <span class="s3">return</span><span class="s1">;</span>
+          <span class="s1">}</span>
+          <span class="s1">const types = buildReactDeclarationTypes(value, key);</span>
+          <span class="s1">types.fullName = key;</span>
+          <span class="s1">types.name = key;</span>
+          <span class="s1">types.node = propNode;</span>
+          <span class="s1">types.isRequired = propsUtil.isRequiredPropType(value);</span>
+          <span class="s1">declaredPropTypes[key] = types;</span>
+        <span class="s1">});</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">'MemberExpression'</span><span class="s1">: {</span>
+        <span class="s1">let curDeclaredPropTypes = declaredPropTypes;</span>
+        <span class="s0">// Walk the list of properties, until we reach the assignment</span>
+        <span class="s0">// ie: ClassX.propTypes.a.b.c = ...</span>
+        <span class="s3">while </span><span class="s1">(</span>
+          <span class="s1">propTypes</span>
+          <span class="s1">&amp;&amp; propTypes.parent</span>
+          <span class="s1">&amp;&amp; propTypes.parent.type !== </span><span class="s2">'AssignmentExpression'</span>
+          <span class="s1">&amp;&amp; propTypes.property</span>
+          <span class="s1">&amp;&amp; curDeclaredPropTypes</span>
+        <span class="s1">) {</span>
+          <span class="s1">const propName = propTypes.property.name;</span>
+          <span class="s3">if </span><span class="s1">(propName </span><span class="s3">in </span><span class="s1">curDeclaredPropTypes) {</span>
+            <span class="s1">curDeclaredPropTypes = curDeclaredPropTypes[propName].children;</span>
+            <span class="s1">propTypes = propTypes.parent;</span>
+          <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s0">// This will crash at runtime because we haven't seen this key before</span>
+            <span class="s0">// stop this and do not declare it</span>
+            <span class="s1">propTypes = </span><span class="s3">null</span><span class="s1">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(propTypes &amp;&amp; propTypes.parent &amp;&amp; propTypes.property) {</span>
+          <span class="s3">if </span><span class="s1">(!(propTypes === propTypes.parent.left &amp;&amp; propTypes.parent.left.object)) {</span>
+            <span class="s1">ignorePropsValidation = </span><span class="s3">true</span><span class="s1">;</span>
+            <span class="s3">break</span><span class="s1">;</span>
+          <span class="s1">}</span>
+          <span class="s1">const parentProp = context.getSource(propTypes.parent.left.object).replace(/^.*\.propTypes\./, </span><span class="s2">''</span><span class="s1">);</span>
+          <span class="s1">const types = buildReactDeclarationTypes(</span>
+            <span class="s1">propTypes.parent.right,</span>
+            <span class="s1">parentProp</span>
+          <span class="s1">);</span>
+
+          <span class="s1">types.name = propTypes.property.name;</span>
+          <span class="s1">types.fullName = [parentProp, propTypes.property.name].join(</span><span class="s2">'.'</span><span class="s1">);</span>
+          <span class="s1">types.node = propTypes.parent;</span>
+          <span class="s1">types.isRequired = propsUtil.isRequiredPropType(propTypes.parent.right);</span>
+          <span class="s1">curDeclaredPropTypes[propTypes.property.name] = types;</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s1">let isUsedInPropTypes = </span><span class="s3">false</span><span class="s1">;</span>
+          <span class="s1">let n = propTypes;</span>
+          <span class="s3">while </span><span class="s1">(n) {</span>
+            <span class="s3">if </span><span class="s1">(((n.type === </span><span class="s2">'AssignmentExpression'</span><span class="s1">) &amp;&amp; propsUtil.isPropTypesDeclaration(n.left))</span>
+              <span class="s1">|| ((n.type === </span><span class="s2">'ClassProperty' </span><span class="s1">|| n.type === </span><span class="s2">'PropertyDefinition' </span><span class="s1">|| n.type === </span><span class="s2">'Property'</span><span class="s1">) &amp;&amp; propsUtil.isPropTypesDeclaration(n))) {</span>
+              <span class="s0">// Found a propType used inside of another propType. This is not considered usage, we'll still validate</span>
+              <span class="s0">// this component.</span>
+              <span class="s1">isUsedInPropTypes = </span><span class="s3">true</span><span class="s1">;</span>
+              <span class="s3">break</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s1">n = n.parent;</span>
+          <span class="s1">}</span>
+          <span class="s3">if </span><span class="s1">(!isUsedInPropTypes) {</span>
+            <span class="s1">ignorePropsValidation = </span><span class="s3">true</span><span class="s1">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">case </span><span class="s2">'Identifier'</span><span class="s1">: {</span>
+        <span class="s1">const variablesInScope = variableUtil.variablesInScope(context);</span>
+        <span class="s1">const firstMatchingVariable = variablesInScope</span>
+          <span class="s1">.find((variableInScope) =&gt; variableInScope.name === propTypes.name);</span>
+        <span class="s3">if </span><span class="s1">(firstMatchingVariable) {</span>
+          <span class="s1">const defInScope = firstMatchingVariable.defs[firstMatchingVariable.defs.length - </span><span class="s4">1</span><span class="s1">];</span>
+          <span class="s1">markPropTypesAsDeclared(node, defInScope.node &amp;&amp; defInScope.node.init);</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">ignorePropsValidation = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">case </span><span class="s2">'CallExpression'</span><span class="s1">: {</span>
+        <span class="s3">if </span><span class="s1">(</span>
+          <span class="s1">propWrapperUtil.isPropWrapperFunction(</span>
+            <span class="s1">context,</span>
+            <span class="s1">context.getSourceCode().getText(propTypes.callee)</span>
+          <span class="s1">)</span>
+          <span class="s1">&amp;&amp; propTypes.arguments &amp;&amp; propTypes.arguments[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">) {</span>
+          <span class="s1">markPropTypesAsDeclared(node, propTypes.arguments[</span><span class="s4">0</span><span class="s1">]);</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s3">case </span><span class="s2">'IntersectionTypeAnnotation'</span><span class="s1">:</span>
+        <span class="s1">ignorePropsValidation = declarePropTypesForIntersectionTypeAnnotation(propTypes, declaredPropTypes);</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">'GenericTypeAnnotation'</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">(propTypes.id.name === </span><span class="s2">'$ReadOnly'</span><span class="s1">) {</span>
+          <span class="s1">ignorePropsValidation = declarePropTypesForObjectTypeAnnotation(</span>
+            <span class="s1">propTypes.typeParameters.params[</span><span class="s4">0</span><span class="s1">],</span>
+            <span class="s1">declaredPropTypes</span>
+          <span class="s1">);</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s1">ignorePropsValidation = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">'TSTypeReference'</span><span class="s1">:</span>
+      <span class="s3">case </span><span class="s2">'TSTypeAnnotation'</span><span class="s1">: {</span>
+        <span class="s1">const tsTypeAnnotation = </span><span class="s3">new </span><span class="s1">DeclarePropTypesForTSTypeAnnotation(propTypes, declaredPropTypes);</span>
+        <span class="s1">ignorePropsValidation = tsTypeAnnotation.shouldIgnorePropTypes;</span>
+        <span class="s1">declaredPropTypes = tsTypeAnnotation.declaredPropTypes;</span>
+      <span class="s1">}</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case null</span><span class="s1">:</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">default</span><span class="s1">:</span>
+        <span class="s1">ignorePropsValidation = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s3">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">components.set(node, {</span>
+      <span class="s1">declaredPropTypes,</span>
+      <span class="s1">ignorePropsValidation,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * @param {ASTNode} node We expect either an ArrowFunctionExpression, 
+   *   FunctionDeclaration, or FunctionExpression 
+   */</span>
+  <span class="s3">function </span><span class="s1">markAnnotatedFunctionArgumentsAsDeclared(node) {</span>
+    <span class="s3">if </span><span class="s1">(!node.params || !node.params.length) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">node.parent</span>
+      <span class="s1">&amp;&amp; node.parent.callee</span>
+      <span class="s1">&amp;&amp; node.parent.typeParameters</span>
+      <span class="s1">&amp;&amp; node.parent.typeParameters.params</span>
+      <span class="s1">&amp;&amp; (</span>
+        <span class="s1">node.parent.callee.name === </span><span class="s2">'forwardRef' </span><span class="s1">|| (</span>
+          <span class="s1">node.parent.callee.object</span>
+          <span class="s1">&amp;&amp; node.parent.callee.property</span>
+          <span class="s1">&amp;&amp; node.parent.callee.object.name === </span><span class="s2">'React'</span>
+          <span class="s1">&amp;&amp; node.parent.callee.property.name === </span><span class="s2">'forwardRef'</span>
+        <span class="s1">)</span>
+      <span class="s1">)</span>
+    <span class="s1">) {</span>
+      <span class="s1">const propTypes = node.parent.typeParameters.params[</span><span class="s4">1</span><span class="s1">];</span>
+      <span class="s1">const declaredPropTypes = {};</span>
+      <span class="s1">const obj = </span><span class="s3">new </span><span class="s1">DeclarePropTypesForTSTypeAnnotation(propTypes, declaredPropTypes);</span>
+      <span class="s1">components.set(node, {</span>
+        <span class="s1">declaredPropTypes: obj.declaredPropTypes,</span>
+        <span class="s1">ignorePropsValidation: obj.shouldIgnorePropTypes,</span>
+      <span class="s1">});</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const siblingIdentifier = node.parent &amp;&amp; node.parent.id;</span>
+    <span class="s1">const siblingHasTypeAnnotation = siblingIdentifier &amp;&amp; siblingIdentifier.typeAnnotation;</span>
+    <span class="s1">const isNodeAnnotated = annotations.isAnnotatedFunctionPropsDeclaration(node, context);</span>
+
+    <span class="s3">if </span><span class="s1">(!isNodeAnnotated &amp;&amp; !siblingHasTypeAnnotation) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// https://github.com/jsx-eslint/eslint-plugin-react/issues/2784</span>
+    <span class="s3">if </span><span class="s1">(isInsideClassBody(node) &amp;&amp; !astUtil.isFunction(node)) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Should ignore function that not return JSXElement</span>
+    <span class="s3">if </span><span class="s1">(!utils.isReturningJSXOrNull(node) || startWithCapitalizedLetter(node)) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(isNodeAnnotated) {</span>
+      <span class="s1">const param = node.params[</span><span class="s4">0</span><span class="s1">];</span>
+      <span class="s3">if </span><span class="s1">(param.typeAnnotation &amp;&amp; param.typeAnnotation.typeAnnotation &amp;&amp; param.typeAnnotation.typeAnnotation.type === </span><span class="s2">'UnionTypeAnnotation'</span><span class="s1">) {</span>
+        <span class="s1">param.typeAnnotation.typeAnnotation.types.forEach((annotation) =&gt; {</span>
+          <span class="s3">if </span><span class="s1">(annotation.type === </span><span class="s2">'GenericTypeAnnotation'</span><span class="s1">) {</span>
+            <span class="s1">markPropTypesAsDeclared(node, resolveTypeAnnotation(annotation));</span>
+          <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">markPropTypesAsDeclared(node, annotation);</span>
+          <span class="s1">}</span>
+        <span class="s1">});</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">markPropTypesAsDeclared(node, resolveTypeAnnotation(param));</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s0">// implements what's discussed here: https://github.com/jsx-eslint/eslint-plugin-react/issues/2777#issuecomment-683944481</span>
+      <span class="s1">const annotation = siblingIdentifier.typeAnnotation.typeAnnotation;</span>
+
+      <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">annotation</span>
+        <span class="s1">&amp;&amp; annotation.type !== </span><span class="s2">'TSTypeReference'</span>
+        <span class="s1">&amp;&amp; annotation.typeParameters == </span><span class="s3">null</span>
+      <span class="s1">) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s3">if </span><span class="s1">(!isValidReactGenericTypeAnnotation(annotation)) </span><span class="s3">return</span><span class="s1">;</span>
+
+      <span class="s1">markPropTypesAsDeclared(node, resolveTypeAnnotation(siblingIdentifier));</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Resolve the type annotation for a given class declaration node with superTypeParameters. 
+   * 
+   * @param {ASTNode} node The annotation or a node containing the type annotation. 
+   * @returns {ASTNode} The resolved type annotation for the node. 
+   */</span>
+  <span class="s3">function </span><span class="s1">resolveSuperParameterPropsType(node) {</span>
+    <span class="s1">let propsParameterPosition;</span>
+    <span class="s3">try </span><span class="s1">{</span>
+      <span class="s0">// Flow &lt;=0.52 had 3 required TypedParameters of which the second one is the Props.</span>
+      <span class="s0">// Flow &gt;=0.53 has 2 optional TypedParameters of which the first one is the Props.</span>
+      <span class="s1">propsParameterPosition = testFlowVersion(context, </span><span class="s2">'&gt;= 0.53.0'</span><span class="s1">) ? </span><span class="s4">0 </span><span class="s1">: </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(e) {</span>
+      <span class="s0">// In case there is no flow version defined, we can safely assume that when there are 3 Props we are dealing with version &lt;= 0.52</span>
+      <span class="s1">propsParameterPosition = node.superTypeParameters.params.length &lt;= </span><span class="s4">2 </span><span class="s1">? </span><span class="s4">0 </span><span class="s1">: </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let annotation = node.superTypeParameters.params[propsParameterPosition];</span>
+    <span class="s3">while </span><span class="s1">(annotation &amp;&amp; (annotation.type === </span><span class="s2">'TypeAnnotation' </span><span class="s1">|| annotation.type === </span><span class="s2">'NullableTypeAnnotation'</span><span class="s1">)) {</span>
+      <span class="s1">annotation = annotation.typeAnnotation;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(annotation &amp;&amp; annotation.type === </span><span class="s2">'GenericTypeAnnotation' </span><span class="s1">&amp;&amp; getInTypeScope(annotation.id.name)) {</span>
+      <span class="s3">return </span><span class="s1">getInTypeScope(annotation.id.name);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">annotation;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Checks if we are declaring a `props` class property with a flow type annotation. 
+   * @param {ASTNode} node The AST node being checked. 
+   * @returns {Boolean} True if the node is a type annotated props declaration, false if not. 
+   */</span>
+  <span class="s3">function </span><span class="s1">isAnnotatedClassPropsDeclaration(node) {</span>
+    <span class="s3">if </span><span class="s1">(node &amp;&amp; (node.type === </span><span class="s2">'ClassProperty' </span><span class="s1">|| node.type === </span><span class="s2">'PropertyDefinition'</span><span class="s1">)) {</span>
+      <span class="s1">const tokens = context.getFirstTokens(node, </span><span class="s4">2</span><span class="s1">);</span>
+      <span class="s3">if </span><span class="s1">(</span>
+        <span class="s1">node.typeAnnotation &amp;&amp; (</span>
+          <span class="s1">tokens[</span><span class="s4">0</span><span class="s1">].value === </span><span class="s2">'props'</span>
+          <span class="s1">|| (tokens[</span><span class="s4">1</span><span class="s1">] &amp;&amp; tokens[</span><span class="s4">1</span><span class="s1">].value === </span><span class="s2">'props'</span><span class="s1">)</span>
+        <span class="s1">)</span>
+      <span class="s1">) {</span>
+        <span class="s3">return true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">return false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">ClassExpression(node) {</span>
+      <span class="s0">// TypeParameterDeclaration need to be added to typeScope in order to handle ClassExpressions.</span>
+      <span class="s0">// This visitor is executed before TypeParameterDeclaration are scoped, therefore we postpone</span>
+      <span class="s0">// processing class expressions until when the program exists.</span>
+      <span class="s1">classExpressions.push(node);</span>
+    <span class="s1">},</span>
+
+    <span class="s1">ClassDeclaration(node) {</span>
+      <span class="s3">if </span><span class="s1">(isSuperTypeParameterPropsDeclaration(node)) {</span>
+        <span class="s1">markPropTypesAsDeclared(node, resolveSuperParameterPropsType(node));</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s2">'ClassProperty, PropertyDefinition'</span><span class="s1">(node) {</span>
+      <span class="s3">if </span><span class="s1">(isAnnotatedClassPropsDeclaration(node)) {</span>
+        <span class="s1">markPropTypesAsDeclared(node, resolveTypeAnnotation(node));</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(propsUtil.isPropTypesDeclaration(node)) {</span>
+        <span class="s1">markPropTypesAsDeclared(node, node.value);</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">ObjectExpression(node) {</span>
+      <span class="s0">// Search for the proptypes declaration</span>
+      <span class="s1">node.properties.forEach((property) =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(!propsUtil.isPropTypesDeclaration(property)) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">markPropTypesAsDeclared(node, property.value);</span>
+      <span class="s1">});</span>
+    <span class="s1">},</span>
+
+    <span class="s1">FunctionExpression(node) {</span>
+      <span class="s3">if </span><span class="s1">(node.parent.type !== </span><span class="s2">'MethodDefinition'</span><span class="s1">) {</span>
+        <span class="s1">markAnnotatedFunctionArgumentsAsDeclared(node);</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">ImportDeclaration(node) {</span>
+      <span class="s0">// parse `import ... from 'react`</span>
+      <span class="s3">if </span><span class="s1">(node.source.value === </span><span class="s2">'react'</span><span class="s1">) {</span>
+        <span class="s1">node.specifiers.forEach((specifier) =&gt; {</span>
+          <span class="s3">if </span><span class="s1">(</span>
+            <span class="s0">// handles import * as X from 'react'</span>
+            <span class="s1">specifier.type === </span><span class="s2">'ImportNamespaceSpecifier'</span>
+            <span class="s0">// handles import React from 'react'</span>
+            <span class="s1">|| specifier.type === </span><span class="s2">'ImportDefaultSpecifier'</span>
+          <span class="s1">) {</span>
+            <span class="s1">genericReactTypesImport.add(specifier.local.name);</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// handles import { FC } from 'react' or import { FC as X } from 'react'</span>
+          <span class="s3">if </span><span class="s1">(specifier.type === </span><span class="s2">'ImportSpecifier' </span><span class="s1">&amp;&amp; allowedGenericTypes.has(specifier.imported.name)) {</span>
+            <span class="s1">genericReactTypesImport.add(specifier.local.name);</span>
+            <span class="s1">localToImportedMap[specifier.local.name] = specifier.imported.name;</span>
+          <span class="s1">}</span>
+        <span class="s1">});</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">FunctionDeclaration: markAnnotatedFunctionArgumentsAsDeclared,</span>
+
+    <span class="s1">ArrowFunctionExpression: markAnnotatedFunctionArgumentsAsDeclared,</span>
+
+    <span class="s1">MemberExpression(node) {</span>
+      <span class="s3">if </span><span class="s1">(propsUtil.isPropTypesDeclaration(node)) {</span>
+        <span class="s1">const component = utils.getRelatedComponent(node);</span>
+        <span class="s3">if </span><span class="s1">(!component) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">try </span><span class="s1">{</span>
+          <span class="s1">markPropTypesAsDeclared(component.node, node.parent.right || node.parent);</span>
+        <span class="s1">} </span><span class="s3">catch </span><span class="s1">(e) {</span>
+          <span class="s3">if </span><span class="s1">(e.constructor !== RangeError) { </span><span class="s3">throw </span><span class="s1">e; }</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">MethodDefinition(node) {</span>
+      <span class="s3">if </span><span class="s1">(!node.static || node.kind !== </span><span class="s2">'get' </span><span class="s1">|| !propsUtil.isPropTypesDeclaration(node)) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">let i = node.value.body.body.length - </span><span class="s4">1</span><span class="s1">;</span>
+      <span class="s3">for </span><span class="s1">(; i &gt;= </span><span class="s4">0</span><span class="s1">; i--) {</span>
+        <span class="s3">if </span><span class="s1">(node.value.body.body[i].type === </span><span class="s2">'ReturnStatement'</span><span class="s1">) {</span>
+          <span class="s3">break</span><span class="s1">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s3">if </span><span class="s1">(i &gt;= </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">markPropTypesAsDeclared(node, node.value.body.body[i].argument);</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">TypeAlias(node) {</span>
+      <span class="s1">setInTypeScope(node.id.name, node.right);</span>
+    <span class="s1">},</span>
+
+    <span class="s1">TypeParameterDeclaration(node) {</span>
+      <span class="s1">const identifier = node.params[</span><span class="s4">0</span><span class="s1">];</span>
+
+      <span class="s3">if </span><span class="s1">(identifier.typeAnnotation) {</span>
+        <span class="s1">setInTypeScope(identifier.name, identifier.typeAnnotation.typeAnnotation);</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">Program() {</span>
+      <span class="s1">stack = [{}];</span>
+    <span class="s1">},</span>
+
+    <span class="s1">BlockStatement() {</span>
+      <span class="s1">stack.push(Object.create(typeScope()));</span>
+    <span class="s1">},</span>
+
+    <span class="s2">'BlockStatement:exit'</span><span class="s1">() {</span>
+      <span class="s1">stack.pop();</span>
+    <span class="s1">},</span>
+
+    <span class="s2">'Program:exit'</span><span class="s1">() {</span>
+      <span class="s1">classExpressions.forEach((node) =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(isSuperTypeParameterPropsDeclaration(node)) {</span>
+          <span class="s1">markPropTypesAsDeclared(node, resolveSuperParameterPropsType(node));</span>
+        <span class="s1">}</span>
+      <span class="s1">});</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

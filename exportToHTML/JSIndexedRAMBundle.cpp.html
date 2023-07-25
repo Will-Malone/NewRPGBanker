@@ -1,0 +1,153 @@
+<html>
+<head>
+<title>JSIndexedRAMBundle.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JSIndexedRAMBundle.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;JSIndexedRAMBundle.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fstream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;sstream&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s1">std::function&lt;std::unique_ptr&lt;JSModulesUnbundle&gt;(std::string)&gt;</span>
+<span class="s1">JSIndexedRAMBundle::buildFactory() {</span>
+  <span class="s4">return </span><span class="s1">[](</span><span class="s4">const </span><span class="s1">std::string &amp;bundlePath) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;JSIndexedRAMBundle&gt;(bundlePath.c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSIndexedRAMBundle::JSIndexedRAMBundle(</span><span class="s4">const char </span><span class="s1">*sourcePath) {</span>
+  <span class="s1">m_bundle = std::make_unique&lt;std::ifstream&gt;(sourcePath</span><span class="s4">, </span><span class="s1">std::ifstream::binary)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!m_bundle) {</span>
+    <span class="s4">throw </span><span class="s1">std::ios_base::failure(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;Bundle &quot;</span><span class="s4">, </span><span class="s1">sourcePath</span><span class="s4">, </span><span class="s3">&quot;cannot be opened: &quot;</span><span class="s4">, </span><span class="s1">m_bundle-&gt;rdstate()))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">init()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSIndexedRAMBundle::JSIndexedRAMBundle(</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; script) {</span>
+  <span class="s0">// tmpStream is needed because m_bundle is std::istream type</span>
+  <span class="s0">// which has no member 'write'</span>
+  <span class="s1">std::unique_ptr&lt;std::stringstream&gt; tmpStream =</span>
+      <span class="s1">std::make_unique&lt;std::stringstream&gt;()</span><span class="s4">;</span>
+  <span class="s1">tmpStream-&gt;write(script-&gt;c_str()</span><span class="s4">, </span><span class="s1">script-&gt;size())</span><span class="s4">;</span>
+  <span class="s1">m_bundle = std::move(tmpStream)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!m_bundle) {</span>
+    <span class="s4">throw </span><span class="s1">std::ios_base::failure(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;Bundle from string cannot be opened: &quot;</span><span class="s4">, </span><span class="s1">m_bundle-&gt;rdstate()))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">init()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIndexedRAMBundle::init() {</span>
+  <span class="s0">// read in magic header, number of entries, and length of the startup section</span>
+  <span class="s1">uint32_t header[</span><span class="s5">3</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">static_assert</span><span class="s1">(</span>
+      <span class="s4">sizeof</span><span class="s1">(header) == </span><span class="s5">12</span><span class="s4">,</span>
+      <span class="s3">&quot;header size must exactly match the input file format&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">readBundle(</span><span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">char </span><span class="s1">*&gt;(header)</span><span class="s4">, sizeof</span><span class="s1">(header))</span><span class="s4">;</span>
+  <span class="s4">const </span><span class="s1">size_t numTableEntries = folly::Endian::little(header[</span><span class="s5">1</span><span class="s1">])</span><span class="s4">;</span>
+  <span class="s4">const </span><span class="s1">size_t startupCodeSize = folly::Endian::little(header[</span><span class="s5">2</span><span class="s1">])</span><span class="s4">;</span>
+
+  <span class="s0">// allocate memory for meta data and lookup table.</span>
+  <span class="s1">m_table = ModuleTable(numTableEntries)</span><span class="s4">;</span>
+  <span class="s1">m_baseOffset = </span><span class="s4">sizeof</span><span class="s1">(header) + m_table.byteLength()</span><span class="s4">;</span>
+
+  <span class="s0">// read the lookup table from the file</span>
+  <span class="s1">readBundle(</span>
+      <span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">char </span><span class="s1">*&gt;(m_table.data.get())</span><span class="s4">, </span><span class="s1">m_table.byteLength())</span><span class="s4">;</span>
+
+  <span class="s0">// read the startup code</span>
+  <span class="s1">m_startupCode = std::unique_ptr&lt;JSBigBufferString&gt;(</span>
+      <span class="s4">new </span><span class="s1">JSBigBufferString{startupCodeSize - </span><span class="s5">1</span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">readBundle(m_startupCode-&gt;data()</span><span class="s4">, </span><span class="s1">startupCodeSize - </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">JSIndexedRAMBundle::Module JSIndexedRAMBundle::getModule(</span>
+    <span class="s1">uint32_t moduleId) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">Module ret</span><span class="s4">;</span>
+  <span class="s1">ret.name = folly::to&lt;std::string&gt;(moduleId</span><span class="s4">, </span><span class="s3">&quot;.js&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">ret.code = getModuleCode(moduleId)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">ret</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; JSIndexedRAMBundle::getStartupCode() {</span>
+  <span class="s1">CHECK(m_startupCode)</span>
+      <span class="s1">&lt;&lt; </span><span class="s3">&quot;startup code for a RAM Bundle can only be retrieved once&quot;</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">std::move(m_startupCode)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string JSIndexedRAMBundle::getModuleCode(</span><span class="s4">const </span><span class="s1">uint32_t id) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">const auto </span><span class="s1">moduleData = id &lt; m_table.numEntries ? &amp;m_table.data[id] : </span><span class="s4">nullptr;</span>
+
+  <span class="s0">// entries without associated code have offset = 0 and length = 0</span>
+  <span class="s4">const </span><span class="s1">uint32_t length =</span>
+      <span class="s1">moduleData ? folly::Endian::little(moduleData-&gt;length) : </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(length == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">throw </span><span class="s1">std::ios_base::failure(</span>
+        <span class="s1">folly::to&lt;std::string&gt;(</span><span class="s3">&quot;Error loading module&quot;</span><span class="s4">, </span><span class="s1">id</span><span class="s4">, </span><span class="s3">&quot;from RAM Bundle&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::string ret(length - </span><span class="s5">1</span><span class="s4">, </span><span class="s3">'</span><span class="s4">\0</span><span class="s3">'</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">readBundle(</span>
+      <span class="s1">&amp;ret.front()</span><span class="s4">,</span>
+      <span class="s1">length - </span><span class="s5">1</span><span class="s4">,</span>
+      <span class="s1">m_baseOffset + folly::Endian::little(moduleData-&gt;offset))</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">ret</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIndexedRAMBundle::readBundle(</span><span class="s4">char </span><span class="s1">*buffer</span><span class="s4">, const </span><span class="s1">std::streamsize bytes)</span>
+    <span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!m_bundle-&gt;read(buffer</span><span class="s4">, </span><span class="s1">bytes)) {</span>
+    <span class="s4">if </span><span class="s1">(m_bundle-&gt;rdstate() &amp; std::ios::eofbit) {</span>
+      <span class="s4">throw </span><span class="s1">std::ios_base::failure(</span><span class="s3">&quot;Unexpected end of RAM Bundle file&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">throw </span><span class="s1">std::ios_base::failure(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;Error reading RAM Bundle: &quot;</span><span class="s4">, </span><span class="s1">m_bundle-&gt;rdstate()))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIndexedRAMBundle::readBundle(</span>
+    <span class="s4">char </span><span class="s1">*buffer</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::streamsize bytes</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::ifstream::pos_type position) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!m_bundle-&gt;seekg(position)) {</span>
+    <span class="s4">throw </span><span class="s1">std::ios_base::failure(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;Error reading RAM Bundle: &quot;</span><span class="s4">, </span><span class="s1">m_bundle-&gt;rdstate()))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">readBundle(buffer</span><span class="s4">, </span><span class="s1">bytes)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

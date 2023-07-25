@@ -1,0 +1,348 @@
+<html>
+<head>
+<title>RCTTextLayoutManager.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTTextLayoutManager.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTTextLayoutManager.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;NSTextStorage+FontScaling.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTAttributedTextUtils.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/utils/ManagedObjectWrapper.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/utils/SimpleThreadSafeCache.h&gt;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::react</span><span class="s4">;</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTTextLayoutManager {</span>
+  <span class="s1">SimpleThreadSafeCache&lt;AttributedString</span><span class="s4">, </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">void</span><span class="s1">&gt;</span><span class="s4">, </span><span class="s5">256</span><span class="s1">&gt; _cache</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSLineBreakMode RCTNSLineBreakModeFromEllipsizeMode(EllipsizeMode ellipsizeMode)</span>
+<span class="s1">{</span>
+  <span class="s4">switch </span><span class="s1">(ellipsizeMode) {</span>
+    <span class="s4">case </span><span class="s1">EllipsizeMode::Clip:</span>
+      <span class="s4">return </span><span class="s1">NSLineBreakByClipping</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">EllipsizeMode::Head:</span>
+      <span class="s4">return </span><span class="s1">NSLineBreakByTruncatingHead</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">EllipsizeMode::Tail:</span>
+      <span class="s4">return </span><span class="s1">NSLineBreakByTruncatingTail</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">EllipsizeMode::Middle:</span>
+      <span class="s4">return </span><span class="s1">NSLineBreakByTruncatingMiddle</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (TextMeasurement)measureNSAttributedString:(NSAttributedString *)attributedString</span>
+                         <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                           <span class="s1">layoutConstraints:(LayoutConstraints)layoutConstraints</span>
+                                 <span class="s1">textStorage:(NSTextStorage *</span><span class="s4">_Nullable</span><span class="s1">)textStorage</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(attributedString.length == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s0">// This is not really an optimization because that should be checked much earlier on the call stack.</span>
+    <span class="s0">// Sometimes, very irregularly, measuring an empty string crashes/freezes iOS internal text infrastructure.</span>
+    <span class="s0">// This is our last line of defense.</span>
+    <span class="s4">return </span><span class="s1">{}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">CGSize maximumSize = CGSize{layoutConstraints.maximumSize.width</span><span class="s4">, </span><span class="s1">CGFLOAT_MAX}</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!textStorage) {</span>
+    <span class="s1">textStorage = [self _textStorageForNSAttributesString:attributedString</span>
+                                      <span class="s1">paragraphAttributes:paragraphAttributes</span>
+                                                     <span class="s1">size:maximumSize]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">[self _measureTextStorage:textStorage]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (TextMeasurement)measureAttributedString:(AttributedString)attributedString</span>
+                       <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                         <span class="s1">layoutConstraints:(LayoutConstraints)layoutConstraints</span>
+                               <span class="s1">textStorage:(NSTextStorage *</span><span class="s4">_Nullable</span><span class="s1">)textStorage</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(textStorage) {</span>
+    <span class="s4">return </span><span class="s1">[self _measureTextStorage:textStorage]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">[self measureNSAttributedString:[self _nsAttributedStringFromAttributedString:attributedString]</span>
+                       <span class="s1">paragraphAttributes:paragraphAttributes</span>
+                         <span class="s1">layoutConstraints:layoutConstraints</span>
+                               <span class="s1">textStorage:nil]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)drawAttributedString:(AttributedString)attributedString</span>
+         <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                       <span class="s1">frame:(CGRect)frame</span>
+                 <span class="s1">textStorage:(NSTextStorage *</span><span class="s4">_Nullable</span><span class="s1">)textStorage</span>
+<span class="s1">{</span>
+  <span class="s1">BOOL createdStorageForFrame = NO</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!textStorage) {</span>
+    <span class="s1">textStorage = [self textStorageForAttributesString:attributedString</span>
+                                   <span class="s1">paragraphAttributes:paragraphAttributes</span>
+                                                  <span class="s1">size:frame.size]</span><span class="s4">;</span>
+    <span class="s1">createdStorageForFrame = YES</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSLayoutManager *layoutManager = textStorage.layoutManagers.firstObject</span><span class="s4">;</span>
+  <span class="s1">NSTextContainer *textContainer = layoutManager.textContainers.firstObject</span><span class="s4">;</span>
+  <span class="s1">CGPoint origin = frame.origin</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!createdStorageForFrame) {</span>
+    <span class="s1">CGRect rect = [layoutManager usedRectForTextContainer:textContainer]</span><span class="s4">;</span>
+    <span class="s4">static auto </span><span class="s1">threshold = </span><span class="s5">1.0 </span><span class="s1">/ RCTScreenScale() + </span><span class="s5">0.01</span><span class="s4">; </span><span class="s0">// Size of a pixel plus some small threshold.</span>
+
+    <span class="s0">// `rect`'s width is stored in double precesion.</span>
+    <span class="s0">// `frame`'s width is also in double precesion but was stored as float in Yoga previously, precesion was lost.</span>
+    <span class="s4">if </span><span class="s1">(std::abs(RCTCeilPixelValue(rect.size.width) - frame.size.width) &lt; threshold) {</span>
+      <span class="s0">// `textStorage` passed to this method was used to calculate size of frame. If that's the case, it's</span>
+      <span class="s0">// width is the same as frame's width. Origin must be adjusted, otherwise glyhps will be painted in wrong</span>
+      <span class="s0">// place.</span>
+      <span class="s0">// We could create new `NSTextStorage` for the specific frame, but that is expensive.</span>
+      <span class="s1">origin.x -= RCTCeilPixelValue(rect.origin.x)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+<span class="s2">#if </span><span class="s1">TARGET_OS_MACCATALYST</span>
+  <span class="s1">CGContextRef context = UIGraphicsGetCurrentContext()</span><span class="s4">;</span>
+  <span class="s1">CGContextSaveGState(context)</span><span class="s4">;</span>
+  <span class="s1">CGContextSetShouldSmoothFonts(context</span><span class="s4">, </span><span class="s1">NO)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s1">NSRange glyphRange = [layoutManager glyphRangeForTextContainer:textContainer]</span><span class="s4">;</span>
+  <span class="s1">[layoutManager drawBackgroundForGlyphRange:glyphRange atPoint:origin]</span><span class="s4">;</span>
+  <span class="s1">[layoutManager drawGlyphsForGlyphRange:glyphRange atPoint:origin]</span><span class="s4">;</span>
+
+<span class="s2">#if </span><span class="s1">TARGET_OS_MACCATALYST</span>
+  <span class="s1">CGContextRestoreGState(context)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">- (LinesMeasurements)getLinesForAttributedString:(AttributedString)attributedString</span>
+                             <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                                            <span class="s1">size:(CGSize)size</span>
+<span class="s1">{</span>
+  <span class="s1">NSTextStorage *textStorage = [self textStorageForAttributesString:attributedString</span>
+                                                <span class="s1">paragraphAttributes:paragraphAttributes</span>
+                                                               <span class="s1">size:size]</span><span class="s4">;</span>
+  <span class="s1">NSLayoutManager *layoutManager = textStorage.layoutManagers.firstObject</span><span class="s4">;</span>
+  <span class="s1">NSTextContainer *textContainer = layoutManager.textContainers.firstObject</span><span class="s4">;</span>
+
+  <span class="s1">NSRange glyphRange = [layoutManager glyphRangeForTextContainer:textContainer]</span><span class="s4">;</span>
+
+  <span class="s1">std::vector&lt;LineMeasurement&gt; paragraphLines{}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">blockParagraphLines = &amp;paragraphLines</span><span class="s4">;</span>
+
+  <span class="s1">[layoutManager enumerateLineFragmentsForGlyphRange:glyphRange</span>
+                                          <span class="s1">usingBlock:^(</span>
+                                              <span class="s1">CGRect overallRect</span><span class="s4">,</span>
+                                              <span class="s1">CGRect usedRect</span><span class="s4">,</span>
+                                              <span class="s1">NSTextContainer *</span><span class="s4">_Nonnull </span><span class="s1">usedTextContainer</span><span class="s4">,</span>
+                                              <span class="s1">NSRange lineGlyphRange</span><span class="s4">,</span>
+                                              <span class="s1">BOOL *</span><span class="s4">_Nonnull </span><span class="s1">stop) {</span>
+                                            <span class="s1">NSRange range = [layoutManager characterRangeForGlyphRange:lineGlyphRange</span>
+                                                                                      <span class="s1">actualGlyphRange:nil]</span><span class="s4">;</span>
+                                            <span class="s1">NSString *renderedString = [textStorage.string substringWithRange:range]</span><span class="s4">;</span>
+                                            <span class="s1">UIFont *font = [[textStorage attributedSubstringFromRange:range]</span>
+                                                     <span class="s1">attribute:NSFontAttributeName</span>
+                                                       <span class="s1">atIndex:</span><span class="s5">0</span>
+                                                <span class="s1">effectiveRange:nil]</span><span class="s4">;</span>
+                                            <span class="s4">auto </span><span class="s1">rect = facebook::react::Rect{</span>
+                                                <span class="s1">facebook::react::Point{usedRect.origin.x</span><span class="s4">, </span><span class="s1">usedRect.origin.y}</span><span class="s4">,</span>
+                                                <span class="s1">facebook::react::Size{usedRect.size.width</span><span class="s4">, </span><span class="s1">usedRect.size.height}}</span><span class="s4">;</span>
+                                            <span class="s4">auto </span><span class="s1">line = LineMeasurement{</span>
+                                                <span class="s1">std::string([renderedString UTF8String])</span><span class="s4">,</span>
+                                                <span class="s1">rect</span><span class="s4">,</span>
+                                                <span class="s1">-font.descender</span><span class="s4">,</span>
+                                                <span class="s1">font.capHeight</span><span class="s4">,</span>
+                                                <span class="s1">font.ascender</span><span class="s4">,</span>
+                                                <span class="s1">font.xHeight}</span><span class="s4">;</span>
+                                            <span class="s1">blockParagraphLines-&gt;push_back(line)</span><span class="s4">;</span>
+                                          <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">paragraphLines</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSTextStorage *)textStorageForAttributesString:(AttributedString)attributedString</span>
+                              <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                                             <span class="s1">size:(CGSize)size</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self _textStorageForNSAttributesString:[self _nsAttributedStringFromAttributedString:attributedString]</span>
+                             <span class="s1">paragraphAttributes:paragraphAttributes</span>
+                                            <span class="s1">size:size]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (SharedEventEmitter)getEventEmitterWithAttributeString:(AttributedString)attributedString</span>
+                                     <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                                                   <span class="s1">frame:(CGRect)frame</span>
+                                                 <span class="s1">atPoint:(CGPoint)point</span>
+<span class="s1">{</span>
+  <span class="s1">NSTextStorage *textStorage = [self textStorageForAttributesString:attributedString</span>
+                                                <span class="s1">paragraphAttributes:paragraphAttributes</span>
+                                                               <span class="s1">size:frame.size]</span><span class="s4">;</span>
+  <span class="s1">NSLayoutManager *layoutManager = textStorage.layoutManagers.firstObject</span><span class="s4">;</span>
+  <span class="s1">NSTextContainer *textContainer = layoutManager.textContainers.firstObject</span><span class="s4">;</span>
+
+  <span class="s1">CGFloat fraction</span><span class="s4">;</span>
+  <span class="s1">NSUInteger characterIndex = [layoutManager characterIndexForPoint:point</span>
+                                                    <span class="s1">inTextContainer:textContainer</span>
+                           <span class="s1">fractionOfDistanceBetweenInsertionPoints:&amp;fraction]</span><span class="s4">;</span>
+
+  <span class="s0">// If the point is not before (fraction == 0.0) the first character and not</span>
+  <span class="s0">// after (fraction == 1.0) the last character, then the attribute is valid.</span>
+  <span class="s4">if </span><span class="s1">(textStorage.length &gt; </span><span class="s5">0 </span><span class="s1">&amp;&amp; (fraction &gt; </span><span class="s5">0 </span><span class="s1">|| characterIndex &gt; </span><span class="s5">0</span><span class="s1">) &amp;&amp;</span>
+      <span class="s1">(fraction &lt; </span><span class="s5">1 </span><span class="s1">|| characterIndex &lt; textStorage.length - </span><span class="s5">1</span><span class="s1">)) {</span>
+    <span class="s1">RCTWeakEventEmitterWrapper *eventEmitterWrapper =</span>
+        <span class="s1">(RCTWeakEventEmitterWrapper *)[textStorage attribute:RCTAttributedStringEventEmitterKey</span>
+                                                     <span class="s1">atIndex:characterIndex</span>
+                                              <span class="s1">effectiveRange:NULL]</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">eventEmitterWrapper.eventEmitter</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)getRectWithAttributedString:(AttributedString)attributedString</span>
+                <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                 <span class="s1">enumerateAttribute:(NSString *)enumerateAttribute</span>
+                              <span class="s1">frame:(CGRect)frame</span>
+                         <span class="s1">usingBlock:(RCTTextLayoutFragmentEnumerationBlock)block</span>
+<span class="s1">{</span>
+  <span class="s1">NSTextStorage *textStorage = [self textStorageForAttributesString:attributedString</span>
+                                                <span class="s1">paragraphAttributes:paragraphAttributes</span>
+                                                               <span class="s1">size:frame.size]</span><span class="s4">;</span>
+
+  <span class="s1">NSLayoutManager *layoutManager = textStorage.layoutManagers.firstObject</span><span class="s4">;</span>
+  <span class="s1">NSTextContainer *textContainer = layoutManager.textContainers.firstObject</span><span class="s4">;</span>
+  <span class="s1">[layoutManager ensureLayoutForTextContainer:textContainer]</span><span class="s4">;</span>
+
+  <span class="s1">NSRange glyphRange = [layoutManager glyphRangeForTextContainer:textContainer]</span><span class="s4">;</span>
+  <span class="s1">NSRange characterRange = [layoutManager characterRangeForGlyphRange:glyphRange actualGlyphRange:NULL]</span><span class="s4">;</span>
+
+  <span class="s1">[textStorage enumerateAttribute:enumerateAttribute</span>
+                          <span class="s1">inRange:characterRange</span>
+                          <span class="s1">options:</span><span class="s5">0</span>
+                       <span class="s1">usingBlock:^(NSString *value</span><span class="s4">, </span><span class="s1">NSRange range</span><span class="s4">, </span><span class="s1">BOOL *pause) {</span>
+                         <span class="s4">if </span><span class="s1">(!value) {</span>
+                           <span class="s4">return;</span>
+                         <span class="s1">}</span>
+
+                         <span class="s1">[layoutManager</span>
+                             <span class="s1">enumerateEnclosingRectsForGlyphRange:range</span>
+                                         <span class="s1">withinSelectedGlyphRange:range</span>
+                                                  <span class="s1">inTextContainer:textContainer</span>
+                                                       <span class="s1">usingBlock:^(CGRect enclosingRect</span><span class="s4">, </span><span class="s1">BOOL *</span><span class="s4">_Nonnull </span><span class="s1">stop) {</span>
+                                                         <span class="s1">block(</span>
+                                                             <span class="s1">enclosingRect</span><span class="s4">,</span>
+                                                             <span class="s1">[textStorage attributedSubstringFromRange:range].string</span><span class="s4">,</span>
+                                                             <span class="s1">value)</span><span class="s4">;</span>
+                                                         <span class="s1">*stop = YES</span><span class="s4">;</span>
+                                                       <span class="s1">}]</span><span class="s4">;</span>
+                       <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private</span>
+
+<span class="s1">- (NSTextStorage *)_textStorageForNSAttributesString:(NSAttributedString *)attributedString</span>
+                                 <span class="s1">paragraphAttributes:(ParagraphAttributes)paragraphAttributes</span>
+                                                <span class="s1">size:(CGSize)size</span>
+<span class="s1">{</span>
+  <span class="s1">NSTextContainer *textContainer = [[NSTextContainer alloc] initWithSize:size]</span><span class="s4">;</span>
+
+  <span class="s1">textContainer.lineFragmentPadding = </span><span class="s5">0.0</span><span class="s4">; </span><span class="s0">// Note, the default value is 5.</span>
+  <span class="s1">textContainer.lineBreakMode = paragraphAttributes.maximumNumberOfLines &gt; </span><span class="s5">0</span>
+      <span class="s1">? RCTNSLineBreakModeFromEllipsizeMode(paragraphAttributes.ellipsizeMode)</span>
+      <span class="s1">: NSLineBreakByClipping</span><span class="s4">;</span>
+  <span class="s1">textContainer.maximumNumberOfLines = paragraphAttributes.maximumNumberOfLines</span><span class="s4">;</span>
+
+  <span class="s1">NSLayoutManager *layoutManager = [NSLayoutManager </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">layoutManager.usesFontLeading = NO</span><span class="s4">;</span>
+  <span class="s1">[layoutManager addTextContainer:textContainer]</span><span class="s4">;</span>
+
+  <span class="s1">NSTextStorage *textStorage = [[NSTextStorage alloc] initWithAttributedString:attributedString]</span><span class="s4">;</span>
+
+  <span class="s1">[textStorage addLayoutManager:layoutManager]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(paragraphAttributes.adjustsFontSizeToFit) {</span>
+    <span class="s1">CGFloat minimumFontSize = !isnan(paragraphAttributes.minimumFontSize) ? paragraphAttributes.minimumFontSize : </span><span class="s5">4.0</span><span class="s4">;</span>
+    <span class="s1">CGFloat maximumFontSize = !isnan(paragraphAttributes.maximumFontSize) ? paragraphAttributes.maximumFontSize : </span><span class="s5">96.0</span><span class="s4">;</span>
+    <span class="s1">[textStorage scaleFontSizeToFitSize:size minimumFontSize:minimumFontSize maximumFontSize:maximumFontSize]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">textStorage</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSAttributedString *)_nsAttributedStringFromAttributedString:(AttributedString)attributedString</span>
+<span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">sharedNSAttributedString = _cache.get(attributedString</span><span class="s4">, </span><span class="s1">[](AttributedString attributedString) {</span>
+    <span class="s4">return </span><span class="s1">wrapManagedObject(RCTNSAttributedStringFromAttributedString(attributedString))</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">unwrapManagedObject(sharedNSAttributedString)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (TextMeasurement)_measureTextStorage:(NSTextStorage *)textStorage</span>
+<span class="s1">{</span>
+  <span class="s1">NSLayoutManager *layoutManager = textStorage.layoutManagers.firstObject</span><span class="s4">;</span>
+  <span class="s1">NSTextContainer *textContainer = layoutManager.textContainers.firstObject</span><span class="s4">;</span>
+  <span class="s1">[layoutManager ensureLayoutForTextContainer:textContainer]</span><span class="s4">;</span>
+
+  <span class="s1">CGSize size = [layoutManager usedRectForTextContainer:textContainer].size</span><span class="s4">;</span>
+
+  <span class="s1">size = (CGSize){RCTCeilPixelValue(size.width)</span><span class="s4">, </span><span class="s1">RCTCeilPixelValue(size.height)}</span><span class="s4">;</span>
+
+  <span class="s1">__block </span><span class="s4">auto </span><span class="s1">attachments = TextMeasurement::Attachments{}</span><span class="s4">;</span>
+
+  <span class="s1">[textStorage</span>
+      <span class="s1">enumerateAttribute:NSAttachmentAttributeName</span>
+                 <span class="s1">inRange:NSMakeRange(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">textStorage.length)</span>
+                 <span class="s1">options:</span><span class="s5">0</span>
+              <span class="s1">usingBlock:^(NSTextAttachment *attachment</span><span class="s4">, </span><span class="s1">NSRange range</span><span class="s4">, </span><span class="s1">BOOL *stop) {</span>
+                <span class="s4">if </span><span class="s1">(!attachment) {</span>
+                  <span class="s4">return;</span>
+                <span class="s1">}</span>
+
+                <span class="s1">CGSize attachmentSize = attachment.bounds.size</span><span class="s4">;</span>
+                <span class="s1">CGRect glyphRect = [layoutManager boundingRectForGlyphRange:range inTextContainer:textContainer]</span><span class="s4">;</span>
+
+                <span class="s1">UIFont *font = [textStorage attribute:NSFontAttributeName atIndex:range.location effectiveRange:nil]</span><span class="s4">;</span>
+
+                <span class="s1">CGRect frame = {</span>
+                    <span class="s1">{glyphRect.origin.x</span><span class="s4">,</span>
+                     <span class="s1">glyphRect.origin.y + glyphRect.size.height - attachmentSize.height + font.descender}</span><span class="s4">,</span>
+                    <span class="s1">attachmentSize}</span><span class="s4">;</span>
+
+                <span class="s4">auto </span><span class="s1">rect = facebook::react::Rect{</span>
+                    <span class="s1">facebook::react::Point{frame.origin.x</span><span class="s4">, </span><span class="s1">frame.origin.y}</span><span class="s4">,</span>
+                    <span class="s1">facebook::react::Size{frame.size.width</span><span class="s4">, </span><span class="s1">frame.size.height}}</span><span class="s4">;</span>
+
+                <span class="s1">attachments.push_back(TextMeasurement::Attachment{rect</span><span class="s4">, false</span><span class="s1">})</span><span class="s4">;</span>
+              <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">TextMeasurement{{size.width</span><span class="s4">, </span><span class="s1">size.height}</span><span class="s4">, </span><span class="s1">attachments}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

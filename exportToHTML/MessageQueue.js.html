@@ -1,0 +1,504 @@
+<html>
+<head>
+<title>MessageQueue.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+MessageQueue.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow strict 
+ * @format 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const Systrace = require(</span><span class="s2">'../Performance/Systrace'</span><span class="s1">);</span>
+<span class="s1">const deepFreezeAndThrowOnMutationInDev = require(</span><span class="s2">'../Utilities/deepFreezeAndThrowOnMutationInDev'</span><span class="s1">);</span>
+<span class="s1">const stringifySafe = require(</span><span class="s2">'../Utilities/stringifySafe'</span><span class="s1">).</span><span class="s3">default</span><span class="s1">;</span>
+<span class="s1">const warnOnce = require(</span><span class="s2">'../Utilities/warnOnce'</span><span class="s1">);</span>
+<span class="s1">const ErrorUtils = require(</span><span class="s2">'../vendor/core/ErrorUtils'</span><span class="s1">);</span>
+<span class="s1">const invariant = require(</span><span class="s2">'invariant'</span><span class="s1">);</span>
+
+<span class="s1">export type SpyData = {</span>
+  <span class="s1">type: number,</span>
+  <span class="s1">module: ?string,</span>
+  <span class="s1">method: string | number,</span>
+  <span class="s1">args: mixed[],</span>
+  <span class="s1">...</span>
+<span class="s1">};</span>
+
+<span class="s1">const TO_JS = </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">const TO_NATIVE = </span><span class="s4">1</span><span class="s1">;</span>
+
+<span class="s1">const MODULE_IDS = </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">const METHOD_IDS = </span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">const PARAMS = </span><span class="s4">2</span><span class="s1">;</span>
+<span class="s1">const MIN_TIME_BETWEEN_FLUSHES_MS = </span><span class="s4">5</span><span class="s1">;</span>
+
+<span class="s0">// eslint-disable-next-line no-bitwise</span>
+<span class="s1">const TRACE_TAG_REACT_APPS = </span><span class="s4">1 </span><span class="s1">&lt;&lt; </span><span class="s4">17</span><span class="s1">;</span>
+
+<span class="s1">const DEBUG_INFO_LIMIT = </span><span class="s4">32</span><span class="s1">;</span>
+
+<span class="s1">class MessageQueue {</span>
+  <span class="s1">_lazyCallableModules: {[key: string]: (</span><span class="s3">void</span><span class="s1">) =&gt; {...}, ...};</span>
+  <span class="s1">_queue: [number[], number[], mixed[], number];</span>
+  <span class="s1">_successCallbacks: Map&lt;number, ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">&gt;;</span>
+  <span class="s1">_failureCallbacks: Map&lt;number, ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">&gt;;</span>
+  <span class="s1">_callID: number;</span>
+  <span class="s1">_lastFlush: number;</span>
+  <span class="s1">_eventLoopStartTime: number;</span>
+  <span class="s1">_reactNativeMicrotasksCallback: ?() =&gt; </span><span class="s3">void</span><span class="s1">;</span>
+
+  <span class="s1">_debugInfo: {[number]: [number, number], ...};</span>
+  <span class="s1">_remoteModuleTable: {[number]: string, ...};</span>
+  <span class="s1">_remoteMethodTable: {[number]: $ReadOnlyArray&lt;string&gt;, ...};</span>
+
+  <span class="s1">__spy: ?(data: SpyData) =&gt; </span><span class="s3">void</span><span class="s1">;</span>
+
+  <span class="s1">constructor() {</span>
+    <span class="s3">this</span><span class="s1">._lazyCallableModules = {};</span>
+    <span class="s3">this</span><span class="s1">._queue = [[], [], [], </span><span class="s4">0</span><span class="s1">];</span>
+    <span class="s3">this</span><span class="s1">._successCallbacks = </span><span class="s3">new </span><span class="s1">Map();</span>
+    <span class="s3">this</span><span class="s1">._failureCallbacks = </span><span class="s3">new </span><span class="s1">Map();</span>
+    <span class="s3">this</span><span class="s1">._callID = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s3">this</span><span class="s1">._lastFlush = </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s3">this</span><span class="s1">._eventLoopStartTime = Date.now();</span>
+    <span class="s3">this</span><span class="s1">._reactNativeMicrotasksCallback = </span><span class="s3">null</span><span class="s1">;</span>
+
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s3">this</span><span class="s1">._debugInfo = {};</span>
+      <span class="s3">this</span><span class="s1">._remoteModuleTable = {};</span>
+      <span class="s3">this</span><span class="s1">._remoteMethodTable = {};</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s3">this</span><span class="s1">.callFunctionReturnFlushedQueue =</span>
+      <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+      <span class="s3">this</span><span class="s1">.callFunctionReturnFlushedQueue.bind(</span><span class="s3">this</span><span class="s1">);</span>
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+    <span class="s3">this</span><span class="s1">.flushedQueue = </span><span class="s3">this</span><span class="s1">.flushedQueue.bind(</span><span class="s3">this</span><span class="s1">);</span>
+
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s3">this</span><span class="s1">.invokeCallbackAndReturnFlushedQueue =</span>
+      <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+      <span class="s3">this</span><span class="s1">.invokeCallbackAndReturnFlushedQueue.bind(</span><span class="s3">this</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Public APIs 
+   */</span>
+
+  <span class="s1">static spy(spyOrToggle: boolean | ((data: SpyData) =&gt; </span><span class="s3">void</span><span class="s1">)) {</span>
+    <span class="s3">if </span><span class="s1">(spyOrToggle === </span><span class="s3">true</span><span class="s1">) {</span>
+      <span class="s1">MessageQueue.prototype.__spy = info =&gt; {</span>
+        <span class="s1">console.log(</span>
+          <span class="s1">`${info.type === TO_JS ? </span><span class="s2">'N-&gt;JS' </span><span class="s1">: </span><span class="s2">'JS-&gt;N'</span><span class="s1">} : ` +</span>
+            <span class="s1">`${info.module != </span><span class="s3">null </span><span class="s1">? info.module + </span><span class="s2">'.' </span><span class="s1">: </span><span class="s2">''</span><span class="s1">}${info.method}` +</span>
+            <span class="s1">`(${JSON.stringify(info.args)})`,</span>
+        <span class="s1">);</span>
+      <span class="s1">};</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(spyOrToggle === </span><span class="s3">false</span><span class="s1">) {</span>
+      <span class="s1">MessageQueue.prototype.__spy = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">MessageQueue.prototype.__spy = spyOrToggle;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">callFunctionReturnFlushedQueue(</span>
+    <span class="s1">module: string,</span>
+    <span class="s1">method: string,</span>
+    <span class="s1">args: mixed[],</span>
+  <span class="s1">): </span><span class="s3">null </span><span class="s1">| [Array&lt;number&gt;, Array&lt;number&gt;, Array&lt;mixed&gt;, number] {</span>
+    <span class="s3">this</span><span class="s1">.__guard(() =&gt; {</span>
+      <span class="s3">this</span><span class="s1">.__callFunction(module, method, args);</span>
+    <span class="s1">});</span>
+
+    <span class="s3">return this</span><span class="s1">.flushedQueue();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">invokeCallbackAndReturnFlushedQueue(</span>
+    <span class="s1">cbID: number,</span>
+    <span class="s1">args: mixed[],</span>
+  <span class="s1">): </span><span class="s3">null </span><span class="s1">| [Array&lt;number&gt;, Array&lt;number&gt;, Array&lt;mixed&gt;, number] {</span>
+    <span class="s3">this</span><span class="s1">.__guard(() =&gt; {</span>
+      <span class="s3">this</span><span class="s1">.__invokeCallback(cbID, args);</span>
+    <span class="s1">});</span>
+
+    <span class="s3">return this</span><span class="s1">.flushedQueue();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">flushedQueue(): </span><span class="s3">null </span><span class="s1">| [Array&lt;number&gt;, Array&lt;number&gt;, Array&lt;mixed&gt;, number] {</span>
+    <span class="s3">this</span><span class="s1">.__guard(() =&gt; {</span>
+      <span class="s3">this</span><span class="s1">.__callReactNativeMicrotasks();</span>
+    <span class="s1">});</span>
+
+    <span class="s1">const queue = </span><span class="s3">this</span><span class="s1">._queue;</span>
+    <span class="s3">this</span><span class="s1">._queue = [[], [], [], </span><span class="s3">this</span><span class="s1">._callID];</span>
+    <span class="s3">return </span><span class="s1">queue[</span><span class="s4">0</span><span class="s1">].length ? queue : </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getEventLoopRunningTime(): number {</span>
+    <span class="s3">return </span><span class="s1">Date.now() - </span><span class="s3">this</span><span class="s1">._eventLoopStartTime;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">registerCallableModule(name: string, module: {...}) {</span>
+    <span class="s3">this</span><span class="s1">._lazyCallableModules[name] = () =&gt; module;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">registerLazyCallableModule(name: string, factory: </span><span class="s3">void </span><span class="s1">=&gt; interface {}) {</span>
+    <span class="s1">let module: interface {};</span>
+    <span class="s1">let getValue: ?(</span><span class="s3">void</span><span class="s1">) =&gt; interface {} = factory;</span>
+    <span class="s3">this</span><span class="s1">._lazyCallableModules[name] = () =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(getValue) {</span>
+        <span class="s1">module = getValue();</span>
+        <span class="s1">getValue = </span><span class="s3">null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s0">/* $FlowFixMe[class-object-subtyping] added when improving typing for 
+       * this parameters */</span>
+      <span class="s3">return </span><span class="s1">module;</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getCallableModule(name: string): {...} | </span><span class="s3">null </span><span class="s1">{</span>
+    <span class="s1">const getValue = </span><span class="s3">this</span><span class="s1">._lazyCallableModules[name];</span>
+    <span class="s3">return </span><span class="s1">getValue ? getValue() : </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">callNativeSyncHook(</span>
+    <span class="s1">moduleID: number,</span>
+    <span class="s1">methodID: number,</span>
+    <span class="s1">params: mixed[],</span>
+    <span class="s1">onFail: ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+    <span class="s1">onSucc: ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+  <span class="s1">): mixed {</span>
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">global.nativeCallSyncHook,</span>
+        <span class="s2">'Calling synchronous methods on native ' </span><span class="s1">+</span>
+          <span class="s2">'modules is not supported in Chrome.</span><span class="s5">\n\n </span><span class="s2">Consider providing alternative ' </span><span class="s1">+</span>
+          <span class="s2">'methods to expose this method in debug mode, e.g. by exposing constants ' </span><span class="s1">+</span>
+          <span class="s2">'ahead-of-time.'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">.processCallbacks(moduleID, methodID, params, onFail, onSucc);</span>
+    <span class="s3">return </span><span class="s1">global.nativeCallSyncHook(moduleID, methodID, params);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">processCallbacks(</span>
+    <span class="s1">moduleID: number,</span>
+    <span class="s1">methodID: number,</span>
+    <span class="s1">params: mixed[],</span>
+    <span class="s1">onFail: ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+    <span class="s1">onSucc: ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">if </span><span class="s1">(onFail || onSucc) {</span>
+      <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+        <span class="s3">this</span><span class="s1">._debugInfo[</span><span class="s3">this</span><span class="s1">._callID] = [moduleID, methodID];</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._callID &gt; DEBUG_INFO_LIMIT) {</span>
+          <span class="s3">delete this</span><span class="s1">._debugInfo[</span><span class="s3">this</span><span class="s1">._callID - DEBUG_INFO_LIMIT];</span>
+        <span class="s1">}</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._successCallbacks.size &gt; </span><span class="s4">500</span><span class="s1">) {</span>
+          <span class="s1">const info: {[number]: {method: string, module: string}} = {};</span>
+          <span class="s3">this</span><span class="s1">._successCallbacks.forEach((_, callID) =&gt; {</span>
+            <span class="s1">const debug = </span><span class="s3">this</span><span class="s1">._debugInfo[callID];</span>
+            <span class="s1">const module = debug &amp;&amp; </span><span class="s3">this</span><span class="s1">._remoteModuleTable[debug[</span><span class="s4">0</span><span class="s1">]];</span>
+            <span class="s1">const method = debug &amp;&amp; </span><span class="s3">this</span><span class="s1">._remoteMethodTable[debug[</span><span class="s4">0</span><span class="s1">]][debug[</span><span class="s4">1</span><span class="s1">]];</span>
+            <span class="s1">info[callID] = {module, method};</span>
+          <span class="s1">});</span>
+          <span class="s1">warnOnce(</span>
+            <span class="s2">'excessive-number-of-pending-callbacks'</span><span class="s1">,</span>
+            <span class="s1">`Excessive number of pending callbacks: ${</span>
+              <span class="s3">this</span><span class="s1">._successCallbacks.size</span>
+            <span class="s1">}. Some pending callbacks that might have leaked by never being called from native code: ${stringifySafe(</span>
+              <span class="s1">info,</span>
+            <span class="s1">)}`,</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s0">// Encode callIDs into pairs of callback identifiers by shifting left and using the rightmost bit</span>
+      <span class="s0">// to indicate fail (0) or success (1)</span>
+      <span class="s0">// eslint-disable-next-line no-bitwise</span>
+      <span class="s1">onFail &amp;&amp; params.push(</span><span class="s3">this</span><span class="s1">._callID &lt;&lt; </span><span class="s4">1</span><span class="s1">);</span>
+      <span class="s0">// eslint-disable-next-line no-bitwise</span>
+      <span class="s1">onSucc &amp;&amp; params.push((</span><span class="s3">this</span><span class="s1">._callID &lt;&lt; </span><span class="s4">1</span><span class="s1">) | </span><span class="s4">1</span><span class="s1">);</span>
+      <span class="s3">this</span><span class="s1">._successCallbacks.set(</span><span class="s3">this</span><span class="s1">._callID, onSucc);</span>
+      <span class="s3">this</span><span class="s1">._failureCallbacks.set(</span><span class="s3">this</span><span class="s1">._callID, onFail);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s1">global.nativeTraceBeginAsyncFlow &amp;&amp;</span>
+        <span class="s1">global.nativeTraceBeginAsyncFlow(</span>
+          <span class="s1">TRACE_TAG_REACT_APPS,</span>
+          <span class="s2">'native'</span><span class="s1">,</span>
+          <span class="s3">this</span><span class="s1">._callID,</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._callID++;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">enqueueNativeCall(</span>
+    <span class="s1">moduleID: number,</span>
+    <span class="s1">methodID: number,</span>
+    <span class="s1">params: mixed[],</span>
+    <span class="s1">onFail: ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+    <span class="s1">onSucc: ?(...mixed[]) =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+  <span class="s1">): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">this</span><span class="s1">.processCallbacks(moduleID, methodID, params, onFail, onSucc);</span>
+
+    <span class="s3">this</span><span class="s1">._queue[MODULE_IDS].push(moduleID);</span>
+    <span class="s3">this</span><span class="s1">._queue[METHOD_IDS].push(methodID);</span>
+
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s0">// Validate that parameters passed over the bridge are</span>
+      <span class="s0">// folly-convertible.  As a special case, if a prop value is a</span>
+      <span class="s0">// function it is permitted here, and special-cased in the</span>
+      <span class="s0">// conversion.</span>
+      <span class="s1">const isValidArgument = (val: mixed): boolean =&gt; {</span>
+        <span class="s3">switch </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">val) {</span>
+          <span class="s3">case </span><span class="s2">'undefined'</span><span class="s1">:</span>
+          <span class="s3">case </span><span class="s2">'boolean'</span><span class="s1">:</span>
+          <span class="s3">case </span><span class="s2">'string'</span><span class="s1">:</span>
+            <span class="s3">return true</span><span class="s1">;</span>
+          <span class="s3">case </span><span class="s2">'number'</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">isFinite(val);</span>
+          <span class="s3">case </span><span class="s2">'object'</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">(val == </span><span class="s3">null</span><span class="s1">) {</span>
+              <span class="s3">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s3">if </span><span class="s1">(Array.isArray(val)) {</span>
+              <span class="s3">return </span><span class="s1">val.every(isValidArgument);</span>
+            <span class="s1">}</span>
+
+            <span class="s3">for </span><span class="s1">(const k </span><span class="s3">in </span><span class="s1">val) {</span>
+              <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">val[k] !== </span><span class="s2">'function' </span><span class="s1">&amp;&amp; !isValidArgument(val[k])) {</span>
+                <span class="s3">return false</span><span class="s1">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s3">return true</span><span class="s1">;</span>
+          <span class="s3">case </span><span class="s2">'function'</span><span class="s1">:</span>
+            <span class="s3">return false</span><span class="s1">;</span>
+          <span class="s3">default</span><span class="s1">:</span>
+            <span class="s3">return false</span><span class="s1">;</span>
+        <span class="s1">}</span>
+      <span class="s1">};</span>
+
+      <span class="s0">// Replacement allows normally non-JSON-convertible values to be</span>
+      <span class="s0">// seen.  There is ambiguity with string values, but in context,</span>
+      <span class="s0">// it should at least be a strong hint.</span>
+      <span class="s1">const replacer = (key: string, val: $FlowFixMe) =&gt; {</span>
+        <span class="s1">const t = </span><span class="s3">typeof </span><span class="s1">val;</span>
+        <span class="s3">if </span><span class="s1">(t === </span><span class="s2">'function'</span><span class="s1">) {</span>
+          <span class="s3">return </span><span class="s2">'&lt;&lt;Function ' </span><span class="s1">+ val.name + </span><span class="s2">'&gt;&gt;'</span><span class="s1">;</span>
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(t === </span><span class="s2">'number' </span><span class="s1">&amp;&amp; !isFinite(val)) {</span>
+          <span class="s3">return </span><span class="s2">'&lt;&lt;' </span><span class="s1">+ val.toString() + </span><span class="s2">'&gt;&gt;'</span><span class="s1">;</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s3">return </span><span class="s1">val;</span>
+        <span class="s1">}</span>
+      <span class="s1">};</span>
+
+      <span class="s0">// Note that JSON.stringify</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">isValidArgument(params),</span>
+        <span class="s2">'%s is not usable as a native method argument'</span><span class="s1">,</span>
+        <span class="s1">JSON.stringify(params, replacer),</span>
+      <span class="s1">);</span>
+
+      <span class="s0">// The params object should not be mutated after being queued</span>
+      <span class="s1">deepFreezeAndThrowOnMutationInDev(params);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._queue[PARAMS].push(params);</span>
+
+    <span class="s1">const now = Date.now();</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">global.nativeFlushQueueImmediate &amp;&amp;</span>
+      <span class="s1">now - </span><span class="s3">this</span><span class="s1">._lastFlush &gt;= MIN_TIME_BETWEEN_FLUSHES_MS</span>
+    <span class="s1">) {</span>
+      <span class="s1">const queue = </span><span class="s3">this</span><span class="s1">._queue;</span>
+      <span class="s3">this</span><span class="s1">._queue = [[], [], [], </span><span class="s3">this</span><span class="s1">._callID];</span>
+      <span class="s3">this</span><span class="s1">._lastFlush = now;</span>
+      <span class="s1">global.nativeFlushQueueImmediate(queue);</span>
+    <span class="s1">}</span>
+    <span class="s1">Systrace.counterEvent(</span><span class="s2">'pending_js_to_native_queue'</span><span class="s1">, </span><span class="s3">this</span><span class="s1">._queue[</span><span class="s4">0</span><span class="s1">].length);</span>
+    <span class="s3">if </span><span class="s1">(__DEV__ &amp;&amp; </span><span class="s3">this</span><span class="s1">.__spy &amp;&amp; isFinite(moduleID)) {</span>
+      <span class="s0">// $FlowFixMe[not-a-function]</span>
+      <span class="s3">this</span><span class="s1">.__spy({</span>
+        <span class="s1">type: TO_NATIVE,</span>
+        <span class="s1">module: </span><span class="s3">this</span><span class="s1">._remoteModuleTable[moduleID],</span>
+        <span class="s1">method: </span><span class="s3">this</span><span class="s1">._remoteMethodTable[moduleID][methodID],</span>
+        <span class="s1">args: params,</span>
+      <span class="s1">});</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.__spy) {</span>
+      <span class="s3">this</span><span class="s1">.__spy({</span>
+        <span class="s1">type: TO_NATIVE,</span>
+        <span class="s1">module: moduleID + </span><span class="s2">''</span><span class="s1">,</span>
+        <span class="s1">method: methodID,</span>
+        <span class="s1">args: params,</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">createDebugLookup(</span>
+    <span class="s1">moduleID: number,</span>
+    <span class="s1">name: string,</span>
+    <span class="s1">methods: ?$ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s1">) {</span>
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s3">this</span><span class="s1">._remoteModuleTable[moduleID] = name;</span>
+      <span class="s3">this</span><span class="s1">._remoteMethodTable[moduleID] = methods || [];</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// For JSTimers to register its callback. Otherwise a circular dependency</span>
+  <span class="s0">// between modules is introduced. Note that only one callback may be</span>
+  <span class="s0">// registered at a time.</span>
+  <span class="s1">setReactNativeMicrotasksCallback(fn: () =&gt; </span><span class="s3">void</span><span class="s1">) {</span>
+    <span class="s3">this</span><span class="s1">._reactNativeMicrotasksCallback = fn;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Private methods 
+   */</span>
+
+  <span class="s1">__guard(fn: () =&gt; </span><span class="s3">void</span><span class="s1">) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.__shouldPauseOnThrow()) {</span>
+      <span class="s1">fn();</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s3">try </span><span class="s1">{</span>
+        <span class="s1">fn();</span>
+      <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+        <span class="s1">ErrorUtils.reportFatalError(error);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// MessageQueue installs a global handler to catch all exceptions where JS users can register their own behavior</span>
+  <span class="s0">// This handler makes all exceptions to be propagated from inside MessageQueue rather than by the VM at their origin</span>
+  <span class="s0">// This makes stacktraces to be placed at MessageQueue rather than at where they were launched</span>
+  <span class="s0">// The parameter DebuggerInternal.shouldPauseOnThrow is used to check before catching all exceptions and</span>
+  <span class="s0">// can be configured by the VM or any Inspector</span>
+  <span class="s1">__shouldPauseOnThrow(): boolean {</span>
+    <span class="s3">return </span><span class="s1">(</span>
+      <span class="s0">// $FlowFixMe[cannot-resolve-name]</span>
+      <span class="s3">typeof </span><span class="s1">DebuggerInternal !== </span><span class="s2">'undefined' </span><span class="s1">&amp;&amp;</span>
+      <span class="s0">// $FlowFixMe[cannot-resolve-name]</span>
+      <span class="s1">DebuggerInternal.shouldPauseOnThrow === </span><span class="s3">true</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">__callReactNativeMicrotasks() {</span>
+    <span class="s1">Systrace.beginEvent(</span><span class="s2">'JSTimers.callReactNativeMicrotasks()'</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._reactNativeMicrotasksCallback != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">this</span><span class="s1">._reactNativeMicrotasksCallback();</span>
+    <span class="s1">}</span>
+    <span class="s1">Systrace.endEvent();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">__callFunction(module: string, method: string, args: mixed[]): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">this</span><span class="s1">._lastFlush = Date.now();</span>
+    <span class="s3">this</span><span class="s1">._eventLoopStartTime = </span><span class="s3">this</span><span class="s1">._lastFlush;</span>
+    <span class="s3">if </span><span class="s1">(__DEV__ || </span><span class="s3">this</span><span class="s1">.__spy) {</span>
+      <span class="s1">Systrace.beginEvent(`${module}.${method}(${stringifySafe(args)})`);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">Systrace.beginEvent(`${module}.${method}(...)`);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.__spy) {</span>
+      <span class="s3">this</span><span class="s1">.__spy({type: TO_JS, module, method, args});</span>
+    <span class="s1">}</span>
+    <span class="s1">const moduleMethods = </span><span class="s3">this</span><span class="s1">.getCallableModule(module);</span>
+    <span class="s3">if </span><span class="s1">(!moduleMethods) {</span>
+      <span class="s1">const callableModuleNames = Object.keys(</span><span class="s3">this</span><span class="s1">._lazyCallableModules);</span>
+      <span class="s1">const n = callableModuleNames.length;</span>
+      <span class="s1">const callableModuleNameList = callableModuleNames.join(</span><span class="s2">', '</span><span class="s1">);</span>
+
+      <span class="s0">// TODO(T122225939): Remove after investigation: Why are we getting to this line in bridgeless mode?</span>
+      <span class="s1">const isBridgelessMode = global.RN$Bridgeless === </span><span class="s3">true </span><span class="s1">? </span><span class="s2">'true' </span><span class="s1">: </span><span class="s2">'false'</span><span class="s1">;</span>
+      <span class="s1">invariant(</span>
+        <span class="s3">false</span><span class="s1">,</span>
+        <span class="s1">`Failed to call into JavaScript module method ${module}.${method}(). Module has not been registered as callable. Bridgeless Mode: ${isBridgelessMode}. Registered callable JavaScript modules (n = ${n}): ${callableModuleNameList}.</span>
+        <span class="s1">A frequent cause of the error is that the application entry file path is incorrect. This can also happen when the JS bundle is corrupt or there is an early initialization error when loading React Native.`,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(!moduleMethods[method]) {</span>
+      <span class="s1">invariant(</span>
+        <span class="s3">false</span><span class="s1">,</span>
+        <span class="s1">`Failed to call into JavaScript module method ${module}.${method}(). Module exists, but the method is undefined.`,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">moduleMethods[method].apply(moduleMethods, args);</span>
+    <span class="s1">Systrace.endEvent();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">__invokeCallback(cbID: number, args: mixed[]): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">this</span><span class="s1">._lastFlush = Date.now();</span>
+    <span class="s3">this</span><span class="s1">._eventLoopStartTime = </span><span class="s3">this</span><span class="s1">._lastFlush;</span>
+
+    <span class="s0">// The rightmost bit of cbID indicates fail (0) or success (1), the other bits are the callID shifted left.</span>
+    <span class="s0">// eslint-disable-next-line no-bitwise</span>
+    <span class="s1">const callID = cbID &gt;&gt;&gt; </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s0">// eslint-disable-next-line no-bitwise</span>
+    <span class="s1">const isSuccess = cbID &amp; </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">const callback = isSuccess</span>
+      <span class="s1">? </span><span class="s3">this</span><span class="s1">._successCallbacks.get(callID)</span>
+      <span class="s1">: </span><span class="s3">this</span><span class="s1">._failureCallbacks.get(callID);</span>
+
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s1">const debug = </span><span class="s3">this</span><span class="s1">._debugInfo[callID];</span>
+      <span class="s1">const module = debug &amp;&amp; </span><span class="s3">this</span><span class="s1">._remoteModuleTable[debug[</span><span class="s4">0</span><span class="s1">]];</span>
+      <span class="s1">const method = debug &amp;&amp; </span><span class="s3">this</span><span class="s1">._remoteMethodTable[debug[</span><span class="s4">0</span><span class="s1">]][debug[</span><span class="s4">1</span><span class="s1">]];</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">callback,</span>
+        <span class="s1">`No callback found </span><span class="s3">with </span><span class="s1">cbID ${cbID} and callID ${callID} </span><span class="s3">for </span><span class="s1">` +</span>
+          <span class="s1">(method</span>
+            <span class="s1">? ` ${module}.${method} - most likely the callback was already invoked`</span>
+            <span class="s1">: `module ${module || </span><span class="s2">'&lt;unknown&gt;'</span><span class="s1">}`) +</span>
+          <span class="s1">`. Args: </span><span class="s2">'${stringifySafe(args)}'</span><span class="s1">`,</span>
+      <span class="s1">);</span>
+      <span class="s1">const profileName = debug</span>
+        <span class="s1">? </span><span class="s2">'&lt;callback for ' </span><span class="s1">+ module + </span><span class="s2">'.' </span><span class="s1">+ method + </span><span class="s2">'&gt;'</span>
+        <span class="s1">: cbID;</span>
+      <span class="s3">if </span><span class="s1">(callback &amp;&amp; </span><span class="s3">this</span><span class="s1">.__spy) {</span>
+        <span class="s3">this</span><span class="s1">.__spy({type: TO_JS, module: </span><span class="s3">null</span><span class="s1">, method: profileName, args});</span>
+      <span class="s1">}</span>
+      <span class="s1">Systrace.beginEvent(</span>
+        <span class="s1">`MessageQueue.invokeCallback(${profileName}, ${stringifySafe(args)})`,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(!callback) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">this</span><span class="s1">._successCallbacks.</span><span class="s3">delete</span><span class="s1">(callID);</span>
+    <span class="s3">this</span><span class="s1">._failureCallbacks.</span><span class="s3">delete</span><span class="s1">(callID);</span>
+    <span class="s1">callback(...args);</span>
+
+    <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s1">Systrace.endEvent();</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = MessageQueue;</span>
+</pre>
+</body>
+</html>

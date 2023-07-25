@@ -1,0 +1,366 @@
+<html>
+<head>
+<title>NativeToJsBridge.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+NativeToJsBridge.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;NativeToJsBridge.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;ReactCommon/CallInvoker.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/MoveWrapper.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/json.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;reactperflogger/BridgeNativeModulePerfLogger.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ErrorUtils.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;Instance.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JSBigString.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;MessageQueueThread.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;MethodCall.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;ModuleRegistry.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;RAMBundleRegistry.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;SystraceSection.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+
+<span class="s2">#ifdef </span><span class="s1">WITH_FBSYSTRACE</span>
+<span class="s2">#include </span><span class="s3">&lt;fbsystrace.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi/jsi.h&gt;</span>
+
+<span class="s4">using </span><span class="s1">fbsystrace::FbSystraceAsyncFlow</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s0">// This class manages calls from JS to native code.</span>
+<span class="s4">class </span><span class="s1">JsToNativeBridge : </span><span class="s4">public </span><span class="s1">react::ExecutorDelegate {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">JsToNativeBridge(</span>
+      <span class="s1">std::shared_ptr&lt;ModuleRegistry&gt; registry</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;InstanceCallback&gt; callback)</span>
+      <span class="s1">: m_registry(registry)</span><span class="s4">, </span><span class="s1">m_callback(callback) {}</span>
+
+  <span class="s1">std::shared_ptr&lt;ModuleRegistry&gt; getModuleRegistry() override {</span>
+    <span class="s4">return </span><span class="s1">m_registry</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">bool </span><span class="s1">isBatchActive() {</span>
+    <span class="s4">return </span><span class="s1">m_batchHadNativeModuleOrTurboModuleCalls</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">callNativeModules(</span>
+      <span class="s1">[[maybe_unused]] JSExecutor &amp;executor</span><span class="s4">,</span>
+      <span class="s1">folly::dynamic &amp;&amp;calls</span><span class="s4">,</span>
+      <span class="s4">bool </span><span class="s1">isEndOfBatch) override {</span>
+    <span class="s1">CHECK(m_registry || calls.empty())</span>
+        <span class="s1">&lt;&lt; </span><span class="s3">&quot;native module calls cannot be completed with no native modules&quot;</span><span class="s4">;</span>
+    <span class="s1">m_batchHadNativeModuleOrTurboModuleCalls =</span>
+        <span class="s1">m_batchHadNativeModuleOrTurboModuleCalls || !calls.empty()</span><span class="s4">;</span>
+
+    <span class="s1">std::vector&lt;MethodCall&gt; methodCalls = parseMethodCalls(std::move(calls))</span><span class="s4">;</span>
+    <span class="s1">BridgeNativeModulePerfLogger::asyncMethodCallBatchPreprocessEnd(</span>
+        <span class="s1">(</span><span class="s4">int</span><span class="s1">)methodCalls.size())</span><span class="s4">;</span>
+
+    <span class="s0">// An exception anywhere in here stops processing of the batch.  This</span>
+    <span class="s0">// was the behavior of the Android bridge, and since exception handling</span>
+    <span class="s0">// terminates the whole bridge, there's not much point in continuing.</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;call : methodCalls) {</span>
+      <span class="s1">m_registry-&gt;callNativeMethod(</span>
+          <span class="s1">call.moduleId</span><span class="s4">, </span><span class="s1">call.methodId</span><span class="s4">, </span><span class="s1">std::move(call.arguments)</span><span class="s4">, </span><span class="s1">call.callId)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(isEndOfBatch) {</span>
+      <span class="s0">// onBatchComplete will be called on the native (module) queue, but</span>
+      <span class="s0">// decrementPendingJSCalls will be called sync. Be aware that the bridge</span>
+      <span class="s0">// may still be processing native calls when the bridge idle signaler</span>
+      <span class="s0">// fires.</span>
+      <span class="s4">if </span><span class="s1">(m_batchHadNativeModuleOrTurboModuleCalls) {</span>
+        <span class="s1">m_callback-&gt;onBatchComplete()</span><span class="s4">;</span>
+        <span class="s1">m_batchHadNativeModuleOrTurboModuleCalls = </span><span class="s4">false;</span>
+      <span class="s1">}</span>
+      <span class="s1">m_callback-&gt;decrementPendingJSCalls()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">MethodCallResult callSerializableNativeHook(</span>
+      <span class="s1">[[maybe_unused]] JSExecutor &amp;executor</span><span class="s4">,</span>
+      <span class="s4">unsigned int </span><span class="s1">moduleId</span><span class="s4">,</span>
+      <span class="s4">unsigned int </span><span class="s1">methodId</span><span class="s4">,</span>
+      <span class="s1">folly::dynamic &amp;&amp;args) override {</span>
+    <span class="s4">return </span><span class="s1">m_registry-&gt;callSerializableNativeHook(</span>
+        <span class="s1">moduleId</span><span class="s4">, </span><span class="s1">methodId</span><span class="s4">, </span><span class="s1">std::move(args))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">recordTurboModuleAsyncMethodCall() {</span>
+    <span class="s1">m_batchHadNativeModuleOrTurboModuleCalls = </span><span class="s4">true;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s0">// These methods are always invoked from an Executor.  The NativeToJsBridge</span>
+  <span class="s0">// keeps a reference to the executor, and when destroy() is called, the</span>
+  <span class="s0">// executor is destroyed synchronously on its queue.</span>
+  <span class="s1">std::shared_ptr&lt;ModuleRegistry&gt; m_registry</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;InstanceCallback&gt; m_callback</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">m_batchHadNativeModuleOrTurboModuleCalls = </span><span class="s4">false;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">NativeToJsBridge::NativeToJsBridge(</span>
+    <span class="s1">JSExecutorFactory *jsExecutorFactory</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;ModuleRegistry&gt; registry</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;MessageQueueThread&gt; jsQueue</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;InstanceCallback&gt; callback)</span>
+    <span class="s1">: m_destroyed(std::make_shared&lt;</span><span class="s4">bool</span><span class="s1">&gt;(</span><span class="s4">false</span><span class="s1">))</span><span class="s4">,</span>
+      <span class="s1">m_delegate(std::make_shared&lt;JsToNativeBridge&gt;(registry</span><span class="s4">, </span><span class="s1">callback))</span><span class="s4">,</span>
+      <span class="s1">m_executor(jsExecutorFactory-&gt;createJSExecutor(m_delegate</span><span class="s4">, </span><span class="s1">jsQueue))</span><span class="s4">,</span>
+      <span class="s1">m_executorMessageQueueThread(std::move(jsQueue))</span><span class="s4">,</span>
+      <span class="s1">m_inspectable(m_executor-&gt;isInspectable()) {}</span>
+
+<span class="s0">// This must be called on the same thread on which the constructor was called.</span>
+<span class="s1">NativeToJsBridge::~NativeToJsBridge() {</span>
+  <span class="s1">CHECK(*m_destroyed)</span>
+      <span class="s1">&lt;&lt; </span><span class="s3">&quot;NativeToJsBridge::destroy() must be called before deallocating the NativeToJsBridge!&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::initializeRuntime() {</span>
+  <span class="s1">runOnExecutorQueue(</span>
+      <span class="s1">[](JSExecutor *executor) </span><span class="s4">mutable </span><span class="s1">{ executor-&gt;initializeRuntime()</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::loadBundle(</span>
+    <span class="s1">std::unique_ptr&lt;RAMBundleRegistry&gt; bundleRegistry</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; startupScript</span><span class="s4">,</span>
+    <span class="s1">std::string startupScriptSourceURL) {</span>
+  <span class="s1">runOnExecutorQueue(</span>
+      <span class="s1">[</span><span class="s4">this,</span>
+       <span class="s1">bundleRegistryWrap = folly::makeMoveWrapper(std::move(bundleRegistry))</span><span class="s4">,</span>
+       <span class="s1">startupScript = folly::makeMoveWrapper(std::move(startupScript))</span><span class="s4">,</span>
+       <span class="s1">startupScriptSourceURL =</span>
+           <span class="s1">std::move(startupScriptSourceURL)](JSExecutor *executor) </span><span class="s4">mutable </span><span class="s1">{</span>
+        <span class="s4">auto </span><span class="s1">bundleRegistry = bundleRegistryWrap.move()</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(bundleRegistry) {</span>
+          <span class="s1">executor-&gt;setBundleRegistry(std::move(bundleRegistry))</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s4">try </span><span class="s1">{</span>
+          <span class="s1">executor-&gt;loadBundle(</span>
+              <span class="s1">std::move(*startupScript)</span><span class="s4">, </span><span class="s1">std::move(startupScriptSourceURL))</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+          <span class="s1">m_applicationScriptHasFailure = </span><span class="s4">true;</span>
+          <span class="s4">throw;</span>
+        <span class="s1">}</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::loadBundleSync(</span>
+    <span class="s1">std::unique_ptr&lt;RAMBundleRegistry&gt; bundleRegistry</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; startupScript</span><span class="s4">,</span>
+    <span class="s1">std::string startupScriptSourceURL) {</span>
+  <span class="s4">if </span><span class="s1">(bundleRegistry) {</span>
+    <span class="s1">m_executor-&gt;setBundleRegistry(std::move(bundleRegistry))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s1">m_executor-&gt;loadBundle(</span>
+        <span class="s1">std::move(startupScript)</span><span class="s4">, </span><span class="s1">std::move(startupScriptSourceURL))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+    <span class="s1">m_applicationScriptHasFailure = </span><span class="s4">true;</span>
+    <span class="s4">throw;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::callFunction(</span>
+    <span class="s1">std::string &amp;&amp;module</span><span class="s4">,</span>
+    <span class="s1">std::string &amp;&amp;method</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic &amp;&amp;arguments) {</span>
+  <span class="s4">int </span><span class="s1">systraceCookie = -</span><span class="s5">1</span><span class="s4">;</span>
+<span class="s2">#ifdef </span><span class="s1">WITH_FBSYSTRACE</span>
+  <span class="s1">systraceCookie = m_systraceCookie++</span><span class="s4">;</span>
+  <span class="s1">FbSystraceAsyncFlow::begin(</span>
+      <span class="s1">TRACE_TAG_REACT_CXX_BRIDGE</span><span class="s4">, </span><span class="s3">&quot;JSCall&quot;</span><span class="s4">, </span><span class="s1">systraceCookie)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s1">runOnExecutorQueue([</span><span class="s4">this,</span>
+                      <span class="s1">module = std::move(module)</span><span class="s4">,</span>
+                      <span class="s1">method = std::move(method)</span><span class="s4">,</span>
+                      <span class="s1">arguments = std::move(arguments)</span><span class="s4">,</span>
+                      <span class="s1">systraceCookie](JSExecutor *executor) {</span>
+    <span class="s4">if </span><span class="s1">(m_applicationScriptHasFailure) {</span>
+      <span class="s1">LOG(ERROR)</span>
+          <span class="s1">&lt;&lt; </span><span class="s3">&quot;Attempting to call JS function on a bad application bundle: &quot;</span>
+          <span class="s1">&lt;&lt; module.c_str() &lt;&lt; </span><span class="s3">&quot;.&quot; </span><span class="s1">&lt;&lt; method.c_str() &lt;&lt; </span><span class="s3">&quot;()&quot;</span><span class="s4">;</span>
+      <span class="s4">throw </span><span class="s1">std::runtime_error(</span>
+          <span class="s3">&quot;Attempting to call JS function on a bad application bundle: &quot; </span><span class="s1">+</span>
+          <span class="s1">module + </span><span class="s3">&quot;.&quot; </span><span class="s1">+ method + </span><span class="s3">&quot;()&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+<span class="s2">#ifdef </span><span class="s1">WITH_FBSYSTRACE</span>
+    <span class="s1">FbSystraceAsyncFlow::end(</span>
+        <span class="s1">TRACE_TAG_REACT_CXX_BRIDGE</span><span class="s4">, </span><span class="s3">&quot;JSCall&quot;</span><span class="s4">, </span><span class="s1">systraceCookie)</span><span class="s4">;</span>
+    <span class="s1">SystraceSection s(</span>
+        <span class="s3">&quot;NativeToJsBridge::callFunction&quot;</span><span class="s4">, </span><span class="s3">&quot;module&quot;</span><span class="s4">, </span><span class="s1">module</span><span class="s4">, </span><span class="s3">&quot;method&quot;</span><span class="s4">, </span><span class="s1">method)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+    <span class="s1">(</span><span class="s4">void</span><span class="s1">)(systraceCookie)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+    <span class="s0">// This is safe because we are running on the executor's thread: it won't</span>
+    <span class="s0">// destruct until after it's been unregistered (which we check above) and</span>
+    <span class="s0">// that will happen on this thread</span>
+    <span class="s1">executor-&gt;callFunction(module</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">arguments)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::invokeCallback(</span>
+    <span class="s4">double </span><span class="s1">callbackId</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic &amp;&amp;arguments) {</span>
+  <span class="s4">int </span><span class="s1">systraceCookie = -</span><span class="s5">1</span><span class="s4">;</span>
+<span class="s2">#ifdef </span><span class="s1">WITH_FBSYSTRACE</span>
+  <span class="s1">systraceCookie = m_systraceCookie++</span><span class="s4">;</span>
+  <span class="s1">FbSystraceAsyncFlow::begin(</span>
+      <span class="s1">TRACE_TAG_REACT_CXX_BRIDGE</span><span class="s4">, </span><span class="s3">&quot;&lt;callback&gt;&quot;</span><span class="s4">, </span><span class="s1">systraceCookie)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s1">runOnExecutorQueue(</span>
+      <span class="s1">[</span><span class="s4">this, </span><span class="s1">callbackId</span><span class="s4">, </span><span class="s1">arguments = std::move(arguments)</span><span class="s4">, </span><span class="s1">systraceCookie](</span>
+          <span class="s1">JSExecutor *executor) {</span>
+        <span class="s4">if </span><span class="s1">(m_applicationScriptHasFailure) {</span>
+          <span class="s1">LOG(ERROR)</span>
+              <span class="s1">&lt;&lt; </span><span class="s3">&quot;Attempting to call JS callback on a bad application bundle: &quot;</span>
+              <span class="s1">&lt;&lt; callbackId</span><span class="s4">;</span>
+          <span class="s4">throw </span><span class="s1">std::runtime_error(</span>
+              <span class="s3">&quot;Attempting to invoke JS callback on a bad application bundle.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+<span class="s2">#ifdef </span><span class="s1">WITH_FBSYSTRACE</span>
+        <span class="s1">FbSystraceAsyncFlow::end(</span>
+            <span class="s1">TRACE_TAG_REACT_CXX_BRIDGE</span><span class="s4">, </span><span class="s3">&quot;&lt;callback&gt;&quot;</span><span class="s4">, </span><span class="s1">systraceCookie)</span><span class="s4">;</span>
+        <span class="s1">SystraceSection s(</span><span class="s3">&quot;NativeToJsBridge::invokeCallback&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+        <span class="s1">(</span><span class="s4">void</span><span class="s1">)(systraceCookie)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+        <span class="s1">executor-&gt;invokeCallback(callbackId</span><span class="s4">, </span><span class="s1">arguments)</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::registerBundle(</span>
+    <span class="s1">uint32_t bundleId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;bundlePath) {</span>
+  <span class="s1">runOnExecutorQueue([bundleId</span><span class="s4">, </span><span class="s1">bundlePath](JSExecutor *executor) {</span>
+    <span class="s1">executor-&gt;registerBundle(bundleId</span><span class="s4">, </span><span class="s1">bundlePath)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::setGlobalVariable(</span>
+    <span class="s1">std::string propName</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; jsonValue) {</span>
+  <span class="s1">runOnExecutorQueue([propName = std::move(propName)</span><span class="s4">,</span>
+                      <span class="s1">jsonValue = folly::makeMoveWrapper(std::move(jsonValue))](</span>
+                         <span class="s1">JSExecutor *executor) </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s1">executor-&gt;setGlobalVariable(propName</span><span class="s4">, </span><span class="s1">jsonValue.move())</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">*NativeToJsBridge::getJavaScriptContext() {</span>
+  <span class="s0">// TODO(cjhopman): this seems unsafe unless we require that it is only called</span>
+  <span class="s0">// on the main js queue.</span>
+  <span class="s4">return </span><span class="s1">m_executor-&gt;getJavaScriptContext()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">NativeToJsBridge::isInspectable() {</span>
+  <span class="s4">return </span><span class="s1">m_inspectable</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">NativeToJsBridge::isBatchActive() {</span>
+  <span class="s4">return </span><span class="s1">m_delegate-&gt;isBatchActive()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::handleMemoryPressure(</span><span class="s4">int </span><span class="s1">pressureLevel) {</span>
+  <span class="s1">runOnExecutorQueue([=](JSExecutor *executor) {</span>
+    <span class="s1">executor-&gt;handleMemoryPressure(pressureLevel)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::destroy() {</span>
+  <span class="s0">// All calls made through runOnExecutorQueue have an early exit if</span>
+  <span class="s0">// m_destroyed is true. Setting this before the runOnQueueSync will cause</span>
+  <span class="s0">// pending work to be cancelled and we won't have to wait for it.</span>
+  <span class="s1">*m_destroyed = </span><span class="s4">true;</span>
+  <span class="s1">m_executorMessageQueueThread-&gt;runOnQueueSync([</span><span class="s4">this</span><span class="s1">] {</span>
+    <span class="s1">m_executor-&gt;destroy()</span><span class="s4">;</span>
+    <span class="s1">m_executorMessageQueueThread-&gt;quitSynchronous()</span><span class="s4">;</span>
+    <span class="s1">m_executor = </span><span class="s4">nullptr;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">NativeToJsBridge::runOnExecutorQueue(</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(JSExecutor *)&gt; task) {</span>
+  <span class="s4">if </span><span class="s1">(*m_destroyed) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::shared_ptr&lt;</span><span class="s4">bool</span><span class="s1">&gt; isDestroyed = m_destroyed</span><span class="s4">;</span>
+  <span class="s1">m_executorMessageQueueThread-&gt;runOnQueue(</span>
+      <span class="s1">[</span><span class="s4">this, </span><span class="s1">isDestroyed</span><span class="s4">, </span><span class="s1">task = std::move(task)] {</span>
+        <span class="s4">if </span><span class="s1">(*isDestroyed) {</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// The executor is guaranteed to be valid for the duration of the task</span>
+        <span class="s0">// because:</span>
+        <span class="s0">// 1. the executor is only destroyed after it is unregistered</span>
+        <span class="s0">// 2. the executor is unregistered on this queue</span>
+        <span class="s0">// 3. we just confirmed that the executor hasn't been unregistered above</span>
+        <span class="s1">task(m_executor.get())</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;CallInvoker&gt; NativeToJsBridge::getDecoratedNativeCallInvoker(</span>
+    <span class="s1">std::shared_ptr&lt;CallInvoker&gt; nativeInvoker) {</span>
+  <span class="s4">class </span><span class="s1">NativeCallInvoker : </span><span class="s4">public </span><span class="s1">CallInvoker {</span>
+   <span class="s4">private</span><span class="s1">:</span>
+    <span class="s1">std::weak_ptr&lt;JsToNativeBridge&gt; m_jsToNativeBridge</span><span class="s4">;</span>
+    <span class="s1">std::shared_ptr&lt;CallInvoker&gt; m_nativeInvoker</span><span class="s4">;</span>
+
+   <span class="s4">public</span><span class="s1">:</span>
+    <span class="s1">NativeCallInvoker(</span>
+        <span class="s1">std::weak_ptr&lt;JsToNativeBridge&gt; jsToNativeBridge</span><span class="s4">,</span>
+        <span class="s1">std::shared_ptr&lt;CallInvoker&gt; nativeInvoker)</span>
+        <span class="s1">: m_jsToNativeBridge(jsToNativeBridge)</span><span class="s4">,</span>
+          <span class="s1">m_nativeInvoker(nativeInvoker) {}</span>
+
+    <span class="s4">void </span><span class="s1">invokeAsync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;func) override {</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">strongJsToNativeBridge = m_jsToNativeBridge.lock()) {</span>
+        <span class="s1">strongJsToNativeBridge-&gt;recordTurboModuleAsyncMethodCall()</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">m_nativeInvoker-&gt;invokeAsync(std::move(func))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">void </span><span class="s1">invokeSync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;func) override {</span>
+      <span class="s1">m_nativeInvoker-&gt;invokeSync(std::move(func))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">std::make_shared&lt;NativeCallInvoker&gt;(m_delegate</span><span class="s4">, </span><span class="s1">nativeInvoker)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

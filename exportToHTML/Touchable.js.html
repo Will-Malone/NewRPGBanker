@@ -1,0 +1,991 @@
+<html>
+<head>
+<title>Touchable.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Touchable.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow 
+ * @format 
+ */</span>
+
+<span class="s1">import type {EdgeInsetsProp} from </span><span class="s2">'../../StyleSheet/EdgeInsetsPropType'</span><span class="s1">;</span>
+<span class="s1">import type {ColorValue} from </span><span class="s2">'../../StyleSheet/StyleSheet'</span><span class="s1">;</span>
+<span class="s1">import type {PressEvent} from </span><span class="s2">'../../Types/CoreEventTypes'</span><span class="s1">;</span>
+<span class="s1">import type {TouchableType} from </span><span class="s2">'./Touchable.flow'</span><span class="s1">;</span>
+
+<span class="s1">import {PressabilityDebugView} from </span><span class="s2">'../../Pressability/PressabilityDebug'</span><span class="s1">;</span>
+<span class="s1">import UIManager from </span><span class="s2">'../../ReactNative/UIManager'</span><span class="s1">;</span>
+<span class="s1">import Platform from </span><span class="s2">'../../Utilities/Platform'</span><span class="s1">;</span>
+<span class="s1">import SoundManager from </span><span class="s2">'../Sound/SoundManager'</span><span class="s1">;</span>
+<span class="s1">import BoundingDimensions from </span><span class="s2">'./BoundingDimensions'</span><span class="s1">;</span>
+<span class="s1">import Position from </span><span class="s2">'./Position'</span><span class="s1">;</span>
+<span class="s1">import * as React from </span><span class="s2">'react'</span><span class="s1">;</span>
+
+<span class="s1">const extractSingleTouch = (nativeEvent: {</span>
+  <span class="s1">+changedTouches: $ReadOnlyArray&lt;PressEvent[</span><span class="s2">'nativeEvent'</span><span class="s1">]&gt;,</span>
+  <span class="s1">+force?: number,</span>
+  <span class="s1">+identifier: number,</span>
+  <span class="s1">+locationX: number,</span>
+  <span class="s1">+locationY: number,</span>
+  <span class="s1">+pageX: number,</span>
+  <span class="s1">+pageY: number,</span>
+  <span class="s1">+target: ?number,</span>
+  <span class="s1">+timestamp: number,</span>
+  <span class="s1">+touches: $ReadOnlyArray&lt;PressEvent[</span><span class="s2">'nativeEvent'</span><span class="s1">]&gt;,</span>
+<span class="s1">}) =&gt; {</span>
+  <span class="s1">const touches = nativeEvent.touches;</span>
+  <span class="s1">const changedTouches = nativeEvent.changedTouches;</span>
+  <span class="s1">const hasTouches = touches &amp;&amp; touches.length &gt; </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">const hasChangedTouches = changedTouches &amp;&amp; changedTouches.length &gt; </span><span class="s3">0</span><span class="s1">;</span>
+
+  <span class="s4">return </span><span class="s1">!hasTouches &amp;&amp; hasChangedTouches</span>
+    <span class="s1">? changedTouches[</span><span class="s3">0</span><span class="s1">]</span>
+    <span class="s1">: hasTouches</span>
+    <span class="s1">? touches[</span><span class="s3">0</span><span class="s1">]</span>
+    <span class="s1">: nativeEvent;</span>
+<span class="s1">};</span>
+
+<span class="s0">/** 
+ * `Touchable`: Taps done right. 
+ * 
+ * You hook your `ResponderEventPlugin` events into `Touchable`. `Touchable` 
+ * will measure time/geometry and tells you when to give feedback to the user. 
+ * 
+ * ====================== Touchable Tutorial =============================== 
+ * The `Touchable` mixin helps you handle the &quot;press&quot; interaction. It analyzes 
+ * the geometry of elements, and observes when another responder (scroll view 
+ * etc) has stolen the touch lock. It notifies your component when it should 
+ * give feedback to the user. (bouncing/highlighting/unhighlighting). 
+ * 
+ * - When a touch was activated (typically you highlight) 
+ * - When a touch was deactivated (typically you unhighlight) 
+ * - When a touch was &quot;pressed&quot; - a touch ended while still within the geometry 
+ *   of the element, and no other element (like scroller) has &quot;stolen&quot; touch 
+ *   lock (&quot;responder&quot;) (Typically you bounce the element). 
+ * 
+ * A good tap interaction isn't as simple as you might think. There should be a 
+ * slight delay before showing a highlight when starting a touch. If a 
+ * subsequent touch move exceeds the boundary of the element, it should 
+ * unhighlight, but if that same touch is brought back within the boundary, it 
+ * should rehighlight again. A touch can move in and out of that boundary 
+ * several times, each time toggling highlighting, but a &quot;press&quot; is only 
+ * triggered if that touch ends while within the element's boundary and no 
+ * scroller (or anything else) has stolen the lock on touches. 
+ * 
+ * To create a new type of component that handles interaction using the 
+ * `Touchable` mixin, do the following: 
+ * 
+ * - Initialize the `Touchable` state. 
+ * 
+ *   getInitialState: function() { 
+ *     return merge(this.touchableGetInitialState(), yourComponentState); 
+ *   } 
+ * 
+ * - Choose the rendered component who's touches should start the interactive 
+ *   sequence. On that rendered node, forward all `Touchable` responder 
+ *   handlers. You can choose any rendered node you like. Choose a node whose 
+ *   hit target you'd like to instigate the interaction sequence: 
+ * 
+ *   // In render function: 
+ *   return ( 
+ *     &lt;View 
+ *       onStartShouldSetResponder={this.touchableHandleStartShouldSetResponder} 
+ *       onResponderTerminationRequest={this.touchableHandleResponderTerminationRequest} 
+ *       onResponderGrant={this.touchableHandleResponderGrant} 
+ *       onResponderMove={this.touchableHandleResponderMove} 
+ *       onResponderRelease={this.touchableHandleResponderRelease} 
+ *       onResponderTerminate={this.touchableHandleResponderTerminate}&gt; 
+ *       &lt;View&gt; 
+ *         Even though the hit detection/interactions are triggered by the 
+ *         wrapping (typically larger) node, we usually end up implementing 
+ *         custom logic that highlights this inner one. 
+ *       &lt;/View&gt; 
+ *     &lt;/View&gt; 
+ *   ); 
+ * 
+ * - You may set up your own handlers for each of these events, so long as you 
+ *   also invoke the `touchable*` handlers inside of your custom handler. 
+ * 
+ * - Implement the handlers on your component class in order to provide 
+ *   feedback to the user. See documentation for each of these class methods 
+ *   that you should implement. 
+ * 
+ *   touchableHandlePress: function() { 
+ *      this.performBounceAnimation();  // or whatever you want to do. 
+ *   }, 
+ *   touchableHandleActivePressIn: function() { 
+ *     this.beginHighlighting(...);  // Whatever you like to convey activation 
+ *   }, 
+ *   touchableHandleActivePressOut: function() { 
+ *     this.endHighlighting(...);  // Whatever you like to convey deactivation 
+ *   }, 
+ * 
+ * - There are more advanced methods you can implement (see documentation below): 
+ *   touchableGetHighlightDelayMS: function() { 
+ *     return 20; 
+ *   } 
+ *   // In practice, *always* use a predeclared constant (conserve memory). 
+ *   touchableGetPressRectOffset: function() { 
+ *     return {top: 20, left: 20, right: 20, bottom: 100}; 
+ *   } 
+ */</span>
+
+<span class="s0">/** 
+ * Touchable states. 
+ */</span>
+
+<span class="s1">const States = {</span>
+  <span class="s1">NOT_RESPONDER: </span><span class="s2">'NOT_RESPONDER'</span><span class="s1">, </span><span class="s0">// Not the responder</span>
+  <span class="s1">RESPONDER_INACTIVE_PRESS_IN: </span><span class="s2">'RESPONDER_INACTIVE_PRESS_IN'</span><span class="s1">, </span><span class="s0">// Responder, inactive, in the `PressRect`</span>
+  <span class="s1">RESPONDER_INACTIVE_PRESS_OUT: </span><span class="s2">'RESPONDER_INACTIVE_PRESS_OUT'</span><span class="s1">, </span><span class="s0">// Responder, inactive, out of `PressRect`</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_IN: </span><span class="s2">'RESPONDER_ACTIVE_PRESS_IN'</span><span class="s1">, </span><span class="s0">// Responder, active, in the `PressRect`</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_OUT: </span><span class="s2">'RESPONDER_ACTIVE_PRESS_OUT'</span><span class="s1">, </span><span class="s0">// Responder, active, out of `PressRect`</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_IN: </span><span class="s2">'RESPONDER_ACTIVE_LONG_PRESS_IN'</span><span class="s1">, </span><span class="s0">// Responder, active, in the `PressRect`, after long press threshold</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_OUT: </span><span class="s2">'RESPONDER_ACTIVE_LONG_PRESS_OUT'</span><span class="s1">, </span><span class="s0">// Responder, active, out of `PressRect`, after long press threshold</span>
+  <span class="s1">ERROR: </span><span class="s2">'ERROR'</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">type State =</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.NOT_RESPONDER</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.RESPONDER_INACTIVE_PRESS_IN</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.RESPONDER_INACTIVE_PRESS_OUT</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.RESPONDER_ACTIVE_PRESS_IN</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.RESPONDER_ACTIVE_PRESS_OUT</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.RESPONDER_ACTIVE_LONG_PRESS_IN</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.RESPONDER_ACTIVE_LONG_PRESS_OUT</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">States.ERROR;</span>
+
+<span class="s0">/* 
+ * Quick lookup map for states that are considered to be &quot;active&quot; 
+ */</span>
+
+<span class="s1">const baseStatesConditions = {</span>
+  <span class="s1">NOT_RESPONDER: </span><span class="s4">false</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_INACTIVE_PRESS_IN: </span><span class="s4">false</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_INACTIVE_PRESS_OUT: </span><span class="s4">false</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_IN: </span><span class="s4">false</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_OUT: </span><span class="s4">false</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_IN: </span><span class="s4">false</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_OUT: </span><span class="s4">false</span><span class="s1">,</span>
+  <span class="s1">ERROR: </span><span class="s4">false</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">const IsActive = {</span>
+  <span class="s1">...baseStatesConditions,</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_OUT: </span><span class="s4">true</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_IN: </span><span class="s4">true</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s0">/** 
+ * Quick lookup for states that are considered to be &quot;pressing&quot; and are 
+ * therefore eligible to result in a &quot;selection&quot; if the press stops. 
+ */</span>
+<span class="s1">const IsPressingIn = {</span>
+  <span class="s1">...baseStatesConditions,</span>
+  <span class="s1">RESPONDER_INACTIVE_PRESS_IN: </span><span class="s4">true</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_IN: </span><span class="s4">true</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_IN: </span><span class="s4">true</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">const IsLongPressingIn = {</span>
+  <span class="s1">...baseStatesConditions,</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_IN: </span><span class="s4">true</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s0">/** 
+ * Inputs to the state machine. 
+ */</span>
+<span class="s1">const Signals = {</span>
+  <span class="s1">DELAY: </span><span class="s2">'DELAY'</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_GRANT: </span><span class="s2">'RESPONDER_GRANT'</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_RELEASE: </span><span class="s2">'RESPONDER_RELEASE'</span><span class="s1">,</span>
+  <span class="s1">RESPONDER_TERMINATED: </span><span class="s2">'RESPONDER_TERMINATED'</span><span class="s1">,</span>
+  <span class="s1">ENTER_PRESS_RECT: </span><span class="s2">'ENTER_PRESS_RECT'</span><span class="s1">,</span>
+  <span class="s1">LEAVE_PRESS_RECT: </span><span class="s2">'LEAVE_PRESS_RECT'</span><span class="s1">,</span>
+  <span class="s1">LONG_PRESS_DETECTED: </span><span class="s2">'LONG_PRESS_DETECTED'</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">type Signal =</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">Signals.DELAY</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">Signals.RESPONDER_GRANT</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">Signals.RESPONDER_RELEASE</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">Signals.RESPONDER_TERMINATED</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">Signals.ENTER_PRESS_RECT</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">Signals.LEAVE_PRESS_RECT</span>
+  <span class="s1">| </span><span class="s4">typeof </span><span class="s1">Signals.LONG_PRESS_DETECTED;</span>
+
+<span class="s0">/** 
+ * Mapping from States x Signals =&gt; States 
+ */</span>
+<span class="s1">const Transitions = {</span>
+  <span class="s1">NOT_RESPONDER: {</span>
+    <span class="s1">DELAY: States.ERROR,</span>
+    <span class="s1">RESPONDER_GRANT: States.RESPONDER_INACTIVE_PRESS_IN,</span>
+    <span class="s1">RESPONDER_RELEASE: States.ERROR,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.ERROR,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.ERROR,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.ERROR,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.ERROR,</span>
+  <span class="s1">},</span>
+  <span class="s1">RESPONDER_INACTIVE_PRESS_IN: {</span>
+    <span class="s1">DELAY: States.RESPONDER_ACTIVE_PRESS_IN,</span>
+    <span class="s1">RESPONDER_GRANT: States.ERROR,</span>
+    <span class="s1">RESPONDER_RELEASE: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.NOT_RESPONDER,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.RESPONDER_INACTIVE_PRESS_IN,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.RESPONDER_INACTIVE_PRESS_OUT,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.ERROR,</span>
+  <span class="s1">},</span>
+  <span class="s1">RESPONDER_INACTIVE_PRESS_OUT: {</span>
+    <span class="s1">DELAY: States.RESPONDER_ACTIVE_PRESS_OUT,</span>
+    <span class="s1">RESPONDER_GRANT: States.ERROR,</span>
+    <span class="s1">RESPONDER_RELEASE: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.NOT_RESPONDER,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.RESPONDER_INACTIVE_PRESS_IN,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.RESPONDER_INACTIVE_PRESS_OUT,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.ERROR,</span>
+  <span class="s1">},</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_IN: {</span>
+    <span class="s1">DELAY: States.ERROR,</span>
+    <span class="s1">RESPONDER_GRANT: States.ERROR,</span>
+    <span class="s1">RESPONDER_RELEASE: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.NOT_RESPONDER,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.RESPONDER_ACTIVE_PRESS_IN,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.RESPONDER_ACTIVE_PRESS_OUT,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.RESPONDER_ACTIVE_LONG_PRESS_IN,</span>
+  <span class="s1">},</span>
+  <span class="s1">RESPONDER_ACTIVE_PRESS_OUT: {</span>
+    <span class="s1">DELAY: States.ERROR,</span>
+    <span class="s1">RESPONDER_GRANT: States.ERROR,</span>
+    <span class="s1">RESPONDER_RELEASE: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.NOT_RESPONDER,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.RESPONDER_ACTIVE_PRESS_IN,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.RESPONDER_ACTIVE_PRESS_OUT,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.ERROR,</span>
+  <span class="s1">},</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_IN: {</span>
+    <span class="s1">DELAY: States.ERROR,</span>
+    <span class="s1">RESPONDER_GRANT: States.ERROR,</span>
+    <span class="s1">RESPONDER_RELEASE: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.NOT_RESPONDER,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.RESPONDER_ACTIVE_LONG_PRESS_IN,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.RESPONDER_ACTIVE_LONG_PRESS_OUT,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.RESPONDER_ACTIVE_LONG_PRESS_IN,</span>
+  <span class="s1">},</span>
+  <span class="s1">RESPONDER_ACTIVE_LONG_PRESS_OUT: {</span>
+    <span class="s1">DELAY: States.ERROR,</span>
+    <span class="s1">RESPONDER_GRANT: States.ERROR,</span>
+    <span class="s1">RESPONDER_RELEASE: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.NOT_RESPONDER,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.RESPONDER_ACTIVE_LONG_PRESS_IN,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.RESPONDER_ACTIVE_LONG_PRESS_OUT,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.ERROR,</span>
+  <span class="s1">},</span>
+  <span class="s1">error: {</span>
+    <span class="s1">DELAY: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_GRANT: States.RESPONDER_INACTIVE_PRESS_IN,</span>
+    <span class="s1">RESPONDER_RELEASE: States.NOT_RESPONDER,</span>
+    <span class="s1">RESPONDER_TERMINATED: States.NOT_RESPONDER,</span>
+    <span class="s1">ENTER_PRESS_RECT: States.NOT_RESPONDER,</span>
+    <span class="s1">LEAVE_PRESS_RECT: States.NOT_RESPONDER,</span>
+    <span class="s1">LONG_PRESS_DETECTED: States.NOT_RESPONDER,</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+
+<span class="s0">// ==== Typical Constants for integrating into UI components ====</span>
+<span class="s0">// var HIT_EXPAND_PX = 20;</span>
+<span class="s0">// var HIT_VERT_OFFSET_PX = 10;</span>
+<span class="s1">const HIGHLIGHT_DELAY_MS = </span><span class="s3">130</span><span class="s1">;</span>
+
+<span class="s1">const PRESS_EXPAND_PX = </span><span class="s3">20</span><span class="s1">;</span>
+
+<span class="s1">const LONG_PRESS_THRESHOLD = </span><span class="s3">500</span><span class="s1">;</span>
+
+<span class="s1">const LONG_PRESS_DELAY_MS = LONG_PRESS_THRESHOLD - HIGHLIGHT_DELAY_MS;</span>
+
+<span class="s1">const LONG_PRESS_ALLOWED_MOVEMENT = </span><span class="s3">10</span><span class="s1">;</span>
+
+<span class="s0">// Default amount &quot;active&quot; region protrudes beyond box</span>
+
+<span class="s0">/** 
+ * By convention, methods prefixed with underscores are meant to be @private, 
+ * and not @protected. Mixers shouldn't access them - not even to provide them 
+ * as callback handlers. 
+ * 
+ * 
+ * ========== Geometry ========= 
+ * `Touchable` only assumes that there exists a `HitRect` node. The `PressRect` 
+ * is an abstract box that is extended beyond the `HitRect`. 
+ * 
+ *  +--------------------------+ 
+ *  |                          | - &quot;Start&quot; events in `HitRect` cause `HitRect` 
+ *  |  +--------------------+  |   to become the responder. 
+ *  |  |  +--------------+  |  | - `HitRect` is typically expanded around 
+ *  |  |  |              |  |  |   the `VisualRect`, but shifted downward. 
+ *  |  |  |  VisualRect  |  |  | - After pressing down, after some delay, 
+ *  |  |  |              |  |  |   and before letting up, the Visual React 
+ *  |  |  +--------------+  |  |   will become &quot;active&quot;. This makes it eligible 
+ *  |  |     HitRect        |  |   for being highlighted (so long as the 
+ *  |  +--------------------+  |   press remains in the `PressRect`). 
+ *  |        PressRect     o   | 
+ *  +----------------------|---+ 
+ *           Out Region    | 
+ *                         +-----+ This gap between the `HitRect` and 
+ *                                 `PressRect` allows a touch to move far away 
+ *                                 from the original hit rect, and remain 
+ *                                 highlighted, and eligible for a &quot;Press&quot;. 
+ *                                 Customize this via 
+ *                                 `touchableGetPressRectOffset()`. 
+ * 
+ * 
+ * 
+ * ======= State Machine ======= 
+ * 
+ * +-------------+ &lt;---+ RESPONDER_RELEASE 
+ * |NOT_RESPONDER| 
+ * +-------------+ &lt;---+ RESPONDER_TERMINATED 
+ *     + 
+ *     | RESPONDER_GRANT (HitRect) 
+ *     v 
+ * +---------------------------+  DELAY   +-------------------------+  T + DELAY     +------------------------------+ 
+ * |RESPONDER_INACTIVE_PRESS_IN|+--------&gt;|RESPONDER_ACTIVE_PRESS_IN| +------------&gt; |RESPONDER_ACTIVE_LONG_PRESS_IN| 
+ * +---------------------------+          +-------------------------+                +------------------------------+ 
+ *     +            ^                         +           ^                                 +           ^ 
+ *     |LEAVE_      |ENTER_                   |LEAVE_     |ENTER_                           |LEAVE_     |ENTER_ 
+ *     |PRESS_RECT  |PRESS_RECT               |PRESS_RECT |PRESS_RECT                       |PRESS_RECT |PRESS_RECT 
+ *     |            |                         |           |                                 |           | 
+ *     v            +                         v           +                                 v           + 
+ * +----------------------------+  DELAY  +--------------------------+               +-------------------------------+ 
+ * |RESPONDER_INACTIVE_PRESS_OUT|+-------&gt;|RESPONDER_ACTIVE_PRESS_OUT|               |RESPONDER_ACTIVE_LONG_PRESS_OUT| 
+ * +----------------------------+         +--------------------------+               +-------------------------------+ 
+ * 
+ * T + DELAY =&gt; LONG_PRESS_DELAY_MS + DELAY 
+ * 
+ * Not drawn are the side effects of each transition. The most important side 
+ * effect is the `touchableHandlePress` abstract method invocation that occurs 
+ * when a responder is released while in either of the &quot;Press&quot; states. 
+ * 
+ * The other important side effects are the highlight abstract method 
+ * invocations (internal callbacks) to be implemented by the mixer. 
+ * 
+ * 
+ * @lends Touchable.prototype 
+ */</span>
+<span class="s1">const TouchableMixin = {</span>
+  <span class="s1">componentDidMount: </span><span class="s4">function </span><span class="s1">() {</span>
+    <span class="s4">if </span><span class="s1">(!Platform.isTV) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Clear all timeouts on unmount 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">componentWillUnmount: </span><span class="s4">function </span><span class="s1">() {</span>
+    <span class="s4">this</span><span class="s1">.touchableDelayTimeout &amp;&amp; clearTimeout(</span><span class="s4">this</span><span class="s1">.touchableDelayTimeout);</span>
+    <span class="s4">this</span><span class="s1">.longPressDelayTimeout &amp;&amp; clearTimeout(</span><span class="s4">this</span><span class="s1">.longPressDelayTimeout);</span>
+    <span class="s4">this</span><span class="s1">.pressOutDelayTimeout &amp;&amp; clearTimeout(</span><span class="s4">this</span><span class="s1">.pressOutDelayTimeout);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * It's prefer that mixins determine state in this way, having the class 
+   * explicitly mix the state in the one and only `getInitialState` method. 
+   * 
+   * @return {object} State object to be placed inside of 
+   * `this.state.touchable`. 
+   */</span>
+  <span class="s1">touchableGetInitialState: </span><span class="s4">function </span><span class="s1">(): {</span>
+    <span class="s1">touchable: {</span>
+      <span class="s1">touchState: ?State,</span>
+      <span class="s1">responderID: ?PressEvent[</span><span class="s2">'currentTarget'</span><span class="s1">],</span>
+    <span class="s1">},</span>
+  <span class="s1">} {</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">touchable: {touchState: undefined, responderID: </span><span class="s4">null</span><span class="s1">},</span>
+    <span class="s1">};</span>
+  <span class="s1">},</span>
+
+  <span class="s0">// ==== Hooks to Gesture Responder system ====</span>
+  <span class="s0">/** 
+   * Must return true if embedded in a native platform scroll view. 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleResponderTerminationRequest: </span><span class="s4">function </span><span class="s1">(): any {</span>
+    <span class="s4">return </span><span class="s1">!</span><span class="s4">this</span><span class="s1">.props.rejectResponderTermination;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Must return true to start the process of `Touchable`. 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleStartShouldSetResponder: </span><span class="s4">function </span><span class="s1">(): any {</span>
+    <span class="s4">return </span><span class="s1">!</span><span class="s4">this</span><span class="s1">.props.disabled;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Return true to cancel press on long press. 
+   */</span>
+  <span class="s1">touchableLongPressCancelsPress: </span><span class="s4">function </span><span class="s1">(): boolean {</span>
+    <span class="s4">return true</span><span class="s1">;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Place as callback for a DOM element's `onResponderGrant` event. 
+   * @param {SyntheticEvent} e Synthetic event from event system. 
+   * 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleResponderGrant: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s1">const dispatchID = e.currentTarget;</span>
+    <span class="s0">// Since e is used in a callback invoked on another event loop</span>
+    <span class="s0">// (as in setTimeout etc), we need to call e.persist() on the</span>
+    <span class="s0">// event to make sure it doesn't get reused in the event object pool.</span>
+    <span class="s1">e.persist();</span>
+
+    <span class="s4">this</span><span class="s1">.pressOutDelayTimeout &amp;&amp; clearTimeout(</span><span class="s4">this</span><span class="s1">.pressOutDelayTimeout);</span>
+    <span class="s4">this</span><span class="s1">.pressOutDelayTimeout = </span><span class="s4">null</span><span class="s1">;</span>
+
+    <span class="s4">this</span><span class="s1">.state.touchable.touchState = States.NOT_RESPONDER;</span>
+    <span class="s4">this</span><span class="s1">.state.touchable.responderID = dispatchID;</span>
+    <span class="s4">this</span><span class="s1">._receiveSignal(Signals.RESPONDER_GRANT, e);</span>
+    <span class="s1">let delayMS =</span>
+      <span class="s4">this</span><span class="s1">.touchableGetHighlightDelayMS !== undefined</span>
+        <span class="s1">? Math.max(</span><span class="s4">this</span><span class="s1">.touchableGetHighlightDelayMS(), </span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">: HIGHLIGHT_DELAY_MS;</span>
+    <span class="s1">delayMS = isNaN(delayMS) ? HIGHLIGHT_DELAY_MS : delayMS;</span>
+    <span class="s4">if </span><span class="s1">(delayMS !== </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">.touchableDelayTimeout = setTimeout(</span>
+        <span class="s4">this</span><span class="s1">._handleDelay.bind(</span><span class="s4">this</span><span class="s1">, e),</span>
+        <span class="s1">delayMS,</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._handleDelay(e);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let longDelayMS =</span>
+      <span class="s4">this</span><span class="s1">.touchableGetLongPressDelayMS !== undefined</span>
+        <span class="s1">? Math.max(</span><span class="s4">this</span><span class="s1">.touchableGetLongPressDelayMS(), </span><span class="s3">10</span><span class="s1">)</span>
+        <span class="s1">: LONG_PRESS_DELAY_MS;</span>
+    <span class="s1">longDelayMS = isNaN(longDelayMS) ? LONG_PRESS_DELAY_MS : longDelayMS;</span>
+    <span class="s4">this</span><span class="s1">.longPressDelayTimeout = setTimeout(</span>
+      <span class="s4">this</span><span class="s1">._handleLongDelay.bind(</span><span class="s4">this</span><span class="s1">, e),</span>
+      <span class="s1">longDelayMS + delayMS,</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Place as callback for a DOM element's `onResponderRelease` event. 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleResponderRelease: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s4">this</span><span class="s1">.pressInLocation = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._receiveSignal(Signals.RESPONDER_RELEASE, e);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Place as callback for a DOM element's `onResponderTerminate` event. 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleResponderTerminate: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s4">this</span><span class="s1">.pressInLocation = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._receiveSignal(Signals.RESPONDER_TERMINATED, e);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Place as callback for a DOM element's `onResponderMove` event. 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleResponderMove: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s0">// Measurement may not have returned yet.</span>
+    <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">.state.touchable.positionOnActivate) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const positionOnActivate = </span><span class="s4">this</span><span class="s1">.state.touchable.positionOnActivate;</span>
+    <span class="s1">const dimensionsOnActivate = </span><span class="s4">this</span><span class="s1">.state.touchable.dimensionsOnActivate;</span>
+    <span class="s1">const pressRectOffset = </span><span class="s4">this</span><span class="s1">.touchableGetPressRectOffset</span>
+      <span class="s1">? </span><span class="s4">this</span><span class="s1">.touchableGetPressRectOffset()</span>
+      <span class="s1">: {</span>
+          <span class="s1">left: PRESS_EXPAND_PX,</span>
+          <span class="s1">right: PRESS_EXPAND_PX,</span>
+          <span class="s1">top: PRESS_EXPAND_PX,</span>
+          <span class="s1">bottom: PRESS_EXPAND_PX,</span>
+        <span class="s1">};</span>
+
+    <span class="s1">let pressExpandLeft = pressRectOffset.left;</span>
+    <span class="s1">let pressExpandTop = pressRectOffset.top;</span>
+    <span class="s1">let pressExpandRight = pressRectOffset.right;</span>
+    <span class="s1">let pressExpandBottom = pressRectOffset.bottom;</span>
+
+    <span class="s1">const hitSlop = </span><span class="s4">this</span><span class="s1">.touchableGetHitSlop</span>
+      <span class="s1">? </span><span class="s4">this</span><span class="s1">.touchableGetHitSlop()</span>
+      <span class="s1">: </span><span class="s4">null</span><span class="s1">;</span>
+
+    <span class="s4">if </span><span class="s1">(hitSlop) {</span>
+      <span class="s1">pressExpandLeft += hitSlop.left || </span><span class="s3">0</span><span class="s1">;</span>
+      <span class="s1">pressExpandTop += hitSlop.top || </span><span class="s3">0</span><span class="s1">;</span>
+      <span class="s1">pressExpandRight += hitSlop.right || </span><span class="s3">0</span><span class="s1">;</span>
+      <span class="s1">pressExpandBottom += hitSlop.bottom || </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const touch = extractSingleTouch(e.nativeEvent);</span>
+    <span class="s1">const pageX = touch &amp;&amp; touch.pageX;</span>
+    <span class="s1">const pageY = touch &amp;&amp; touch.pageY;</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.pressInLocation) {</span>
+      <span class="s1">const movedDistance = </span><span class="s4">this</span><span class="s1">._getDistanceBetweenPoints(</span>
+        <span class="s1">pageX,</span>
+        <span class="s1">pageY,</span>
+        <span class="s4">this</span><span class="s1">.pressInLocation.pageX,</span>
+        <span class="s4">this</span><span class="s1">.pressInLocation.pageY,</span>
+      <span class="s1">);</span>
+      <span class="s4">if </span><span class="s1">(movedDistance &gt; LONG_PRESS_ALLOWED_MOVEMENT) {</span>
+        <span class="s4">this</span><span class="s1">._cancelLongPressDelayTimeout();</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const isTouchWithinActive =</span>
+      <span class="s1">pageX &gt; positionOnActivate.left - pressExpandLeft &amp;&amp;</span>
+      <span class="s1">pageY &gt; positionOnActivate.top - pressExpandTop &amp;&amp;</span>
+      <span class="s1">pageX &lt;</span>
+        <span class="s1">positionOnActivate.left +</span>
+          <span class="s1">dimensionsOnActivate.width +</span>
+          <span class="s1">pressExpandRight &amp;&amp;</span>
+      <span class="s1">pageY &lt;</span>
+        <span class="s1">positionOnActivate.top +</span>
+          <span class="s1">dimensionsOnActivate.height +</span>
+          <span class="s1">pressExpandBottom;</span>
+    <span class="s4">if </span><span class="s1">(isTouchWithinActive) {</span>
+      <span class="s1">const prevState = </span><span class="s4">this</span><span class="s1">.state.touchable.touchState;</span>
+      <span class="s4">this</span><span class="s1">._receiveSignal(Signals.ENTER_PRESS_RECT, e);</span>
+      <span class="s1">const curState = </span><span class="s4">this</span><span class="s1">.state.touchable.touchState;</span>
+      <span class="s4">if </span><span class="s1">(</span>
+        <span class="s1">curState === States.RESPONDER_INACTIVE_PRESS_IN &amp;&amp;</span>
+        <span class="s1">prevState !== States.RESPONDER_INACTIVE_PRESS_IN</span>
+      <span class="s1">) {</span>
+        <span class="s0">// fix for t7967420</span>
+        <span class="s4">this</span><span class="s1">._cancelLongPressDelayTimeout();</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._cancelLongPressDelayTimeout();</span>
+      <span class="s4">this</span><span class="s1">._receiveSignal(Signals.LEAVE_PRESS_RECT, e);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when the item receives focus. Mixers might override this to 
+   * visually distinguish the `VisualRect` so that the user knows that it 
+   * currently has the focus. Most platforms only support a single element being 
+   * focused at a time, in which case there may have been a previously focused 
+   * element that was blurred just prior to this. This can be overridden when 
+   * using `Touchable.Mixin.withoutDefaultFocusAndBlur`. 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleFocus: </span><span class="s4">function </span><span class="s1">(e: Event) {</span>
+    <span class="s4">this</span><span class="s1">.props.onFocus &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onFocus(e);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when the item loses focus. Mixers might override this to 
+   * visually distinguish the `VisualRect` so that the user knows that it 
+   * no longer has focus. Most platforms only support a single element being 
+   * focused at a time, in which case the focus may have moved to another. 
+   * This can be overridden when using 
+   * `Touchable.Mixin.withoutDefaultFocusAndBlur`. 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">touchableHandleBlur: </span><span class="s4">function </span><span class="s1">(e: Event) {</span>
+    <span class="s4">this</span><span class="s1">.props.onBlur &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onBlur(e);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">// ==== Abstract Application Callbacks ====</span>
+
+  <span class="s0">/** 
+   * Invoked when the item should be highlighted. Mixers should implement this 
+   * to visually distinguish the `VisualRect` so that the user knows that 
+   * releasing a touch will result in a &quot;selection&quot; (analog to click). 
+   * 
+   * @abstract 
+   * touchableHandleActivePressIn: function, 
+   */</span>
+
+  <span class="s0">/** 
+   * Invoked when the item is &quot;active&quot; (in that it is still eligible to become 
+   * a &quot;select&quot;) but the touch has left the `PressRect`. Usually the mixer will 
+   * want to unhighlight the `VisualRect`. If the user (while pressing) moves 
+   * back into the `PressRect` `touchableHandleActivePressIn` will be invoked 
+   * again and the mixer should probably highlight the `VisualRect` again. This 
+   * event will not fire on an `touchEnd/mouseUp` event, only move events while 
+   * the user is depressing the mouse/touch. 
+   * 
+   * @abstract 
+   * touchableHandleActivePressOut: function 
+   */</span>
+
+  <span class="s0">/** 
+   * Invoked when the item is &quot;selected&quot; - meaning the interaction ended by 
+   * letting up while the item was either in the state 
+   * `RESPONDER_ACTIVE_PRESS_IN` or `RESPONDER_INACTIVE_PRESS_IN`. 
+   * 
+   * @abstract 
+   * touchableHandlePress: function 
+   */</span>
+
+  <span class="s0">/** 
+   * Invoked when the item is long pressed - meaning the interaction ended by 
+   * letting up while the item was in `RESPONDER_ACTIVE_LONG_PRESS_IN`. If 
+   * `touchableHandleLongPress` is *not* provided, `touchableHandlePress` will 
+   * be called as it normally is. If `touchableHandleLongPress` is provided, by 
+   * default any `touchableHandlePress` callback will not be invoked. To 
+   * override this default behavior, override `touchableLongPressCancelsPress` 
+   * to return false. As a result, `touchableHandlePress` will be called when 
+   * lifting up, even if `touchableHandleLongPress` has also been called. 
+   * 
+   * @abstract 
+   * touchableHandleLongPress: function 
+   */</span>
+
+  <span class="s0">/** 
+   * Returns the number of millis to wait before triggering a highlight. 
+   * 
+   * @abstract 
+   * touchableGetHighlightDelayMS: function 
+   */</span>
+
+  <span class="s0">/** 
+   * Returns the amount to extend the `HitRect` into the `PressRect`. Positive 
+   * numbers mean the size expands outwards. 
+   * 
+   * @abstract 
+   * touchableGetPressRectOffset: function 
+   */</span>
+
+  <span class="s0">// ==== Internal Logic ====</span>
+
+  <span class="s0">/** 
+   * Measures the `HitRect` node on activation. The Bounding rectangle is with 
+   * respect to viewport - not page, so adding the `pageXOffset/pageYOffset` 
+   * should result in points that are in the same coordinate system as an 
+   * event's `globalX/globalY` data values. 
+   * 
+   * - Consider caching this for the lifetime of the component, or possibly 
+   *   being able to share this cache between any `ScrollMap` view. 
+   * 
+   * @sideeffects 
+   * @private 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_remeasureMetricsOnActivation: </span><span class="s4">function </span><span class="s1">() {</span>
+    <span class="s1">const responderID = </span><span class="s4">this</span><span class="s1">.state.touchable.responderID;</span>
+    <span class="s4">if </span><span class="s1">(responderID == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">typeof </span><span class="s1">responderID === </span><span class="s2">'number'</span><span class="s1">) {</span>
+      <span class="s1">UIManager.measure(responderID, </span><span class="s4">this</span><span class="s1">._handleQueryLayout);</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">responderID.measure(</span><span class="s4">this</span><span class="s1">._handleQueryLayout);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_handleQueryLayout: </span><span class="s4">function </span><span class="s1">(</span>
+    <span class="s1">l: number,</span>
+    <span class="s1">t: number,</span>
+    <span class="s1">w: number,</span>
+    <span class="s1">h: number,</span>
+    <span class="s1">globalX: number,</span>
+    <span class="s1">globalY: number,</span>
+  <span class="s1">) {</span>
+    <span class="s0">//don't do anything UIManager failed to measure node</span>
+    <span class="s4">if </span><span class="s1">(!l &amp;&amp; !t &amp;&amp; !w &amp;&amp; !h &amp;&amp; !globalX &amp;&amp; !globalY) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">.state.touchable.positionOnActivate &amp;&amp;</span>
+      <span class="s1">Position.release(</span><span class="s4">this</span><span class="s1">.state.touchable.positionOnActivate);</span>
+    <span class="s4">this</span><span class="s1">.state.touchable.dimensionsOnActivate &amp;&amp;</span>
+      <span class="s1">BoundingDimensions.release(</span><span class="s4">this</span><span class="s1">.state.touchable.dimensionsOnActivate);</span>
+    <span class="s4">this</span><span class="s1">.state.touchable.positionOnActivate = Position.getPooled(</span>
+      <span class="s1">globalX,</span>
+      <span class="s1">globalY,</span>
+    <span class="s1">);</span>
+    <span class="s4">this</span><span class="s1">.state.touchable.dimensionsOnActivate = BoundingDimensions.getPooled(</span>
+      <span class="s1">w,</span>
+      <span class="s1">h,</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_handleDelay: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s4">this</span><span class="s1">.touchableDelayTimeout = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._receiveSignal(Signals.DELAY, e);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_handleLongDelay: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s4">this</span><span class="s1">.longPressDelayTimeout = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">const curState = </span><span class="s4">this</span><span class="s1">.state.touchable.touchState;</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">curState === States.RESPONDER_ACTIVE_PRESS_IN ||</span>
+      <span class="s1">curState === States.RESPONDER_ACTIVE_LONG_PRESS_IN</span>
+    <span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._receiveSignal(Signals.LONG_PRESS_DETECTED, e);</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Receives a state machine signal, performs side effects of the transition 
+   * and stores the new state. Validates the transition as well. 
+   * 
+   * @param {Signals} signal State machine signal. 
+   * @throws Error if invalid state transition or unrecognized signal. 
+   * @sideeffects 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_receiveSignal: </span><span class="s4">function </span><span class="s1">(signal: Signal, e: PressEvent) {</span>
+    <span class="s1">const responderID = </span><span class="s4">this</span><span class="s1">.state.touchable.responderID;</span>
+    <span class="s1">const curState = </span><span class="s4">this</span><span class="s1">.state.touchable.touchState;</span>
+    <span class="s1">const nextState = Transitions[curState] &amp;&amp; Transitions[curState][signal];</span>
+    <span class="s4">if </span><span class="s1">(!responderID &amp;&amp; signal === Signals.RESPONDER_RELEASE) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(!nextState) {</span>
+      <span class="s4">throw new </span><span class="s1">Error(</span>
+        <span class="s2">'Unrecognized signal `' </span><span class="s1">+</span>
+          <span class="s1">signal +</span>
+          <span class="s2">'` or state `' </span><span class="s1">+</span>
+          <span class="s1">curState +</span>
+          <span class="s2">'` for Touchable responder `' </span><span class="s1">+</span>
+          <span class="s4">typeof this</span><span class="s1">.state.touchable.responderID ===</span>
+        <span class="s2">'number'</span>
+          <span class="s1">? </span><span class="s4">this</span><span class="s1">.state.touchable.responderID</span>
+          <span class="s1">: </span><span class="s2">'host component' </span><span class="s1">+ </span><span class="s2">'`'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(nextState === States.ERROR) {</span>
+      <span class="s4">throw new </span><span class="s1">Error(</span>
+        <span class="s2">'Touchable cannot transition from `' </span><span class="s1">+</span>
+          <span class="s1">curState +</span>
+          <span class="s2">'` to `' </span><span class="s1">+</span>
+          <span class="s1">signal +</span>
+          <span class="s2">'` for responder `' </span><span class="s1">+</span>
+          <span class="s4">typeof this</span><span class="s1">.state.touchable.responderID ===</span>
+        <span class="s2">'number'</span>
+          <span class="s1">? </span><span class="s4">this</span><span class="s1">.state.touchable.responderID</span>
+          <span class="s1">: </span><span class="s2">'&lt;&lt;host component&gt;&gt;' </span><span class="s1">+ </span><span class="s2">'`'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(curState !== nextState) {</span>
+      <span class="s4">this</span><span class="s1">._performSideEffectsForTransition(curState, nextState, signal, e);</span>
+      <span class="s4">this</span><span class="s1">.state.touchable.touchState = nextState;</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_cancelLongPressDelayTimeout: </span><span class="s4">function </span><span class="s1">() {</span>
+    <span class="s4">this</span><span class="s1">.longPressDelayTimeout &amp;&amp; clearTimeout(</span><span class="s4">this</span><span class="s1">.longPressDelayTimeout);</span>
+    <span class="s4">this</span><span class="s1">.longPressDelayTimeout = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">_isHighlight: </span><span class="s4">function </span><span class="s1">(state: State): boolean {</span>
+    <span class="s4">return </span><span class="s1">(</span>
+      <span class="s1">state === States.RESPONDER_ACTIVE_PRESS_IN ||</span>
+      <span class="s1">state === States.RESPONDER_ACTIVE_LONG_PRESS_IN</span>
+    <span class="s1">);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_savePressInLocation: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s1">const touch = extractSingleTouch(e.nativeEvent);</span>
+    <span class="s1">const pageX = touch &amp;&amp; touch.pageX;</span>
+    <span class="s1">const pageY = touch &amp;&amp; touch.pageY;</span>
+    <span class="s1">const locationX = touch &amp;&amp; touch.locationX;</span>
+    <span class="s1">const locationY = touch &amp;&amp; touch.locationY;</span>
+    <span class="s4">this</span><span class="s1">.pressInLocation = {pageX, pageY, locationX, locationY};</span>
+  <span class="s1">},</span>
+
+  <span class="s1">_getDistanceBetweenPoints: </span><span class="s4">function </span><span class="s1">(</span>
+    <span class="s1">aX: number,</span>
+    <span class="s1">aY: number,</span>
+    <span class="s1">bX: number,</span>
+    <span class="s1">bY: number,</span>
+  <span class="s1">): number {</span>
+    <span class="s1">const deltaX = aX - bX;</span>
+    <span class="s1">const deltaY = aY - bY;</span>
+    <span class="s4">return </span><span class="s1">Math.sqrt(deltaX * deltaX + deltaY * deltaY);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Will perform a transition between touchable states, and identify any 
+   * highlighting or unhighlighting that must be performed for this particular 
+   * transition. 
+   * 
+   * @param {States} curState Current Touchable state. 
+   * @param {States} nextState Next Touchable state. 
+   * @param {Signal} signal Signal that triggered the transition. 
+   * @param {Event} e Native event. 
+   * @sideeffects 
+   */</span>
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_performSideEffectsForTransition: </span><span class="s4">function </span><span class="s1">(</span>
+    <span class="s1">curState: State,</span>
+    <span class="s1">nextState: State,</span>
+    <span class="s1">signal: Signal,</span>
+    <span class="s1">e: PressEvent,</span>
+  <span class="s1">) {</span>
+    <span class="s1">const curIsHighlight = </span><span class="s4">this</span><span class="s1">._isHighlight(curState);</span>
+    <span class="s1">const newIsHighlight = </span><span class="s4">this</span><span class="s1">._isHighlight(nextState);</span>
+
+    <span class="s1">const isFinalSignal =</span>
+      <span class="s1">signal === Signals.RESPONDER_TERMINATED ||</span>
+      <span class="s1">signal === Signals.RESPONDER_RELEASE;</span>
+
+    <span class="s4">if </span><span class="s1">(isFinalSignal) {</span>
+      <span class="s4">this</span><span class="s1">._cancelLongPressDelayTimeout();</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const isInitialTransition =</span>
+      <span class="s1">curState === States.NOT_RESPONDER &amp;&amp;</span>
+      <span class="s1">nextState === States.RESPONDER_INACTIVE_PRESS_IN;</span>
+
+    <span class="s1">const isActiveTransition = !IsActive[curState] &amp;&amp; IsActive[nextState];</span>
+    <span class="s4">if </span><span class="s1">(isInitialTransition || isActiveTransition) {</span>
+      <span class="s4">this</span><span class="s1">._remeasureMetricsOnActivation();</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(IsPressingIn[curState] &amp;&amp; signal === Signals.LONG_PRESS_DETECTED) {</span>
+      <span class="s4">this</span><span class="s1">.touchableHandleLongPress &amp;&amp; </span><span class="s4">this</span><span class="s1">.touchableHandleLongPress(e);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(newIsHighlight &amp;&amp; !curIsHighlight) {</span>
+      <span class="s4">this</span><span class="s1">._startHighlight(e);</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!newIsHighlight &amp;&amp; curIsHighlight) {</span>
+      <span class="s4">this</span><span class="s1">._endHighlight(e);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(IsPressingIn[curState] &amp;&amp; signal === Signals.RESPONDER_RELEASE) {</span>
+      <span class="s1">const hasLongPressHandler = !!</span><span class="s4">this</span><span class="s1">.props.onLongPress;</span>
+      <span class="s1">const pressIsLongButStillCallOnPress =</span>
+        <span class="s1">IsLongPressingIn[curState] &amp;&amp; </span><span class="s0">// We *are* long pressing.. // But either has no long handler</span>
+        <span class="s1">(!hasLongPressHandler || !</span><span class="s4">this</span><span class="s1">.touchableLongPressCancelsPress()); </span><span class="s0">// or we're told to ignore it.</span>
+
+      <span class="s1">const shouldInvokePress =</span>
+        <span class="s1">!IsLongPressingIn[curState] || pressIsLongButStillCallOnPress;</span>
+      <span class="s4">if </span><span class="s1">(shouldInvokePress &amp;&amp; </span><span class="s4">this</span><span class="s1">.touchableHandlePress) {</span>
+        <span class="s4">if </span><span class="s1">(!newIsHighlight &amp;&amp; !curIsHighlight) {</span>
+          <span class="s0">// we never highlighted because of delay, but we should highlight now</span>
+          <span class="s4">this</span><span class="s1">._startHighlight(e);</span>
+          <span class="s4">this</span><span class="s1">._endHighlight(e);</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(Platform.OS === </span><span class="s2">'android' </span><span class="s1">&amp;&amp; !</span><span class="s4">this</span><span class="s1">.props.touchSoundDisabled) {</span>
+          <span class="s1">SoundManager.playTouchSound();</span>
+        <span class="s1">}</span>
+        <span class="s4">this</span><span class="s1">.touchableHandlePress(e);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">.touchableDelayTimeout &amp;&amp; clearTimeout(</span><span class="s4">this</span><span class="s1">.touchableDelayTimeout);</span>
+    <span class="s4">this</span><span class="s1">.touchableDelayTimeout = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_startHighlight: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s4">this</span><span class="s1">._savePressInLocation(e);</span>
+    <span class="s4">this</span><span class="s1">.touchableHandleActivePressIn &amp;&amp; </span><span class="s4">this</span><span class="s1">.touchableHandleActivePressIn(e);</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) required by 
+   * Flow's LTI update could not be added via codemod */</span>
+  <span class="s1">_endHighlight: </span><span class="s4">function </span><span class="s1">(e: PressEvent) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.touchableHandleActivePressOut) {</span>
+      <span class="s4">if </span><span class="s1">(</span>
+        <span class="s4">this</span><span class="s1">.touchableGetPressOutDelayMS &amp;&amp;</span>
+        <span class="s4">this</span><span class="s1">.touchableGetPressOutDelayMS()</span>
+      <span class="s1">) {</span>
+        <span class="s4">this</span><span class="s1">.pressOutDelayTimeout = setTimeout(() =&gt; {</span>
+          <span class="s4">this</span><span class="s1">.touchableHandleActivePressOut(e);</span>
+        <span class="s1">}, </span><span class="s4">this</span><span class="s1">.touchableGetPressOutDelayMS());</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s4">this</span><span class="s1">.touchableHandleActivePressOut(e);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">},</span>
+
+  <span class="s1">withoutDefaultFocusAndBlur: ({}: {...}),</span>
+<span class="s1">};</span>
+
+<span class="s0">/** 
+ * Provide an optional version of the mixin where `touchableHandleFocus` and 
+ * `touchableHandleBlur` can be overridden. This allows appropriate defaults to 
+ * be set on TV platforms, without breaking existing implementations of 
+ * `Touchable`. 
+ */</span>
+<span class="s1">const {</span>
+  <span class="s1">touchableHandleFocus,</span>
+  <span class="s1">touchableHandleBlur,</span>
+  <span class="s1">...TouchableMixinWithoutDefaultFocusAndBlur</span>
+<span class="s1">} = TouchableMixin;</span>
+<span class="s1">TouchableMixin.withoutDefaultFocusAndBlur =</span>
+  <span class="s1">TouchableMixinWithoutDefaultFocusAndBlur;</span>
+
+<span class="s1">const Touchable: TouchableType = {</span>
+  <span class="s1">Mixin: TouchableMixin,</span>
+  <span class="s0">/** 
+   * Renders a debugging overlay to visualize touch target with hitSlop (might not work on Android). 
+   */</span>
+  <span class="s1">renderDebugView: ({</span>
+    <span class="s1">color,</span>
+    <span class="s1">hitSlop,</span>
+  <span class="s1">}: {</span>
+    <span class="s1">color: ColorValue,</span>
+    <span class="s1">hitSlop: EdgeInsetsProp,</span>
+    <span class="s1">...</span>
+  <span class="s1">}): </span><span class="s4">null </span><span class="s1">| React.Node =&gt; {</span>
+    <span class="s4">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s4">return </span><span class="s1">&lt;PressabilityDebugView color={color} hitSlop={hitSlop} /&gt;;</span>
+    <span class="s1">}</span>
+    <span class="s4">return null</span><span class="s1">;</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+
+<span class="s1">module.exports = Touchable;</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,430 @@
+<html>
+<head>
+<title>PerformanceEntryReporter.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+PerformanceEntryReporter.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;PerformanceEntryReporter.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSExecutor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/EventLogger.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&quot;NativePerformanceObserver.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;unordered_map&gt;</span>
+
+<span class="s0">// All the unflushed entries beyond this amount will get discarded, with</span>
+<span class="s0">// the amount of discarded ones sent back to the observers' callbacks as</span>
+<span class="s0">// &quot;droppedEntryCount&quot; value</span>
+<span class="s4">static constexpr </span><span class="s1">size_t MAX_ENTRY_BUFFER_SIZE = </span><span class="s5">1024</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+<span class="s1">EventTag PerformanceEntryReporter::sCurrentEventTag_{</span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">RawPerformanceEntry PerformanceMark::toRawPerformanceEntry() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">name</span><span class="s4">,</span>
+      <span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(PerformanceEntryType::MARK)</span><span class="s4">,</span>
+      <span class="s1">timeStamp</span><span class="s4">,</span>
+      <span class="s5">0.0</span><span class="s4">,</span>
+      <span class="s1">std::nullopt</span><span class="s4">,</span>
+      <span class="s1">std::nullopt</span><span class="s4">,</span>
+      <span class="s1">std::nullopt}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RawPerformanceEntry PerformanceMeasure::toRawPerformanceEntry() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">name</span><span class="s4">,</span>
+      <span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(PerformanceEntryType::MEASURE)</span><span class="s4">,</span>
+      <span class="s1">timeStamp</span><span class="s4">,</span>
+      <span class="s1">duration</span><span class="s4">,</span>
+      <span class="s1">std::nullopt</span><span class="s4">,</span>
+      <span class="s1">std::nullopt</span><span class="s4">,</span>
+      <span class="s1">std::nullopt}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">PerformanceEntryReporter &amp;PerformanceEntryReporter::getInstance() {</span>
+  <span class="s4">static </span><span class="s1">PerformanceEntryReporter instance</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">instance</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::setReportingCallback(</span>
+    <span class="s1">std::optional&lt;AsyncCallback&lt;&gt;&gt; callback) {</span>
+  <span class="s1">callback_ = callback</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::startReporting(PerformanceEntryType entryType) {</span>
+  <span class="s4">int </span><span class="s1">entryTypeIdx = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(entryType)</span><span class="s4">;</span>
+  <span class="s1">reportingType_[entryTypeIdx] = </span><span class="s4">true;</span>
+  <span class="s1">durationThreshold_[entryTypeIdx] = DEFAULT_DURATION_THRESHOLD</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::setDurationThreshold(</span>
+    <span class="s1">PerformanceEntryType entryType</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">durationThreshold) {</span>
+  <span class="s1">durationThreshold_[</span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(entryType)] = durationThreshold</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::stopReporting(PerformanceEntryType entryType) {</span>
+  <span class="s1">reportingType_[</span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(entryType)] = </span><span class="s4">false;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::stopReporting() {</span>
+  <span class="s1">reportingType_.fill(</span><span class="s4">false</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">GetPendingEntriesResult PerformanceEntryReporter::popPendingEntries() {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(entriesMutex_)</span><span class="s4">;</span>
+
+  <span class="s1">GetPendingEntriesResult res = {std::move(entries_)</span><span class="s4">, </span><span class="s1">droppedEntryCount_}</span><span class="s4">;</span>
+  <span class="s1">entries_ = {}</span><span class="s4">;</span>
+  <span class="s1">droppedEntryCount_ = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">res</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::logEntry(</span><span class="s4">const </span><span class="s1">RawPerformanceEntry &amp;entry) {</span>
+  <span class="s4">const auto </span><span class="s1">entryType = </span><span class="s4">static_cast</span><span class="s1">&lt;PerformanceEntryType&gt;(entry.entryType)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(entryType == PerformanceEntryType::EVENT) {</span>
+    <span class="s1">eventCounts_[entry.name]++</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!isReporting(entryType)) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(entry.duration &lt; durationThreshold_[entry.entryType]) {</span>
+    <span class="s0">// The entries duration is lower than the desired reporting threshold, skip</span>
+    <span class="s0">// return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(entriesMutex_)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(entries_.size() == MAX_ENTRY_BUFFER_SIZE) {</span>
+    <span class="s0">// Start dropping entries once reached maximum buffer size.</span>
+    <span class="s0">// The number of dropped entries will be reported back to the corresponding</span>
+    <span class="s0">// PerformanceObserver callback.</span>
+    <span class="s1">droppedEntryCount_ += </span><span class="s5">1</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">entries_.emplace_back(entry)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(entries_.size() == </span><span class="s5">1</span><span class="s1">) {</span>
+    <span class="s0">// If the buffer was empty, it signals that JS side just has possibly</span>
+    <span class="s0">// consumed it and is ready to get more</span>
+    <span class="s1">scheduleFlushBuffer()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::mark(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;name</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">startTime</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">duration) {</span>
+  <span class="s0">// Register the mark for further possible &quot;measure&quot; lookup, as well as add</span>
+  <span class="s0">// it to a circular buffer:</span>
+  <span class="s1">PerformanceMark &amp;mark = marksBuffer_[marksBufferPosition_]</span><span class="s4">;</span>
+  <span class="s1">marksBufferPosition_ = (marksBufferPosition_ + </span><span class="s5">1</span><span class="s1">) % marksBuffer_.size()</span><span class="s4">;</span>
+  <span class="s1">marksCount_ = std::min(marksBuffer_.size()</span><span class="s4">, </span><span class="s1">marksCount_ + </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!mark.name.empty()) {</span>
+    <span class="s0">// Drop off the oldest mark out of the queue, but only if that's indeed the</span>
+    <span class="s0">// oldest one</span>
+    <span class="s4">auto </span><span class="s1">it = marksRegistry_.find(&amp;mark)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(it != marksRegistry_.end() &amp;&amp; *it == &amp;mark) {</span>
+      <span class="s1">marksRegistry_.erase(it)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mark.name = name</span><span class="s4">;</span>
+  <span class="s1">mark.timeStamp = startTime</span><span class="s4">;</span>
+  <span class="s1">marksRegistry_.insert(&amp;mark)</span><span class="s4">;</span>
+
+  <span class="s1">logEntry(</span>
+      <span class="s1">{name</span><span class="s4">,</span>
+       <span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(PerformanceEntryType::MARK)</span><span class="s4">,</span>
+       <span class="s1">startTime</span><span class="s4">,</span>
+       <span class="s1">duration</span><span class="s4">,</span>
+       <span class="s1">std::nullopt</span><span class="s4">,</span>
+       <span class="s1">std::nullopt</span><span class="s4">,</span>
+       <span class="s1">std::nullopt})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::clearEntries(</span>
+    <span class="s1">PerformanceEntryType entryType</span><span class="s4">,</span>
+    <span class="s4">const char </span><span class="s1">*entryName) {</span>
+  <span class="s4">if </span><span class="s1">(entryType == PerformanceEntryType::MARK ||</span>
+      <span class="s1">entryType == PerformanceEntryType::UNDEFINED) {</span>
+    <span class="s4">if </span><span class="s1">(entryName != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s0">// remove a named mark from the mark/measure registry</span>
+      <span class="s1">PerformanceMark mark{{entryName</span><span class="s4">, </span><span class="s5">0</span><span class="s1">}}</span><span class="s4">;</span>
+      <span class="s1">marksRegistry_.erase(&amp;mark)</span><span class="s4">;</span>
+
+      <span class="s1">clearCircularBuffer(</span>
+          <span class="s1">marksBuffer_</span><span class="s4">, </span><span class="s1">marksCount_</span><span class="s4">, </span><span class="s1">marksBufferPosition_</span><span class="s4">, </span><span class="s1">entryName)</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">marksCount_ = </span><span class="s5">0</span><span class="s4">;</span>
+      <span class="s1">marksRegistry_.clear()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(entryType == PerformanceEntryType::MEASURE ||</span>
+      <span class="s1">entryType == PerformanceEntryType::UNDEFINED) {</span>
+    <span class="s4">if </span><span class="s1">(entryName != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s1">clearCircularBuffer(</span>
+          <span class="s1">measuresBuffer_</span><span class="s4">, </span><span class="s1">measuresCount_</span><span class="s4">, </span><span class="s1">measuresBufferPosition_</span><span class="s4">, </span><span class="s1">entryName)</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">measuresCount_ = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">int </span><span class="s1">lastPos = entries_.size() - </span><span class="s5">1</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">pos = lastPos</span><span class="s4">;</span>
+  <span class="s4">while </span><span class="s1">(pos &gt;= </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">const </span><span class="s1">RawPerformanceEntry &amp;entry = entries_[pos]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(entry.entryType == </span><span class="s4">static_cast</span><span class="s1">&lt;int32_t&gt;(entryType) &amp;&amp;</span>
+        <span class="s1">(entryName == </span><span class="s4">nullptr </span><span class="s1">|| entry.name == entryName)) {</span>
+      <span class="s1">entries_[pos] = entries_[lastPos]</span><span class="s4">;</span>
+      <span class="s1">lastPos--</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">pos--</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">entries_.resize(lastPos + </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::vector&lt;RawPerformanceEntry&gt; PerformanceEntryReporter::getEntries(</span>
+    <span class="s1">PerformanceEntryType entryType</span><span class="s4">,</span>
+    <span class="s4">const char </span><span class="s1">*entryName) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(entryType == PerformanceEntryType::MARK) {</span>
+    <span class="s4">return </span><span class="s1">getCircularBufferContents(</span>
+        <span class="s1">marksBuffer_</span><span class="s4">, </span><span class="s1">marksCount_</span><span class="s4">, </span><span class="s1">marksBufferPosition_</span><span class="s4">, </span><span class="s1">entryName)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(entryType == PerformanceEntryType::MEASURE) {</span>
+    <span class="s4">return </span><span class="s1">getCircularBufferContents(</span>
+        <span class="s1">measuresBuffer_</span><span class="s4">, </span><span class="s1">measuresCount_</span><span class="s4">, </span><span class="s1">measuresBufferPosition_</span><span class="s4">, </span><span class="s1">entryName)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(entryType == PerformanceEntryType::UNDEFINED) {</span>
+    <span class="s4">auto </span><span class="s1">marks = getCircularBufferContents(</span>
+        <span class="s1">marksBuffer_</span><span class="s4">, </span><span class="s1">marksCount_</span><span class="s4">, </span><span class="s1">marksBufferPosition_</span><span class="s4">, </span><span class="s1">entryName)</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">measures = getCircularBufferContents(</span>
+        <span class="s1">measuresBuffer_</span><span class="s4">, </span><span class="s1">measuresCount_</span><span class="s4">, </span><span class="s1">measuresBufferPosition_</span><span class="s4">, </span><span class="s1">entryName)</span><span class="s4">;</span>
+    <span class="s1">marks.insert(marks.end()</span><span class="s4">, </span><span class="s1">measures.begin()</span><span class="s4">, </span><span class="s1">measures.end())</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">marks</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">{}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::measure(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;name</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">startTime</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">endTime</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::optional&lt;</span><span class="s4">double</span><span class="s1">&gt; &amp;duration</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::optional&lt;std::string&gt; &amp;startMark</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::optional&lt;std::string&gt; &amp;endMark) {</span>
+  <span class="s4">double </span><span class="s1">startTimeVal = startMark ? getMarkTime(*startMark) : startTime</span><span class="s4">;</span>
+  <span class="s4">double </span><span class="s1">endTimeVal = endMark ? getMarkTime(*endMark) : endTime</span><span class="s4">;</span>
+  <span class="s4">double </span><span class="s1">durationVal = duration ? *duration : endTimeVal - startTimeVal</span><span class="s4">;</span>
+
+  <span class="s1">measuresBuffer_[measuresBufferPosition_] =</span>
+      <span class="s1">PerformanceMeasure{name</span><span class="s4">, </span><span class="s1">startTime</span><span class="s4">, </span><span class="s1">endTime}</span><span class="s4">;</span>
+  <span class="s1">measuresBufferPosition_ =</span>
+      <span class="s1">(measuresBufferPosition_ + </span><span class="s5">1</span><span class="s1">) % measuresBuffer_.size()</span><span class="s4">;</span>
+  <span class="s1">measuresCount_ = std::min(measuresBuffer_.size()</span><span class="s4">, </span><span class="s1">measuresCount_ + </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">logEntry(</span>
+      <span class="s1">{name</span><span class="s4">,</span>
+       <span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(PerformanceEntryType::MEASURE)</span><span class="s4">,</span>
+       <span class="s1">startTimeVal</span><span class="s4">,</span>
+       <span class="s1">durationVal</span><span class="s4">,</span>
+       <span class="s1">std::nullopt</span><span class="s4">,</span>
+       <span class="s1">std::nullopt</span><span class="s4">,</span>
+       <span class="s1">std::nullopt})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">double </span><span class="s1">PerformanceEntryReporter::getMarkTime(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;markName) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">PerformanceMark mark{{std::move(markName)</span><span class="s4">, </span><span class="s5">0</span><span class="s1">}}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">it = marksRegistry_.find(&amp;mark)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(it != marksRegistry_.end()) {</span>
+    <span class="s4">return </span><span class="s1">(*it)-&gt;timeStamp</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s5">0.0</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::event(</span>
+    <span class="s1">std::string name</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">startTime</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">duration</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">processingStart</span><span class="s4">,</span>
+    <span class="s4">double </span><span class="s1">processingEnd</span><span class="s4">,</span>
+    <span class="s1">uint32_t interactionId) {</span>
+  <span class="s1">logEntry(</span>
+      <span class="s1">{std::move(name)</span><span class="s4">,</span>
+       <span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(PerformanceEntryType::EVENT)</span><span class="s4">,</span>
+       <span class="s1">startTime</span><span class="s4">,</span>
+       <span class="s1">duration</span><span class="s4">,</span>
+       <span class="s1">processingStart</span><span class="s4">,</span>
+       <span class="s1">processingEnd</span><span class="s4">,</span>
+       <span class="s1">interactionId})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::scheduleFlushBuffer() {</span>
+  <span class="s4">if </span><span class="s1">(callback_) {</span>
+    <span class="s1">callback_-&gt;callWithPriority(SchedulerPriority::IdlePriority)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">struct </span><span class="s1">StrKey {</span>
+  <span class="s1">uint32_t key</span><span class="s4">;</span>
+  <span class="s4">constexpr </span><span class="s1">StrKey(</span><span class="s4">const char </span><span class="s1">*s)</span>
+      <span class="s1">: key(folly::hash::fnv32_buf(s</span><span class="s4">, sizeof</span><span class="s1">(s) - </span><span class="s5">1</span><span class="s1">)) {}</span>
+
+  <span class="s4">constexpr bool operator</span><span class="s1">==(</span><span class="s4">const </span><span class="s1">StrKey &amp;rhs) </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">key == rhs.key</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">struct </span><span class="s1">StrKeyHash {</span>
+  <span class="s4">constexpr </span><span class="s1">size_t </span><span class="s4">operator</span><span class="s1">()(</span><span class="s4">const </span><span class="s1">StrKey &amp;strKey) </span><span class="s4">const </span><span class="s1">{</span>
+    <span class="s4">return static_cast</span><span class="s1">&lt;size_t&gt;(strKey.key)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">// Supported events for reporting, see</span>
+<span class="s0">// https://www.w3.org/TR/event-timing/#sec-events-exposed</span>
+<span class="s0">// Not all of these are currently supported by RN, but we map them anyway for</span>
+<span class="s0">// future-proofing.</span>
+<span class="s4">using </span><span class="s1">SupportedEventTypeRegistry =</span>
+    <span class="s1">std::unordered_map&lt;StrKey</span><span class="s4">, const char </span><span class="s1">*</span><span class="s4">, </span><span class="s1">StrKeyHash&gt;</span><span class="s4">;</span>
+
+<span class="s4">static const </span><span class="s1">SupportedEventTypeRegistry &amp;getSupportedEvents() {</span>
+  <span class="s4">static </span><span class="s1">SupportedEventTypeRegistry SUPPORTED_EVENTS = {</span>
+      <span class="s1">{</span><span class="s3">&quot;topAuxClick&quot;</span><span class="s4">, </span><span class="s3">&quot;auxclick&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topClick&quot;</span><span class="s4">, </span><span class="s3">&quot;click&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topContextMenu&quot;</span><span class="s4">, </span><span class="s3">&quot;contextmenu&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topDblClick&quot;</span><span class="s4">, </span><span class="s3">&quot;dblclick&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topMouseDown&quot;</span><span class="s4">, </span><span class="s3">&quot;mousedown&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topMouseEnter&quot;</span><span class="s4">, </span><span class="s3">&quot;mouseenter&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topMouseLeave&quot;</span><span class="s4">, </span><span class="s3">&quot;mouseleave&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topMouseOut&quot;</span><span class="s4">, </span><span class="s3">&quot;mouseout&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topMouseOver&quot;</span><span class="s4">, </span><span class="s3">&quot;mouseover&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topMouseUp&quot;</span><span class="s4">, </span><span class="s3">&quot;mouseup&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topPointerOver&quot;</span><span class="s4">, </span><span class="s3">&quot;pointerover&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topPointerEnter&quot;</span><span class="s4">, </span><span class="s3">&quot;pointerenter&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topPointerDown&quot;</span><span class="s4">, </span><span class="s3">&quot;pointerdown&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topPointerUp&quot;</span><span class="s4">, </span><span class="s3">&quot;pointerup&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topPointerCancel&quot;</span><span class="s4">, </span><span class="s3">&quot;pointercancel&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topPointerOut&quot;</span><span class="s4">, </span><span class="s3">&quot;pointerout&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topPointerLeave&quot;</span><span class="s4">, </span><span class="s3">&quot;pointerleave&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topGotPointerCapture&quot;</span><span class="s4">, </span><span class="s3">&quot;gotpointercapture&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topLostPointerCapture&quot;</span><span class="s4">, </span><span class="s3">&quot;lostpointercapture&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topTouchStart&quot;</span><span class="s4">, </span><span class="s3">&quot;touchstart&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topTouchEnd&quot;</span><span class="s4">, </span><span class="s3">&quot;touchend&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topTouchCancel&quot;</span><span class="s4">, </span><span class="s3">&quot;touchcancel&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topKeyDown&quot;</span><span class="s4">, </span><span class="s3">&quot;keydown&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topKeyPress&quot;</span><span class="s4">, </span><span class="s3">&quot;keypress&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topKeyUp&quot;</span><span class="s4">, </span><span class="s3">&quot;keyup&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topBeforeInput&quot;</span><span class="s4">, </span><span class="s3">&quot;beforeinput&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topInput&quot;</span><span class="s4">, </span><span class="s3">&quot;input&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topCompositionStart&quot;</span><span class="s4">, </span><span class="s3">&quot;compositionstart&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topCompositionUpdate&quot;</span><span class="s4">, </span><span class="s3">&quot;compositionupdate&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topCompositionEnd&quot;</span><span class="s4">, </span><span class="s3">&quot;compositionend&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topDragStart&quot;</span><span class="s4">, </span><span class="s3">&quot;dragstart&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topDragEnd&quot;</span><span class="s4">, </span><span class="s3">&quot;dragend&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topDragEnter&quot;</span><span class="s4">, </span><span class="s3">&quot;dragenter&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topDragLeave&quot;</span><span class="s4">, </span><span class="s3">&quot;dragleave&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topDragOver&quot;</span><span class="s4">, </span><span class="s3">&quot;dragover&quot;</span><span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s3">&quot;topDrop&quot;</span><span class="s4">, </span><span class="s3">&quot;drop&quot;</span><span class="s1">}</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">SUPPORTED_EVENTS</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">EventTag PerformanceEntryReporter::onEventStart(</span><span class="s4">const char </span><span class="s1">*name) {</span>
+  <span class="s4">if </span><span class="s1">(!isReportingEvents()) {</span>
+    <span class="s4">return </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">const auto </span><span class="s1">&amp;supportedEvents = getSupportedEvents()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">it = supportedEvents.find(name)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(it == supportedEvents.end()) {</span>
+    <span class="s4">return </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const char </span><span class="s1">*reportedName = it-&gt;second</span><span class="s4">;</span>
+
+  <span class="s1">sCurrentEventTag_++</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(sCurrentEventTag_ == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s0">// The tag wrapped around (which is highly unlikely, but still)</span>
+    <span class="s1">sCurrentEventTag_ = </span><span class="s5">1</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">timeStamp = JSExecutor::performanceNow()</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(eventsInFlightMutex_)</span><span class="s4">;</span>
+    <span class="s1">eventsInFlight_.emplace(std::make_pair(</span>
+        <span class="s1">sCurrentEventTag_</span><span class="s4">, </span><span class="s1">EventEntry{reportedName</span><span class="s4">, </span><span class="s1">timeStamp</span><span class="s4">, </span><span class="s5">0.0</span><span class="s1">}))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">sCurrentEventTag_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::onEventDispatch(EventTag tag) {</span>
+  <span class="s4">if </span><span class="s1">(!isReportingEvents() || tag == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s4">auto </span><span class="s1">timeStamp = JSExecutor::performanceNow()</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(eventsInFlightMutex_)</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">it = eventsInFlight_.find(tag)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(it != eventsInFlight_.end()) {</span>
+      <span class="s1">it-&gt;second.dispatchTime = timeStamp</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PerformanceEntryReporter::onEventEnd(EventTag tag) {</span>
+  <span class="s4">if </span><span class="s1">(!isReportingEvents() || tag == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s4">auto </span><span class="s1">timeStamp = JSExecutor::performanceNow()</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(eventsInFlightMutex_)</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">it = eventsInFlight_.find(tag)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(it == eventsInFlight_.end()) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+    <span class="s4">auto </span><span class="s1">&amp;entry = it-&gt;second</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">&amp;name = entry.name</span><span class="s4">;</span>
+
+    <span class="s0">// TODO: Define the way to assign interaction IDs to the event chains</span>
+    <span class="s0">// (T141358175)</span>
+    <span class="s4">const </span><span class="s1">uint32_t interactionId = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">event(</span>
+        <span class="s1">name</span><span class="s4">,</span>
+        <span class="s1">entry.startTime</span><span class="s4">,</span>
+        <span class="s1">timeStamp - entry.startTime</span><span class="s4">,</span>
+        <span class="s1">entry.dispatchTime</span><span class="s4">,</span>
+        <span class="s1">timeStamp</span><span class="s4">,</span>
+        <span class="s1">interactionId)</span><span class="s4">;</span>
+    <span class="s1">eventsInFlight_.erase(it)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

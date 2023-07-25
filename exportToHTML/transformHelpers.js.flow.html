@@ -1,0 +1,238 @@
+<html>
+<head>
+<title>transformHelpers.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+transformHelpers.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict-local</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type Bundler from '../Bundler';</span>
+<span class="s0">import type DeltaBundler, {TransformFn} from '../DeltaBundler';</span>
+<span class="s0">import type {</span>
+  <span class="s0">BundlerResolution,</span>
+  <span class="s0">TransformInputOptions,</span>
+<span class="s0">} from '../DeltaBundler/types.flow';</span>
+<span class="s0">import type {TransformOptions} from '../DeltaBundler/Worker';</span>
+<span class="s0">import type {ConfigT} from 'metro-config/src/configTypes.flow';</span>
+<span class="s0">import type {Type} from 'metro-transform-worker';</span>
+<span class="s0">import type {RequireContext} from './contextModule';</span>
+
+<span class="s0">import {getContextModuleTemplate} from './contextModuleTemplates';</span>
+<span class="s0">import isAssetFile from 'metro-resolver/src/utils/isAssetFile';</span>
+
+<span class="s0">import type {ResolverInputOptions} from '../shared/types.flow';</span>
+
+<span class="s0">type InlineRequiresRaw = {+blockList: {[string]: true, ...}, ...} | boolean;</span>
+
+<span class="s0">type TransformOptionsWithRawInlines = {</span>
+  <span class="s0">...TransformOptions,</span>
+  <span class="s0">+inlineRequires: InlineRequiresRaw,</span>
+<span class="s0">};</span>
+
+<span class="s0">const baseIgnoredInlineRequires = ['React', 'react', 'react-native'];</span>
+
+<span class="s0">async function calcTransformerOptions(</span>
+  <span class="s0">entryFiles: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">bundler: Bundler,</span>
+  <span class="s0">deltaBundler: DeltaBundler&lt;&gt;,</span>
+  <span class="s0">config: ConfigT,</span>
+  <span class="s0">options: TransformInputOptions,</span>
+  <span class="s0">resolverOptions: ResolverInputOptions,</span>
+<span class="s0">): Promise&lt;TransformOptionsWithRawInlines&gt; {</span>
+  <span class="s0">const baseOptions = {</span>
+    <span class="s0">customTransformOptions: options.customTransformOptions,</span>
+    <span class="s0">dev: options.dev,</span>
+    <span class="s0">hot: options.hot,</span>
+    <span class="s0">inlineRequires: false,</span>
+    <span class="s0">inlinePlatform: true,</span>
+    <span class="s0">minify: options.minify,</span>
+    <span class="s0">platform: options.platform,</span>
+    <span class="s0">unstable_transformProfile: options.unstable_transformProfile,</span>
+  <span class="s0">};</span>
+
+  <span class="s0">// When we're processing scripts, we don't need to calculate any</span>
+  <span class="s0">// inlineRequires information, since scripts by definition don't have</span>
+  <span class="s0">// requires().</span>
+  <span class="s0">if (options.type === 'script') {</span>
+    <span class="s0">return {</span>
+      <span class="s0">...baseOptions,</span>
+      <span class="s0">type: 'script',</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const getDependencies = async (path: string) =&gt; {</span>
+    <span class="s0">const dependencies = await deltaBundler.getDependencies([path], {</span>
+      <span class="s0">resolve: await getResolveDependencyFn(</span>
+        <span class="s0">bundler,</span>
+        <span class="s0">options.platform,</span>
+        <span class="s0">resolverOptions,</span>
+      <span class="s0">),</span>
+      <span class="s0">transform: await getTransformFn(</span>
+        <span class="s0">[path],</span>
+        <span class="s0">bundler,</span>
+        <span class="s0">deltaBundler,</span>
+        <span class="s0">config,</span>
+        <span class="s0">{</span>
+          <span class="s0">...options,</span>
+          <span class="s0">minify: false,</span>
+        <span class="s0">},</span>
+        <span class="s0">resolverOptions,</span>
+      <span class="s0">),</span>
+      <span class="s0">transformOptions: options,</span>
+      <span class="s0">onProgress: null,</span>
+      <span class="s0">lazy: false,</span>
+      <span class="s0">unstable_allowRequireContext:</span>
+        <span class="s0">config.transformer.unstable_allowRequireContext,</span>
+      <span class="s0">unstable_enablePackageExports:</span>
+        <span class="s0">config.resolver.unstable_enablePackageExports,</span>
+      <span class="s0">shallow: false,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">return Array.from(dependencies.keys());</span>
+  <span class="s0">};</span>
+
+  <span class="s0">const {transform} = await config.transformer.getTransformOptions(</span>
+    <span class="s0">entryFiles,</span>
+    <span class="s0">{dev: options.dev, hot: options.hot, platform: options.platform},</span>
+    <span class="s0">getDependencies,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">...baseOptions,</span>
+    <span class="s0">inlineRequires: transform?.inlineRequires || false,</span>
+    <span class="s0">experimentalImportSupport: transform?.experimentalImportSupport || false,</span>
+    <span class="s0">unstable_disableES6Transforms:</span>
+      <span class="s0">transform?.unstable_disableES6Transforms || false,</span>
+    <span class="s0">nonInlinedRequires:</span>
+      <span class="s0">transform?.nonInlinedRequires || baseIgnoredInlineRequires,</span>
+    <span class="s0">type: 'module',</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function removeInlineRequiresBlockListFromOptions(</span>
+  <span class="s0">path: string,</span>
+  <span class="s0">inlineRequires: InlineRequiresRaw,</span>
+<span class="s0">): boolean {</span>
+  <span class="s0">if (typeof inlineRequires === 'object') {</span>
+    <span class="s0">return !(path in inlineRequires.blockList);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return inlineRequires;</span>
+<span class="s0">}</span>
+
+<span class="s0">async function getTransformFn(</span>
+  <span class="s0">entryFiles: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">bundler: Bundler,</span>
+  <span class="s0">deltaBundler: DeltaBundler&lt;&gt;,</span>
+  <span class="s0">config: ConfigT,</span>
+  <span class="s0">options: TransformInputOptions,</span>
+  <span class="s0">resolverOptions: ResolverInputOptions,</span>
+<span class="s0">): Promise&lt;TransformFn&lt;&gt;&gt; {</span>
+  <span class="s0">const {inlineRequires, ...transformOptions} = await calcTransformerOptions(</span>
+    <span class="s0">entryFiles,</span>
+    <span class="s0">bundler,</span>
+    <span class="s0">deltaBundler,</span>
+    <span class="s0">config,</span>
+    <span class="s0">options,</span>
+    <span class="s0">resolverOptions,</span>
+  <span class="s0">);</span>
+  <span class="s0">const assetExts = new Set(config.resolver.assetExts);</span>
+
+  <span class="s0">return async (modulePath: string, requireContext: ?RequireContext) =&gt; {</span>
+    <span class="s0">let templateBuffer: Buffer;</span>
+
+    <span class="s0">if (requireContext) {</span>
+      <span class="s0">const graph = await bundler.getDependencyGraph();</span>
+
+      <span class="s0">// TODO: Check delta changes to avoid having to look over all files each time</span>
+      <span class="s0">// this is a massive performance boost.</span>
+
+      <span class="s0">// Search against all files, this is very expensive.</span>
+      <span class="s0">// TODO: Maybe we could let the user specify which root to check against.</span>
+      <span class="s0">const files = graph.matchFilesWithContext(requireContext.from, {</span>
+        <span class="s0">filter: requireContext.filter,</span>
+        <span class="s0">recursive: requireContext.recursive,</span>
+      <span class="s0">});</span>
+
+      <span class="s0">const template = getContextModuleTemplate(</span>
+        <span class="s0">requireContext.mode,</span>
+        <span class="s0">requireContext.from,</span>
+        <span class="s0">files,</span>
+      <span class="s0">);</span>
+
+      <span class="s0">templateBuffer = Buffer.from(template);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return await bundler.transformFile(</span>
+      <span class="s0">modulePath,</span>
+      <span class="s0">{</span>
+        <span class="s0">...transformOptions,</span>
+        <span class="s0">type: getType(transformOptions.type, modulePath, assetExts),</span>
+        <span class="s0">inlineRequires: removeInlineRequiresBlockListFromOptions(</span>
+          <span class="s0">modulePath,</span>
+          <span class="s0">inlineRequires,</span>
+        <span class="s0">),</span>
+      <span class="s0">},</span>
+      <span class="s0">templateBuffer,</span>
+    <span class="s0">);</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function getType(</span>
+  <span class="s0">type: string,</span>
+  <span class="s0">filePath: string,</span>
+  <span class="s0">assetExts: $ReadOnlySet&lt;string&gt;,</span>
+<span class="s0">): Type {</span>
+  <span class="s0">if (type === 'script') {</span>
+    <span class="s0">return type;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (isAssetFile(filePath, assetExts)) {</span>
+    <span class="s0">return 'asset';</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return 'module';</span>
+<span class="s0">}</span>
+
+<span class="s0">async function getResolveDependencyFn(</span>
+  <span class="s0">bundler: Bundler,</span>
+  <span class="s0">platform: ?string,</span>
+  <span class="s0">resolverOptions: ResolverInputOptions,</span>
+<span class="s0">): Promise&lt;(from: string, to: string) =&gt; BundlerResolution&gt; {</span>
+  <span class="s0">const dependencyGraph = await await bundler.getDependencyGraph();</span>
+
+  <span class="s0">return (from: string, to: string) =&gt;</span>
+    <span class="s0">dependencyGraph.resolveDependency(</span>
+      <span class="s0">from,</span>
+      <span class="s0">to,</span>
+      <span class="s0">platform ?? null,</span>
+      <span class="s0">resolverOptions,</span>
+    <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">getTransformFn,</span>
+  <span class="s0">getResolveDependencyFn,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

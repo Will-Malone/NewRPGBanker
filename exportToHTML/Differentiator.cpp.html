@@ -1,0 +1,1662 @@
+<html>
+<head>
+<title>Differentiator.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Differentiator.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;Differentiator.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;butter/map.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;butter/small_vector.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/LayoutableShadowNode.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;algorithm&gt;</span>
+<span class="s2">#include </span><span class="s3">&quot;ShadowView.h&quot;</span>
+
+<span class="s2">#ifdef </span><span class="s1">DEBUG_LOGS_DIFFER</span>
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#define </span><span class="s1">DEBUG_LOGS_BREADCRUMBS </span><span class="s4">1</span>
+<span class="s2">#define </span><span class="s1">DEBUG_LOGS(code) code</span>
+<span class="s2">#else</span>
+<span class="s2">#define </span><span class="s1">DEBUG_LOGS(code)</span>
+<span class="s2">#endif</span>
+
+<span class="s2">#ifdef </span><span class="s1">DEBUG_LOGS_BREADCRUMBS</span>
+<span class="s2">#define </span><span class="s1">BREADCRUMB_TYPE std::string</span>
+<span class="s2">#define </span><span class="s1">DIFF_BREADCRUMB(X) (breadcrumb + </span><span class="s3">&quot; - &quot; </span><span class="s1">+ std::string(X))</span>
+<span class="s2">#define </span><span class="s1">CREATE_DIFF_BREADCRUMB(X) std::to_string(X)</span>
+<span class="s2">#else</span>
+
+<span class="s5">enum class </span><span class="s1">NoBreadcrumb {}</span><span class="s5">;</span>
+
+<span class="s2">#define </span><span class="s1">BREADCRUMB_TYPE NoBreadcrumb </span><span class="s5">const </span><span class="s1">&amp;</span>
+<span class="s2">#define </span><span class="s1">DIFF_BREADCRUMB(X) \ 
+  {}</span>
+<span class="s2">#define </span><span class="s1">CREATE_DIFF_BREADCRUMB(X) \ 
+  {}</span>
+<span class="s2">#endif</span>
+
+<span class="s5">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s0">/* 
+ * Extremely simple and naive implementation of a map. 
+ * The map is simple but it's optimized for particular constraints that we have 
+ * here. 
+ * 
+ * A regular map implementation (e.g. `std::unordered_map`) has some basic 
+ * performance guarantees like constant average insertion and lookup complexity. 
+ * This is nice, but it's *average* complexity measured on a non-trivial amount 
+ * of data. The regular map is a very complex data structure that using hashing, 
+ * buckets, multiple comprising operations, multiple allocations and so on. 
+ * 
+ * In our particular case, we need a map for `int` to `void *` with a dozen 
+ * values. In these conditions, nothing can beat a naive implementation using a 
+ * stack-allocated vector. And this implementation is exactly this: no 
+ * allocation, no hashing, no complex branching, no buckets, no iterators, no 
+ * rehashing, no other guarantees. It's crazy limited, unsafe, and performant on 
+ * a trivial amount of data. 
+ * 
+ * Besides that, we also need to optimize for insertion performance (the case 
+ * where a bunch of views appears on the screen first time); in this 
+ * implementation, this is as performant as vector `push_back`. 
+ */</span>
+<span class="s5">template </span><span class="s1">&lt;</span><span class="s5">typename </span><span class="s1">KeyT</span><span class="s5">, typename </span><span class="s1">ValueT</span><span class="s5">, int </span><span class="s1">DefaultSize = </span><span class="s4">16</span><span class="s1">&gt;</span>
+<span class="s5">class </span><span class="s1">TinyMap final {</span>
+ <span class="s5">public</span><span class="s1">:</span>
+  <span class="s5">using </span><span class="s1">Pair = std::pair&lt;KeyT</span><span class="s5">, </span><span class="s1">ValueT&gt;</span><span class="s5">;</span>
+  <span class="s5">using </span><span class="s1">Iterator = Pair *</span><span class="s5">;</span>
+
+  <span class="s0">/** 
+   * This must strictly only be called from outside of this class. 
+   */</span>
+  <span class="s5">inline </span><span class="s1">Iterator begin() {</span>
+    <span class="s0">// Force a clean so that iterating over this TinyMap doesn't iterate over</span>
+    <span class="s0">// erased elements. If all elements erased are at the front of the vector,</span>
+    <span class="s0">// then we don't need to clean.</span>
+    <span class="s1">cleanVector(erasedAtFront_ != numErased_)</span><span class="s5">;</span>
+
+    <span class="s1">Iterator it = begin_()</span><span class="s5">;</span>
+
+    <span class="s5">if </span><span class="s1">(it != </span><span class="s5">nullptr</span><span class="s1">) {</span>
+      <span class="s5">return </span><span class="s1">it + erasedAtFront_</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s5">return nullptr;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">inline </span><span class="s1">Iterator end() {</span>
+    <span class="s0">// `back()` asserts on the vector being non-empty</span>
+    <span class="s5">if </span><span class="s1">(vector_.empty() || numErased_ == vector_.size()) {</span>
+      <span class="s5">return nullptr;</span>
+    <span class="s1">}</span>
+
+    <span class="s5">return </span><span class="s1">&amp;vector_.back() + </span><span class="s4">1</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">inline </span><span class="s1">Iterator find(KeyT key) {</span>
+    <span class="s1">cleanVector()</span><span class="s5">;</span>
+
+    <span class="s1">react_native_assert(key != </span><span class="s4">0</span><span class="s1">)</span><span class="s5">;</span>
+
+    <span class="s5">if </span><span class="s1">(begin_() == </span><span class="s5">nullptr</span><span class="s1">) {</span>
+      <span class="s5">return </span><span class="s1">end()</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">it = begin_() + erasedAtFront_</span><span class="s5">; </span><span class="s1">it != end()</span><span class="s5">; </span><span class="s1">it++) {</span>
+      <span class="s5">if </span><span class="s1">(it-&gt;first == key) {</span>
+        <span class="s5">return </span><span class="s1">it</span><span class="s5">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s5">return </span><span class="s1">end()</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">inline void </span><span class="s1">insert(Pair pair) {</span>
+    <span class="s1">react_native_assert(pair.first != </span><span class="s4">0</span><span class="s1">)</span><span class="s5">;</span>
+    <span class="s1">vector_.push_back(pair)</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">inline void </span><span class="s1">erase(Iterator iterator) {</span>
+    <span class="s0">// Invalidate tag.</span>
+    <span class="s1">iterator-&gt;first = </span><span class="s4">0</span><span class="s5">;</span>
+
+    <span class="s5">if </span><span class="s1">(iterator == begin_() + erasedAtFront_) {</span>
+      <span class="s1">erasedAtFront_++</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">numErased_++</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+ <span class="s5">private</span><span class="s1">:</span>
+  <span class="s0">/** 
+   * Same as begin() but doesn't call cleanVector at the beginning. 
+   */</span>
+  <span class="s5">inline </span><span class="s1">Iterator begin_() {</span>
+    <span class="s0">// `front()` asserts on the vector being non-empty</span>
+    <span class="s5">if </span><span class="s1">(vector_.empty() || vector_.size() == numErased_) {</span>
+      <span class="s5">return nullptr;</span>
+    <span class="s1">}</span>
+
+    <span class="s5">return </span><span class="s1">&amp;vector_.front()</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Remove erased elements from internal vector. 
+   * We only modify the vector if erased elements are at least half of the 
+   * vector. 
+   */</span>
+  <span class="s5">inline void </span><span class="s1">cleanVector(</span><span class="s5">bool </span><span class="s1">forceClean = </span><span class="s5">false</span><span class="s1">) {</span>
+    <span class="s5">if </span><span class="s1">((numErased_ &lt; (vector_.size() / </span><span class="s4">2</span><span class="s1">) &amp;&amp; !forceClean) || vector_.empty() ||</span>
+        <span class="s1">numErased_ == </span><span class="s4">0 </span><span class="s1">|| numErased_ == erasedAtFront_) {</span>
+      <span class="s5">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s5">if </span><span class="s1">(numErased_ == vector_.size()) {</span>
+      <span class="s1">vector_.clear()</span><span class="s5">;</span>
+    <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+      <span class="s1">vector_.erase(</span>
+          <span class="s1">std::remove_if(</span>
+              <span class="s1">vector_.begin()</span><span class="s5">,</span>
+              <span class="s1">vector_.end()</span><span class="s5">,</span>
+              <span class="s1">[](</span><span class="s5">auto const </span><span class="s1">&amp;item) { </span><span class="s5">return </span><span class="s1">item.first == </span><span class="s4">0</span><span class="s5">; </span><span class="s1">})</span><span class="s5">,</span>
+          <span class="s1">vector_.end())</span><span class="s5">;</span>
+    <span class="s1">}</span>
+    <span class="s1">numErased_ = </span><span class="s4">0</span><span class="s5">;</span>
+    <span class="s1">erasedAtFront_ = </span><span class="s4">0</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">butter::small_vector&lt;Pair</span><span class="s5">, </span><span class="s1">DefaultSize&gt; vector_</span><span class="s5">;</span>
+  <span class="s1">size_t numErased_{</span><span class="s4">0</span><span class="s1">}</span><span class="s5">;</span>
+  <span class="s1">size_t erasedAtFront_{</span><span class="s4">0</span><span class="s1">}</span><span class="s5">;</span>
+<span class="s1">}</span><span class="s5">;</span>
+
+<span class="s0">/* 
+ * Sorting comparator for `reorderInPlaceIfNeeded`. 
+ */</span>
+<span class="s5">static bool </span><span class="s1">shouldFirstPairComesBeforeSecondOne(</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">*lhs</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">*rhs) </span><span class="s5">noexcept </span><span class="s1">{</span>
+  <span class="s5">return </span><span class="s1">lhs-&gt;shadowNode-&gt;getOrderIndex() &lt; rhs-&gt;shadowNode-&gt;getOrderIndex()</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Reorders pairs in-place based on `orderIndex` using a stable sort algorithm. 
+ */</span>
+<span class="s5">static void </span><span class="s1">reorderInPlaceIfNeeded(</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;pairs) </span><span class="s5">noexcept </span><span class="s1">{</span>
+  <span class="s5">if </span><span class="s1">(pairs.size() &lt; </span><span class="s4">2</span><span class="s1">) {</span>
+    <span class="s5">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">auto </span><span class="s1">isReorderNeeded = </span><span class="s5">false;</span>
+  <span class="s5">for </span><span class="s1">(</span><span class="s5">auto const </span><span class="s1">&amp;pair : pairs) {</span>
+    <span class="s5">if </span><span class="s1">(pair-&gt;shadowNode-&gt;getOrderIndex() != </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">isReorderNeeded = </span><span class="s5">true;</span>
+      <span class="s5">break;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s5">if </span><span class="s1">(!isReorderNeeded) {</span>
+    <span class="s5">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::stable_sort(</span>
+      <span class="s1">pairs.begin()</span><span class="s5">, </span><span class="s1">pairs.end()</span><span class="s5">, </span><span class="s1">&amp;shouldFirstPairComesBeforeSecondOne)</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s5">static inline bool </span><span class="s1">shadowNodeIsConcrete(ShadowNode </span><span class="s5">const </span><span class="s1">&amp;shadowNode) {</span>
+  <span class="s5">return </span><span class="s1">shadowNode.getTraits().check(ShadowNodeTraits::Trait::FormsView)</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s5">static void </span><span class="s1">sliceChildShadowNodeViewPairsRecursivelyV2(</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;pairList</span><span class="s5">,</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s1">Point layoutOffset</span><span class="s5">,</span>
+    <span class="s1">ShadowNode </span><span class="s5">const </span><span class="s1">&amp;shadowNode) {</span>
+  <span class="s5">for </span><span class="s1">(</span><span class="s5">auto const </span><span class="s1">&amp;sharedChildShadowNode : shadowNode.getChildren()) {</span>
+    <span class="s5">auto </span><span class="s1">&amp;childShadowNode = *sharedChildShadowNode</span><span class="s5">;</span>
+
+<span class="s2">#ifndef </span><span class="s1">ANDROID</span>
+    <span class="s0">// Temporary disabled on Android because the mounting infrastructure</span>
+    <span class="s0">// is not fully ready yet.</span>
+    <span class="s5">if </span><span class="s1">(childShadowNode.getTraits().check(ShadowNodeTraits::Trait::Hidden)) {</span>
+      <span class="s5">continue;</span>
+    <span class="s1">}</span>
+<span class="s2">#endif</span>
+
+    <span class="s5">auto </span><span class="s1">shadowView = ShadowView(childShadowNode)</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">origin = layoutOffset</span><span class="s5">;</span>
+    <span class="s5">if </span><span class="s1">(shadowView.layoutMetrics != EmptyLayoutMetrics) {</span>
+      <span class="s1">origin += shadowView.layoutMetrics.frame.origin</span><span class="s5">;</span>
+      <span class="s1">shadowView.layoutMetrics.frame.origin += layoutOffset</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// This might not be a FormsView, or a FormsStackingContext. We let the</span>
+    <span class="s0">// differ handle removal of flattened views from the Mounting layer and</span>
+    <span class="s0">// shuffling their children around.</span>
+    <span class="s5">bool </span><span class="s1">isConcreteView = shadowNodeIsConcrete(childShadowNode)</span><span class="s5">;</span>
+    <span class="s5">bool </span><span class="s1">areChildrenFlattened = !childShadowNode.getTraits().check(</span>
+        <span class="s1">ShadowNodeTraits::Trait::FormsStackingContext)</span><span class="s5">;</span>
+    <span class="s1">Point storedOrigin = {}</span><span class="s5">;</span>
+    <span class="s5">if </span><span class="s1">(areChildrenFlattened) {</span>
+      <span class="s1">storedOrigin = origin</span><span class="s5">;</span>
+    <span class="s1">}</span>
+    <span class="s1">scope.push_back(</span>
+        <span class="s1">{shadowView</span><span class="s5">,</span>
+         <span class="s1">&amp;childShadowNode</span><span class="s5">,</span>
+         <span class="s1">areChildrenFlattened</span><span class="s5">,</span>
+         <span class="s1">isConcreteView</span><span class="s5">,</span>
+         <span class="s1">storedOrigin})</span><span class="s5">;</span>
+    <span class="s1">pairList.push_back(&amp;scope.back())</span><span class="s5">;</span>
+
+    <span class="s5">if </span><span class="s1">(areChildrenFlattened) {</span>
+      <span class="s1">sliceChildShadowNodeViewPairsRecursivelyV2(</span>
+          <span class="s1">pairList</span><span class="s5">, </span><span class="s1">scope</span><span class="s5">, </span><span class="s1">origin</span><span class="s5">, </span><span class="s1">childShadowNode)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowViewNodePair::NonOwningList sliceChildShadowNodeViewPairsV2(</span>
+    <span class="s1">ShadowNode </span><span class="s5">const </span><span class="s1">&amp;shadowNode</span><span class="s5">,</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">allowFlattened</span><span class="s5">,</span>
+    <span class="s1">Point layoutOffset) {</span>
+  <span class="s5">auto </span><span class="s1">pairList = ShadowViewNodePair::NonOwningList{}</span><span class="s5">;</span>
+
+  <span class="s5">if </span><span class="s1">(!shadowNode.getTraits().check(</span>
+          <span class="s1">ShadowNodeTraits::Trait::FormsStackingContext) &amp;&amp;</span>
+      <span class="s1">shadowNode.getTraits().check(ShadowNodeTraits::Trait::FormsView) &amp;&amp;</span>
+      <span class="s1">!allowFlattened) {</span>
+    <span class="s5">return </span><span class="s1">pairList</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">sliceChildShadowNodeViewPairsRecursivelyV2(</span>
+      <span class="s1">pairList</span><span class="s5">, </span><span class="s1">scope</span><span class="s5">, </span><span class="s1">layoutOffset</span><span class="s5">, </span><span class="s1">shadowNode)</span><span class="s5">;</span>
+
+  <span class="s0">// Sorting pairs based on `orderIndex` if needed.</span>
+  <span class="s1">reorderInPlaceIfNeeded(pairList)</span><span class="s5">;</span>
+
+  <span class="s0">// Set list and mountIndex for each after reordering</span>
+  <span class="s1">size_t mountIndex = </span><span class="s4">0</span><span class="s5">;</span>
+  <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">child : pairList) {</span>
+    <span class="s1">child-&gt;mountIndex = (child-&gt;isConcreteView ? mountIndex++ : -</span><span class="s4">1</span><span class="s1">)</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">return </span><span class="s1">pairList</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Prefer calling this over `sliceChildShadowNodeViewPairsV2` directly, when 
+ * possible. This can account for adding parent LayoutMetrics that are 
+ * important to take into account, but tricky, in (un)flattening cases. 
+ */</span>
+<span class="s5">static </span><span class="s1">ShadowViewNodePair::NonOwningList</span>
+<span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;shadowViewNodePair</span><span class="s5">,</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">allowFlattened = </span><span class="s5">false</span><span class="s1">) {</span>
+  <span class="s5">return </span><span class="s1">sliceChildShadowNodeViewPairsV2(</span>
+      <span class="s1">*shadowViewNodePair.shadowNode</span><span class="s5">,</span>
+      <span class="s1">scope</span><span class="s5">,</span>
+      <span class="s1">allowFlattened</span><span class="s5">,</span>
+      <span class="s1">shadowViewNodePair.contextOrigin)</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Before we start to diff, let's make sure all our core data structures are 
+ * in good shape to deliver the best performance. 
+ */</span>
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_constructible&lt;ShadowViewMutation&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowViewMutation` must be `move constructible`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_constructible&lt;ShadowView&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowView` must be `move constructible`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_constructible&lt;ShadowViewNodePair&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowViewNodePair` must be `move constructible`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_constructible&lt;ShadowViewNodePair::NonOwningList&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowViewNodePair::NonOwningList` must be `move constructible`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_assignable&lt;ShadowViewMutation&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowViewMutation` must be `move assignable`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_assignable&lt;ShadowView&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowView` must be `move assignable`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_assignable&lt;ShadowViewNodePair&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowViewNodePair` must be `move assignable`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+<span class="s5">static_assert</span><span class="s1">(</span>
+    <span class="s1">std::is_move_assignable&lt;ShadowViewNodePair::NonOwningList&gt;::value</span><span class="s5">,</span>
+    <span class="s3">&quot;`ShadowViewNodePair::NonOwningList` must be `move assignable`.&quot;</span><span class="s1">)</span><span class="s5">;</span>
+
+<span class="s5">static void </span><span class="s1">calculateShadowViewMutationsV2(</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s1">ShadowViewMutation::List &amp;mutations</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;&amp;oldChildPairs</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;&amp;newChildPairs</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">isRecursionRedundant = </span><span class="s5">false</span><span class="s1">)</span><span class="s5">;</span>
+
+<span class="s5">struct </span><span class="s1">OrderedMutationInstructionContainer {</span>
+  <span class="s1">ShadowViewMutation::List createMutations{}</span><span class="s5">;</span>
+  <span class="s1">ShadowViewMutation::List deleteMutations{}</span><span class="s5">;</span>
+  <span class="s1">ShadowViewMutation::List insertMutations{}</span><span class="s5">;</span>
+  <span class="s1">ShadowViewMutation::List removeMutations{}</span><span class="s5">;</span>
+  <span class="s1">ShadowViewMutation::List updateMutations{}</span><span class="s5">;</span>
+  <span class="s1">ShadowViewMutation::List downwardMutations{}</span><span class="s5">;</span>
+  <span class="s1">ShadowViewMutation::List destructiveDownwardMutations{}</span><span class="s5">;</span>
+<span class="s1">}</span><span class="s5">;</span>
+
+<span class="s5">static void </span><span class="s1">updateMatchedPairSubtrees(</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s1">OrderedMutationInstructionContainer &amp;mutationContainer</span><span class="s5">,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; &amp;newRemainingPairs</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;oldChildPairs</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;oldPair</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;newPair)</span><span class="s5">;</span>
+
+<span class="s5">static void </span><span class="s1">updateMatchedPair(</span>
+    <span class="s1">OrderedMutationInstructionContainer &amp;mutationContainer</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">oldNodeFoundInOrder</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">newNodeFoundInOrder</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;oldPair</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;newPair)</span><span class="s5">;</span>
+
+<span class="s5">static void </span><span class="s1">calculateShadowViewMutationsFlattener(</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s1">ReparentMode reparentMode</span><span class="s5">,</span>
+    <span class="s1">OrderedMutationInstructionContainer &amp;mutationContainer</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; &amp;unvisitedOtherNodes</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;node</span><span class="s5">,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; *parentSubVisitedOtherNewNodes = </span><span class="s5">nullptr,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; *parentSubVisitedOtherOldNodes =</span>
+        <span class="s5">nullptr</span><span class="s1">)</span><span class="s5">;</span>
+
+<span class="s0">/** 
+ * Updates the subtrees of any matched ShadowViewNodePair. This handles 
+ * all cases of flattening/unflattening. 
+ * 
+ * This may modify data-structures passed to it and owned by the caller, 
+ * specifically `newRemainingPairs`, and so the caller must also own 
+ * the ViewNodePairScope used within. 
+ */</span>
+<span class="s5">static void </span><span class="s1">updateMatchedPairSubtrees(</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s1">OrderedMutationInstructionContainer &amp;mutationContainer</span><span class="s5">,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; &amp;newRemainingPairs</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;oldChildPairs</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;oldPair</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;newPair) {</span>
+  <span class="s0">// Are we flattening or unflattening either one? If node was</span>
+  <span class="s0">// flattened in both trees, there's no change, just continue.</span>
+  <span class="s5">if </span><span class="s1">(oldPair.flattened &amp;&amp; newPair.flattened) {</span>
+    <span class="s5">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// We are either flattening or unflattening this node.</span>
+  <span class="s5">if </span><span class="s1">(oldPair.flattened != newPair.flattened) {</span>
+    <span class="s1">DEBUG_LOGS({</span>
+      <span class="s1">LOG(ERROR)</span>
+          <span class="s1">&lt;&lt; </span><span class="s3">&quot;Differ: flattening or unflattening in updateMatchedPairSubtrees: [&quot;</span>
+          <span class="s1">&lt;&lt; oldPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;] [&quot; </span><span class="s1">&lt;&lt; newPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;] &quot;</span>
+          <span class="s1">&lt;&lt; oldPair.flattened &lt;&lt; </span><span class="s3">&quot; &quot; </span><span class="s1">&lt;&lt; newPair.flattened &lt;&lt; </span><span class="s3">&quot; with parent: [&quot;</span>
+          <span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+    <span class="s1">})</span><span class="s5">;</span>
+
+    <span class="s0">// Flattening</span>
+    <span class="s5">if </span><span class="s1">(!oldPair.flattened) {</span>
+      <span class="s0">// Flatten old tree into new list</span>
+      <span class="s0">// At the end of this loop we still want to know which of these</span>
+      <span class="s0">// children are visited, so we reuse the `newRemainingPairs`</span>
+      <span class="s0">// map.</span>
+      <span class="s1">calculateShadowViewMutationsFlattener(</span>
+          <span class="s1">scope</span><span class="s5">,</span>
+          <span class="s1">ReparentMode::Flatten</span><span class="s5">,</span>
+          <span class="s1">mutationContainer</span><span class="s5">,</span>
+          <span class="s1">parentShadowView</span><span class="s5">,</span>
+          <span class="s1">newRemainingPairs</span><span class="s5">,</span>
+          <span class="s1">oldPair)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+    <span class="s0">// Unflattening</span>
+    <span class="s5">else </span><span class="s1">{</span>
+      <span class="s0">// Construct unvisited nodes map</span>
+      <span class="s5">auto </span><span class="s1">unvisitedOldChildPairs = TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt;{}</span><span class="s5">;</span>
+      <span class="s0">// We don't know where all the children of oldChildPair are</span>
+      <span class="s0">// within oldChildPairs, but we know that they're in the same</span>
+      <span class="s0">// relative order. The reason for this is because of flattening</span>
+      <span class="s0">// + zIndex: the children could be listed before the parent,</span>
+      <span class="s0">// interwoven with children from other nodes, etc.</span>
+      <span class="s5">auto </span><span class="s1">oldFlattenedNodes =</span>
+          <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(oldPair</span><span class="s5">, </span><span class="s1">scope</span><span class="s5">, true</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s5">for </span><span class="s1">(size_t i = </span><span class="s4">0</span><span class="s5">, </span><span class="s1">j = </span><span class="s4">0</span><span class="s5">;</span>
+           <span class="s1">i &lt; oldChildPairs.size() &amp;&amp; j &lt; oldFlattenedNodes.size()</span><span class="s5">;</span>
+           <span class="s1">i++) {</span>
+        <span class="s5">auto </span><span class="s1">&amp;oldChild = *oldChildPairs[i]</span><span class="s5">;</span>
+        <span class="s5">if </span><span class="s1">(oldChild.shadowView.tag == oldFlattenedNodes[j]-&gt;shadowView.tag) {</span>
+          <span class="s1">unvisitedOldChildPairs.insert({oldChild.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;oldChild})</span><span class="s5">;</span>
+          <span class="s1">j++</span><span class="s5">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Unflatten old list into new tree</span>
+      <span class="s1">calculateShadowViewMutationsFlattener(</span>
+          <span class="s1">scope</span><span class="s5">,</span>
+          <span class="s1">ReparentMode::Unflatten</span><span class="s5">,</span>
+          <span class="s1">mutationContainer</span><span class="s5">,</span>
+          <span class="s1">parentShadowView</span><span class="s5">,</span>
+          <span class="s1">unvisitedOldChildPairs</span><span class="s5">,</span>
+          <span class="s1">newPair)</span><span class="s5">;</span>
+
+      <span class="s0">// If old nodes were not visited, we know that we can delete</span>
+      <span class="s0">// them now. They will be removed from the hierarchy by the</span>
+      <span class="s0">// outermost loop of this function.</span>
+      <span class="s0">// TODO: is this necessary anymore?</span>
+      <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">&amp;oldFlattenedNodePtr : oldFlattenedNodes) {</span>
+        <span class="s5">auto </span><span class="s1">&amp;oldFlattenedNode = *oldFlattenedNodePtr</span><span class="s5">;</span>
+        <span class="s5">auto </span><span class="s1">unvisitedOldChildPairIt =</span>
+            <span class="s1">unvisitedOldChildPairs.find(oldFlattenedNode.shadowView.tag)</span><span class="s5">;</span>
+        <span class="s5">if </span><span class="s1">(unvisitedOldChildPairIt == unvisitedOldChildPairs.end()) {</span>
+          <span class="s0">// Node was visited - make sure to remove it from</span>
+          <span class="s0">// &quot;newRemainingPairs&quot; map</span>
+          <span class="s5">auto </span><span class="s1">newRemainingIt =</span>
+              <span class="s1">newRemainingPairs.find(oldFlattenedNode.shadowView.tag)</span><span class="s5">;</span>
+          <span class="s5">if </span><span class="s1">(newRemainingIt != newRemainingPairs.end()) {</span>
+            <span class="s1">newRemainingPairs.erase(newRemainingIt)</span><span class="s5">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s5">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Update subtrees if View is not flattened, and if node addresses</span>
+  <span class="s0">// are not equal</span>
+  <span class="s5">if </span><span class="s1">(oldPair.shadowNode != newPair.shadowNode) {</span>
+    <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">oldGrandChildPairs =</span>
+        <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(oldPair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">newGrandChildPairs =</span>
+        <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(newPair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">;</span>
+    <span class="s1">calculateShadowViewMutationsV2(</span>
+        <span class="s1">innerScope</span><span class="s5">,</span>
+        <span class="s1">*(newGrandChildPairs.size()</span>
+              <span class="s1">? &amp;mutationContainer.downwardMutations</span>
+              <span class="s1">: &amp;mutationContainer.destructiveDownwardMutations)</span><span class="s5">,</span>
+        <span class="s1">oldPair.shadowView</span><span class="s5">,</span>
+        <span class="s1">std::move(oldGrandChildPairs)</span><span class="s5">,</span>
+        <span class="s1">std::move(newGrandChildPairs))</span><span class="s5">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Handle updates to a matched node pair, but NOT to their subtrees. 
+ * 
+ * Here we have (and need) knowledge of whether a node was found during 
+ * in-order traversal, or out-of-order via a map lookup. Nodes are only REMOVEd 
+ * or INSERTTed when they are encountered via in-order-traversal, to ensure 
+ * correct ordering of INSERT and REMOVE mutations. 
+ */</span>
+<span class="s5">static void </span><span class="s1">updateMatchedPair(</span>
+    <span class="s1">OrderedMutationInstructionContainer &amp;mutationContainer</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">oldNodeFoundInOrder</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">newNodeFoundInOrder</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;oldPair</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;newPair) {</span>
+  <span class="s1">oldPair.otherTreePair = &amp;newPair</span><span class="s5">;</span>
+  <span class="s1">newPair.otherTreePair = &amp;oldPair</span><span class="s5">;</span>
+
+  <span class="s0">// Check concrete-ness of views</span>
+  <span class="s0">// Create/Delete and Insert/Remove if necessary</span>
+  <span class="s5">if </span><span class="s1">(oldPair.isConcreteView != newPair.isConcreteView) {</span>
+    <span class="s5">if </span><span class="s1">(newPair.isConcreteView) {</span>
+      <span class="s5">if </span><span class="s1">(newNodeFoundInOrder) {</span>
+        <span class="s1">mutationContainer.insertMutations.push_back(</span>
+            <span class="s1">ShadowViewMutation::InsertMutation(</span>
+                <span class="s1">parentShadowView</span><span class="s5">,</span>
+                <span class="s1">newPair.shadowView</span><span class="s5">,</span>
+                <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(newPair.mountIndex)))</span><span class="s5">;</span>
+      <span class="s1">}</span>
+      <span class="s1">mutationContainer.createMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::CreateMutation(newPair.shadowView))</span><span class="s5">;</span>
+    <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+      <span class="s5">if </span><span class="s1">(oldNodeFoundInOrder) {</span>
+        <span class="s1">mutationContainer.removeMutations.push_back(</span>
+            <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+                <span class="s1">parentShadowView</span><span class="s5">,</span>
+                <span class="s1">oldPair.shadowView</span><span class="s5">,</span>
+                <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(oldPair.mountIndex)))</span><span class="s5">;</span>
+      <span class="s1">}</span>
+      <span class="s1">mutationContainer.deleteMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::DeleteMutation(oldPair.shadowView))</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s5">else if </span><span class="s1">(oldPair.isConcreteView &amp;&amp; newPair.isConcreteView) {</span>
+    <span class="s0">// If we found the old node by traversing, but not the new node,</span>
+    <span class="s0">// it means that there's some reordering requiring a REMOVE mutation.</span>
+    <span class="s5">if </span><span class="s1">(oldNodeFoundInOrder &amp;&amp; !newNodeFoundInOrder) {</span>
+      <span class="s1">mutationContainer.removeMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+              <span class="s1">parentShadowView</span><span class="s5">,</span>
+              <span class="s1">newPair.shadowView</span><span class="s5">,</span>
+              <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(oldPair.mountIndex)))</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Even if node's children are flattened, it might still be a</span>
+    <span class="s0">// concrete view. The case where they're different is handled</span>
+    <span class="s0">// above.</span>
+    <span class="s5">if </span><span class="s1">(oldPair.shadowView != newPair.shadowView) {</span>
+      <span class="s1">mutationContainer.updateMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::UpdateMutation(</span>
+              <span class="s1">oldPair.shadowView</span><span class="s5">, </span><span class="s1">newPair.shadowView</span><span class="s5">, </span><span class="s1">parentShadowView))</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Here we flatten or unflatten a subtree, given an unflattened node in either 
+ * the old or new tree, and a list of flattened nodes in the other tree. 
+ * 
+ * For example: if you are Flattening, the node will be in the old tree and 
+ the 
+ * list will be from the new tree. If you are Unflattening, the opposite is 
+ true. 
+ 
+ * It is currently not possible for ReactJS, and therefore React Native, to 
+ move 
+ * a node *from* one parent to another without an entirely new subtree being 
+ * created. When we &quot;reparent&quot; in React Native here it is only because 
+ intermediate 
+ * ShadowNodes/ShadowViews, which *always* exist, are flattened or unflattened 
+ away. 
+ * Thus, this algorithm handles the very specialized cases of the tree 
+ collapsing or 
+ * expanding vertically in that way. 
+ 
+ * Sketch of algorithm: 
+ * 0. Create a map of nodes in the flattened list. This should be done 
+ *before* 
+ *    calling this function. 
+ * 1. Traverse the Node Subtree; remove elements from the map as they are 
+ *    visited in the tree. 
+ *    Perform a Remove/Insert depending on if we're flattening or unflattening 
+ *    If Tree node is not in Map/List, perform Delete/Create. 
+ * 2. Traverse the list. 
+ *    Perform linear remove from the old View, or insert into the new parent 
+ *    View if we're flattening. 
+ *    If a node is in the list but not the map, it means it's been visited and 
+ *    Update has already been 
+ *    performed in the subtree. If it *is* in the map, it means the node is 
+ not 
+ *    * in the Tree, and should be Deleted/Created 
+ *    **after this function is called**, by the caller. 
+ */</span>
+<span class="s5">static void </span><span class="s1">calculateShadowViewMutationsFlattener(</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s1">ReparentMode reparentMode</span><span class="s5">,</span>
+    <span class="s1">OrderedMutationInstructionContainer &amp;mutationContainer</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; &amp;unvisitedOtherNodes</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">&amp;node</span><span class="s5">,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; *parentSubVisitedOtherNewNodes</span><span class="s5">,</span>
+    <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; *parentSubVisitedOtherOldNodes) {</span>
+  <span class="s1">DEBUG_LOGS({</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Flattener 1: &quot;</span>
+               <span class="s1">&lt;&lt; (reparentMode == ReparentMode::Unflatten ? </span><span class="s3">&quot;Unflattening&quot;</span>
+                                                           <span class="s1">: </span><span class="s3">&quot;Flattening&quot;</span><span class="s1">)</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot; [&quot; </span><span class="s1">&lt;&lt; node.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+  <span class="s1">})</span><span class="s5">;</span>
+
+  <span class="s0">// Step 1: iterate through entire tree</span>
+  <span class="s1">ShadowViewNodePair::NonOwningList treeChildren =</span>
+      <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(node</span><span class="s5">, </span><span class="s1">scope)</span><span class="s5">;</span>
+
+  <span class="s1">DEBUG_LOGS({</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Flattener 1.4: &quot;</span>
+               <span class="s1">&lt;&lt; (reparentMode == ReparentMode::Unflatten ? </span><span class="s3">&quot;Unflattening&quot;</span>
+                                                           <span class="s1">: </span><span class="s3">&quot;Flattening&quot;</span><span class="s1">)</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot; [&quot; </span><span class="s1">&lt;&lt; node.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Flattener Entry: Child Pairs: &quot;</span><span class="s5">;</span>
+    <span class="s1">std::string strTreeChildPairs</span><span class="s5">;</span>
+    <span class="s5">for </span><span class="s1">(size_t k = </span><span class="s4">0</span><span class="s5">; </span><span class="s1">k &lt; treeChildren.size()</span><span class="s5">; </span><span class="s1">k++) {</span>
+      <span class="s1">strTreeChildPairs.append(std::to_string(treeChildren[k]-&gt;shadowView.tag))</span><span class="s5">;</span>
+      <span class="s1">strTreeChildPairs.append(treeChildren[k]-&gt;isConcreteView ? </span><span class="s3">&quot;&quot; </span><span class="s1">: </span><span class="s3">&quot;'&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strTreeChildPairs.append(treeChildren[k]-&gt;flattened ? </span><span class="s3">&quot;*&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strTreeChildPairs.append(</span><span class="s3">&quot;, &quot;</span><span class="s1">)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+    <span class="s1">std::string strListChildPairs</span><span class="s5">;</span>
+    <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">&amp;unvisitedNode : unvisitedOtherNodes) {</span>
+      <span class="s1">strListChildPairs.append(</span>
+          <span class="s1">std::to_string(unvisitedNode.second-&gt;shadowView.tag))</span><span class="s5">;</span>
+      <span class="s1">strListChildPairs.append(unvisitedNode.second-&gt;isConcreteView ? </span><span class="s3">&quot;&quot; </span><span class="s1">: </span><span class="s3">&quot;'&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strListChildPairs.append(unvisitedNode.second-&gt;flattened ? </span><span class="s3">&quot;*&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strListChildPairs.append(</span><span class="s3">&quot;, &quot;</span><span class="s1">)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Flattener Entry: Tree Child Pairs: &quot;</span>
+               <span class="s1">&lt;&lt; strTreeChildPairs</span><span class="s5">;</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Flattener Entry: List Child Pairs: &quot;</span>
+               <span class="s1">&lt;&lt; strListChildPairs</span><span class="s5">;</span>
+  <span class="s1">})</span><span class="s5">;</span>
+
+  <span class="s0">// Views in other tree that are visited by sub-flattening or</span>
+  <span class="s0">// sub-unflattening</span>
+  <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; subVisitedOtherNewNodes{}</span><span class="s5">;</span>
+  <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt; subVisitedOtherOldNodes{}</span><span class="s5">;</span>
+  <span class="s5">auto </span><span class="s1">subVisitedNewMap =</span>
+      <span class="s1">(parentSubVisitedOtherNewNodes != </span><span class="s5">nullptr </span><span class="s1">? parentSubVisitedOtherNewNodes</span>
+                                                <span class="s1">: &amp;subVisitedOtherNewNodes)</span><span class="s5">;</span>
+  <span class="s5">auto </span><span class="s1">subVisitedOldMap =</span>
+      <span class="s1">(parentSubVisitedOtherOldNodes != </span><span class="s5">nullptr </span><span class="s1">? parentSubVisitedOtherOldNodes</span>
+                                                <span class="s1">: &amp;subVisitedOtherOldNodes)</span><span class="s5">;</span>
+
+  <span class="s0">// Candidates for full tree creation or deletion at the end of this function</span>
+  <span class="s5">auto </span><span class="s1">deletionCreationCandidatePairs =</span>
+      <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">*&gt;{}</span><span class="s5">;</span>
+
+  <span class="s5">for </span><span class="s1">(size_t index = </span><span class="s4">0</span><span class="s5">;</span>
+       <span class="s1">index &lt; treeChildren.size() &amp;&amp; index &lt; treeChildren.size()</span><span class="s5">;</span>
+       <span class="s1">index++) {</span>
+    <span class="s5">auto </span><span class="s1">&amp;treeChildPair = *treeChildren[index]</span><span class="s5">;</span>
+
+    <span class="s0">// Try to find node in other tree</span>
+    <span class="s5">auto </span><span class="s1">unvisitedIt = unvisitedOtherNodes.find(treeChildPair.shadowView.tag)</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">subVisitedOtherNewIt =</span>
+        <span class="s1">(unvisitedIt == unvisitedOtherNodes.end()</span>
+             <span class="s1">? subVisitedNewMap-&gt;find(treeChildPair.shadowView.tag)</span>
+             <span class="s1">: subVisitedNewMap-&gt;end())</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">subVisitedOtherOldIt =</span>
+        <span class="s1">(unvisitedIt == unvisitedOtherNodes.end() &amp;&amp; subVisitedNewMap-&gt;end()</span>
+             <span class="s1">? subVisitedOldMap-&gt;find(treeChildPair.shadowView.tag)</span>
+             <span class="s1">: subVisitedOldMap-&gt;end())</span><span class="s5">;</span>
+
+    <span class="s5">bool </span><span class="s1">existsInOtherTree = unvisitedIt != unvisitedOtherNodes.end() ||</span>
+        <span class="s1">subVisitedOtherNewIt != subVisitedNewMap-&gt;end() ||</span>
+        <span class="s1">subVisitedOtherOldIt != subVisitedOldMap-&gt;end()</span><span class="s5">;</span>
+
+    <span class="s5">auto </span><span class="s1">otherTreeNodePairPtr =</span>
+        <span class="s1">(existsInOtherTree</span>
+             <span class="s1">? (unvisitedIt != unvisitedOtherNodes.end()</span>
+                    <span class="s1">? unvisitedIt-&gt;second</span>
+                    <span class="s1">: (subVisitedOtherNewIt != subVisitedNewMap-&gt;end()</span>
+                           <span class="s1">? subVisitedOtherNewIt-&gt;second</span>
+                           <span class="s1">: subVisitedOtherOldIt-&gt;second))</span>
+             <span class="s1">: </span><span class="s5">nullptr</span><span class="s1">)</span><span class="s5">;</span>
+
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">!existsInOtherTree ||</span>
+        <span class="s1">(unvisitedIt != unvisitedOtherNodes.end() ||</span>
+         <span class="s1">subVisitedOtherNewIt != subVisitedNewMap-&gt;end() ||</span>
+         <span class="s1">subVisitedOtherOldIt != subVisitedOldMap-&gt;end()))</span><span class="s5">;</span>
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">unvisitedIt == unvisitedOtherNodes.end() ||</span>
+        <span class="s1">unvisitedIt-&gt;second-&gt;shadowView.tag == treeChildPair.shadowView.tag)</span><span class="s5">;</span>
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">subVisitedOtherNewIt == subVisitedNewMap-&gt;end() ||</span>
+        <span class="s1">subVisitedOtherNewIt-&gt;second-&gt;shadowView.tag ==</span>
+            <span class="s1">treeChildPair.shadowView.tag)</span><span class="s5">;</span>
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">subVisitedOtherOldIt == subVisitedOldMap-&gt;end() ||</span>
+        <span class="s1">subVisitedOtherOldIt-&gt;second-&gt;shadowView.tag ==</span>
+            <span class="s1">treeChildPair.shadowView.tag)</span><span class="s5">;</span>
+
+    <span class="s5">bool </span><span class="s1">alreadyUpdated = </span><span class="s5">false;</span>
+
+    <span class="s0">// Find in other tree and updated `otherTreePair` pointers</span>
+    <span class="s5">if </span><span class="s1">(existsInOtherTree) {</span>
+      <span class="s1">react_native_assert(otherTreeNodePairPtr != </span><span class="s5">nullptr</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s5">auto </span><span class="s1">newTreeNodePair =</span>
+          <span class="s1">(reparentMode == ReparentMode::Flatten ? otherTreeNodePairPtr</span>
+                                                 <span class="s1">: &amp;treeChildPair)</span><span class="s5">;</span>
+      <span class="s5">auto </span><span class="s1">oldTreeNodePair =</span>
+          <span class="s1">(reparentMode == ReparentMode::Flatten ? &amp;treeChildPair</span>
+                                                 <span class="s1">: otherTreeNodePairPtr)</span><span class="s5">;</span>
+
+      <span class="s1">react_native_assert(newTreeNodePair-&gt;shadowView.tag != </span><span class="s4">0</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">react_native_assert(oldTreeNodePair-&gt;shadowView.tag != </span><span class="s4">0</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">react_native_assert(</span>
+          <span class="s1">oldTreeNodePair-&gt;shadowView.tag == newTreeNodePair-&gt;shadowView.tag)</span><span class="s5">;</span>
+
+      <span class="s1">alreadyUpdated =</span>
+          <span class="s1">newTreeNodePair-&gt;inOtherTree() || oldTreeNodePair-&gt;inOtherTree()</span><span class="s5">;</span>
+
+      <span class="s0">// We want to update these values unconditionally. Always do this</span>
+      <span class="s0">// before hitting any &quot;continue&quot; statements.</span>
+      <span class="s1">newTreeNodePair-&gt;otherTreePair = oldTreeNodePair</span><span class="s5">;</span>
+      <span class="s1">oldTreeNodePair-&gt;otherTreePair = newTreeNodePair</span><span class="s5">;</span>
+      <span class="s1">react_native_assert(treeChildPair.otherTreePair != </span><span class="s5">nullptr</span><span class="s1">)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Remove all children (non-recursively) of tree being flattened, or</span>
+    <span class="s0">// insert children into parent tree if they're being unflattened.</span>
+    <span class="s0">//  Caller will take care of the corresponding action in the other tree</span>
+    <span class="s0">//  (caller will handle DELETE case if we REMOVE here; caller will handle</span>
+    <span class="s0">//  CREATE case if we INSERT here).</span>
+    <span class="s5">if </span><span class="s1">(treeChildPair.isConcreteView) {</span>
+      <span class="s5">if </span><span class="s1">(reparentMode == ReparentMode::Flatten) {</span>
+        <span class="s0">// treeChildPair.shadowView represents the &quot;old&quot; view in this case.</span>
+        <span class="s0">// If there's a &quot;new&quot; view, an UPDATE new -&gt; old will be generated</span>
+        <span class="s0">// and will be executed before the REMOVE. Thus, we must actually</span>
+        <span class="s0">// perform a REMOVE (new view) FROM (old index) in this case so that</span>
+        <span class="s0">// we don't hit asserts in StubViewTree's REMOVE path.</span>
+        <span class="s0">// We also only do this if the &quot;other&quot; (newer) view is concrete. If</span>
+        <span class="s0">// it's not concrete, there will be no UPDATE mutation.</span>
+        <span class="s1">react_native_assert(existsInOtherTree == treeChildPair.inOtherTree())</span><span class="s5">;</span>
+        <span class="s5">if </span><span class="s1">(treeChildPair.inOtherTree() &amp;&amp;</span>
+            <span class="s1">treeChildPair.otherTreePair-&gt;isConcreteView) {</span>
+          <span class="s1">mutationContainer.removeMutations.push_back(</span>
+              <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+                  <span class="s1">node.shadowView</span><span class="s5">,</span>
+                  <span class="s1">treeChildPair.otherTreePair-&gt;shadowView</span><span class="s5">,</span>
+                  <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(treeChildPair.mountIndex)))</span><span class="s5">;</span>
+        <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+          <span class="s1">mutationContainer.removeMutations.push_back(</span>
+              <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+                  <span class="s1">node.shadowView</span><span class="s5">,</span>
+                  <span class="s1">treeChildPair.shadowView</span><span class="s5">,</span>
+                  <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(treeChildPair.mountIndex)))</span><span class="s5">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+        <span class="s0">// treeChildParent represents the &quot;new&quot; version of the node, so</span>
+        <span class="s0">// we can safely insert it without checking in the other tree</span>
+        <span class="s1">mutationContainer.insertMutations.push_back(</span>
+            <span class="s1">ShadowViewMutation::InsertMutation(</span>
+                <span class="s1">node.shadowView</span><span class="s5">,</span>
+                <span class="s1">treeChildPair.shadowView</span><span class="s5">,</span>
+                <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(treeChildPair.mountIndex)))</span><span class="s5">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Find in other tree</span>
+    <span class="s5">if </span><span class="s1">(existsInOtherTree) {</span>
+      <span class="s1">react_native_assert(otherTreeNodePairPtr != </span><span class="s5">nullptr</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s5">auto </span><span class="s1">&amp;otherTreeNodePair = *otherTreeNodePairPtr</span><span class="s5">;</span>
+
+      <span class="s5">auto </span><span class="s1">&amp;newTreeNodePair =</span>
+          <span class="s1">(reparentMode == ReparentMode::Flatten ? otherTreeNodePair</span>
+                                                 <span class="s1">: treeChildPair)</span><span class="s5">;</span>
+      <span class="s5">auto </span><span class="s1">&amp;oldTreeNodePair =</span>
+          <span class="s1">(reparentMode == ReparentMode::Flatten ? treeChildPair</span>
+                                                 <span class="s1">: otherTreeNodePair)</span><span class="s5">;</span>
+
+      <span class="s1">react_native_assert(newTreeNodePair.shadowView.tag != </span><span class="s4">0</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">react_native_assert(oldTreeNodePair.shadowView.tag != </span><span class="s4">0</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">react_native_assert(</span>
+          <span class="s1">oldTreeNodePair.shadowView.tag == newTreeNodePair.shadowView.tag)</span><span class="s5">;</span>
+
+      <span class="s0">// If we've already done updates, don't repeat it.</span>
+      <span class="s5">if </span><span class="s1">(alreadyUpdated) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// If we've already done updates on this node, don't repeat.</span>
+      <span class="s5">if </span><span class="s1">(reparentMode == ReparentMode::Flatten &amp;&amp;</span>
+          <span class="s1">unvisitedIt == unvisitedOtherNodes.end() &amp;&amp;</span>
+          <span class="s1">subVisitedOtherOldIt != subVisitedOldMap-&gt;end()) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">} </span><span class="s5">else if </span><span class="s1">(</span>
+          <span class="s1">reparentMode == ReparentMode::Unflatten &amp;&amp;</span>
+          <span class="s1">unvisitedIt == unvisitedOtherNodes.end() &amp;&amp;</span>
+          <span class="s1">subVisitedOtherNewIt != subVisitedNewMap-&gt;end()) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// TODO: compare ShadowNode pointer instead of ShadowView here?</span>
+      <span class="s0">// Or ShadowNode ptr comparison before comparing ShadowView, to allow for</span>
+      <span class="s0">// short-circuiting? ShadowView comparison is relatively expensive vs</span>
+      <span class="s0">// ShadowNode.</span>
+      <span class="s5">if </span><span class="s1">(newTreeNodePair.shadowView != oldTreeNodePair.shadowView &amp;&amp;</span>
+          <span class="s1">newTreeNodePair.isConcreteView &amp;&amp; oldTreeNodePair.isConcreteView) {</span>
+        <span class="s1">mutationContainer.updateMutations.push_back(</span>
+            <span class="s1">ShadowViewMutation::UpdateMutation(</span>
+                <span class="s1">oldTreeNodePair.shadowView</span><span class="s5">,</span>
+                <span class="s1">newTreeNodePair.shadowView</span><span class="s5">,</span>
+                <span class="s1">node.shadowView))</span><span class="s5">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Update children if appropriate.</span>
+      <span class="s5">if </span><span class="s1">(!oldTreeNodePair.flattened &amp;&amp; !newTreeNodePair.flattened) {</span>
+        <span class="s5">if </span><span class="s1">(oldTreeNodePair.shadowNode != newTreeNodePair.shadowNode) {</span>
+          <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+          <span class="s1">calculateShadowViewMutationsV2(</span>
+              <span class="s1">innerScope</span><span class="s5">,</span>
+              <span class="s1">mutationContainer.downwardMutations</span><span class="s5">,</span>
+              <span class="s1">newTreeNodePair.shadowView</span><span class="s5">,</span>
+              <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+                  <span class="s1">oldTreeNodePair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">,</span>
+              <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+                  <span class="s1">newTreeNodePair</span><span class="s5">, </span><span class="s1">innerScope))</span><span class="s5">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s5">else if </span><span class="s1">(oldTreeNodePair.flattened != newTreeNodePair.flattened) {</span>
+        <span class="s0">// We need to handle one of the children being flattened or</span>
+        <span class="s0">// unflattened, in the context of a parent flattening or unflattening.</span>
+        <span class="s1">ReparentMode childReparentMode =</span>
+            <span class="s1">(oldTreeNodePair.flattened ? ReparentMode::Unflatten</span>
+                                       <span class="s1">: ReparentMode::Flatten)</span><span class="s5">;</span>
+
+        <span class="s0">// Case 1: child mode is the same as parent.</span>
+        <span class="s0">// This is a flatten-flatten, or unflatten-unflatten.</span>
+        <span class="s5">if </span><span class="s1">(childReparentMode == reparentMode) {</span>
+          <span class="s1">calculateShadowViewMutationsFlattener(</span>
+              <span class="s1">scope</span><span class="s5">,</span>
+              <span class="s1">childReparentMode</span><span class="s5">,</span>
+              <span class="s1">mutationContainer</span><span class="s5">,</span>
+              <span class="s1">(reparentMode == ReparentMode::Flatten</span>
+                   <span class="s1">? parentShadowView</span>
+                   <span class="s1">: newTreeNodePair.shadowView)</span><span class="s5">,</span>
+              <span class="s1">unvisitedOtherNodes</span><span class="s5">,</span>
+              <span class="s1">treeChildPair</span><span class="s5">,</span>
+              <span class="s1">subVisitedNewMap</span><span class="s5">,</span>
+              <span class="s1">subVisitedOldMap)</span><span class="s5">;</span>
+        <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+          <span class="s0">// Get flattened nodes from either new or old tree</span>
+          <span class="s5">auto </span><span class="s1">flattenedNodes = sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+              <span class="s1">(childReparentMode == ReparentMode::Flatten ? newTreeNodePair</span>
+                                                          <span class="s1">: oldTreeNodePair)</span><span class="s5">,</span>
+              <span class="s1">scope</span><span class="s5">,</span>
+              <span class="s5">true</span><span class="s1">)</span><span class="s5">;</span>
+          <span class="s0">// Construct unvisited nodes map</span>
+          <span class="s5">auto </span><span class="s1">unvisitedRecursiveChildPairs =</span>
+              <span class="s1">TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt;{}</span><span class="s5">;</span>
+          <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">&amp;flattenedNode : flattenedNodes) {</span>
+            <span class="s5">auto </span><span class="s1">&amp;newChild = *flattenedNode</span><span class="s5">;</span>
+
+            <span class="s5">auto </span><span class="s1">unvisitedOtherNodesIt =</span>
+                <span class="s1">unvisitedOtherNodes.find(newChild.shadowView.tag)</span><span class="s5">;</span>
+            <span class="s5">if </span><span class="s1">(unvisitedOtherNodesIt != unvisitedOtherNodes.end()) {</span>
+              <span class="s5">auto </span><span class="s1">unvisitedItPair = *unvisitedOtherNodesIt-&gt;second</span><span class="s5">;</span>
+              <span class="s1">unvisitedRecursiveChildPairs.insert(</span>
+                  <span class="s1">{unvisitedItPair.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;unvisitedItPair})</span><span class="s5">;</span>
+            <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+              <span class="s1">unvisitedRecursiveChildPairs.insert(</span>
+                  <span class="s1">{newChild.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;newChild})</span><span class="s5">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// Unflatten parent, flatten child</span>
+          <span class="s5">if </span><span class="s1">(childReparentMode == ReparentMode::Flatten) {</span>
+            <span class="s0">// Flatten old tree into new list</span>
+            <span class="s0">// At the end of this loop we still want to know which of these</span>
+            <span class="s0">// children are visited, so we reuse the `newRemainingPairs` map.</span>
+            <span class="s1">calculateShadowViewMutationsFlattener(</span>
+                <span class="s1">scope</span><span class="s5">,</span>
+                <span class="s1">ReparentMode::Flatten</span><span class="s5">,</span>
+                <span class="s1">mutationContainer</span><span class="s5">,</span>
+                <span class="s1">(reparentMode == ReparentMode::Flatten</span>
+                     <span class="s1">? parentShadowView</span>
+                     <span class="s1">: newTreeNodePair.shadowView)</span><span class="s5">,</span>
+                <span class="s1">unvisitedRecursiveChildPairs</span><span class="s5">,</span>
+                <span class="s1">oldTreeNodePair</span><span class="s5">,</span>
+                <span class="s1">subVisitedNewMap</span><span class="s5">,</span>
+                <span class="s1">subVisitedOldMap)</span><span class="s5">;</span>
+          <span class="s1">}</span>
+          <span class="s0">// Flatten parent, unflatten child</span>
+          <span class="s5">else </span><span class="s1">{</span>
+            <span class="s0">// Unflatten old list into new tree</span>
+            <span class="s1">calculateShadowViewMutationsFlattener(</span>
+                <span class="s1">scope</span><span class="s5">,</span>
+                <span class="s1">ReparentMode::Unflatten</span><span class="s5">,</span>
+                <span class="s1">mutationContainer</span><span class="s5">,</span>
+                <span class="s1">(reparentMode == ReparentMode::Flatten</span>
+                     <span class="s1">? parentShadowView</span>
+                     <span class="s1">: newTreeNodePair.shadowView)</span><span class="s5">,</span>
+                <span class="s1">unvisitedRecursiveChildPairs</span><span class="s5">,</span>
+                <span class="s1">newTreeNodePair</span><span class="s5">,</span>
+                <span class="s1">subVisitedNewMap</span><span class="s5">,</span>
+                <span class="s1">subVisitedOldMap)</span><span class="s5">;</span>
+
+            <span class="s0">// If old nodes were not visited, we know that we can delete them</span>
+            <span class="s0">// now. They will be removed from the hierarchy by the outermost</span>
+            <span class="s0">// loop of this function.</span>
+            <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">&amp;unvisitedRecursiveChildPair :</span>
+                 <span class="s1">unvisitedRecursiveChildPairs) {</span>
+              <span class="s5">if </span><span class="s1">(unvisitedRecursiveChildPair.first == </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s5">continue;</span>
+              <span class="s1">}</span>
+              <span class="s5">auto </span><span class="s1">&amp;oldFlattenedNode = *unvisitedRecursiveChildPair.second</span><span class="s5">;</span>
+
+              <span class="s0">// Node unvisited - mark the entire subtree for deletion</span>
+              <span class="s5">if </span><span class="s1">(oldFlattenedNode.isConcreteView &amp;&amp;</span>
+                  <span class="s1">!oldFlattenedNode.inOtherTree()) {</span>
+                <span class="s1">Tag tag = oldFlattenedNode.shadowView.tag</span><span class="s5">;</span>
+                <span class="s5">auto </span><span class="s1">deleteCreateIt = deletionCreationCandidatePairs.find(</span>
+                    <span class="s1">oldFlattenedNode.shadowView.tag)</span><span class="s5">;</span>
+                <span class="s5">if </span><span class="s1">(deleteCreateIt == deletionCreationCandidatePairs.end()) {</span>
+                  <span class="s1">deletionCreationCandidatePairs.insert(</span>
+                      <span class="s1">{tag</span><span class="s5">, </span><span class="s1">&amp;oldFlattenedNode})</span><span class="s5">;</span>
+                <span class="s1">}</span>
+              <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+                <span class="s0">// Node was visited - make sure to remove it from</span>
+                <span class="s0">// &quot;newRemainingPairs&quot; map</span>
+                <span class="s5">auto </span><span class="s1">newRemainingIt =</span>
+                    <span class="s1">unvisitedOtherNodes.find(oldFlattenedNode.shadowView.tag)</span><span class="s5">;</span>
+                <span class="s5">if </span><span class="s1">(newRemainingIt != unvisitedOtherNodes.end()) {</span>
+                  <span class="s1">unvisitedOtherNodes.erase(newRemainingIt)</span><span class="s5">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Mark that node exists in another tree, but only if the tree node is a</span>
+      <span class="s0">// concrete view. Removing the node from the unvisited list prevents the</span>
+      <span class="s0">// caller from taking further action on this node, so make sure to</span>
+      <span class="s0">// delete/create if the Concreteness of the node has changed.</span>
+      <span class="s5">if </span><span class="s1">(newTreeNodePair.isConcreteView != oldTreeNodePair.isConcreteView) {</span>
+        <span class="s5">if </span><span class="s1">(newTreeNodePair.isConcreteView) {</span>
+          <span class="s1">mutationContainer.createMutations.push_back(</span>
+              <span class="s1">ShadowViewMutation::CreateMutation(newTreeNodePair.shadowView))</span><span class="s5">;</span>
+        <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+          <span class="s1">mutationContainer.deleteMutations.push_back(</span>
+              <span class="s1">ShadowViewMutation::DeleteMutation(oldTreeNodePair.shadowView))</span><span class="s5">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s1">subVisitedNewMap-&gt;insert(</span>
+          <span class="s1">{newTreeNodePair.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;newTreeNodePair})</span><span class="s5">;</span>
+      <span class="s1">subVisitedOldMap-&gt;insert(</span>
+          <span class="s1">{oldTreeNodePair.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;oldTreeNodePair})</span><span class="s5">;</span>
+    <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+      <span class="s0">// Node does not in exist in other tree.</span>
+      <span class="s5">if </span><span class="s1">(treeChildPair.isConcreteView &amp;&amp; !treeChildPair.inOtherTree()) {</span>
+        <span class="s5">auto </span><span class="s1">deletionCreationIt =</span>
+            <span class="s1">deletionCreationCandidatePairs.find(treeChildPair.shadowView.tag)</span><span class="s5">;</span>
+        <span class="s5">if </span><span class="s1">(deletionCreationIt == deletionCreationCandidatePairs.end()) {</span>
+          <span class="s1">deletionCreationCandidatePairs.insert(</span>
+              <span class="s1">{treeChildPair.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;treeChildPair})</span><span class="s5">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Final step: go through creation/deletion candidates and delete/create</span>
+  <span class="s0">// subtrees if they were never visited during the execution of the above</span>
+  <span class="s0">// loop and recursions.</span>
+  <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">&amp;deletionCreationCandidatePair : deletionCreationCandidatePairs) {</span>
+    <span class="s5">if </span><span class="s1">(deletionCreationCandidatePair.first == </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s5">continue;</span>
+    <span class="s1">}</span>
+    <span class="s5">auto </span><span class="s1">&amp;treeChildPair = *deletionCreationCandidatePair.second</span><span class="s5">;</span>
+
+    <span class="s0">// If node was visited during a flattening/unflattening recursion,</span>
+    <span class="s0">// and the node in the other tree is concrete, that means it was</span>
+    <span class="s0">// already created/deleted and we don't need to do that here.</span>
+    <span class="s0">// It is always the responsibility of the matcher to update subtrees when</span>
+    <span class="s0">// nodes are matched.</span>
+    <span class="s5">if </span><span class="s1">(treeChildPair.inOtherTree()) {</span>
+      <span class="s5">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s5">if </span><span class="s1">(reparentMode == ReparentMode::Flatten) {</span>
+      <span class="s1">mutationContainer.deleteMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::DeleteMutation(treeChildPair.shadowView))</span><span class="s5">;</span>
+
+      <span class="s5">if </span><span class="s1">(!treeChildPair.flattened) {</span>
+        <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+        <span class="s1">calculateShadowViewMutationsV2(</span>
+            <span class="s1">innerScope</span><span class="s5">,</span>
+            <span class="s1">mutationContainer.destructiveDownwardMutations</span><span class="s5">,</span>
+            <span class="s1">treeChildPair.shadowView</span><span class="s5">,</span>
+            <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+                <span class="s1">treeChildPair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">,</span>
+            <span class="s1">{})</span><span class="s5">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+      <span class="s1">mutationContainer.createMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::CreateMutation(treeChildPair.shadowView))</span><span class="s5">;</span>
+
+      <span class="s5">if </span><span class="s1">(!treeChildPair.flattened) {</span>
+        <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+        <span class="s1">calculateShadowViewMutationsV2(</span>
+            <span class="s1">innerScope</span><span class="s5">,</span>
+            <span class="s1">mutationContainer.downwardMutations</span><span class="s5">,</span>
+            <span class="s1">treeChildPair.shadowView</span><span class="s5">,</span>
+            <span class="s1">{}</span><span class="s5">,</span>
+            <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+                <span class="s1">treeChildPair</span><span class="s5">, </span><span class="s1">innerScope))</span><span class="s5">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s5">static void </span><span class="s1">calculateShadowViewMutationsV2(</span>
+    <span class="s1">ViewNodePairScope &amp;scope</span><span class="s5">,</span>
+    <span class="s1">ShadowViewMutation::List &amp;mutations</span><span class="s5">,</span>
+    <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;parentShadowView</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;&amp;oldChildPairs</span><span class="s5">,</span>
+    <span class="s1">ShadowViewNodePair::NonOwningList &amp;&amp;newChildPairs</span><span class="s5">,</span>
+    <span class="s5">bool </span><span class="s1">isRecursionRedundant) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;Differentiator::calculateShadowViewMutationsV2&quot;</span><span class="s1">)</span><span class="s5">;</span>
+  <span class="s5">if </span><span class="s1">(oldChildPairs.empty() &amp;&amp; newChildPairs.empty()) {</span>
+    <span class="s5">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">size_t index = </span><span class="s4">0</span><span class="s5">;</span>
+
+  <span class="s0">// Lists of mutations</span>
+  <span class="s5">auto </span><span class="s1">mutationContainer = OrderedMutationInstructionContainer{}</span><span class="s5">;</span>
+
+  <span class="s1">DEBUG_LOGS({</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Entry: Child Pairs of node: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+    <span class="s1">std::string strOldChildPairs</span><span class="s5">;</span>
+    <span class="s5">for </span><span class="s1">(size_t oldIndex = </span><span class="s4">0</span><span class="s5">; </span><span class="s1">oldIndex &lt; oldChildPairs.size()</span><span class="s5">; </span><span class="s1">oldIndex++) {</span>
+      <span class="s1">strOldChildPairs.append(</span>
+          <span class="s1">std::to_string(oldChildPairs[oldIndex]-&gt;shadowView.tag))</span><span class="s5">;</span>
+      <span class="s1">strOldChildPairs.append(</span>
+          <span class="s1">oldChildPairs[oldIndex]-&gt;isConcreteView ? </span><span class="s3">&quot;&quot; </span><span class="s1">: </span><span class="s3">&quot;'&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strOldChildPairs.append(oldChildPairs[oldIndex]-&gt;flattened ? </span><span class="s3">&quot;*&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strOldChildPairs.append(</span><span class="s3">&quot;, &quot;</span><span class="s1">)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+    <span class="s1">std::string strNewChildPairs</span><span class="s5">;</span>
+    <span class="s5">for </span><span class="s1">(size_t newIndex = </span><span class="s4">0</span><span class="s5">; </span><span class="s1">newIndex &lt; newChildPairs.size()</span><span class="s5">; </span><span class="s1">newIndex++) {</span>
+      <span class="s1">strNewChildPairs.append(</span>
+          <span class="s1">std::to_string(newChildPairs[newIndex]-&gt;shadowView.tag))</span><span class="s5">;</span>
+      <span class="s1">strNewChildPairs.append(</span>
+          <span class="s1">newChildPairs[newIndex]-&gt;isConcreteView ? </span><span class="s3">&quot;&quot; </span><span class="s1">: </span><span class="s3">&quot;'&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strNewChildPairs.append(newChildPairs[newIndex]-&gt;flattened ? </span><span class="s3">&quot;*&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s5">;</span>
+      <span class="s1">strNewChildPairs.append(</span><span class="s3">&quot;, &quot;</span><span class="s1">)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Entry: Old Child Pairs: &quot; </span><span class="s1">&lt;&lt; strOldChildPairs</span><span class="s5">;</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Entry: New Child Pairs: &quot; </span><span class="s1">&lt;&lt; strNewChildPairs</span><span class="s5">;</span>
+  <span class="s1">})</span><span class="s5">;</span>
+
+  <span class="s0">// Stage 1: Collecting `Update` mutations</span>
+  <span class="s5">for </span><span class="s1">(index = </span><span class="s4">0</span><span class="s5">; </span><span class="s1">index &lt; oldChildPairs.size() &amp;&amp; index &lt; newChildPairs.size()</span><span class="s5">;</span>
+       <span class="s1">index++) {</span>
+    <span class="s5">auto </span><span class="s1">&amp;oldChildPair = *oldChildPairs[index]</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">&amp;newChildPair = *newChildPairs[index]</span><span class="s5">;</span>
+
+    <span class="s5">if </span><span class="s1">(oldChildPair.shadowView.tag != newChildPair.shadowView.tag) {</span>
+      <span class="s1">DEBUG_LOGS({</span>
+        <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Branch 1.1: Tags Different: [&quot;</span>
+                   <span class="s1">&lt;&lt; oldChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;] [&quot;</span>
+                   <span class="s1">&lt;&lt; newChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                   <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+      <span class="s1">})</span><span class="s5">;</span>
+
+      <span class="s0">// Totally different nodes, updating is impossible.</span>
+      <span class="s5">break;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// If either view was flattened, and that has changed this frame, don't</span>
+    <span class="s0">// try to update</span>
+    <span class="s5">if </span><span class="s1">(oldChildPair.flattened != newChildPair.flattened ||</span>
+        <span class="s1">oldChildPair.isConcreteView != newChildPair.isConcreteView) {</span>
+      <span class="s5">break;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">DEBUG_LOGS({</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Branch 1.2: Same tags, update and recurse: [&quot;</span>
+                 <span class="s1">&lt;&lt; oldChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                 <span class="s1">&lt;&lt; (oldChildPair.flattened ? </span><span class="s3">&quot; (flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                 <span class="s1">&lt;&lt; (oldChildPair.isConcreteView ? </span><span class="s3">&quot; (concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">) &lt;&lt; </span><span class="s3">&quot;[&quot;</span>
+                 <span class="s1">&lt;&lt; newChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                 <span class="s1">&lt;&lt; (newChildPair.flattened ? </span><span class="s3">&quot; (flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                 <span class="s1">&lt;&lt; (newChildPair.isConcreteView ? </span><span class="s3">&quot; (concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                 <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+    <span class="s1">})</span><span class="s5">;</span>
+
+    <span class="s5">if </span><span class="s1">(newChildPair.isConcreteView &amp;&amp;</span>
+        <span class="s1">oldChildPair.shadowView != newChildPair.shadowView) {</span>
+      <span class="s1">mutationContainer.updateMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::UpdateMutation(</span>
+              <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+              <span class="s1">newChildPair.shadowView</span><span class="s5">,</span>
+              <span class="s1">parentShadowView))</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Recursively update tree if ShadowNode pointers are not equal</span>
+    <span class="s5">if </span><span class="s1">(!oldChildPair.flattened &amp;&amp;</span>
+        <span class="s1">oldChildPair.shadowNode != newChildPair.shadowNode) {</span>
+      <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+      <span class="s5">auto </span><span class="s1">oldGrandChildPairs = sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+          <span class="s1">oldChildPair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">;</span>
+      <span class="s5">auto </span><span class="s1">newGrandChildPairs = sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+          <span class="s1">newChildPair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">;</span>
+      <span class="s1">calculateShadowViewMutationsV2(</span>
+          <span class="s1">innerScope</span><span class="s5">,</span>
+          <span class="s1">*(newGrandChildPairs.size()</span>
+                <span class="s1">? &amp;mutationContainer.downwardMutations</span>
+                <span class="s1">: &amp;mutationContainer.destructiveDownwardMutations)</span><span class="s5">,</span>
+          <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+          <span class="s1">std::move(oldGrandChildPairs)</span><span class="s5">,</span>
+          <span class="s1">std::move(newGrandChildPairs))</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">size_t lastIndexAfterFirstStage = index</span><span class="s5">;</span>
+
+  <span class="s5">if </span><span class="s1">(index == newChildPairs.size()) {</span>
+    <span class="s0">// We've reached the end of the new children. We can delete+remove the</span>
+    <span class="s0">// rest.</span>
+    <span class="s5">for </span><span class="s1">(</span><span class="s5">; </span><span class="s1">index &lt; oldChildPairs.size()</span><span class="s5">; </span><span class="s1">index++) {</span>
+      <span class="s5">auto const </span><span class="s1">&amp;oldChildPair = *oldChildPairs[index]</span><span class="s5">;</span>
+
+      <span class="s1">DEBUG_LOGS({</span>
+        <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Branch 2: Deleting Tag/Tree: [&quot;</span>
+                   <span class="s1">&lt;&lt; oldChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                   <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+      <span class="s1">})</span><span class="s5">;</span>
+
+      <span class="s5">if </span><span class="s1">(!oldChildPair.isConcreteView) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// If we take this path, technically the operations and recursion below</span>
+      <span class="s0">// are redundant. However, some parts of the Fabric ecosystem (namely, as</span>
+      <span class="s0">// of writing this, LayoutAnimations) rely heavily on getting /explicit/</span>
+      <span class="s0">// Remove/Delete instructions for every single node in the tree. Thus, we</span>
+      <span class="s0">// generate the &quot;RemoveDeleteTree&quot; instruction as well as all of the</span>
+      <span class="s0">// individual Remove/Delete operations below, but we mark those as</span>
+      <span class="s0">// redundant. The platform layer can then discard the unnecessary</span>
+      <span class="s0">// instructions. RemoveDeleteTreeMutation is a significant performance</span>
+      <span class="s0">// improvement but could be improved significantly by eliminating the need</span>
+      <span class="s0">// for any of the redundant instructions in the future.</span>
+      <span class="s5">if </span><span class="s1">(ShadowViewMutation::PlatformSupportsRemoveDeleteTreeInstruction &amp;&amp;</span>
+          <span class="s1">!isRecursionRedundant) {</span>
+        <span class="s1">mutationContainer.removeMutations.push_back(</span>
+            <span class="s1">ShadowViewMutation::RemoveDeleteTreeMutation(</span>
+                <span class="s1">parentShadowView</span><span class="s5">,</span>
+                <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+                <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(oldChildPair.mountIndex)))</span><span class="s5">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">mutationContainer.deleteMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::DeleteMutation(</span>
+              <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+              <span class="s1">isRecursionRedundant ||</span>
+                  <span class="s1">ShadowViewMutation::</span>
+                      <span class="s1">PlatformSupportsRemoveDeleteTreeInstruction))</span><span class="s5">;</span>
+      <span class="s1">mutationContainer.removeMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+              <span class="s1">parentShadowView</span><span class="s5">,</span>
+              <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+              <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(oldChildPair.mountIndex)</span><span class="s5">,</span>
+              <span class="s1">isRecursionRedundant ||</span>
+                  <span class="s1">ShadowViewMutation::</span>
+                      <span class="s1">PlatformSupportsRemoveDeleteTreeInstruction))</span><span class="s5">;</span>
+
+      <span class="s0">// We also have to call the algorithm recursively to clean up the entire</span>
+      <span class="s0">// subtree starting from the removed view.</span>
+      <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+      <span class="s1">calculateShadowViewMutationsV2(</span>
+          <span class="s1">innerScope</span><span class="s5">,</span>
+          <span class="s1">mutationContainer.destructiveDownwardMutations</span><span class="s5">,</span>
+          <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+          <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+              <span class="s1">oldChildPair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">,</span>
+          <span class="s1">{}</span><span class="s5">,</span>
+          <span class="s1">ShadowViewMutation::PlatformSupportsRemoveDeleteTreeInstruction)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s5">else if </span><span class="s1">(index == oldChildPairs.size()) {</span>
+    <span class="s0">// If we don't have any more existing children we can choose a fast path</span>
+    <span class="s0">// since the rest will all be create+insert.</span>
+    <span class="s5">for </span><span class="s1">(</span><span class="s5">; </span><span class="s1">index &lt; newChildPairs.size()</span><span class="s5">; </span><span class="s1">index++) {</span>
+      <span class="s5">auto const </span><span class="s1">&amp;newChildPair = *newChildPairs[index]</span><span class="s5">;</span>
+
+      <span class="s1">DEBUG_LOGS({</span>
+        <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Branch 3: Creating Tag/Tree: [&quot;</span>
+                   <span class="s1">&lt;&lt; newChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                   <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+      <span class="s1">})</span><span class="s5">;</span>
+
+      <span class="s5">if </span><span class="s1">(!newChildPair.isConcreteView) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">mutationContainer.insertMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::InsertMutation(</span>
+              <span class="s1">parentShadowView</span><span class="s5">,</span>
+              <span class="s1">newChildPair.shadowView</span><span class="s5">,</span>
+              <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(newChildPair.mountIndex)))</span><span class="s5">;</span>
+      <span class="s1">mutationContainer.createMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::CreateMutation(newChildPair.shadowView))</span><span class="s5">;</span>
+
+      <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+      <span class="s1">calculateShadowViewMutationsV2(</span>
+          <span class="s1">innerScope</span><span class="s5">,</span>
+          <span class="s1">mutationContainer.downwardMutations</span><span class="s5">,</span>
+          <span class="s1">newChildPair.shadowView</span><span class="s5">,</span>
+          <span class="s1">{}</span><span class="s5">,</span>
+          <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+              <span class="s1">newChildPair</span><span class="s5">, </span><span class="s1">innerScope))</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+    <span class="s0">// Collect map of tags in the new list</span>
+    <span class="s5">auto </span><span class="s1">newRemainingPairs = TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt;{}</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">newInsertedPairs = TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair *&gt;{}</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">deletionCandidatePairs = TinyMap&lt;Tag</span><span class="s5">, </span><span class="s1">ShadowViewNodePair </span><span class="s5">const </span><span class="s1">*&gt;{}</span><span class="s5">;</span>
+    <span class="s5">for </span><span class="s1">(</span><span class="s5">; </span><span class="s1">index &lt; newChildPairs.size()</span><span class="s5">; </span><span class="s1">index++) {</span>
+      <span class="s5">auto </span><span class="s1">&amp;newChildPair = *newChildPairs[index]</span><span class="s5">;</span>
+      <span class="s1">newRemainingPairs.insert({newChildPair.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;newChildPair})</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Walk through both lists at the same time</span>
+    <span class="s0">// We will perform updates, create+insert, remove+delete, remove+insert</span>
+    <span class="s0">// (move) here.</span>
+    <span class="s1">size_t oldIndex = lastIndexAfterFirstStage</span><span class="s5">;</span>
+    <span class="s1">size_t newIndex = lastIndexAfterFirstStage</span><span class="s5">;</span>
+    <span class="s1">size_t newSize = newChildPairs.size()</span><span class="s5">;</span>
+    <span class="s1">size_t oldSize = oldChildPairs.size()</span><span class="s5">;</span>
+    <span class="s5">while </span><span class="s1">(newIndex &lt; newSize || oldIndex &lt; oldSize) {</span>
+      <span class="s5">bool </span><span class="s1">haveNewPair = newIndex &lt; newSize</span><span class="s5">;</span>
+      <span class="s5">bool </span><span class="s1">haveOldPair = oldIndex &lt; oldSize</span><span class="s5">;</span>
+
+      <span class="s0">// Advance both pointers if pointing to the same element</span>
+      <span class="s5">if </span><span class="s1">(haveNewPair &amp;&amp; haveOldPair) {</span>
+        <span class="s5">auto const </span><span class="s1">&amp;oldChildPair = *oldChildPairs[oldIndex]</span><span class="s5">;</span>
+        <span class="s5">auto const </span><span class="s1">&amp;newChildPair = *newChildPairs[newIndex]</span><span class="s5">;</span>
+
+        <span class="s1">Tag newTag = newChildPair.shadowView.tag</span><span class="s5">;</span>
+        <span class="s1">Tag oldTag = oldChildPair.shadowView.tag</span><span class="s5">;</span>
+
+        <span class="s5">if </span><span class="s1">(newTag == oldTag) {</span>
+          <span class="s1">DEBUG_LOGS({</span>
+            <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Differ Branch 5: Matched Tags at indices: &quot;</span>
+                       <span class="s1">&lt;&lt; oldIndex &lt;&lt; </span><span class="s3">&quot; &quot; </span><span class="s1">&lt;&lt; newIndex &lt;&lt; </span><span class="s3">&quot;: [&quot;</span>
+                       <span class="s1">&lt;&lt; oldChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                       <span class="s1">&lt;&lt; (oldChildPair.flattened ? </span><span class="s3">&quot;(flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                       <span class="s1">&lt;&lt; (oldChildPair.isConcreteView ? </span><span class="s3">&quot;(concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                       <span class="s1">&lt;&lt; </span><span class="s3">&quot; [&quot; </span><span class="s1">&lt;&lt; newChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                       <span class="s1">&lt;&lt; (newChildPair.flattened ? </span><span class="s3">&quot;(flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                       <span class="s1">&lt;&lt; (newChildPair.isConcreteView ? </span><span class="s3">&quot;(concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                       <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+          <span class="s1">})</span><span class="s5">;</span>
+
+          <span class="s1">updateMatchedPair(</span>
+              <span class="s1">mutationContainer</span><span class="s5">,</span>
+              <span class="s5">true,</span>
+              <span class="s5">true,</span>
+              <span class="s1">parentShadowView</span><span class="s5">,</span>
+              <span class="s1">oldChildPair</span><span class="s5">,</span>
+              <span class="s1">newChildPair)</span><span class="s5">;</span>
+
+          <span class="s1">updateMatchedPairSubtrees(</span>
+              <span class="s1">scope</span><span class="s5">,</span>
+              <span class="s1">mutationContainer</span><span class="s5">,</span>
+              <span class="s1">newRemainingPairs</span><span class="s5">,</span>
+              <span class="s1">oldChildPairs</span><span class="s5">,</span>
+              <span class="s1">parentShadowView</span><span class="s5">,</span>
+              <span class="s1">oldChildPair</span><span class="s5">,</span>
+              <span class="s1">newChildPair)</span><span class="s5">;</span>
+
+          <span class="s1">newIndex++</span><span class="s5">;</span>
+          <span class="s1">oldIndex++</span><span class="s5">;</span>
+          <span class="s5">continue;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// We have an old pair, but we either don't have any remaining new pairs</span>
+      <span class="s0">// or we have one but it's not matched up with the old pair</span>
+      <span class="s5">if </span><span class="s1">(haveOldPair) {</span>
+        <span class="s5">auto const </span><span class="s1">&amp;oldChildPair = *oldChildPairs[oldIndex]</span><span class="s5">;</span>
+
+        <span class="s1">Tag oldTag = oldChildPair.shadowView.tag</span><span class="s5">;</span>
+
+        <span class="s0">// Was oldTag already inserted? This indicates a reordering, not just</span>
+        <span class="s0">// a move. The new node has already been inserted, we just need to</span>
+        <span class="s0">// remove the node from its old position now, and update the node's</span>
+        <span class="s0">// subtree.</span>
+        <span class="s5">auto const </span><span class="s1">insertedIt = newInsertedPairs.find(oldTag)</span><span class="s5">;</span>
+        <span class="s5">if </span><span class="s1">(insertedIt != newInsertedPairs.end()) {</span>
+          <span class="s5">auto const </span><span class="s1">&amp;newChildPair = *insertedIt-&gt;second</span><span class="s5">;</span>
+
+          <span class="s1">updateMatchedPair(</span>
+              <span class="s1">mutationContainer</span><span class="s5">,</span>
+              <span class="s5">true,</span>
+              <span class="s5">false,</span>
+              <span class="s1">parentShadowView</span><span class="s5">,</span>
+              <span class="s1">oldChildPair</span><span class="s5">,</span>
+              <span class="s1">newChildPair)</span><span class="s5">;</span>
+
+          <span class="s1">updateMatchedPairSubtrees(</span>
+              <span class="s1">scope</span><span class="s5">,</span>
+              <span class="s1">mutationContainer</span><span class="s5">,</span>
+              <span class="s1">newRemainingPairs</span><span class="s5">,</span>
+              <span class="s1">oldChildPairs</span><span class="s5">,</span>
+              <span class="s1">parentShadowView</span><span class="s5">,</span>
+              <span class="s1">oldChildPair</span><span class="s5">,</span>
+              <span class="s1">newChildPair)</span><span class="s5">;</span>
+
+          <span class="s1">newInsertedPairs.erase(insertedIt)</span><span class="s5">;</span>
+          <span class="s1">oldIndex++</span><span class="s5">;</span>
+          <span class="s5">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Should we generate a delete+remove instruction for the old node?</span>
+        <span class="s0">// If there's an old node and it's not found in the &quot;new&quot; list, we</span>
+        <span class="s0">// generate remove+delete for this node and its subtree.</span>
+        <span class="s5">auto const </span><span class="s1">newIt = newRemainingPairs.find(oldTag)</span><span class="s5">;</span>
+        <span class="s5">if </span><span class="s1">(newIt == newRemainingPairs.end()) {</span>
+          <span class="s1">oldIndex++</span><span class="s5">;</span>
+
+          <span class="s5">if </span><span class="s1">(!oldChildPair.isConcreteView) {</span>
+            <span class="s5">continue;</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// From here, we know the oldChildPair is concrete.</span>
+          <span class="s0">// We *probably* need to generate a REMOVE mutation (see edge-case</span>
+          <span class="s0">// notes below).</span>
+
+          <span class="s1">DEBUG_LOGS({</span>
+            <span class="s1">LOG(ERROR)</span>
+                <span class="s1">&lt;&lt; </span><span class="s3">&quot;Differ Branch 9: Removing tag that was not reinserted: &quot;</span>
+                <span class="s1">&lt;&lt; oldIndex &lt;&lt; </span><span class="s3">&quot;: [&quot; </span><span class="s1">&lt;&lt; oldChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+                <span class="s1">&lt;&lt; (oldChildPair.flattened ? </span><span class="s3">&quot; (flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                <span class="s1">&lt;&lt; (oldChildPair.isConcreteView ? </span><span class="s3">&quot; (concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+                <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;] &quot;</span>
+                <span class="s1">&lt;&lt; </span><span class="s3">&quot;node is in other tree? &quot;</span>
+                <span class="s1">&lt;&lt; (oldChildPair.inOtherTree() ? </span><span class="s3">&quot;yes&quot; </span><span class="s1">: </span><span class="s3">&quot;no&quot;</span><span class="s1">)</span><span class="s5">;</span>
+          <span class="s1">})</span><span class="s5">;</span>
+
+          <span class="s0">// Edge case: node is not found in `newRemainingPairs`, due to</span>
+          <span class="s0">// complex (un)flattening cases, but exists in other tree *and* is</span>
+          <span class="s0">// concrete.</span>
+          <span class="s5">if </span><span class="s1">(oldChildPair.inOtherTree() &amp;&amp;</span>
+              <span class="s1">oldChildPair.otherTreePair-&gt;isConcreteView) {</span>
+            <span class="s1">ShadowView </span><span class="s5">const </span><span class="s1">&amp;otherTreeView =</span>
+                <span class="s1">oldChildPair.otherTreePair-&gt;shadowView</span><span class="s5">;</span>
+
+            <span class="s0">// Remove, but remove using the *new* node, since we know</span>
+            <span class="s0">// an UPDATE mutation from old -&gt; new has been generated.</span>
+            <span class="s0">// Practically this shouldn't matter for most mounting layer</span>
+            <span class="s0">// implementations, but helps adhere to the invariant that</span>
+            <span class="s0">// for all mutation instructions, &quot;oldViewShadowNode&quot; == &quot;current</span>
+            <span class="s0">// node on mounting layer / stubView&quot;.</span>
+            <span class="s0">// Here we do *not&quot; need to generate a potential DELETE mutation</span>
+            <span class="s0">// because we know the view is concrete, and still in the new</span>
+            <span class="s0">// hierarchy.</span>
+            <span class="s1">mutationContainer.removeMutations.push_back(</span>
+                <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+                    <span class="s1">parentShadowView</span><span class="s5">,</span>
+                    <span class="s1">otherTreeView</span><span class="s5">,</span>
+                    <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(oldChildPair.mountIndex)))</span><span class="s5">;</span>
+            <span class="s5">continue;</span>
+          <span class="s1">}</span>
+
+          <span class="s1">mutationContainer.removeMutations.push_back(</span>
+              <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+                  <span class="s1">parentShadowView</span><span class="s5">,</span>
+                  <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+                  <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(oldChildPair.mountIndex)))</span><span class="s5">;</span>
+
+          <span class="s1">deletionCandidatePairs.insert(</span>
+              <span class="s1">{oldChildPair.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;oldChildPair})</span><span class="s5">;</span>
+
+          <span class="s5">continue;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// At this point, oldTag is -1 or is in the new list, and hasn't been</span>
+      <span class="s0">// inserted or matched yet. We're not sure yet if the new node is in the</span>
+      <span class="s0">// old list - generate an insert instruction for the new node.</span>
+      <span class="s5">auto </span><span class="s1">&amp;newChildPair = *newChildPairs[newIndex]</span><span class="s5">;</span>
+      <span class="s1">DEBUG_LOGS({</span>
+        <span class="s1">LOG(ERROR)</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot;Differ Branch 10: Inserting tag/tree that was not (yet?) removed from hierarchy: &quot;</span>
+            <span class="s1">&lt;&lt; newIndex &lt;&lt; </span><span class="s3">&quot;/&quot; </span><span class="s1">&lt;&lt; newSize &lt;&lt; </span><span class="s3">&quot;: [&quot;</span>
+            <span class="s1">&lt;&lt; newChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+            <span class="s1">&lt;&lt; (newChildPair.flattened ? </span><span class="s3">&quot; (flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; (newChildPair.isConcreteView ? </span><span class="s3">&quot; (concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+      <span class="s1">})</span><span class="s5">;</span>
+      <span class="s5">if </span><span class="s1">(newChildPair.isConcreteView) {</span>
+        <span class="s1">mutationContainer.insertMutations.push_back(</span>
+            <span class="s1">ShadowViewMutation::InsertMutation(</span>
+                <span class="s1">parentShadowView</span><span class="s5">,</span>
+                <span class="s1">newChildPair.shadowView</span><span class="s5">,</span>
+                <span class="s5">static_cast</span><span class="s1">&lt;</span><span class="s5">int</span><span class="s1">&gt;(newChildPair.mountIndex)))</span><span class="s5">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// `inOtherTree` is only set to true during flattening/unflattening of</span>
+      <span class="s0">// parent. If the parent isn't (un)flattened, this will always be</span>
+      <span class="s0">// `false`, even if the node is in the other (old) tree. In this case,</span>
+      <span class="s0">// we expect the node to be removed from `newInsertedPairs` when we</span>
+      <span class="s0">// later encounter it in this loop.</span>
+      <span class="s5">if </span><span class="s1">(!newChildPair.inOtherTree()) {</span>
+        <span class="s1">newInsertedPairs.insert({newChildPair.shadowView.tag</span><span class="s5">, </span><span class="s1">&amp;newChildPair})</span><span class="s5">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">newIndex++</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Penultimate step: generate Delete instructions for entirely deleted</span>
+    <span class="s0">// subtrees/nodes. We do this here because we need to traverse the entire</span>
+    <span class="s0">// list to make sure that a node was not reparented into an unflattened</span>
+    <span class="s0">// node that occurs *after* it in the hierarchy, due to zIndex ordering.</span>
+    <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">&amp;deletionCandidatePair : deletionCandidatePairs) {</span>
+      <span class="s5">if </span><span class="s1">(deletionCandidatePair.first == </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s5">auto const </span><span class="s1">&amp;oldChildPair = *deletionCandidatePair.second</span><span class="s5">;</span>
+
+      <span class="s1">DEBUG_LOGS({</span>
+        <span class="s1">LOG(ERROR)</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot;Differ Branch 11: Deleting tag/tree that was not in new hierarchy: &quot;</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot;[&quot; </span><span class="s1">&lt;&lt; oldChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+            <span class="s1">&lt;&lt; (oldChildPair.flattened ? </span><span class="s3">&quot;(flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; (oldChildPair.isConcreteView ? </span><span class="s3">&quot;(concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; (oldChildPair.inOtherTree() ? </span><span class="s3">&quot;(in other tree)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;] ##&quot;</span>
+            <span class="s1">&lt;&lt; std::hash&lt;ShadowView&gt;{}(oldChildPair.shadowView)</span><span class="s5">;</span>
+      <span class="s1">})</span><span class="s5">;</span>
+
+      <span class="s0">// This can happen when the parent is unflattened</span>
+      <span class="s5">if </span><span class="s1">(!oldChildPair.inOtherTree() &amp;&amp; oldChildPair.isConcreteView) {</span>
+        <span class="s1">mutationContainer.deleteMutations.push_back(</span>
+            <span class="s1">ShadowViewMutation::DeleteMutation(oldChildPair.shadowView))</span><span class="s5">;</span>
+
+        <span class="s0">// We also have to call the algorithm recursively to clean up the</span>
+        <span class="s0">// entire subtree starting from the removed view.</span>
+        <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+        <span class="s1">calculateShadowViewMutationsV2(</span>
+            <span class="s1">innerScope</span><span class="s5">,</span>
+            <span class="s1">mutationContainer.destructiveDownwardMutations</span><span class="s5">,</span>
+            <span class="s1">oldChildPair.shadowView</span><span class="s5">,</span>
+            <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+                <span class="s1">oldChildPair</span><span class="s5">, </span><span class="s1">innerScope)</span><span class="s5">,</span>
+            <span class="s1">{})</span><span class="s5">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Final step: generate Create instructions for entirely new</span>
+    <span class="s0">// subtrees/nodes that are not the result of flattening or unflattening.</span>
+    <span class="s5">for </span><span class="s1">(</span><span class="s5">auto </span><span class="s1">&amp;newInsertedPair : newInsertedPairs) {</span>
+      <span class="s0">// Erased elements of a TinyMap will have a Tag/key of 0 - skip those</span>
+      <span class="s0">// These *should* be removed by the map; there are currently no KNOWN</span>
+      <span class="s0">// cases where TinyMap will do the wrong thing, but there are not yet</span>
+      <span class="s0">// any unit tests explicitly for TinyMap, so this is safer for now.</span>
+      <span class="s5">if </span><span class="s1">(newInsertedPair.first == </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s5">auto const </span><span class="s1">&amp;newChildPair = *newInsertedPair.second</span><span class="s5">;</span>
+
+      <span class="s1">DEBUG_LOGS({</span>
+        <span class="s1">LOG(ERROR)</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot;Differ Branch 12: Inserting tag/tree that was not in old hierarchy: &quot;</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot;[&quot; </span><span class="s1">&lt;&lt; newChildPair.shadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span>
+            <span class="s1">&lt;&lt; (newChildPair.flattened ? </span><span class="s3">&quot;(flattened)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; (newChildPair.isConcreteView ? </span><span class="s3">&quot;(concrete)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; (newChildPair.inOtherTree() ? </span><span class="s3">&quot;(in other tree)&quot; </span><span class="s1">: </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot; with parent: [&quot; </span><span class="s1">&lt;&lt; parentShadowView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s5">;</span>
+      <span class="s1">})</span><span class="s5">;</span>
+
+      <span class="s5">if </span><span class="s1">(!newChildPair.isConcreteView) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+      <span class="s5">if </span><span class="s1">(newChildPair.inOtherTree()) {</span>
+        <span class="s5">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">mutationContainer.createMutations.push_back(</span>
+          <span class="s1">ShadowViewMutation::CreateMutation(newChildPair.shadowView))</span><span class="s5">;</span>
+
+      <span class="s1">ViewNodePairScope innerScope{}</span><span class="s5">;</span>
+      <span class="s1">calculateShadowViewMutationsV2(</span>
+          <span class="s1">innerScope</span><span class="s5">,</span>
+          <span class="s1">mutationContainer.downwardMutations</span><span class="s5">,</span>
+          <span class="s1">newChildPair.shadowView</span><span class="s5">,</span>
+          <span class="s1">{}</span><span class="s5">,</span>
+          <span class="s1">sliceChildShadowNodeViewPairsFromViewNodePair(</span>
+              <span class="s1">newChildPair</span><span class="s5">, </span><span class="s1">innerScope))</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// All mutations in an optimal order:</span>
+  <span class="s1">std::move(</span>
+      <span class="s1">mutationContainer.destructiveDownwardMutations.begin()</span><span class="s5">,</span>
+      <span class="s1">mutationContainer.destructiveDownwardMutations.end()</span><span class="s5">,</span>
+      <span class="s1">std::back_inserter(mutations))</span><span class="s5">;</span>
+  <span class="s1">std::move(</span>
+      <span class="s1">mutationContainer.updateMutations.begin()</span><span class="s5">,</span>
+      <span class="s1">mutationContainer.updateMutations.end()</span><span class="s5">,</span>
+      <span class="s1">std::back_inserter(mutations))</span><span class="s5">;</span>
+  <span class="s1">std::move(</span>
+      <span class="s1">mutationContainer.removeMutations.rbegin()</span><span class="s5">,</span>
+      <span class="s1">mutationContainer.removeMutations.rend()</span><span class="s5">,</span>
+      <span class="s1">std::back_inserter(mutations))</span><span class="s5">;</span>
+  <span class="s1">std::move(</span>
+      <span class="s1">mutationContainer.deleteMutations.begin()</span><span class="s5">,</span>
+      <span class="s1">mutationContainer.deleteMutations.end()</span><span class="s5">,</span>
+      <span class="s1">std::back_inserter(mutations))</span><span class="s5">;</span>
+  <span class="s1">std::move(</span>
+      <span class="s1">mutationContainer.createMutations.begin()</span><span class="s5">,</span>
+      <span class="s1">mutationContainer.createMutations.end()</span><span class="s5">,</span>
+      <span class="s1">std::back_inserter(mutations))</span><span class="s5">;</span>
+  <span class="s1">std::move(</span>
+      <span class="s1">mutationContainer.downwardMutations.begin()</span><span class="s5">,</span>
+      <span class="s1">mutationContainer.downwardMutations.end()</span><span class="s5">,</span>
+      <span class="s1">std::back_inserter(mutations))</span><span class="s5">;</span>
+  <span class="s1">std::move(</span>
+      <span class="s1">mutationContainer.insertMutations.begin()</span><span class="s5">,</span>
+      <span class="s1">mutationContainer.insertMutations.end()</span><span class="s5">,</span>
+      <span class="s1">std::back_inserter(mutations))</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Only used by unit tests currently. 
+ */</span>
+<span class="s5">static void </span><span class="s1">sliceChildShadowNodeViewPairsRecursivelyLegacy(</span>
+    <span class="s1">ShadowViewNodePair::OwningList &amp;pairList</span><span class="s5">,</span>
+    <span class="s1">Point layoutOffset</span><span class="s5">,</span>
+    <span class="s1">ShadowNode </span><span class="s5">const </span><span class="s1">&amp;shadowNode) {</span>
+  <span class="s5">for </span><span class="s1">(</span><span class="s5">auto const </span><span class="s1">&amp;sharedChildShadowNode : shadowNode.getChildren()) {</span>
+    <span class="s5">auto </span><span class="s1">&amp;childShadowNode = *sharedChildShadowNode</span><span class="s5">;</span>
+
+<span class="s2">#ifndef </span><span class="s1">ANDROID</span>
+    <span class="s0">// Temporary disabled on Android because the mounting infrastructure</span>
+    <span class="s0">// is not fully ready yet.</span>
+    <span class="s5">if </span><span class="s1">(childShadowNode.getTraits().check(ShadowNodeTraits::Trait::Hidden)) {</span>
+      <span class="s5">continue;</span>
+    <span class="s1">}</span>
+<span class="s2">#endif</span>
+
+    <span class="s5">auto </span><span class="s1">shadowView = ShadowView(childShadowNode)</span><span class="s5">;</span>
+    <span class="s5">auto </span><span class="s1">origin = layoutOffset</span><span class="s5">;</span>
+    <span class="s5">if </span><span class="s1">(shadowView.layoutMetrics != EmptyLayoutMetrics) {</span>
+      <span class="s1">origin += shadowView.layoutMetrics.frame.origin</span><span class="s5">;</span>
+      <span class="s1">shadowView.layoutMetrics.frame.origin += layoutOffset</span><span class="s5">;</span>
+    <span class="s1">}</span>
+
+    <span class="s5">if </span><span class="s1">(childShadowNode.getTraits().check(</span>
+            <span class="s1">ShadowNodeTraits::Trait::FormsStackingContext)) {</span>
+      <span class="s1">pairList.push_back({shadowView</span><span class="s5">, </span><span class="s1">&amp;childShadowNode})</span><span class="s5">;</span>
+    <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+      <span class="s5">if </span><span class="s1">(childShadowNode.getTraits().check(</span>
+              <span class="s1">ShadowNodeTraits::Trait::FormsView)) {</span>
+        <span class="s1">pairList.push_back({shadowView</span><span class="s5">, </span><span class="s1">&amp;childShadowNode})</span><span class="s5">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">sliceChildShadowNodeViewPairsRecursivelyLegacy(</span>
+          <span class="s1">pairList</span><span class="s5">, </span><span class="s1">origin</span><span class="s5">, </span><span class="s1">childShadowNode)</span><span class="s5">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Only used by unit tests currently. 
+ */</span>
+<span class="s1">ShadowViewNodePair::OwningList sliceChildShadowNodeViewPairsLegacy(</span>
+    <span class="s1">ShadowNode </span><span class="s5">const </span><span class="s1">&amp;shadowNode) {</span>
+  <span class="s5">auto </span><span class="s1">pairList = ShadowViewNodePair::OwningList{}</span><span class="s5">;</span>
+
+  <span class="s5">if </span><span class="s1">(!shadowNode.getTraits().check(</span>
+          <span class="s1">ShadowNodeTraits::Trait::FormsStackingContext) &amp;&amp;</span>
+      <span class="s1">shadowNode.getTraits().check(ShadowNodeTraits::Trait::FormsView)) {</span>
+    <span class="s5">return </span><span class="s1">pairList</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">sliceChildShadowNodeViewPairsRecursivelyLegacy(pairList</span><span class="s5">, </span><span class="s1">{</span><span class="s4">0</span><span class="s5">, </span><span class="s4">0</span><span class="s1">}</span><span class="s5">, </span><span class="s1">shadowNode)</span><span class="s5">;</span>
+
+  <span class="s5">return </span><span class="s1">pairList</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowViewMutation::List calculateShadowViewMutations(</span>
+    <span class="s1">ShadowNode </span><span class="s5">const </span><span class="s1">&amp;oldRootShadowNode</span><span class="s5">,</span>
+    <span class="s1">ShadowNode </span><span class="s5">const </span><span class="s1">&amp;newRootShadowNode) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;calculateShadowViewMutations&quot;</span><span class="s1">)</span><span class="s5">;</span>
+
+  <span class="s0">// Root shadow nodes must be belong the same family.</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">ShadowNode::sameFamily(oldRootShadowNode</span><span class="s5">, </span><span class="s1">newRootShadowNode))</span><span class="s5">;</span>
+
+  <span class="s0">// See explanation of scope in Differentiator.h.</span>
+  <span class="s1">ViewNodePairScope viewNodePairScope{}</span><span class="s5">;</span>
+  <span class="s1">ViewNodePairScope innerViewNodePairScope{}</span><span class="s5">;</span>
+
+  <span class="s5">auto </span><span class="s1">mutations = ShadowViewMutation::List{}</span><span class="s5">;</span>
+  <span class="s1">mutations.reserve(</span><span class="s4">256</span><span class="s1">)</span><span class="s5">;</span>
+
+  <span class="s5">auto </span><span class="s1">oldRootShadowView = ShadowView(oldRootShadowNode)</span><span class="s5">;</span>
+  <span class="s5">auto </span><span class="s1">newRootShadowView = ShadowView(newRootShadowNode)</span><span class="s5">;</span>
+
+  <span class="s5">if </span><span class="s1">(oldRootShadowView != newRootShadowView) {</span>
+    <span class="s1">mutations.push_back(ShadowViewMutation::UpdateMutation(</span>
+        <span class="s1">oldRootShadowView</span><span class="s5">, </span><span class="s1">newRootShadowView</span><span class="s5">, </span><span class="s1">{}))</span><span class="s5">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">calculateShadowViewMutationsV2(</span>
+      <span class="s1">innerViewNodePairScope</span><span class="s5">,</span>
+      <span class="s1">mutations</span><span class="s5">,</span>
+      <span class="s1">ShadowView(oldRootShadowNode)</span><span class="s5">,</span>
+      <span class="s1">sliceChildShadowNodeViewPairsV2(oldRootShadowNode</span><span class="s5">, </span><span class="s1">viewNodePairScope)</span><span class="s5">,</span>
+      <span class="s1">sliceChildShadowNodeViewPairsV2(newRootShadowNode</span><span class="s5">, </span><span class="s1">viewNodePairScope))</span><span class="s5">;</span>
+
+  <span class="s5">return </span><span class="s1">mutations</span><span class="s5">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

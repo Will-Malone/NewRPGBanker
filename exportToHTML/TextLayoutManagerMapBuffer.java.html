@@ -1,0 +1,602 @@
+<html>
+<head>
+<title>TextLayoutManagerMapBuffer.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #629755; font-weight: bold; font-style: italic;}
+.s5 { color: #6897bb;}
+.s6 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+TextLayoutManagerMapBuffer.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.views.text</span><span class="s2">;</span>
+
+<span class="s2">import static </span><span class="s1">com.facebook.react.views.text.TextAttributeProps.UNSET</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.content.Context</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.os.Build</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.text.BoringLayout</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.text.Layout</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.text.Spannable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.text.SpannableStringBuilder</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.text.Spanned</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.text.StaticLayout</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.text.TextPaint</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.util.LayoutDirection</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.util.LruCache</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.view.View</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.NonNull</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactNoCrashSoftException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactSoftExceptionLogger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.WritableArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.build.ReactBuildConfig</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.mapbuffer.MapBuffer</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.PixelUtil</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.yoga.YogaConstants</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.yoga.YogaMeasureMode</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.yoga.YogaMeasureOutput</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.List</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.ConcurrentHashMap</span><span class="s2">;</span>
+
+<span class="s3">/** Class responsible of creating {</span><span class="s4">@link </span><span class="s3">Spanned} object for the JS representation of Text */</span>
+<span class="s2">public class </span><span class="s1">TextLayoutManagerMapBuffer {</span>
+
+  <span class="s0">// constants for AttributedString serialization</span>
+  <span class="s2">public static final short </span><span class="s1">AS_KEY_HASH = </span><span class="s5">0</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">AS_KEY_STRING = </span><span class="s5">1</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">AS_KEY_FRAGMENTS = </span><span class="s5">2</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">AS_KEY_CACHE_ID = </span><span class="s5">3</span><span class="s2">;</span>
+
+  <span class="s0">// constants for Fragment serialization</span>
+  <span class="s2">public static final short </span><span class="s1">FR_KEY_STRING = </span><span class="s5">0</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">FR_KEY_REACT_TAG = </span><span class="s5">1</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">FR_KEY_IS_ATTACHMENT = </span><span class="s5">2</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">FR_KEY_WIDTH = </span><span class="s5">3</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">FR_KEY_HEIGHT = </span><span class="s5">4</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">FR_KEY_TEXT_ATTRIBUTES = </span><span class="s5">5</span><span class="s2">;</span>
+
+  <span class="s0">// constants for ParagraphAttributes serialization</span>
+  <span class="s2">public static final short </span><span class="s1">PA_KEY_MAX_NUMBER_OF_LINES = </span><span class="s5">0</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">PA_KEY_ELLIPSIZE_MODE = </span><span class="s5">1</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">PA_KEY_TEXT_BREAK_STRATEGY = </span><span class="s5">2</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">PA_KEY_ADJUST_FONT_SIZE_TO_FIT = </span><span class="s5">3</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">PA_KEY_INCLUDE_FONT_PADDING = </span><span class="s5">4</span><span class="s2">;</span>
+  <span class="s2">public static final short </span><span class="s1">PA_KEY_HYPHENATION_FREQUENCY = </span><span class="s5">5</span><span class="s2">;</span>
+
+  <span class="s2">private static final boolean </span><span class="s1">ENABLE_MEASURE_LOGGING = ReactBuildConfig.DEBUG &amp;&amp; </span><span class="s2">false;</span>
+
+  <span class="s2">private static final </span><span class="s1">String TAG = TextLayoutManagerMapBuffer.</span><span class="s2">class</span><span class="s1">.getSimpleName()</span><span class="s2">;</span>
+
+  <span class="s0">// It's important to pass the ANTI_ALIAS_FLAG flag to the constructor rather than setting it</span>
+  <span class="s0">// later by calling setFlags. This is because the latter approach triggers a bug on Android 4.4.2.</span>
+  <span class="s0">// The bug is that unicode emoticons aren't measured properly which causes text to be clipped.</span>
+  <span class="s2">private static final </span><span class="s1">TextPaint sTextPaintInstance = </span><span class="s2">new </span><span class="s1">TextPaint(TextPaint.ANTI_ALIAS_FLAG)</span><span class="s2">;</span>
+
+  <span class="s0">// Specifies the amount of spannable that are stored into the {@link sSpannableCache}.</span>
+  <span class="s2">private static final short </span><span class="s1">spannableCacheSize = </span><span class="s5">100</span><span class="s2">;</span>
+
+  <span class="s2">private static final </span><span class="s1">String INLINE_VIEW_PLACEHOLDER = </span><span class="s6">&quot;0&quot;</span><span class="s2">;</span>
+
+  <span class="s2">private static final boolean </span><span class="s1">DEFAULT_INCLUDE_FONT_PADDING = </span><span class="s2">true;</span>
+  <span class="s2">private static final </span><span class="s1">LruCache&lt;MapBuffer</span><span class="s2">, </span><span class="s1">Spannable&gt; sSpannableCache =</span>
+      <span class="s2">new </span><span class="s1">LruCache&lt;&gt;(spannableCacheSize)</span><span class="s2">;</span>
+  <span class="s2">private static final </span><span class="s1">ConcurrentHashMap&lt;Integer</span><span class="s2">, </span><span class="s1">Spannable&gt; sTagToSpannableCache =</span>
+      <span class="s2">new </span><span class="s1">ConcurrentHashMap&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s2">public static void </span><span class="s1">setCachedSpannabledForTag(</span><span class="s2">int </span><span class="s1">reactTag</span><span class="s2">, </span><span class="s1">@NonNull Spannable sp) {</span>
+    <span class="s2">if </span><span class="s1">(ENABLE_MEASURE_LOGGING) {</span>
+      <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s6">&quot;Set cached spannable for tag[&quot; </span><span class="s1">+ reactTag + </span><span class="s6">&quot;]: &quot; </span><span class="s1">+ sp.toString())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">sTagToSpannableCache.put(reactTag</span><span class="s2">, </span><span class="s1">sp)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public static void </span><span class="s1">deleteCachedSpannableForTag(</span><span class="s2">int </span><span class="s1">reactTag) {</span>
+    <span class="s2">if </span><span class="s1">(ENABLE_MEASURE_LOGGING) {</span>
+      <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s6">&quot;Delete cached spannable for tag[&quot; </span><span class="s1">+ reactTag + </span><span class="s6">&quot;]&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">sTagToSpannableCache.remove(reactTag)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public static boolean </span><span class="s1">isRTL(MapBuffer attributedString) {</span>
+    <span class="s1">MapBuffer fragments = attributedString.getMapBuffer(AS_KEY_FRAGMENTS)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(fragments.getCount() == </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">MapBuffer fragment = fragments.getMapBuffer((</span><span class="s2">short</span><span class="s1">) </span><span class="s5">0</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">MapBuffer textAttributes = fragment.getMapBuffer(FR_KEY_TEXT_ATTRIBUTES)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(!textAttributes.contains(TextAttributeProps.TA_KEY_LAYOUT_DIRECTION)) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">TextAttributeProps.getLayoutDirection(</span>
+            <span class="s1">textAttributes.getString(TextAttributeProps.TA_KEY_LAYOUT_DIRECTION))</span>
+        <span class="s1">== LayoutDirection.RTL</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static void </span><span class="s1">buildSpannableFromFragment(</span>
+      <span class="s1">Context context</span><span class="s2">, </span><span class="s1">MapBuffer fragments</span><span class="s2">, </span><span class="s1">SpannableStringBuilder sb</span><span class="s2">, </span><span class="s1">List&lt;SetSpanOperation&gt; ops) {</span>
+
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s5">0</span><span class="s2">, </span><span class="s1">length = fragments.getCount()</span><span class="s2">; </span><span class="s1">i &lt; length</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">MapBuffer fragment = fragments.getMapBuffer(i)</span><span class="s2">;</span>
+      <span class="s2">int </span><span class="s1">start = sb.length()</span><span class="s2">;</span>
+
+      <span class="s1">TextAttributeProps textAttributes =</span>
+          <span class="s1">TextAttributeProps.fromMapBuffer(fragment.getMapBuffer(FR_KEY_TEXT_ATTRIBUTES))</span><span class="s2">;</span>
+
+      <span class="s1">sb.append(</span>
+          <span class="s1">TextTransform.apply(fragment.getString(FR_KEY_STRING)</span><span class="s2">, </span><span class="s1">textAttributes.mTextTransform))</span><span class="s2">;</span>
+
+      <span class="s2">int </span><span class="s1">end = sb.length()</span><span class="s2">;</span>
+      <span class="s2">int </span><span class="s1">reactTag =</span>
+          <span class="s1">fragment.contains(FR_KEY_REACT_TAG) ? fragment.getInt(FR_KEY_REACT_TAG) : View.NO_ID</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(fragment.contains(FR_KEY_IS_ATTACHMENT) &amp;&amp; fragment.getBoolean(FR_KEY_IS_ATTACHMENT)) {</span>
+        <span class="s2">float </span><span class="s1">width = PixelUtil.toPixelFromSP(fragment.getDouble(FR_KEY_WIDTH))</span><span class="s2">;</span>
+        <span class="s2">float </span><span class="s1">height = PixelUtil.toPixelFromSP(fragment.getDouble(FR_KEY_HEIGHT))</span><span class="s2">;</span>
+        <span class="s1">ops.add(</span>
+            <span class="s2">new </span><span class="s1">SetSpanOperation(</span>
+                <span class="s1">sb.length() - INLINE_VIEW_PLACEHOLDER.length()</span><span class="s2">,</span>
+                <span class="s1">sb.length()</span><span class="s2">,</span>
+                <span class="s2">new </span><span class="s1">TextInlineViewPlaceholderSpan(reactTag</span><span class="s2">, </span><span class="s1">(</span><span class="s2">int</span><span class="s1">) width</span><span class="s2">, </span><span class="s1">(</span><span class="s2">int</span><span class="s1">) height)))</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else if </span><span class="s1">(end &gt;= start) {</span>
+        <span class="s2">if </span><span class="s1">(textAttributes.mIsAccessibilityLink) {</span>
+          <span class="s1">ops.add(</span><span class="s2">new </span><span class="s1">SetSpanOperation(start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">ReactClickableSpan(reactTag)))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(textAttributes.mIsColorSet) {</span>
+          <span class="s1">ops.add(</span>
+              <span class="s2">new </span><span class="s1">SetSpanOperation(</span>
+                  <span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">ReactForegroundColorSpan(textAttributes.mColor)))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(textAttributes.mIsBackgroundColorSet) {</span>
+          <span class="s1">ops.add(</span>
+              <span class="s2">new </span><span class="s1">SetSpanOperation(</span>
+                  <span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">ReactBackgroundColorSpan(textAttributes.mBackgroundColor)))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(!Float.isNaN(textAttributes.getLetterSpacing())) {</span>
+          <span class="s1">ops.add(</span>
+              <span class="s2">new </span><span class="s1">SetSpanOperation(</span>
+                  <span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">CustomLetterSpacingSpan(textAttributes.getLetterSpacing())))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s1">ops.add(</span>
+            <span class="s2">new </span><span class="s1">SetSpanOperation(start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">ReactAbsoluteSizeSpan(textAttributes.mFontSize)))</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(textAttributes.mFontStyle != UNSET</span>
+            <span class="s1">|| textAttributes.mFontWeight != UNSET</span>
+            <span class="s1">|| textAttributes.mFontFamily != </span><span class="s2">null</span><span class="s1">) {</span>
+          <span class="s1">ops.add(</span>
+              <span class="s2">new </span><span class="s1">SetSpanOperation(</span>
+                  <span class="s1">start</span><span class="s2">,</span>
+                  <span class="s1">end</span><span class="s2">,</span>
+                  <span class="s2">new </span><span class="s1">CustomStyleSpan(</span>
+                      <span class="s1">textAttributes.mFontStyle</span><span class="s2">,</span>
+                      <span class="s1">textAttributes.mFontWeight</span><span class="s2">,</span>
+                      <span class="s1">textAttributes.mFontFeatureSettings</span><span class="s2">,</span>
+                      <span class="s1">textAttributes.mFontFamily</span><span class="s2">,</span>
+                      <span class="s1">context.getAssets())))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(textAttributes.mIsUnderlineTextDecorationSet) {</span>
+          <span class="s1">ops.add(</span><span class="s2">new </span><span class="s1">SetSpanOperation(start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">ReactUnderlineSpan()))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(textAttributes.mIsLineThroughTextDecorationSet) {</span>
+          <span class="s1">ops.add(</span><span class="s2">new </span><span class="s1">SetSpanOperation(start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">ReactStrikethroughSpan()))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(textAttributes.mTextShadowOffsetDx != </span><span class="s5">0 </span><span class="s1">|| textAttributes.mTextShadowOffsetDy != </span><span class="s5">0</span><span class="s1">) {</span>
+          <span class="s1">ops.add(</span>
+              <span class="s2">new </span><span class="s1">SetSpanOperation(</span>
+                  <span class="s1">start</span><span class="s2">,</span>
+                  <span class="s1">end</span><span class="s2">,</span>
+                  <span class="s2">new </span><span class="s1">ShadowStyleSpan(</span>
+                      <span class="s1">textAttributes.mTextShadowOffsetDx</span><span class="s2">,</span>
+                      <span class="s1">textAttributes.mTextShadowOffsetDy</span><span class="s2">,</span>
+                      <span class="s1">textAttributes.mTextShadowRadius</span><span class="s2">,</span>
+                      <span class="s1">textAttributes.mTextShadowColor)))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(!Float.isNaN(textAttributes.getEffectiveLineHeight())) {</span>
+          <span class="s1">ops.add(</span>
+              <span class="s2">new </span><span class="s1">SetSpanOperation(</span>
+                  <span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">CustomLineHeightSpan(textAttributes.getEffectiveLineHeight())))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">ops.add(</span><span class="s2">new </span><span class="s1">SetSpanOperation(start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, new </span><span class="s1">ReactTagSpan(reactTag)))</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// public because both ReactTextViewManager and ReactTextInputManager need to use this</span>
+  <span class="s2">public static </span><span class="s1">Spannable getOrCreateSpannableForText(</span>
+      <span class="s1">Context context</span><span class="s2">,</span>
+      <span class="s1">MapBuffer attributedString</span><span class="s2">,</span>
+      <span class="s1">@Nullable ReactTextViewManagerCallback reactTextViewManagerCallback) {</span>
+
+    <span class="s2">return </span><span class="s1">createSpannableFromAttributedString(</span>
+        <span class="s1">context</span><span class="s2">, </span><span class="s1">attributedString</span><span class="s2">, </span><span class="s1">reactTextViewManagerCallback)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static </span><span class="s1">Spannable createSpannableFromAttributedString(</span>
+      <span class="s1">Context context</span><span class="s2">,</span>
+      <span class="s1">MapBuffer attributedString</span><span class="s2">,</span>
+      <span class="s1">@Nullable ReactTextViewManagerCallback reactTextViewManagerCallback) {</span>
+
+    <span class="s1">SpannableStringBuilder sb = </span><span class="s2">new </span><span class="s1">SpannableStringBuilder()</span><span class="s2">;</span>
+
+    <span class="s0">// The {@link SpannableStringBuilder} implementation require setSpan operation to be called</span>
+    <span class="s0">// up-to-bottom, otherwise all the spannables that are within the region for which one may set</span>
+    <span class="s0">// a new spannable will be wiped out</span>
+    <span class="s1">List&lt;SetSpanOperation&gt; ops = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+
+    <span class="s1">buildSpannableFromFragment(context</span><span class="s2">, </span><span class="s1">attributedString.getMapBuffer(AS_KEY_FRAGMENTS)</span><span class="s2">, </span><span class="s1">sb</span><span class="s2">, </span><span class="s1">ops)</span><span class="s2">;</span>
+
+    <span class="s0">// TODO T31905686: add support for inline Images</span>
+    <span class="s0">// While setting the Spans on the final text, we also check whether any of them are images.</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">priorityIndex = </span><span class="s5">0</span><span class="s2">; </span><span class="s1">priorityIndex &lt; ops.size()</span><span class="s2">; </span><span class="s1">++priorityIndex) {</span>
+      <span class="s2">final </span><span class="s1">SetSpanOperation op = ops.get(ops.size() - priorityIndex - </span><span class="s5">1</span><span class="s1">)</span><span class="s2">;</span>
+
+      <span class="s0">// Actual order of calling {@code execute} does NOT matter,</span>
+      <span class="s0">// but the {@code priorityIndex} DOES matter.</span>
+      <span class="s1">op.execute(sb</span><span class="s2">, </span><span class="s1">priorityIndex)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(reactTextViewManagerCallback != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">reactTextViewManagerCallback.onPostProcessSpannable(sb)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">sb</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static </span><span class="s1">Layout createLayout(</span>
+      <span class="s1">Spannable text</span><span class="s2">,</span>
+      <span class="s1">BoringLayout.Metrics boring</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">width</span><span class="s2">,</span>
+      <span class="s1">YogaMeasureMode widthYogaMeasureMode</span><span class="s2">,</span>
+      <span class="s2">boolean </span><span class="s1">includeFontPadding</span><span class="s2">,</span>
+      <span class="s2">int </span><span class="s1">textBreakStrategy</span><span class="s2">,</span>
+      <span class="s2">int </span><span class="s1">hyphenationFrequency) {</span>
+    <span class="s1">Layout layout</span><span class="s2">;</span>
+    <span class="s2">int </span><span class="s1">spanLength = text.length()</span><span class="s2">;</span>
+    <span class="s2">boolean </span><span class="s1">unconstrainedWidth = widthYogaMeasureMode == YogaMeasureMode.UNDEFINED || width &lt; </span><span class="s5">0</span><span class="s2">;</span>
+    <span class="s2">float </span><span class="s1">desiredWidth =</span>
+        <span class="s1">boring == </span><span class="s2">null </span><span class="s1">? Layout.getDesiredWidth(text</span><span class="s2">, </span><span class="s1">sTextPaintInstance) : Float.NaN</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(boring == </span><span class="s2">null</span>
+        <span class="s1">&amp;&amp; (unconstrainedWidth</span>
+            <span class="s1">|| (!YogaConstants.isUndefined(desiredWidth) &amp;&amp; desiredWidth &lt;= width))) {</span>
+      <span class="s0">// Is used when the width is not known and the text is not boring, ie. if it contains</span>
+      <span class="s0">// unicode characters.</span>
+
+      <span class="s2">int </span><span class="s1">hintWidth = (</span><span class="s2">int</span><span class="s1">) Math.ceil(desiredWidth)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(Build.VERSION.SDK_INT &lt; Build.VERSION_CODES.M) {</span>
+        <span class="s1">layout =</span>
+            <span class="s2">new </span><span class="s1">StaticLayout(</span>
+                <span class="s1">text</span><span class="s2">,</span>
+                <span class="s1">sTextPaintInstance</span><span class="s2">,</span>
+                <span class="s1">hintWidth</span><span class="s2">,</span>
+                <span class="s1">Layout.Alignment.ALIGN_NORMAL</span><span class="s2">,</span>
+                <span class="s5">1.f</span><span class="s2">,</span>
+                <span class="s5">0.f</span><span class="s2">,</span>
+                <span class="s1">includeFontPadding)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">layout =</span>
+            <span class="s1">StaticLayout.Builder.obtain(text</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">spanLength</span><span class="s2">, </span><span class="s1">sTextPaintInstance</span><span class="s2">, </span><span class="s1">hintWidth)</span>
+                <span class="s1">.setAlignment(Layout.Alignment.ALIGN_NORMAL)</span>
+                <span class="s1">.setLineSpacing(</span><span class="s5">0.f</span><span class="s2">, </span><span class="s5">1.f</span><span class="s1">)</span>
+                <span class="s1">.setIncludePad(includeFontPadding)</span>
+                <span class="s1">.setBreakStrategy(textBreakStrategy)</span>
+                <span class="s1">.setHyphenationFrequency(hyphenationFrequency)</span>
+                <span class="s1">.build()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(boring != </span><span class="s2">null </span><span class="s1">&amp;&amp; (unconstrainedWidth || boring.width &lt;= width)) {</span>
+      <span class="s2">int </span><span class="s1">boringLayoutWidth = boring.width</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(boring.width &lt; </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+            <span class="s1">TAG</span><span class="s2">, new </span><span class="s1">ReactNoCrashSoftException(</span><span class="s6">&quot;Text width is invalid: &quot; </span><span class="s1">+ boring.width))</span><span class="s2">;</span>
+        <span class="s1">boringLayoutWidth = </span><span class="s5">0</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s0">// Is used for single-line, boring text when the width is either unknown or bigger</span>
+      <span class="s0">// than the width of the text.</span>
+      <span class="s1">layout =</span>
+          <span class="s1">BoringLayout.make(</span>
+              <span class="s1">text</span><span class="s2">,</span>
+              <span class="s1">sTextPaintInstance</span><span class="s2">,</span>
+              <span class="s1">boringLayoutWidth</span><span class="s2">,</span>
+              <span class="s1">Layout.Alignment.ALIGN_NORMAL</span><span class="s2">,</span>
+              <span class="s5">1.f</span><span class="s2">,</span>
+              <span class="s5">0.f</span><span class="s2">,</span>
+              <span class="s1">boring</span><span class="s2">,</span>
+              <span class="s1">includeFontPadding)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s0">// Is used for multiline, boring text and the width is known.</span>
+
+      <span class="s2">if </span><span class="s1">(Build.VERSION.SDK_INT &lt; Build.VERSION_CODES.M) {</span>
+        <span class="s1">layout =</span>
+            <span class="s2">new </span><span class="s1">StaticLayout(</span>
+                <span class="s1">text</span><span class="s2">,</span>
+                <span class="s1">sTextPaintInstance</span><span class="s2">,</span>
+                <span class="s1">(</span><span class="s2">int</span><span class="s1">) width</span><span class="s2">,</span>
+                <span class="s1">Layout.Alignment.ALIGN_NORMAL</span><span class="s2">,</span>
+                <span class="s5">1.f</span><span class="s2">,</span>
+                <span class="s5">0.f</span><span class="s2">,</span>
+                <span class="s1">includeFontPadding)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">StaticLayout.Builder builder =</span>
+            <span class="s1">StaticLayout.Builder.obtain(text</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">spanLength</span><span class="s2">, </span><span class="s1">sTextPaintInstance</span><span class="s2">, </span><span class="s1">(</span><span class="s2">int</span><span class="s1">) width)</span>
+                <span class="s1">.setAlignment(Layout.Alignment.ALIGN_NORMAL)</span>
+                <span class="s1">.setLineSpacing(</span><span class="s5">0.f</span><span class="s2">, </span><span class="s5">1.f</span><span class="s1">)</span>
+                <span class="s1">.setIncludePad(includeFontPadding)</span>
+                <span class="s1">.setBreakStrategy(textBreakStrategy)</span>
+                <span class="s1">.setHyphenationFrequency(hyphenationFrequency)</span><span class="s2">;</span>
+
+        <span class="s2">if </span><span class="s1">(Build.VERSION.SDK_INT &gt;= Build.VERSION_CODES.P) {</span>
+          <span class="s1">builder.setUseLineSpacingFromFallbacks(</span><span class="s2">true</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">layout = builder.build()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">layout</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public static long </span><span class="s1">measureText(</span>
+      <span class="s1">Context context</span><span class="s2">,</span>
+      <span class="s1">MapBuffer attributedString</span><span class="s2">,</span>
+      <span class="s1">MapBuffer paragraphAttributes</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">width</span><span class="s2">,</span>
+      <span class="s1">YogaMeasureMode widthYogaMeasureMode</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">height</span><span class="s2">,</span>
+      <span class="s1">YogaMeasureMode heightYogaMeasureMode</span><span class="s2">,</span>
+      <span class="s1">ReactTextViewManagerCallback reactTextViewManagerCallback</span><span class="s2">,</span>
+      <span class="s1">@Nullable </span><span class="s2">float</span><span class="s1">[] attachmentsPositions) {</span>
+
+    <span class="s0">// TODO(5578671): Handle text direction (see View#getTextDirectionHeuristic)</span>
+    <span class="s1">TextPaint textPaint = sTextPaintInstance</span><span class="s2">;</span>
+    <span class="s1">Spannable text</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(attributedString.contains(AS_KEY_CACHE_ID)) {</span>
+      <span class="s2">int </span><span class="s1">cacheId = attributedString.getInt(AS_KEY_CACHE_ID)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(ENABLE_MEASURE_LOGGING) {</span>
+        <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s6">&quot;Get cached spannable for cacheId[&quot; </span><span class="s1">+ cacheId + </span><span class="s6">&quot;]&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(sTagToSpannableCache.containsKey(cacheId)) {</span>
+        <span class="s1">text = sTagToSpannableCache.get(cacheId)</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(ENABLE_MEASURE_LOGGING) {</span>
+          <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s6">&quot;Text for spannable found for cacheId[&quot; </span><span class="s1">+ cacheId + </span><span class="s6">&quot;]: &quot; </span><span class="s1">+ text)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s2">if </span><span class="s1">(ENABLE_MEASURE_LOGGING) {</span>
+          <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s6">&quot;No cached spannable found for cacheId[&quot; </span><span class="s1">+ cacheId + </span><span class="s6">&quot;]&quot;</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s5">0</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">text = getOrCreateSpannableForText(context</span><span class="s2">, </span><span class="s1">attributedString</span><span class="s2">, </span><span class="s1">reactTextViewManagerCallback)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">int </span><span class="s1">textBreakStrategy =</span>
+        <span class="s1">TextAttributeProps.getTextBreakStrategy(</span>
+            <span class="s1">paragraphAttributes.getString(PA_KEY_TEXT_BREAK_STRATEGY))</span><span class="s2">;</span>
+    <span class="s2">boolean </span><span class="s1">includeFontPadding =</span>
+        <span class="s1">paragraphAttributes.contains(PA_KEY_INCLUDE_FONT_PADDING)</span>
+            <span class="s1">? paragraphAttributes.getBoolean(PA_KEY_INCLUDE_FONT_PADDING)</span>
+            <span class="s1">: DEFAULT_INCLUDE_FONT_PADDING</span><span class="s2">;</span>
+    <span class="s2">int </span><span class="s1">hyphenationFrequency =</span>
+        <span class="s1">TextAttributeProps.getHyphenationFrequency(</span>
+            <span class="s1">paragraphAttributes.getString(PA_KEY_HYPHENATION_FREQUENCY))</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(text == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s6">&quot;Spannable element has not been prepared in onBeforeLayout&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">BoringLayout.Metrics boring = BoringLayout.isBoring(text</span><span class="s2">, </span><span class="s1">textPaint)</span><span class="s2">;</span>
+    <span class="s1">Layout layout =</span>
+        <span class="s1">createLayout(</span>
+            <span class="s1">text</span><span class="s2">,</span>
+            <span class="s1">boring</span><span class="s2">,</span>
+            <span class="s1">width</span><span class="s2">,</span>
+            <span class="s1">widthYogaMeasureMode</span><span class="s2">,</span>
+            <span class="s1">includeFontPadding</span><span class="s2">,</span>
+            <span class="s1">textBreakStrategy</span><span class="s2">,</span>
+            <span class="s1">hyphenationFrequency)</span><span class="s2">;</span>
+
+    <span class="s2">int </span><span class="s1">maximumNumberOfLines =</span>
+        <span class="s1">paragraphAttributes.contains(PA_KEY_MAX_NUMBER_OF_LINES)</span>
+            <span class="s1">? paragraphAttributes.getInt(PA_KEY_MAX_NUMBER_OF_LINES)</span>
+            <span class="s1">: UNSET</span><span class="s2">;</span>
+
+    <span class="s2">int </span><span class="s1">calculatedLineCount =</span>
+        <span class="s1">maximumNumberOfLines == UNSET || maximumNumberOfLines == </span><span class="s5">0</span>
+            <span class="s1">? layout.getLineCount()</span>
+            <span class="s1">: Math.min(maximumNumberOfLines</span><span class="s2">, </span><span class="s1">layout.getLineCount())</span><span class="s2">;</span>
+
+    <span class="s0">// Instead of using `layout.getWidth()` (which may yield a significantly larger width for</span>
+    <span class="s0">// text that is wrapping), compute width using the longest line.</span>
+    <span class="s2">float </span><span class="s1">calculatedWidth = </span><span class="s5">0</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(widthYogaMeasureMode == YogaMeasureMode.EXACTLY) {</span>
+      <span class="s1">calculatedWidth = width</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">lineIndex = </span><span class="s5">0</span><span class="s2">; </span><span class="s1">lineIndex &lt; calculatedLineCount</span><span class="s2">; </span><span class="s1">lineIndex++) {</span>
+        <span class="s2">boolean </span><span class="s1">endsWithNewLine =</span>
+            <span class="s1">text.length() &gt; </span><span class="s5">0 </span><span class="s1">&amp;&amp; text.charAt(layout.getLineEnd(lineIndex) - </span><span class="s5">1</span><span class="s1">) == </span><span class="s6">'</span><span class="s2">\n</span><span class="s6">'</span><span class="s2">;</span>
+        <span class="s2">float </span><span class="s1">lineWidth =</span>
+            <span class="s1">endsWithNewLine ? layout.getLineMax(lineIndex) : layout.getLineWidth(lineIndex)</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(lineWidth &gt; calculatedWidth) {</span>
+          <span class="s1">calculatedWidth = lineWidth</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(widthYogaMeasureMode == YogaMeasureMode.AT_MOST &amp;&amp; calculatedWidth &gt; width) {</span>
+        <span class="s1">calculatedWidth = width</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Android 11+ introduces changes in text width calculation which leads to cases</span>
+    <span class="s0">// where the container is measured smaller than text. Math.ceil prevents it</span>
+    <span class="s0">// See T136756103 for investigation</span>
+    <span class="s2">if </span><span class="s1">(android.os.Build.VERSION.SDK_INT &gt; android.os.Build.VERSION_CODES.Q) {</span>
+      <span class="s1">calculatedWidth = (</span><span class="s2">float</span><span class="s1">) Math.ceil(calculatedWidth)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">float </span><span class="s1">calculatedHeight = height</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(heightYogaMeasureMode != YogaMeasureMode.EXACTLY) {</span>
+      <span class="s1">calculatedHeight = layout.getLineBottom(calculatedLineCount - </span><span class="s5">1</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(heightYogaMeasureMode == YogaMeasureMode.AT_MOST &amp;&amp; calculatedHeight &gt; height) {</span>
+        <span class="s1">calculatedHeight = height</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Calculate the positions of the attachments (views) that will be rendered inside the</span>
+    <span class="s0">// Spanned Text. The following logic is only executed when a text contains views inside.</span>
+    <span class="s0">// This follows a similar logic than used in pre-fabric (see ReactTextView.onLayout method).</span>
+    <span class="s2">int </span><span class="s1">attachmentIndex = </span><span class="s5">0</span><span class="s2">;</span>
+    <span class="s2">int </span><span class="s1">lastAttachmentFoundInSpan</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s5">0</span><span class="s2">; </span><span class="s1">i &lt; text.length()</span><span class="s2">; </span><span class="s1">i = lastAttachmentFoundInSpan) {</span>
+      <span class="s1">lastAttachmentFoundInSpan =</span>
+          <span class="s1">text.nextSpanTransition(i</span><span class="s2">, </span><span class="s1">text.length()</span><span class="s2">, </span><span class="s1">TextInlineViewPlaceholderSpan.</span><span class="s2">class</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">TextInlineViewPlaceholderSpan[] placeholders =</span>
+          <span class="s1">text.getSpans(i</span><span class="s2">, </span><span class="s1">lastAttachmentFoundInSpan</span><span class="s2">, </span><span class="s1">TextInlineViewPlaceholderSpan.</span><span class="s2">class</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">for </span><span class="s1">(TextInlineViewPlaceholderSpan placeholder : placeholders) {</span>
+        <span class="s2">int </span><span class="s1">start = text.getSpanStart(placeholder)</span><span class="s2">;</span>
+        <span class="s2">int </span><span class="s1">line = layout.getLineForOffset(start)</span><span class="s2">;</span>
+        <span class="s2">boolean </span><span class="s1">isLineTruncated = layout.getEllipsisCount(line) &gt; </span><span class="s5">0</span><span class="s2">;</span>
+        <span class="s0">// This truncation check works well on recent versions of Android (tested on 5.1.1 and</span>
+        <span class="s0">// 6.0.1) but not on Android 4.4.4. The reason is that getEllipsisCount is buggy on</span>
+        <span class="s0">// Android 4.4.4. Specifically, it incorrectly returns 0 if an inline view is the</span>
+        <span class="s0">// first thing to be truncated.</span>
+        <span class="s2">if </span><span class="s1">(!(isLineTruncated &amp;&amp; start &gt;= layout.getLineStart(line) + layout.getEllipsisStart(line))</span>
+            <span class="s1">|| start &gt;= layout.getLineEnd(line)) {</span>
+          <span class="s2">float </span><span class="s1">placeholderWidth = placeholder.getWidth()</span><span class="s2">;</span>
+          <span class="s2">float </span><span class="s1">placeholderHeight = placeholder.getHeight()</span><span class="s2">;</span>
+          <span class="s0">// Calculate if the direction of the placeholder character is Right-To-Left.</span>
+          <span class="s2">boolean </span><span class="s1">isRtlChar = layout.isRtlCharAt(start)</span><span class="s2">;</span>
+          <span class="s2">boolean </span><span class="s1">isRtlParagraph = layout.getParagraphDirection(line) == Layout.DIR_RIGHT_TO_LEFT</span><span class="s2">;</span>
+          <span class="s2">float </span><span class="s1">placeholderLeftPosition</span><span class="s2">;</span>
+          <span class="s0">// There's a bug on Samsung devices where calling getPrimaryHorizontal on</span>
+          <span class="s0">// the last offset in the layout will result in an endless loop. Work around</span>
+          <span class="s0">// this bug by avoiding getPrimaryHorizontal in that case.</span>
+          <span class="s2">if </span><span class="s1">(start == text.length() - </span><span class="s5">1</span><span class="s1">) {</span>
+            <span class="s2">boolean </span><span class="s1">endsWithNewLine =</span>
+                <span class="s1">text.length() &gt; </span><span class="s5">0 </span><span class="s1">&amp;&amp; text.charAt(layout.getLineEnd(line) - </span><span class="s5">1</span><span class="s1">) == </span><span class="s6">'</span><span class="s2">\n</span><span class="s6">'</span><span class="s2">;</span>
+            <span class="s2">float </span><span class="s1">lineWidth = endsWithNewLine ? layout.getLineMax(line) : layout.getLineWidth(line)</span><span class="s2">;</span>
+            <span class="s1">placeholderLeftPosition =</span>
+                <span class="s1">isRtlParagraph</span>
+                    <span class="s0">// Equivalent to `layout.getLineLeft(line)` but `getLineLeft` returns</span>
+                    <span class="s0">// incorrect</span>
+                    <span class="s0">// values when the paragraph is RTL and `setSingleLine(true)`.</span>
+                    <span class="s1">? calculatedWidth - lineWidth</span>
+                    <span class="s1">: layout.getLineRight(line) - placeholderWidth</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">// The direction of the paragraph may not be exactly the direction the string is</span>
+            <span class="s0">// heading</span>
+            <span class="s0">// in at the</span>
+            <span class="s0">// position of the placeholder. So, if the direction of the character is the same</span>
+            <span class="s0">// as the</span>
+            <span class="s0">// paragraph</span>
+            <span class="s0">// use primary, secondary otherwise.</span>
+            <span class="s2">boolean </span><span class="s1">characterAndParagraphDirectionMatch = isRtlParagraph == isRtlChar</span><span class="s2">;</span>
+            <span class="s1">placeholderLeftPosition =</span>
+                <span class="s1">characterAndParagraphDirectionMatch</span>
+                    <span class="s1">? layout.getPrimaryHorizontal(start)</span>
+                    <span class="s1">: layout.getSecondaryHorizontal(start)</span><span class="s2">;</span>
+            <span class="s2">if </span><span class="s1">(isRtlParagraph) {</span>
+              <span class="s0">// Adjust `placeholderLeftPosition` to work around an Android bug.</span>
+              <span class="s0">// The bug is when the paragraph is RTL and `setSingleLine(true)`, some layout</span>
+              <span class="s0">// methods such as `getPrimaryHorizontal`, `getSecondaryHorizontal`, and</span>
+              <span class="s0">// `getLineRight` return incorrect values. Their return values seem to be off</span>
+              <span class="s0">// by the same number of pixels so subtracting these values cancels out the</span>
+              <span class="s0">// error.</span>
+              <span class="s0">//</span>
+              <span class="s0">// The result is equivalent to bugless versions of</span>
+              <span class="s0">// `getPrimaryHorizontal`/`getSecondaryHorizontal`.</span>
+              <span class="s1">placeholderLeftPosition =</span>
+                  <span class="s1">calculatedWidth - (layout.getLineRight(line) - placeholderLeftPosition)</span><span class="s2">;</span>
+            <span class="s1">}</span>
+            <span class="s2">if </span><span class="s1">(isRtlChar) {</span>
+              <span class="s1">placeholderLeftPosition -= placeholderWidth</span><span class="s2">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+          <span class="s0">// Vertically align the inline view to the baseline of the line of text.</span>
+          <span class="s2">float </span><span class="s1">placeholderTopPosition = layout.getLineBaseline(line) - placeholderHeight</span><span class="s2">;</span>
+          <span class="s2">int </span><span class="s1">attachmentPosition = attachmentIndex * </span><span class="s5">2</span><span class="s2">;</span>
+
+          <span class="s0">// The attachment array returns the positions of each of the attachments as</span>
+          <span class="s1">attachmentsPositions[attachmentPosition] =</span>
+              <span class="s1">PixelUtil.toDIPFromPixel(placeholderTopPosition)</span><span class="s2">;</span>
+          <span class="s1">attachmentsPositions[attachmentPosition + </span><span class="s5">1</span><span class="s1">] =</span>
+              <span class="s1">PixelUtil.toDIPFromPixel(placeholderLeftPosition)</span><span class="s2">;</span>
+          <span class="s1">attachmentIndex++</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">float </span><span class="s1">widthInSP = PixelUtil.toDIPFromPixel(calculatedWidth)</span><span class="s2">;</span>
+    <span class="s2">float </span><span class="s1">heightInSP = PixelUtil.toDIPFromPixel(calculatedHeight)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(ENABLE_MEASURE_LOGGING) {</span>
+      <span class="s1">FLog.e(</span>
+          <span class="s1">TAG</span><span class="s2">,</span>
+          <span class="s6">&quot;TextMeasure call ('&quot;</span>
+              <span class="s1">+ text</span>
+              <span class="s1">+ </span><span class="s6">&quot;'): w: &quot;</span>
+              <span class="s1">+ calculatedWidth</span>
+              <span class="s1">+ </span><span class="s6">&quot; px - h: &quot;</span>
+              <span class="s1">+ calculatedHeight</span>
+              <span class="s1">+ </span><span class="s6">&quot; px - w : &quot;</span>
+              <span class="s1">+ widthInSP</span>
+              <span class="s1">+ </span><span class="s6">&quot; sp - h: &quot;</span>
+              <span class="s1">+ heightInSP</span>
+              <span class="s1">+ </span><span class="s6">&quot; sp&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">YogaMeasureOutput.make(widthInSP</span><span class="s2">, </span><span class="s1">heightInSP)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public static </span><span class="s1">WritableArray measureLines(</span>
+      <span class="s1">@NonNull Context context</span><span class="s2">,</span>
+      <span class="s1">MapBuffer attributedString</span><span class="s2">,</span>
+      <span class="s1">MapBuffer paragraphAttributes</span><span class="s2">,</span>
+      <span class="s2">float </span><span class="s1">width) {</span>
+
+    <span class="s1">Spannable text = getOrCreateSpannableForText(context</span><span class="s2">, </span><span class="s1">attributedString</span><span class="s2">, null</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">BoringLayout.Metrics boring = BoringLayout.isBoring(text</span><span class="s2">, </span><span class="s1">sTextPaintInstance)</span><span class="s2">;</span>
+
+    <span class="s2">int </span><span class="s1">textBreakStrategy =</span>
+        <span class="s1">TextAttributeProps.getTextBreakStrategy(</span>
+            <span class="s1">paragraphAttributes.getString(PA_KEY_TEXT_BREAK_STRATEGY))</span><span class="s2">;</span>
+    <span class="s2">boolean </span><span class="s1">includeFontPadding =</span>
+        <span class="s1">paragraphAttributes.contains(PA_KEY_INCLUDE_FONT_PADDING)</span>
+            <span class="s1">? paragraphAttributes.getBoolean(PA_KEY_INCLUDE_FONT_PADDING)</span>
+            <span class="s1">: DEFAULT_INCLUDE_FONT_PADDING</span><span class="s2">;</span>
+    <span class="s2">int </span><span class="s1">hyphenationFrequency =</span>
+        <span class="s1">TextAttributeProps.getTextBreakStrategy(</span>
+            <span class="s1">paragraphAttributes.getString(PA_KEY_HYPHENATION_FREQUENCY))</span><span class="s2">;</span>
+
+    <span class="s1">Layout layout =</span>
+        <span class="s1">createLayout(</span>
+            <span class="s1">text</span><span class="s2">,</span>
+            <span class="s1">boring</span><span class="s2">,</span>
+            <span class="s1">width</span><span class="s2">,</span>
+            <span class="s1">YogaMeasureMode.EXACTLY</span><span class="s2">,</span>
+            <span class="s1">includeFontPadding</span><span class="s2">,</span>
+            <span class="s1">textBreakStrategy</span><span class="s2">,</span>
+            <span class="s1">hyphenationFrequency)</span><span class="s2">;</span>
+    <span class="s2">return </span><span class="s1">FontMetricsUtil.getFontMetrics(text</span><span class="s2">, </span><span class="s1">layout</span><span class="s2">, </span><span class="s1">sTextPaintInstance</span><span class="s2">, </span><span class="s1">context)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

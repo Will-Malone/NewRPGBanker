@@ -1,0 +1,381 @@
+<html>
+<head>
+<title>WatchmanWatcher.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+WatchmanWatcher.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict-local</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">import type {WatcherOptions} from './common';</span>
+<span class="s0">import type {ChangeEventMetadata} from '../flow-types';</span>
+<span class="s0">import type {</span>
+  <span class="s0">Client,</span>
+  <span class="s0">WatchmanClockResponse,</span>
+  <span class="s0">WatchmanFileChange,</span>
+  <span class="s0">WatchmanQuery,</span>
+  <span class="s0">WatchmanSubscriptionEvent,</span>
+  <span class="s0">WatchmanSubscribeResponse,</span>
+  <span class="s0">WatchmanWatchResponse,</span>
+<span class="s0">} from 'fb-watchman';</span>
+
+<span class="s0">import * as common from './common';</span>
+<span class="s0">import RecrawlWarning from './RecrawlWarning';</span>
+<span class="s0">import assert from 'assert';</span>
+<span class="s0">import {createHash} from 'crypto';</span>
+<span class="s0">import EventEmitter from 'events';</span>
+<span class="s0">import watchman from 'fb-watchman';</span>
+<span class="s0">import invariant from 'invariant';</span>
+<span class="s0">import path from 'path';</span>
+
+<span class="s0">const debug = require('debug')('Metro:WatchmanWatcher');</span>
+
+<span class="s0">const CHANGE_EVENT = common.CHANGE_EVENT;</span>
+<span class="s0">const DELETE_EVENT = common.DELETE_EVENT;</span>
+<span class="s0">const ADD_EVENT = common.ADD_EVENT;</span>
+<span class="s0">const ALL_EVENT = common.ALL_EVENT;</span>
+<span class="s0">const SUB_PREFIX = 'metro-file-map';</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Watches `dir`.</span>
+ <span class="s0">*/</span>
+<span class="s0">export default class WatchmanWatcher extends EventEmitter {</span>
+  <span class="s0">client: Client;</span>
+  <span class="s0">dot: boolean;</span>
+  <span class="s0">doIgnore: string =&gt; boolean;</span>
+  <span class="s0">globs: $ReadOnlyArray&lt;string&gt;;</span>
+  <span class="s0">root: string;</span>
+  <span class="s0">subscriptionName: string;</span>
+  <span class="s0">watchProjectInfo: ?$ReadOnly&lt;{</span>
+    <span class="s0">relativePath: string,</span>
+    <span class="s0">root: string,</span>
+  <span class="s0">}&gt;;</span>
+  <span class="s0">watchmanDeferStates: $ReadOnlyArray&lt;string&gt;;</span>
+  <span class="s0">#deferringStates: Set&lt;string&gt; = new Set();</span>
+
+  <span class="s0">constructor(dir: string, opts: WatcherOptions) {</span>
+    <span class="s0">super();</span>
+
+    <span class="s0">common.assignOptions(this, opts);</span>
+    <span class="s0">this.root = path.resolve(dir);</span>
+
+    <span class="s0">// Use a unique subscription name per process per watched directory</span>
+    <span class="s0">const watchKey = createHash('md5').update(this.root).digest('hex');</span>
+    <span class="s0">const readablePath = this.root</span>
+      <span class="s0">.replace(/[\/\\]/g, '-') // \ and / to -</span>
+      <span class="s0">.replace(/[^\-\w]/g, ''); // Remove non-word/hyphen</span>
+    <span class="s0">this.subscriptionName = `${SUB_PREFIX}-${process.pid}-${readablePath}-${watchKey}`;</span>
+
+    <span class="s0">this._init();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Run the watchman `watch` command on the root and subscribe to changes.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_init() {</span>
+    <span class="s0">if (this.client) {</span>
+      <span class="s0">this.client.removeAllListeners();</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const self = this;</span>
+    <span class="s0">this.client = new watchman.Client();</span>
+    <span class="s0">this.client.on('error', error =&gt; {</span>
+      <span class="s0">self.emit('error', error);</span>
+    <span class="s0">});</span>
+    <span class="s0">this.client.on('subscription', changeEvent =&gt;</span>
+      <span class="s0">this._handleChangeEvent(changeEvent),</span>
+    <span class="s0">);</span>
+    <span class="s0">this.client.on('end', () =&gt; {</span>
+      <span class="s0">console.warn(</span>
+        <span class="s0">'[metro-file-map] Warning: Lost connection to Watchman, reconnecting..',</span>
+      <span class="s0">);</span>
+      <span class="s0">self._init();</span>
+    <span class="s0">});</span>
+
+    <span class="s0">this.watchProjectInfo = null;</span>
+
+    <span class="s0">function getWatchRoot() {</span>
+      <span class="s0">return self.watchProjectInfo ? self.watchProjectInfo.root : self.root;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">function onWatchProject(error: ?Error, resp: WatchmanWatchResponse) {</span>
+      <span class="s0">if (handleError(self, error)) {</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+      <span class="s0">debug('Received watch-project response: %s', resp.relative_path);</span>
+
+      <span class="s0">handleWarning(resp);</span>
+
+      <span class="s0">self.watchProjectInfo = {</span>
+        <span class="s0">relativePath: resp.relative_path ? resp.relative_path : '',</span>
+        <span class="s0">root: resp.watch,</span>
+      <span class="s0">};</span>
+
+      <span class="s0">self.client.command(['clock', getWatchRoot()], onClock);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">function onClock(error: ?Error, resp: WatchmanClockResponse) {</span>
+      <span class="s0">if (handleError(self, error)) {</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">debug('Received clock response: %s', resp.clock);</span>
+      <span class="s0">const watchProjectInfo = self.watchProjectInfo;</span>
+
+      <span class="s0">invariant(</span>
+        <span class="s0">watchProjectInfo != null,</span>
+        <span class="s0">'watch-project response should have been set before clock response',</span>
+      <span class="s0">);</span>
+
+      <span class="s0">handleWarning(resp);</span>
+
+      <span class="s0">const options: WatchmanQuery = {</span>
+        <span class="s0">fields: ['name', 'exists', 'new', 'type', 'size', 'mtime_ms'],</span>
+        <span class="s0">since: resp.clock,</span>
+        <span class="s0">defer: self.watchmanDeferStates,</span>
+        <span class="s0">relative_root: watchProjectInfo.relativePath,</span>
+      <span class="s0">};</span>
+
+      <span class="s0">// Make sure we honor the dot option if even we're not using globs.</span>
+      <span class="s0">if (self.globs.length === 0 &amp;&amp; !self.dot) {</span>
+        <span class="s0">options.expression = [</span>
+          <span class="s0">'match',</span>
+          <span class="s0">'**',</span>
+          <span class="s0">'wholename',</span>
+          <span class="s0">{</span>
+            <span class="s0">includedotfiles: false,</span>
+          <span class="s0">},</span>
+        <span class="s0">];</span>
+      <span class="s0">}</span>
+
+      <span class="s0">self.client.command(</span>
+        <span class="s0">['subscribe', getWatchRoot(), self.subscriptionName, options],</span>
+        <span class="s0">onSubscribe,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const onSubscribe = (error: ?Error, resp: WatchmanSubscribeResponse) =&gt; {</span>
+      <span class="s0">if (handleError(self, error)) {</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+      <span class="s0">debug('Received subscribe response: %s', resp.subscribe);</span>
+
+      <span class="s0">handleWarning(resp);</span>
+
+      <span class="s0">for (const state of resp['asserted-states']) {</span>
+        <span class="s0">this.#deferringStates.add(state);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">self.emit('ready');</span>
+    <span class="s0">};</span>
+
+    <span class="s0">self.client.command(['watch-project', getWatchRoot()], onWatchProject);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Handles a change event coming from the subscription.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_handleChangeEvent(resp: WatchmanSubscriptionEvent) {</span>
+    <span class="s0">debug(</span>
+      <span class="s0">'Received subscription response: %s (fresh: %s, files: %s, enter: %s, leave: %s)',</span>
+      <span class="s0">resp.subscription,</span>
+      <span class="s0">resp.is_fresh_instance,</span>
+      <span class="s0">resp.files?.length,</span>
+      <span class="s0">resp['state-enter'],</span>
+      <span class="s0">resp['state-leave'],</span>
+    <span class="s0">);</span>
+
+    <span class="s0">assert.equal(</span>
+      <span class="s0">resp.subscription,</span>
+      <span class="s0">this.subscriptionName,</span>
+      <span class="s0">'Invalid subscription event.',</span>
+    <span class="s0">);</span>
+
+    <span class="s0">if (resp.is_fresh_instance) {</span>
+      <span class="s0">this.emit('fresh_instance');</span>
+    <span class="s0">}</span>
+    <span class="s0">if (resp.is_fresh_instance) {</span>
+      <span class="s0">this.emit('fresh_instance');</span>
+    <span class="s0">}</span>
+    <span class="s0">if (Array.isArray(resp.files)) {</span>
+      <span class="s0">resp.files.forEach(change =&gt; this._handleFileChange(change));</span>
+    <span class="s0">}</span>
+    <span class="s0">const {'state-enter': stateEnter, 'state-leave': stateLeave} = resp;</span>
+    <span class="s0">if (</span>
+      <span class="s0">stateEnter != null &amp;&amp;</span>
+      <span class="s0">(this.watchmanDeferStates ?? []).includes(stateEnter)</span>
+    <span class="s0">) {</span>
+      <span class="s0">this.#deferringStates.add(stateEnter);</span>
+      <span class="s0">debug(</span>
+        <span class="s0">'Watchman reports &quot;%s&quot; just started. Filesystem notifications are paused.',</span>
+        <span class="s0">stateEnter,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s0">if (</span>
+      <span class="s0">stateLeave != null &amp;&amp;</span>
+      <span class="s0">(this.watchmanDeferStates ?? []).includes(stateLeave)</span>
+    <span class="s0">) {</span>
+      <span class="s0">this.#deferringStates.delete(stateLeave);</span>
+      <span class="s0">debug(</span>
+        <span class="s0">'Watchman reports &quot;%s&quot; ended. Filesystem notifications resumed.',</span>
+        <span class="s0">stateLeave,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Handles a single change event record.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_handleFileChange(changeDescriptor: WatchmanFileChange) {</span>
+    <span class="s0">const self = this;</span>
+    <span class="s0">const watchProjectInfo = self.watchProjectInfo;</span>
+
+    <span class="s0">invariant(</span>
+      <span class="s0">watchProjectInfo != null,</span>
+      <span class="s0">'watch-project response should have been set before receiving subscription events',</span>
+    <span class="s0">);</span>
+
+    <span class="s0">const {</span>
+      <span class="s0">name: relativePath,</span>
+      <span class="s0">new: isNew = false,</span>
+      <span class="s0">exists = false,</span>
+      <span class="s0">type,</span>
+      <span class="s0">mtime_ms,</span>
+      <span class="s0">size,</span>
+    <span class="s0">} = changeDescriptor;</span>
+
+    <span class="s0">debug(</span>
+      <span class="s0">'Handling change to: %s (new: %s, exists: %s, type: %s)',</span>
+      <span class="s0">relativePath,</span>
+      <span class="s0">isNew,</span>
+      <span class="s0">exists,</span>
+      <span class="s0">type,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">// Ignore files of an unrecognized type</span>
+    <span class="s0">if (type != null &amp;&amp; !(type === 'f' || type === 'd' || type === 'l')) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (</span>
+      <span class="s0">!common.isIncluded(</span>
+        <span class="s0">type,</span>
+        <span class="s0">this.globs,</span>
+        <span class="s0">this.dot,</span>
+        <span class="s0">this.doIgnore,</span>
+        <span class="s0">relativePath,</span>
+      <span class="s0">)</span>
+    <span class="s0">) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (!exists) {</span>
+      <span class="s0">self._emitEvent(DELETE_EVENT, relativePath, self.root);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">const eventType = isNew ? ADD_EVENT : CHANGE_EVENT;</span>
+      <span class="s0">invariant(</span>
+        <span class="s0">type != null &amp;&amp; mtime_ms != null &amp;&amp; size != null,</span>
+        <span class="s0">'Watchman file change event for &quot;%s&quot; missing some requested metadata. ' +</span>
+          <span class="s0">'Got type: %s, mtime_ms: %s, size: %s',</span>
+        <span class="s0">relativePath,</span>
+        <span class="s0">type,</span>
+        <span class="s0">mtime_ms,</span>
+        <span class="s0">size,</span>
+      <span class="s0">);</span>
+
+      <span class="s0">if (</span>
+        <span class="s0">// Change event on dirs are mostly useless.</span>
+        <span class="s0">!(type === 'd' &amp;&amp; eventType === CHANGE_EVENT)</span>
+      <span class="s0">) {</span>
+        <span class="s0">const mtime = Number(mtime_ms);</span>
+        <span class="s0">self._emitEvent(eventType, relativePath, self.root, {</span>
+          <span class="s0">modifiedTime: mtime !== 0 ? mtime : null,</span>
+          <span class="s0">size,</span>
+          <span class="s0">type,</span>
+        <span class="s0">});</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Dispatches the event.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_emitEvent(</span>
+    <span class="s0">eventType: string,</span>
+    <span class="s0">filepath: string,</span>
+    <span class="s0">root: string,</span>
+    <span class="s0">changeMetadata?: ChangeEventMetadata,</span>
+  <span class="s0">) {</span>
+    <span class="s0">this.emit(eventType, filepath, root, changeMetadata);</span>
+    <span class="s0">this.emit(ALL_EVENT, eventType, filepath, root, changeMetadata);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Closes the watcher.</span>
+   <span class="s0">*/</span>
+  <span class="s0">async close() {</span>
+    <span class="s0">this.client.removeAllListeners();</span>
+    <span class="s0">this.client.end();</span>
+    <span class="s0">this.#deferringStates.clear();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getPauseReason(): ?string {</span>
+    <span class="s0">if (this.#deferringStates.size) {</span>
+      <span class="s0">const states = [...this.#deferringStates];</span>
+      <span class="s0">if (states.length === 1) {</span>
+        <span class="s0">return `The watch is in the '${states[0]}' state.`;</span>
+      <span class="s0">}</span>
+      <span class="s0">return `The watch is in the ${states</span>
+        <span class="s0">.slice(0, -1)</span>
+        <span class="s0">.map(s =&gt; `'${s}'`)</span>
+        <span class="s0">.join(', ')} and '${states[states.length - 1]}' states.`;</span>
+    <span class="s0">}</span>
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Handles an error and returns true if exists.</span>
+ <span class="s0">*/</span>
+<span class="s0">function handleError(emitter: EventEmitter, error: ?Error) {</span>
+  <span class="s0">if (error != null) {</span>
+    <span class="s0">emitter.emit('error', error);</span>
+    <span class="s0">return true;</span>
+  <span class="s0">} else {</span>
+    <span class="s0">return false;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Handles a warning in the watchman resp object.</span>
+ <span class="s0">*/</span>
+<span class="s0">function handleWarning(resp: $ReadOnly&lt;{warning?: mixed, ...}&gt;) {</span>
+  <span class="s0">if ('warning' in resp) {</span>
+    <span class="s0">if (RecrawlWarning.isRecrawlWarningDupe(resp.warning)) {</span>
+      <span class="s0">return true;</span>
+    <span class="s0">}</span>
+    <span class="s0">console.warn(resp.warning);</span>
+    <span class="s0">return true;</span>
+  <span class="s0">} else {</span>
+    <span class="s0">return false;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+</pre>
+</body>
+</html>

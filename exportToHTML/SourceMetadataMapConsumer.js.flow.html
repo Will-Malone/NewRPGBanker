@@ -1,0 +1,250 @@
+<html>
+<head>
+<title>SourceMetadataMapConsumer.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+SourceMetadataMapConsumer.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">BasicSourceMap,</span>
+  <span class="s0">FBSourceFunctionMap,</span>
+  <span class="s0">FBSourceMetadata,</span>
+  <span class="s0">FBSourcesArray,</span>
+  <span class="s0">IndexMap,</span>
+  <span class="s0">MixedSourceMap,</span>
+<span class="s0">} from 'metro-source-map';</span>
+
+<span class="s0">const {normalizeSourcePath} = require('metro-source-map');</span>
+<span class="s0">const vlq = require('vlq');</span>
+
+<span class="s0">const METADATA_FIELD_FUNCTIONS = 0;</span>
+
+<span class="s0">type Position = {</span>
+  <span class="s0">+line: number,</span>
+  <span class="s0">+column: number,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+<span class="s0">type FunctionMapping = {</span>
+  <span class="s0">+line: number,</span>
+  <span class="s0">+column: number,</span>
+  <span class="s0">+name: string,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+<span class="s0">type SourceNameNormalizer = (string, {+sourceRoot?: ?string, ...}) =&gt; string;</span>
+<span class="s0">type MetadataMap = {[source: string]: ?FBSourceMetadata, ...};</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Consumes the `x_facebook_sources` metadata field from a source map and</span>
+ <span class="s0">* exposes various queries on it.</span>
+ <span class="s0">*</span>
+ <span class="s0">* By default, source names are normalized using the same logic that the</span>
+ <span class="s0">* `source-map@0.5.6` package uses internally. This is crucial for keeping the</span>
+ <span class="s0">* sources list in sync with a `SourceMapConsumer` instance.</span>
+
+ <span class="s0">* If you're using this with a different source map reader (e.g. one that</span>
+ <span class="s0">* doesn't normalize source names at all), you can switch out the normalization</span>
+ <span class="s0">* function in the constructor, e.g.</span>
+ <span class="s0">*</span>
+ <span class="s0">*     new SourceMetadataMapConsumer(map, source =&gt; source) // Don't normalize</span>
+ <span class="s0">*/</span>
+<span class="s0">class SourceMetadataMapConsumer {</span>
+  <span class="s0">constructor(</span>
+    <span class="s0">map: MixedSourceMap,</span>
+    <span class="s0">normalizeSourceFn: SourceNameNormalizer = normalizeSourcePath,</span>
+  <span class="s0">) {</span>
+    <span class="s0">this._sourceMap = map;</span>
+    <span class="s0">this._decodedFunctionMapCache = new Map();</span>
+    <span class="s0">this._normalizeSource = normalizeSourceFn;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_sourceMap: MixedSourceMap;</span>
+  <span class="s0">_decodedFunctionMapCache: Map&lt;string, ?$ReadOnlyArray&lt;FunctionMapping&gt;&gt;;</span>
+  <span class="s0">_normalizeSource: SourceNameNormalizer;</span>
+  <span class="s0">_metadataBySource: ?MetadataMap;</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Retrieves a human-readable name for the function enclosing a particular</span>
+   <span class="s0">* source location.</span>
+   <span class="s0">*</span>
+   <span class="s0">* When used with the `source-map` package, you'll first use</span>
+   <span class="s0">* `SourceMapConsumer#originalPositionFor` to retrieve a source location,</span>
+   <span class="s0">* then pass that location to `functionNameFor`.</span>
+   <span class="s0">*/</span>
+  <span class="s0">functionNameFor({</span>
+    <span class="s0">line,</span>
+    <span class="s0">column,</span>
+    <span class="s0">source,</span>
+  <span class="s0">}: Position &amp; {+source: ?string, ...}): ?string {</span>
+    <span class="s0">if (source &amp;&amp; line != null &amp;&amp; column != null) {</span>
+      <span class="s0">const mappings = this._getFunctionMappings(source);</span>
+      <span class="s0">if (mappings) {</span>
+        <span class="s0">const mapping = findEnclosingMapping(mappings, {line, column});</span>
+        <span class="s0">if (mapping) {</span>
+          <span class="s0">return mapping.name;</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Returns this map's source metadata as a new array with the same order as</span>
+   <span class="s0">* `sources`.</span>
+   <span class="s0">*</span>
+   <span class="s0">* This array can be used as the `x_facebook_sources` field of a map whose</span>
+   <span class="s0">* `sources` field is the array that was passed into this method.</span>
+   <span class="s0">*/</span>
+  <span class="s0">toArray(sources: $ReadOnlyArray&lt;string&gt;): FBSourcesArray {</span>
+    <span class="s0">const metadataBySource = this._getMetadataBySource();</span>
+    <span class="s0">const encoded = [];</span>
+    <span class="s0">for (const source of sources) {</span>
+      <span class="s0">encoded.push(metadataBySource[source] || null);</span>
+    <span class="s0">}</span>
+    <span class="s0">return encoded;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Prepares and caches a lookup table of metadata by source name.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_getMetadataBySource(): MetadataMap {</span>
+    <span class="s0">if (!this._metadataBySource) {</span>
+      <span class="s0">this._metadataBySource = this._getMetadataObjectsBySourceNames(</span>
+        <span class="s0">this._sourceMap,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return this._metadataBySource;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Decodes the function name mappings for the given source if needed, and</span>
+   <span class="s0">* retrieves a sorted, searchable array of mappings.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_getFunctionMappings(source: string): ?$ReadOnlyArray&lt;FunctionMapping&gt; {</span>
+    <span class="s0">if (this._decodedFunctionMapCache.has(source)) {</span>
+      <span class="s0">return this._decodedFunctionMapCache.get(source);</span>
+    <span class="s0">}</span>
+    <span class="s0">let parsedFunctionMap = null;</span>
+    <span class="s0">const metadataBySource = this._getMetadataBySource();</span>
+    <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+    <span class="s0">if (Object.prototype.hasOwnProperty.call(metadataBySource, source)) {</span>
+      <span class="s0">const metadata = metadataBySource[source] || [];</span>
+      <span class="s0">parsedFunctionMap = decodeFunctionMap(metadata[METADATA_FIELD_FUNCTIONS]);</span>
+    <span class="s0">}</span>
+    <span class="s0">this._decodedFunctionMapCache.set(source, parsedFunctionMap);</span>
+    <span class="s0">return parsedFunctionMap;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Collects source metadata from the given map using the current source name</span>
+   <span class="s0">* normalization function. Handles both index maps (with sections) and plain</span>
+   <span class="s0">* maps.</span>
+   <span class="s0">*</span>
+   <span class="s0">* NOTE: If any sources are repeated in the map (which shouldn't happen in</span>
+   <span class="s0">* Metro, but is technically possible because of index maps) we only keep the</span>
+   <span class="s0">* metadata from the last occurrence of any given source.</span>
+   <span class="s0">*/</span>
+  <span class="s0">_getMetadataObjectsBySourceNames(map: MixedSourceMap): MetadataMap {</span>
+    <span class="s0">// eslint-disable-next-line lint/strictly-null</span>
+    <span class="s0">if (map.mappings === undefined) {</span>
+      <span class="s0">const indexMap: IndexMap = map;</span>
+      <span class="s0">return Object.assign(</span>
+        <span class="s0">{},</span>
+        <span class="s0">...indexMap.sections.map(section =&gt;</span>
+          <span class="s0">this._getMetadataObjectsBySourceNames(section.map),</span>
+        <span class="s0">),</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if ('x_facebook_sources' in map) {</span>
+      <span class="s0">const basicMap: BasicSourceMap = map;</span>
+      <span class="s0">return (basicMap.x_facebook_sources || []).reduce&lt;{</span>
+        <span class="s0">[string]: ?FBSourceMetadata,</span>
+      <span class="s0">}&gt;((acc, metadata, index) =&gt; {</span>
+        <span class="s0">let source = basicMap.sources[index];</span>
+        <span class="s0">if (source != null) {</span>
+          <span class="s0">source = this._normalizeSource(source, basicMap);</span>
+          <span class="s0">acc[source] = metadata;</span>
+        <span class="s0">}</span>
+        <span class="s0">return acc;</span>
+      <span class="s0">}, {});</span>
+    <span class="s0">}</span>
+    <span class="s0">return {};</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function decodeFunctionMap(</span>
+  <span class="s0">functionMap: ?FBSourceFunctionMap,</span>
+<span class="s0">): $ReadOnlyArray&lt;FunctionMapping&gt; {</span>
+  <span class="s0">if (!functionMap) {</span>
+    <span class="s0">return [];</span>
+  <span class="s0">}</span>
+  <span class="s0">const parsed = [];</span>
+  <span class="s0">let line = 1;</span>
+  <span class="s0">let nameIndex = 0;</span>
+  <span class="s0">for (const lineMappings of functionMap.mappings.split(';')) {</span>
+    <span class="s0">let column = 0;</span>
+    <span class="s0">for (const mapping of lineMappings.split(',')) {</span>
+      <span class="s0">const [columnDelta, nameDelta, lineDelta = 0] = vlq.decode(mapping);</span>
+      <span class="s0">line += lineDelta;</span>
+      <span class="s0">nameIndex += nameDelta;</span>
+      <span class="s0">column += columnDelta;</span>
+      <span class="s0">parsed.push({line, column, name: functionMap.names[nameIndex]});</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s0">return parsed;</span>
+<span class="s0">}</span>
+
+<span class="s0">function findEnclosingMapping(</span>
+  <span class="s0">mappings: $ReadOnlyArray&lt;FunctionMapping&gt;,</span>
+  <span class="s0">target: Position,</span>
+<span class="s0">): ?FunctionMapping {</span>
+  <span class="s0">let first = 0;</span>
+  <span class="s0">let it = 0;</span>
+  <span class="s0">let count = mappings.length;</span>
+  <span class="s0">let step;</span>
+  <span class="s0">while (count &gt; 0) {</span>
+    <span class="s0">it = first;</span>
+    <span class="s0">step = Math.floor(count / 2);</span>
+    <span class="s0">it += step;</span>
+    <span class="s0">if (comparePositions(target, mappings[it]) &gt;= 0) {</span>
+      <span class="s0">first = ++it;</span>
+      <span class="s0">count -= step + 1;</span>
+    <span class="s0">} else {</span>
+      <span class="s0">count = step;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s0">return first ? mappings[first - 1] : null;</span>
+<span class="s0">}</span>
+
+<span class="s0">function comparePositions(a: Position, b: Position): number {</span>
+  <span class="s0">if (a.line === b.line) {</span>
+    <span class="s0">return a.column - b.column;</span>
+  <span class="s0">}</span>
+  <span class="s0">return a.line - b.line;</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = SourceMetadataMapConsumer;</span>
+</pre>
+</body>
+</html>

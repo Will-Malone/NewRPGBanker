@@ -1,0 +1,827 @@
+<html>
+<head>
+<title>RCTProfile.m</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTProfile.m</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTProfile.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;dlfcn.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;mach/mach.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;objc/message.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;objc/runtime.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;stdatomic.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;UIKit/UIKit.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTAssert.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge+Private.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTComponentData.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTDefines.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTLog.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTModuleData.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTReloadCommand.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUIManager.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUIManagerUtils.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUtils.h&quot;</span>
+
+<span class="s1">NSString *</span><span class="s4">const </span><span class="s1">RCTProfileDidStartProfiling = </span><span class="s4">@</span><span class="s3">&quot;RCTProfileDidStartProfiling&quot;</span><span class="s4">;</span>
+<span class="s1">NSString *</span><span class="s4">const </span><span class="s1">RCTProfileDidEndProfiling = </span><span class="s4">@</span><span class="s3">&quot;RCTProfileDidEndProfiling&quot;</span><span class="s4">;</span>
+
+<span class="s4">const </span><span class="s1">uint64_t RCTProfileTagAlways = </span><span class="s5">1L </span><span class="s1">&lt;&lt; </span><span class="s5">0</span><span class="s4">;</span>
+
+<span class="s2">#if </span><span class="s1">RCT_PROFILE</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Constants</span>
+
+<span class="s4">static </span><span class="s1">NSString *</span><span class="s4">const </span><span class="s1">kProfileTraceEvents = </span><span class="s4">@</span><span class="s3">&quot;traceEvents&quot;</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">NSString *</span><span class="s4">const </span><span class="s1">kProfileSamples = </span><span class="s4">@</span><span class="s3">&quot;samples&quot;</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">NSString *</span><span class="s4">const </span><span class="s1">kProfilePrefix = </span><span class="s4">@</span><span class="s3">&quot;rct_profile_&quot;</span><span class="s4">;</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Variables</span>
+
+<span class="s4">static </span><span class="s1">atomic_bool RCTProfileProfiling = ATOMIC_VAR_INIT(NO)</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">NSDictionary *RCTProfileInfo</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">NSMutableDictionary *RCTProfileOngoingEvents</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">NSTimeInterval RCTProfileStartTime</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">NSUInteger RCTProfileEventID = </span><span class="s5">0</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">CADisplayLink *RCTProfileDisplayLink</span><span class="s4">;</span>
+<span class="s4">static __weak </span><span class="s1">RCTBridge *_RCTProfilingBridge</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">UIWindow *RCTProfileControlsWindow</span><span class="s4">;</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Macros</span>
+
+<span class="s2">#define </span><span class="s1">RCTProfileAddEvent(type</span><span class="s4">, </span><span class="s1">props...) \ 
+  [RCTProfileInfo[type] addObject:</span><span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;pid&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">([[NSProcessInfo processInfo] processIdentifier])</span><span class="s4">, </span><span class="s1">props}]</span><span class="s4">;</span>
+
+<span class="s2">#define </span><span class="s1">CHECK(...)                \ 
+  </span><span class="s4">if </span><span class="s1">(!RCTProfileIsProfiling()) { \ 
+    </span><span class="s4">return </span><span class="s1">__VA_ARGS__</span><span class="s4">;           </span><span class="s1">\ 
+  }</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - systrace glue code</span>
+
+<span class="s4">static </span><span class="s1">RCTProfileCallbacks *callbacks</span><span class="s4">;</span>
+<span class="s4">static char </span><span class="s1">*systrace_buffer</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">systrace_arg_t *newSystraceArgsFromDictionary(NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">NSString *&gt; *args)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(args.count == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">NULL</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">systrace_arg_t *systrace_args = malloc(</span><span class="s4">sizeof</span><span class="s1">(systrace_arg_t) * args.count)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(systrace_args) {</span>
+    <span class="s1">__block size_t i = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">[args enumerateKeysAndObjectsUsingBlock:^(NSString *key</span><span class="s4">, </span><span class="s1">NSString *value</span><span class="s4">, </span><span class="s1">__unused BOOL *stop) {</span>
+      <span class="s1">systrace_args[i].key = [key UTF8String]</span><span class="s4">;</span>
+      <span class="s1">systrace_args[i].key_len = [key length]</span><span class="s4">;</span>
+      <span class="s1">systrace_args[i].value = [value UTF8String]</span><span class="s4">;</span>
+      <span class="s1">systrace_args[i].value_len = [value length]</span><span class="s4">;</span>
+      <span class="s1">i++</span><span class="s4">;</span>
+    <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">systrace_args</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileRegisterCallbacks(RCTProfileCallbacks *cb)</span>
+<span class="s1">{</span>
+  <span class="s1">callbacks = cb</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private Helpers</span>
+
+<span class="s4">static </span><span class="s1">RCTBridge *RCTProfilingBridge(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_RCTProfilingBridge ?: [RCTBridge currentBridge]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSNumber *RCTProfileTimestamp(NSTimeInterval timestamp)</span>
+<span class="s1">{</span>
+  <span class="s4">return @</span><span class="s1">((timestamp - RCTProfileStartTime) * </span><span class="s5">1e6</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSString *RCTProfileMemory(vm_size_t memory)</span>
+<span class="s1">{</span>
+  <span class="s4">double </span><span class="s1">mem = ((</span><span class="s4">double</span><span class="s1">)memory) / </span><span class="s5">1024 </span><span class="s1">/ </span><span class="s5">1024</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;%.2lfmb&quot;</span><span class="s4">, </span><span class="s1">mem]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSDictionary *RCTProfileGetMemoryUsage(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">struct </span><span class="s1">task_basic_info info</span><span class="s4">;</span>
+  <span class="s1">mach_msg_type_number_t size = </span><span class="s4">sizeof</span><span class="s1">(info)</span><span class="s4">;</span>
+  <span class="s1">kern_return_t kerr = task_info(mach_task_self()</span><span class="s4">, </span><span class="s1">TASK_BASIC_INFO</span><span class="s4">, </span><span class="s1">(task_info_t)&amp;info</span><span class="s4">, </span><span class="s1">&amp;size)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(kerr == KERN_SUCCESS) {</span>
+    <span class="s4">return @</span><span class="s1">{</span>
+      <span class="s4">@</span><span class="s3">&quot;suspend_count&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(info.suspend_count)</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;virtual_size&quot; </span><span class="s1">: RCTProfileMemory(info.virtual_size)</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;resident_size&quot; </span><span class="s1">: RCTProfileMemory(info.resident_size)</span><span class="s4">,</span>
+    <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return @</span><span class="s1">{}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Module hooks</span>
+
+<span class="s4">static const char </span><span class="s1">*RCTProfileProxyClassName(Class </span><span class="s4">class</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[kProfilePrefix stringByAppendingString:NSStringFromClass(</span><span class="s4">class</span><span class="s1">)].UTF8String</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">dispatch_group_t RCTProfileGetUnhookGroup(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">dispatch_group_t unhookGroup</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">unhookGroup = dispatch_group_create()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">unhookGroup</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// Used by RCTProfileTrampoline assembly file to call libc`malloc</span>
+<span class="s1">RCT_EXTERN </span><span class="s4">void </span><span class="s1">*RCTProfileMalloc(size_t size)</span><span class="s4">;</span>
+<span class="s4">void </span><span class="s1">*RCTProfileMalloc(size_t size)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">malloc(size)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// Used by RCTProfileTrampoline assembly file to call libc`free</span>
+<span class="s1">RCT_EXTERN </span><span class="s4">void </span><span class="s1">RCTProfileFree(</span><span class="s4">void </span><span class="s1">*buf)</span><span class="s4">;</span>
+<span class="s4">void </span><span class="s1">RCTProfileFree(</span><span class="s4">void </span><span class="s1">*buf)</span>
+<span class="s1">{</span>
+  <span class="s1">free(buf)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXTERN IMP RCTProfileGetImplementation(id obj</span><span class="s4">, </span><span class="s1">SEL cmd)</span><span class="s4">;</span>
+<span class="s1">IMP RCTProfileGetImplementation(id obj</span><span class="s4">, </span><span class="s1">SEL cmd)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">class_getMethodImplementation([obj </span><span class="s4">class</span><span class="s1">]</span><span class="s4">, </span><span class="s1">cmd)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * For the profiling we have to execute some code before and after every 
+ * function being profiled, the only way of doing that with pure Objective-C is 
+ * by using `-forwardInvocation:`, which is slow and could skew the profile 
+ * results. 
+ * 
+ * The alternative in assembly is much simpler, we just need to store all the 
+ * state at the beginning of the function, start the profiler, restore all the 
+ * state, call the actual function we want to profile and stop the profiler. 
+ * 
+ * The implementation can be found in RCTProfileTrampoline-&lt;arch&gt;.s where arch 
+ * is one of: i386, x86_64, arm, arm64. 
+ */</span>
+<span class="s2">#if </span><span class="s1">defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__arm64__)</span>
+
+<span class="s1">RCT_EXTERN </span><span class="s4">void </span><span class="s1">RCTProfileTrampoline(</span><span class="s4">void</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+<span class="s4">static void </span><span class="s1">*RCTProfileTrampoline = NULL</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+<span class="s1">RCT_EXTERN </span><span class="s4">void </span><span class="s1">RCTProfileTrampolineStart(id</span><span class="s4">, </span><span class="s1">SEL)</span><span class="s4">;</span>
+<span class="s4">void </span><span class="s1">RCTProfileTrampolineStart(id self</span><span class="s4">, </span><span class="s1">SEL cmd)</span>
+<span class="s1">{</span>
+  <span class="s0">/** 
+   * This call might be during dealloc, so we shouldn't retain the object in the 
+   * block. 
+   */</span>
+  <span class="s1">Class klass = [self </span><span class="s4">class</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">RCT_PROFILE_BEGIN_EVENT(</span>
+      <span class="s1">RCTProfileTagAlways</span><span class="s4">, </span><span class="s1">([NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;-[%s %s]&quot;</span><span class="s4">, </span><span class="s1">class_getName(klass)</span><span class="s4">, </span><span class="s1">sel_getName(cmd)])</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXTERN </span><span class="s4">void </span><span class="s1">RCTProfileTrampolineEnd(</span><span class="s4">void</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s4">void </span><span class="s1">RCTProfileTrampolineEnd(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;objc_call,modules,auto&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">UIView *(*originalCreateView)(RCTComponentData *</span><span class="s4">, </span><span class="s1">SEL</span><span class="s4">, </span><span class="s1">NSNumber *</span><span class="s4">, </span><span class="s1">NSNumber *)</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">UIView *RCTProfileCreateView(RCTComponentData *self</span><span class="s4">, </span><span class="s1">SEL _cmd</span><span class="s4">, </span><span class="s1">NSNumber *tag</span><span class="s4">, </span><span class="s1">NSNumber *rootTag)</span>
+<span class="s1">{</span>
+  <span class="s1">UIView *view = originalCreateView(self</span><span class="s4">, </span><span class="s1">_cmd</span><span class="s4">, </span><span class="s1">tag</span><span class="s4">, </span><span class="s1">rootTag)</span><span class="s4">;</span>
+  <span class="s1">RCTProfileHookInstance(view)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">view</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static void </span><span class="s1">RCTProfileHookUIManager(RCTUIManager *uiManager)</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_async(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s4">for </span><span class="s1">(id view in [uiManager valueForKey:</span><span class="s4">@</span><span class="s3">&quot;viewRegistry&quot;</span><span class="s1">]) {</span>
+      <span class="s1">RCTProfileHookInstance([uiManager viewForReactTag:view])</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Method createView = class_getInstanceMethod([RCTComponentData </span><span class="s4">class</span><span class="s1">]</span><span class="s4">, @selector</span><span class="s1">(createViewWithTag:rootTag:))</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(method_getImplementation(createView) != (IMP)RCTProfileCreateView) {</span>
+      <span class="s1">originalCreateView = (</span><span class="s4">typeof</span><span class="s1">(originalCreateView))method_getImplementation(createView)</span><span class="s4">;</span>
+      <span class="s1">method_setImplementation(createView</span><span class="s4">, </span><span class="s1">(IMP)RCTProfileCreateView)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileHookInstance(id instance)</span>
+<span class="s1">{</span>
+  <span class="s1">Class moduleClass = object_getClass(instance)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * We swizzle the instance -class method to return the original class, but 
+   * object_getClass will return the actual class. 
+   * 
+   * If they are different, it means that the object is returning the original 
+   * class, but it's actual class is the proxy subclass we created. 
+   */</span>
+  <span class="s4">if </span><span class="s1">([instance </span><span class="s4">class</span><span class="s1">] != moduleClass) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">Class proxyClass = objc_allocateClassPair(moduleClass</span><span class="s4">, </span><span class="s1">RCTProfileProxyClassName(moduleClass)</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!proxyClass) {</span>
+    <span class="s1">proxyClass = objc_getClass(RCTProfileProxyClassName(moduleClass))</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(proxyClass) {</span>
+      <span class="s1">object_setClass(instance</span><span class="s4">, </span><span class="s1">proxyClass)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">unsigned int </span><span class="s1">methodCount</span><span class="s4">;</span>
+  <span class="s1">Method *methods = class_copyMethodList(moduleClass</span><span class="s4">, </span><span class="s1">&amp;methodCount)</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(NSUInteger i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; methodCount</span><span class="s4">; </span><span class="s1">i++) {</span>
+    <span class="s1">Method method = methods[i]</span><span class="s4">;</span>
+    <span class="s1">SEL </span><span class="s4">selector </span><span class="s1">= method_getName(method)</span><span class="s4">;</span>
+
+    <span class="s0">/** 
+     * Bail out on struct returns (except arm64) - we don't use it enough 
+     * to justify writing a stret version 
+     */</span>
+<span class="s2">#ifdef </span><span class="s1">__arm64__</span>
+    <span class="s1">BOOL returnsStruct = NO</span><span class="s4">;</span>
+<span class="s2">#else</span>
+    <span class="s4">const char </span><span class="s1">*typeEncoding = method_getTypeEncoding(method)</span><span class="s4">;</span>
+    <span class="s0">// bail out on structs and unions (since they might contain structs)</span>
+    <span class="s1">BOOL returnsStruct = typeEncoding[</span><span class="s5">0</span><span class="s1">] == </span><span class="s3">'{' </span><span class="s1">|| typeEncoding[</span><span class="s5">0</span><span class="s1">] == </span><span class="s3">'('</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+    <span class="s0">/** 
+     * Avoid hooking into NSObject methods, methods generated by React Native 
+     * and special methods that start `.` (e.g. .cxx_destruct) 
+     */</span>
+    <span class="s4">if </span><span class="s1">([NSStringFromSelector(</span><span class="s4">selector</span><span class="s1">) hasPrefix:</span><span class="s4">@</span><span class="s3">&quot;rct&quot;</span><span class="s1">] || [NSObject instancesRespondToSelector:</span><span class="s4">selector</span><span class="s1">] ||</span>
+        <span class="s1">sel_getName(</span><span class="s4">selector</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">] == </span><span class="s3">'.' </span><span class="s1">|| returnsStruct) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">const char </span><span class="s1">*types = method_getTypeEncoding(method)</span><span class="s4">;</span>
+    <span class="s1">class_addMethod(proxyClass</span><span class="s4">, selector, </span><span class="s1">(IMP)RCTProfileTrampoline</span><span class="s4">, </span><span class="s1">types)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">free(methods)</span><span class="s4">;</span>
+
+  <span class="s1">class_replaceMethod(</span>
+      <span class="s1">object_getClass(proxyClass)</span><span class="s4">,</span>
+      <span class="s4">@selector</span><span class="s1">(initialize)</span><span class="s4">,</span>
+      <span class="s1">imp_implementationWithBlock(^{</span>
+      <span class="s1">})</span><span class="s4">,</span>
+      <span class="s3">&quot;v@:&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(Class cls in </span><span class="s4">@</span><span class="s1">[ proxyClass</span><span class="s4">, </span><span class="s1">object_getClass(proxyClass) ]) {</span>
+    <span class="s1">Method oldImp = class_getInstanceMethod(cls</span><span class="s4">, @selector</span><span class="s1">(</span><span class="s4">class</span><span class="s1">))</span><span class="s4">;</span>
+    <span class="s1">class_replaceMethod(</span>
+        <span class="s1">cls</span><span class="s4">,</span>
+        <span class="s4">@selector</span><span class="s1">(</span><span class="s4">class</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">imp_implementationWithBlock(^{</span>
+          <span class="s4">return </span><span class="s1">moduleClass</span><span class="s4">;</span>
+        <span class="s1">})</span><span class="s4">,</span>
+        <span class="s1">method_getTypeEncoding(oldImp))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">objc_registerClassPair(proxyClass)</span><span class="s4">;</span>
+  <span class="s1">object_setClass(instance</span><span class="s4">, </span><span class="s1">proxyClass)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(moduleClass == [RCTUIManager </span><span class="s4">class</span><span class="s1">]) {</span>
+    <span class="s1">RCTProfileHookUIManager((RCTUIManager *)instance)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileHookModules(RCTBridge *bridge)</span>
+<span class="s1">{</span>
+  <span class="s1">_RCTProfilingBridge = bridge</span><span class="s4">;</span>
+
+<span class="s2">#pragma </span><span class="s1">clang diagnostic push</span>
+<span class="s2">#pragma </span><span class="s1">clang diagnostic ignored </span><span class="s3">&quot;-Wtautological-pointer-compare&quot;</span>
+  <span class="s4">if </span><span class="s1">(RCTProfileTrampoline == NULL) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+<span class="s2">#pragma </span><span class="s1">clang diagnostic pop</span>
+
+  <span class="s1">RCT_PROFILE_BEGIN_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;RCTProfileHookModules&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(RCTModuleData *moduleData in [bridge valueForKey:</span><span class="s4">@</span><span class="s3">&quot;moduleDataByID&quot;</span><span class="s1">]) {</span>
+    <span class="s0">// Only hook modules with an instance, to prevent initializing everything</span>
+    <span class="s4">if </span><span class="s1">([moduleData hasInstance]) {</span>
+      <span class="s1">[bridge</span>
+          <span class="s1">dispatchBlock:^{</span>
+            <span class="s1">RCTProfileHookInstance(moduleData.instance)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+                  <span class="s1">queue:moduleData.methodQueue]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static void </span><span class="s1">RCTProfileUnhookInstance(id instance)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">([instance </span><span class="s4">class</span><span class="s1">] != object_getClass(instance)) {</span>
+    <span class="s1">object_setClass(instance</span><span class="s4">, </span><span class="s1">[instance </span><span class="s4">class</span><span class="s1">])</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileUnhookModules(RCTBridge *bridge)</span>
+<span class="s1">{</span>
+  <span class="s1">_RCTProfilingBridge = nil</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_group_enter(RCTProfileGetUnhookGroup())</span><span class="s4">;</span>
+
+  <span class="s1">NSDictionary *moduleDataByID = [bridge valueForKey:</span><span class="s4">@</span><span class="s3">&quot;moduleDataByID&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(RCTModuleData *moduleData in moduleDataByID) {</span>
+    <span class="s4">if </span><span class="s1">([moduleData hasInstance]) {</span>
+      <span class="s1">RCTProfileUnhookInstance(moduleData.instance)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">([bridge moduleIsInitialized:[RCTUIManager </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s1">dispatch_async(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s4">for </span><span class="s1">(id view in [bridge.uiManager valueForKey:</span><span class="s4">@</span><span class="s3">&quot;viewRegistry&quot;</span><span class="s1">]) {</span>
+        <span class="s1">RCTProfileUnhookInstance([bridge.uiManager viewForReactTag:view])</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">dispatch_group_leave(RCTProfileGetUnhookGroup())</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private ObjC </span><span class="s4">class </span><span class="s1">only used </span><span class="s4">for </span><span class="s1">the vSYNC CADisplayLink target</span>
+
+<span class="s4">@interface </span><span class="s1">RCTProfile : NSObject</span>
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTProfile</span>
+
+<span class="s1">+ (</span><span class="s4">void</span><span class="s1">)vsync:(CADisplayLink *)displayLink</span>
+<span class="s1">{</span>
+  <span class="s1">RCTProfileImmediateEvent(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;VSYNC&quot;</span><span class="s4">, </span><span class="s1">displayLink.timestamp</span><span class="s4">, </span><span class="s3">'g'</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (</span><span class="s4">void</span><span class="s1">)reload</span>
+<span class="s1">{</span>
+  <span class="s1">RCTTriggerReloadCommandListeners(</span><span class="s4">@</span><span class="s3">&quot;Profiling controls&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (</span><span class="s4">void</span><span class="s1">)toggle:(UIButton *)target</span>
+<span class="s1">{</span>
+  <span class="s1">BOOL isProfiling = RCTProfileIsProfiling()</span><span class="s4">;</span>
+
+  <span class="s0">// Start and Stop are switched here, since we're going to toggle isProfiling</span>
+  <span class="s1">[target setTitle:isProfiling ? </span><span class="s4">@</span><span class="s3">&quot;Start&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;Stop&quot; </span><span class="s1">forState:UIControlStateNormal]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(isProfiling) {</span>
+    <span class="s1">RCTProfileEnd(RCTProfilingBridge()</span><span class="s4">, </span><span class="s1">^(NSString *result) {</span>
+      <span class="s1">NSString *outFile = [NSTemporaryDirectory() stringByAppendingString:</span><span class="s4">@</span><span class="s3">&quot;tmp_trace.json&quot;</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">[result writeToFile:outFile atomically:YES encoding:NSUTF8StringEncoding error:nil]</span><span class="s4">;</span>
+      <span class="s1">UIActivityViewController *activityViewController =</span>
+          <span class="s1">[[UIActivityViewController alloc] initWithActivityItems:</span><span class="s4">@</span><span class="s1">[ [NSURL fileURLWithPath:outFile] ]</span>
+                                            <span class="s1">applicationActivities:nil]</span><span class="s4">;</span>
+      <span class="s1">activityViewController.completionWithItemsHandler =</span>
+          <span class="s1">^(__unused UIActivityType activityType</span><span class="s4">,</span>
+            <span class="s1">__unused BOOL completed</span><span class="s4">,</span>
+            <span class="s1">__unused NSArray *items</span><span class="s4">,</span>
+            <span class="s1">__unused NSError *error) {</span>
+            <span class="s1">RCTProfileControlsWindow.hidden = NO</span><span class="s4">;</span>
+          <span class="s1">}</span><span class="s4">;</span>
+      <span class="s1">RCTProfileControlsWindow.hidden = YES</span><span class="s4">;</span>
+      <span class="s1">dispatch_async(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+        <span class="s1">[[[[RCTSharedApplication() delegate] window] rootViewController] presentViewController:activityViewController</span>
+                                                                                      <span class="s1">animated:YES</span>
+                                                                                    <span class="s1">completion:nil]</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">RCTProfileInit(RCTProfilingBridge())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (</span><span class="s4">void</span><span class="s1">)drag:(UIPanGestureRecognizer *)gestureRecognizer</span>
+<span class="s1">{</span>
+  <span class="s1">CGPoint translation = [gestureRecognizer translationInView:RCTProfileControlsWindow]</span><span class="s4">;</span>
+  <span class="s1">RCTProfileControlsWindow.center =</span>
+      <span class="s1">CGPointMake(RCTProfileControlsWindow.center.x + translation.x</span><span class="s4">, </span><span class="s1">RCTProfileControlsWindow.center.y + translation.y)</span><span class="s4">;</span>
+  <span class="s1">[gestureRecognizer setTranslation:CGPointMake(</span><span class="s5">0</span><span class="s4">, </span><span class="s5">0</span><span class="s1">) inView:RCTProfileControlsWindow]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Public Functions</span>
+
+<span class="s1">dispatch_queue_t RCTProfileGetQueue(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">dispatch_queue_t queue</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">queue = dispatch_queue_create(</span><span class="s3">&quot;com.facebook.react.Profiler&quot;</span><span class="s4">, </span><span class="s1">DISPATCH_QUEUE_SERIAL)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">queue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTProfileIsProfiling(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">atomic_load(&amp;RCTProfileProfiling)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileInit(RCTBridge *bridge)</span>
+<span class="s1">{</span>
+  <span class="s0">// TODO: enable assert JS thread from any file (and assert here)</span>
+  <span class="s1">BOOL wasProfiling = atomic_fetch_or(&amp;RCTProfileProfiling</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(wasProfiling) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">systrace_buffer = callbacks-&gt;start()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">NSTimeInterval time = CACurrentMediaTime()</span><span class="s4">;</span>
+    <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">RCTProfileStartTime = time</span><span class="s4">;</span>
+      <span class="s1">RCTProfileOngoingEvents = [NSMutableDictionary new]</span><span class="s4">;</span>
+      <span class="s1">RCTProfileInfo = </span><span class="s4">@</span><span class="s1">{</span>
+        <span class="s1">kProfileTraceEvents : [NSMutableArray new]</span><span class="s4">,</span>
+        <span class="s1">kProfileSamples : [NSMutableArray new]</span><span class="s4">,</span>
+      <span class="s1">}</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Set up thread ordering</span>
+  <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">NSArray *orderedThreads =</span>
+        <span class="s4">@</span><span class="s1">[ </span><span class="s4">@</span><span class="s3">&quot;JS async&quot;</span><span class="s4">, @</span><span class="s3">&quot;RCTPerformanceLogger&quot;</span><span class="s4">, @</span><span class="s3">&quot;com.facebook.react.JavaScript&quot;</span><span class="s4">, @</span><span class="s1">(RCTUIManagerQueueName)</span><span class="s4">, @</span><span class="s3">&quot;main&quot; </span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">[orderedThreads enumerateObjectsUsingBlock:^(NSString *thread</span><span class="s4">, </span><span class="s1">NSUInteger idx</span><span class="s4">, </span><span class="s1">__unused BOOL *stop) {</span>
+      <span class="s1">RCTProfileAddEvent(</span>
+          <span class="s1">kProfileTraceEvents</span><span class="s4">,</span>
+          <span class="s4">@</span><span class="s3">&quot;ph&quot;</span>
+          <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;M&quot;</span><span class="s4">, </span><span class="s0">// metadata event</span>
+            <span class="s4">@</span><span class="s3">&quot;name&quot;</span>
+          <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;thread_sort_index&quot;</span><span class="s4">, @</span><span class="s3">&quot;tid&quot;</span>
+          <span class="s1">: thread</span><span class="s4">, @</span><span class="s3">&quot;args&quot;</span>
+          <span class="s1">:</span>
+          <span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;sort_index&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(-</span><span class="s5">1000 </span><span class="s1">+ (NSInteger)idx)})</span><span class="s4">;</span>
+    <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">RCTProfileHookModules(bridge)</span><span class="s4">;</span>
+
+  <span class="s1">RCTProfileDisplayLink = [CADisplayLink displayLinkWithTarget:[RCTProfile </span><span class="s4">class</span><span class="s1">] </span><span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(vsync:)]</span><span class="s4">;</span>
+  <span class="s1">[RCTProfileDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes]</span><span class="s4">;</span>
+
+  <span class="s1">[[NSNotificationCenter defaultCenter] postNotificationName:RCTProfileDidStartProfiling object:bridge]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileEnd(RCTBridge *bridge</span><span class="s4">, void </span><span class="s1">(^callback)(NSString *))</span>
+<span class="s1">{</span>
+  <span class="s0">// assert JavaScript thread here again</span>
+  <span class="s1">BOOL wasProfiling = atomic_fetch_and(&amp;RCTProfileProfiling</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!wasProfiling) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[[NSNotificationCenter defaultCenter] postNotificationName:RCTProfileDidEndProfiling object:bridge]</span><span class="s4">;</span>
+
+  <span class="s1">[RCTProfileDisplayLink invalidate]</span><span class="s4">;</span>
+  <span class="s1">RCTProfileDisplayLink = nil</span><span class="s4">;</span>
+
+  <span class="s1">RCTProfileUnhookModules(bridge)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s4">if </span><span class="s1">(systrace_buffer) {</span>
+      <span class="s1">callbacks-&gt;stop()</span><span class="s4">;</span>
+      <span class="s1">callback(</span><span class="s4">@</span><span class="s1">(systrace_buffer))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">NSString *log = RCTJSONStringify(RCTProfileInfo</span><span class="s4">, </span><span class="s1">NULL)</span><span class="s4">;</span>
+      <span class="s1">RCTProfileEventID = </span><span class="s5">0</span><span class="s4">;</span>
+      <span class="s1">RCTProfileInfo = nil</span><span class="s4">;</span>
+      <span class="s1">RCTProfileOngoingEvents = nil</span><span class="s4">;</span>
+
+      <span class="s1">callback(log)</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSMutableArray&lt;NSArray *&gt; *RCTProfileGetThreadEvents(NSThread *thread)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSString *</span><span class="s4">const </span><span class="s1">RCTProfileThreadEventsKey = </span><span class="s4">@</span><span class="s3">&quot;RCTProfileThreadEventsKey&quot;</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray&lt;NSArray *&gt; *threadEvents = thread.threadDictionary[RCTProfileThreadEventsKey]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!threadEvents) {</span>
+    <span class="s1">threadEvents = [NSMutableArray new]</span><span class="s4">;</span>
+    <span class="s1">thread.threadDictionary[RCTProfileThreadEventsKey] = threadEvents</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">threadEvents</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">_RCTProfileBeginEvent(</span>
+    <span class="s1">NSThread *calleeThread</span><span class="s4">,</span>
+    <span class="s1">NSTimeInterval time</span><span class="s4">,</span>
+    <span class="s1">uint64_t tag</span><span class="s4">,</span>
+    <span class="s1">NSString *name</span><span class="s4">,</span>
+    <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">NSString *&gt; *args)</span>
+<span class="s1">{</span>
+  <span class="s1">CHECK()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">systrace_arg_t *systraceArgs = newSystraceArgsFromDictionary(args)</span><span class="s4">;</span>
+    <span class="s1">callbacks-&gt;begin_section(tag</span><span class="s4">, </span><span class="s1">name.UTF8String</span><span class="s4">, </span><span class="s1">args.count</span><span class="s4">, </span><span class="s1">systraceArgs)</span><span class="s4">;</span>
+    <span class="s1">free(systraceArgs)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">NSMutableArray *events = RCTProfileGetThreadEvents(calleeThread)</span><span class="s4">;</span>
+    <span class="s1">[events addObject:</span><span class="s4">@</span><span class="s1">[</span>
+      <span class="s1">RCTProfileTimestamp(time)</span><span class="s4">,</span>
+      <span class="s1">name</span><span class="s4">,</span>
+      <span class="s1">RCTNullIfNil(args)</span><span class="s4">,</span>
+    <span class="s1">]]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">_RCTProfileEndEvent(</span>
+    <span class="s1">NSThread *calleeThread</span><span class="s4">,</span>
+    <span class="s1">NSString *threadName</span><span class="s4">,</span>
+    <span class="s1">NSTimeInterval time</span><span class="s4">,</span>
+    <span class="s1">uint64_t tag</span><span class="s4">,</span>
+    <span class="s1">NSString *category)</span>
+<span class="s1">{</span>
+  <span class="s1">CHECK()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">callbacks-&gt;end_section(tag</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">NSMutableArray&lt;NSArray *&gt; *events = RCTProfileGetThreadEvents(calleeThread)</span><span class="s4">;</span>
+    <span class="s1">NSArray *event = events.lastObject</span><span class="s4">;</span>
+    <span class="s1">[events removeLastObject]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!event) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">NSNumber *start = event[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">RCTProfileAddEvent(kProfileTraceEvents</span><span class="s4">, @</span><span class="s3">&quot;tid&quot;</span>
+                       <span class="s1">: threadName</span><span class="s4">, @</span><span class="s3">&quot;name&quot;</span>
+                       <span class="s1">: event[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, @</span><span class="s3">&quot;cat&quot;</span>
+                       <span class="s1">: category</span><span class="s4">, @</span><span class="s3">&quot;ph&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;X&quot;</span><span class="s4">, @</span><span class="s3">&quot;ts&quot;</span>
+                       <span class="s1">: start</span><span class="s4">, @</span><span class="s3">&quot;dur&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s1">(RCTProfileTimestamp(time).doubleValue - start.doubleValue)</span><span class="s4">, @</span><span class="s3">&quot;args&quot;</span>
+                       <span class="s1">: event[</span><span class="s5">2</span><span class="s1">]</span><span class="s4">, </span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSUInteger RCTProfileBeginAsyncEvent(uint64_t tag</span><span class="s4">, </span><span class="s1">NSString *name</span><span class="s4">, </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">NSString *&gt; *args)</span>
+<span class="s1">{</span>
+  <span class="s1">CHECK(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">static </span><span class="s1">NSUInteger eventID = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s1">NSTimeInterval time = CACurrentMediaTime()</span><span class="s4">;</span>
+  <span class="s1">NSUInteger currentEventID = ++eventID</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">systrace_arg_t *systraceArgs = newSystraceArgsFromDictionary(args)</span><span class="s4">;</span>
+    <span class="s1">callbacks-&gt;begin_async_section(tag</span><span class="s4">, </span><span class="s1">name.UTF8String</span><span class="s4">, </span><span class="s1">(</span><span class="s4">int</span><span class="s1">)(currentEventID % INT_MAX)</span><span class="s4">, </span><span class="s1">args.count</span><span class="s4">, </span><span class="s1">systraceArgs)</span><span class="s4">;</span>
+    <span class="s1">free(systraceArgs)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">RCTProfileOngoingEvents[</span><span class="s4">@</span><span class="s1">(currentEventID)] = </span><span class="s4">@</span><span class="s1">[</span>
+        <span class="s1">RCTProfileTimestamp(time)</span><span class="s4">,</span>
+        <span class="s1">name</span><span class="s4">,</span>
+        <span class="s1">RCTNullIfNil(args)</span><span class="s4">,</span>
+      <span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">currentEventID</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileEndAsyncEvent(uint64_t tag</span><span class="s4">, </span><span class="s1">NSString *category</span><span class="s4">, </span><span class="s1">NSUInteger cookie</span><span class="s4">, </span><span class="s1">NSString *name</span><span class="s4">, </span><span class="s1">NSString *threadName)</span>
+<span class="s1">{</span>
+  <span class="s1">CHECK()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">callbacks-&gt;end_async_section(tag</span><span class="s4">, </span><span class="s1">name.UTF8String</span><span class="s4">, </span><span class="s1">(</span><span class="s4">int</span><span class="s1">)(cookie % INT_MAX)</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSTimeInterval time = CACurrentMediaTime()</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">NSArray *event = RCTProfileOngoingEvents[</span><span class="s4">@</span><span class="s1">(cookie)]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(event) {</span>
+      <span class="s1">NSNumber *endTimestamp = RCTProfileTimestamp(time)</span><span class="s4">;</span>
+
+      <span class="s1">RCTProfileAddEvent(kProfileTraceEvents</span><span class="s4">, @</span><span class="s3">&quot;tid&quot;</span>
+                         <span class="s1">: threadName</span><span class="s4">, @</span><span class="s3">&quot;name&quot;</span>
+                         <span class="s1">: event[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">, @</span><span class="s3">&quot;cat&quot;</span>
+                         <span class="s1">: category</span><span class="s4">, @</span><span class="s3">&quot;ph&quot;</span>
+                         <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;X&quot;</span><span class="s4">, @</span><span class="s3">&quot;ts&quot;</span>
+                         <span class="s1">: event[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, @</span><span class="s3">&quot;dur&quot;</span>
+                         <span class="s1">: </span><span class="s4">@</span><span class="s1">(endTimestamp.doubleValue - [event[</span><span class="s5">0</span><span class="s1">] doubleValue])</span><span class="s4">, @</span><span class="s3">&quot;args&quot;</span>
+                         <span class="s1">: event[</span><span class="s5">2</span><span class="s1">]</span><span class="s4">, </span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">[RCTProfileOngoingEvents removeObjectForKey:</span><span class="s4">@</span><span class="s1">(cookie)]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileImmediateEvent(uint64_t tag</span><span class="s4">, </span><span class="s1">NSString *name</span><span class="s4">, </span><span class="s1">NSTimeInterval time</span><span class="s4">, char </span><span class="s1">scope)</span>
+<span class="s1">{</span>
+  <span class="s1">CHECK()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">callbacks-&gt;instant_section(tag</span><span class="s4">, </span><span class="s1">name.UTF8String</span><span class="s4">, </span><span class="s1">scope)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSString *threadName = RCTCurrentThreadName()</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">RCTProfileAddEvent(kProfileTraceEvents</span><span class="s4">, @</span><span class="s3">&quot;tid&quot;</span>
+                       <span class="s1">: threadName</span><span class="s4">, @</span><span class="s3">&quot;name&quot;</span>
+                       <span class="s1">: name</span><span class="s4">, @</span><span class="s3">&quot;ts&quot;</span>
+                       <span class="s1">: RCTProfileTimestamp(time)</span><span class="s4">, @</span><span class="s3">&quot;scope&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s1">(scope)</span><span class="s4">, @</span><span class="s3">&quot;ph&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;i&quot;</span><span class="s4">, @</span><span class="s3">&quot;args&quot;</span>
+                       <span class="s1">: RCTProfileGetMemoryUsage()</span><span class="s4">, </span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSUInteger _RCTProfileBeginFlowEvent(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSUInteger flowID = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s1">CHECK(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">NSUInteger cookie = ++flowID</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">callbacks-&gt;begin_async_flow(</span><span class="s5">1</span><span class="s4">, </span><span class="s3">&quot;flow&quot;</span><span class="s4">, </span><span class="s1">(</span><span class="s4">int</span><span class="s1">)cookie)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">cookie</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSTimeInterval time = CACurrentMediaTime()</span><span class="s4">;</span>
+  <span class="s1">NSString *threadName = RCTCurrentThreadName()</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">RCTProfileAddEvent(kProfileTraceEvents</span><span class="s4">, @</span><span class="s3">&quot;tid&quot;</span>
+                       <span class="s1">: threadName</span><span class="s4">, @</span><span class="s3">&quot;name&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;flow&quot;</span><span class="s4">, @</span><span class="s3">&quot;id&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s1">(cookie)</span><span class="s4">, @</span><span class="s3">&quot;cat&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;flow&quot;</span><span class="s4">, @</span><span class="s3">&quot;ph&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;s&quot;</span><span class="s4">, @</span><span class="s3">&quot;ts&quot;</span>
+                       <span class="s1">: RCTProfileTimestamp(time)</span><span class="s4">, </span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">cookie</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">_RCTProfileEndFlowEvent(NSUInteger cookie)</span>
+<span class="s1">{</span>
+  <span class="s1">CHECK()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(callbacks != NULL) {</span>
+    <span class="s1">callbacks-&gt;end_async_flow(</span><span class="s5">1</span><span class="s4">, </span><span class="s3">&quot;flow&quot;</span><span class="s4">, </span><span class="s1">(</span><span class="s4">int</span><span class="s1">)cookie)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSTimeInterval time = CACurrentMediaTime()</span><span class="s4">;</span>
+  <span class="s1">NSString *threadName = RCTCurrentThreadName()</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_async(RCTProfileGetQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">RCTProfileAddEvent(kProfileTraceEvents</span><span class="s4">, @</span><span class="s3">&quot;tid&quot;</span>
+                       <span class="s1">: threadName</span><span class="s4">, @</span><span class="s3">&quot;name&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;flow&quot;</span><span class="s4">, @</span><span class="s3">&quot;id&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s1">(cookie)</span><span class="s4">, @</span><span class="s3">&quot;cat&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;flow&quot;</span><span class="s4">, @</span><span class="s3">&quot;ph&quot;</span>
+                       <span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;f&quot;</span><span class="s4">, @</span><span class="s3">&quot;ts&quot;</span>
+                       <span class="s1">: RCTProfileTimestamp(time)</span><span class="s4">, </span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileSendResult(RCTBridge *bridge</span><span class="s4">, </span><span class="s1">NSString *route</span><span class="s4">, </span><span class="s1">NSData *data)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(![bridge.bundleURL.scheme hasPrefix:</span><span class="s4">@</span><span class="s3">&quot;http&quot;</span><span class="s1">]) {</span>
+    <span class="s1">RCTLogWarn(</span>
+        <span class="s4">@</span><span class="s3">&quot;Cannot upload profile information because you're not connected to the packager. The profiling data is still saved in the app container.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSURL *URL = [NSURL URLWithString:[</span><span class="s4">@</span><span class="s3">&quot;/&quot; </span><span class="s1">stringByAppendingString:route] relativeToURL:bridge.bundleURL]</span><span class="s4">;</span>
+
+  <span class="s1">NSMutableURLRequest *URLRequest = [NSMutableURLRequest requestWithURL:URL]</span><span class="s4">;</span>
+  <span class="s1">URLRequest.HTTPMethod = </span><span class="s4">@</span><span class="s3">&quot;POST&quot;</span><span class="s4">;</span>
+  <span class="s1">[URLRequest setValue:</span><span class="s4">@</span><span class="s3">&quot;application/json&quot; </span><span class="s1">forHTTPHeaderField:</span><span class="s4">@</span><span class="s3">&quot;Content-Type&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">NSURLSessionTask *task = [[NSURLSession sharedSession]</span>
+      <span class="s1">uploadTaskWithRequest:URLRequest</span>
+                   <span class="s1">fromData:data</span>
+          <span class="s1">completionHandler:^(NSData *responseData</span><span class="s4">, </span><span class="s1">__unused NSURLResponse *response</span><span class="s4">, </span><span class="s1">NSError *error) {</span>
+            <span class="s4">if </span><span class="s1">(error) {</span>
+              <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;%@&quot;</span><span class="s4">, </span><span class="s1">error.localizedDescription)</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+              <span class="s1">NSString *message = [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding]</span><span class="s4">;</span>
+
+              <span class="s4">if </span><span class="s1">(message.length) {</span>
+                <span class="s1">dispatch_async(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+                  <span class="s1">UIAlertController *alertController =</span>
+                      <span class="s1">[UIAlertController alertControllerWithTitle:</span><span class="s4">@</span><span class="s3">&quot;Profile&quot;</span>
+                                                          <span class="s1">message:message</span>
+                                                   <span class="s1">preferredStyle:UIAlertControllerStyleAlert]</span><span class="s4">;</span>
+                  <span class="s1">[alertController addAction:[UIAlertAction actionWithTitle:</span><span class="s4">@</span><span class="s3">&quot;OK&quot;</span>
+                                                                      <span class="s1">style:UIAlertActionStyleCancel</span>
+                                                                    <span class="s1">handler:nil]]</span><span class="s4">;</span>
+                  <span class="s1">[RCTPresentedViewController() presentViewController:alertController animated:YES completion:nil]</span><span class="s4">;</span>
+                <span class="s1">})</span><span class="s4">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s1">[task resume]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileShowControls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static const </span><span class="s1">CGFloat height = </span><span class="s5">30</span><span class="s4">;</span>
+  <span class="s4">static const </span><span class="s1">CGFloat width = </span><span class="s5">60</span><span class="s4">;</span>
+
+  <span class="s1">UIWindow *window = [[UIWindow alloc] initWithFrame:CGRectMake(</span><span class="s5">20</span><span class="s4">, </span><span class="s5">80</span><span class="s4">, </span><span class="s1">width * </span><span class="s5">2</span><span class="s4">, </span><span class="s1">height)]</span><span class="s4">;</span>
+  <span class="s1">window.windowLevel = UIWindowLevelAlert + </span><span class="s5">1000</span><span class="s4">;</span>
+  <span class="s1">window.hidden = NO</span><span class="s4">;</span>
+  <span class="s1">window.backgroundColor = [UIColor lightGrayColor]</span><span class="s4">;</span>
+  <span class="s1">window.layer.borderColor = [UIColor grayColor].CGColor</span><span class="s4">;</span>
+  <span class="s1">window.layer.borderWidth = </span><span class="s5">1</span><span class="s4">;</span>
+  <span class="s1">window.alpha = </span><span class="s5">0.8</span><span class="s4">;</span>
+
+  <span class="s1">UIButton *startOrStop = [[UIButton alloc] initWithFrame:CGRectMake(</span><span class="s5">0</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">width</span><span class="s4">, </span><span class="s1">height)]</span><span class="s4">;</span>
+  <span class="s1">[startOrStop setTitle:RCTProfileIsProfiling() ? </span><span class="s4">@</span><span class="s3">&quot;Stop&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s3">&quot;Start&quot; </span><span class="s1">forState:UIControlStateNormal]</span><span class="s4">;</span>
+  <span class="s1">[startOrStop addTarget:[RCTProfile </span><span class="s4">class</span><span class="s1">] action:</span><span class="s4">@selector</span><span class="s1">(toggle:) forControlEvents:UIControlEventTouchUpInside]</span><span class="s4">;</span>
+  <span class="s1">startOrStop.titleLabel.font = [UIFont systemFontOfSize:</span><span class="s5">12</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">UIButton *reload = [[UIButton alloc] initWithFrame:CGRectMake(width</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">width</span><span class="s4">, </span><span class="s1">height)]</span><span class="s4">;</span>
+  <span class="s1">[reload setTitle:</span><span class="s4">@</span><span class="s3">&quot;Reload&quot; </span><span class="s1">forState:UIControlStateNormal]</span><span class="s4">;</span>
+  <span class="s1">[reload addTarget:[RCTProfile </span><span class="s4">class</span><span class="s1">] action:</span><span class="s4">@selector</span><span class="s1">(reload) forControlEvents:UIControlEventTouchUpInside]</span><span class="s4">;</span>
+  <span class="s1">reload.titleLabel.font = [UIFont systemFontOfSize:</span><span class="s5">12</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">[window addSubview:startOrStop]</span><span class="s4">;</span>
+  <span class="s1">[window addSubview:reload]</span><span class="s4">;</span>
+
+  <span class="s1">UIPanGestureRecognizer *gestureRecognizer = [[UIPanGestureRecognizer alloc] initWithTarget:[RCTProfile </span><span class="s4">class</span><span class="s1">]</span>
+                                                                                      <span class="s1">action:</span><span class="s4">@selector</span><span class="s1">(drag:)]</span><span class="s4">;</span>
+  <span class="s1">[window addGestureRecognizer:gestureRecognizer]</span><span class="s4">;</span>
+
+  <span class="s1">RCTProfileControlsWindow = window</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTProfileHideControls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s1">RCTProfileControlsWindow.hidden = YES</span><span class="s4">;</span>
+  <span class="s1">RCTProfileControlsWindow = nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#endif</span>
+</pre>
+</body>
+</html>

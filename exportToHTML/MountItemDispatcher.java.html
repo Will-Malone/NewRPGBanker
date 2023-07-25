@@ -1,0 +1,452 @@
+<html>
+<head>
+<title>MountItemDispatcher.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #629755; font-style: italic;}
+.s6 { color: #629755; font-weight: bold; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+MountItemDispatcher.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.fabric.mounting</span><span class="s2">;</span>
+
+<span class="s2">import static </span><span class="s1">com.facebook.infer.annotation.ThreadConfined.ANY</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.infer.annotation.ThreadConfined.UI</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.react.fabric.FabricUIManager.ENABLE_FABRIC_LOGS</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.react.fabric.FabricUIManager.IS_DEVELOPMENT_ENVIRONMENT</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.os.SystemClock</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.view.View</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.AnyThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.NonNull</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.UiThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.ThreadConfined</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactIgnorableMountingException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactNoCrashSoftException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactSoftExceptionLogger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.RetryableMountingLayerException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.fabric.mounting.mountitems.DispatchCommandMountItem</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.fabric.mounting.mountitems.MountItem</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.fabric.mounting.mountitems.PreAllocateViewMountItem</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.systrace.Systrace</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Collection</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.List</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Queue</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.ConcurrentLinkedQueue</span><span class="s2">;</span>
+
+<span class="s2">public class </span><span class="s1">MountItemDispatcher {</span>
+
+  <span class="s2">private static final </span><span class="s1">String TAG = </span><span class="s3">&quot;MountItemDispatcher&quot;</span><span class="s2">;</span>
+  <span class="s2">private static final int </span><span class="s1">FRAME_TIME_MS = </span><span class="s4">16</span><span class="s2">;</span>
+  <span class="s2">private static final int </span><span class="s1">MAX_TIME_IN_FRAME_FOR_NON_BATCHED_OPERATIONS_MS = </span><span class="s4">8</span><span class="s2">;</span>
+
+  <span class="s2">private final </span><span class="s1">MountingManager mMountingManager</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ItemDispatchListener mItemDispatchListener</span><span class="s2">;</span>
+
+  <span class="s1">@NonNull</span>
+  <span class="s2">private final </span><span class="s1">ConcurrentLinkedQueue&lt;DispatchCommandMountItem&gt; mViewCommandMountItems =</span>
+      <span class="s2">new </span><span class="s1">ConcurrentLinkedQueue&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s1">@NonNull</span>
+  <span class="s2">private final </span><span class="s1">ConcurrentLinkedQueue&lt;MountItem&gt; mMountItems = </span><span class="s2">new </span><span class="s1">ConcurrentLinkedQueue&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s1">@NonNull</span>
+  <span class="s2">private final </span><span class="s1">ConcurrentLinkedQueue&lt;PreAllocateViewMountItem&gt; mPreMountItems =</span>
+      <span class="s2">new </span><span class="s1">ConcurrentLinkedQueue&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s2">private boolean </span><span class="s1">mInDispatch = </span><span class="s2">false;</span>
+  <span class="s2">private int </span><span class="s1">mReDispatchCounter = </span><span class="s4">0</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mBatchedExecutionTime = </span><span class="s4">0L</span><span class="s2">;</span>
+  <span class="s2">private long </span><span class="s1">mRunStartTime = </span><span class="s4">0L</span><span class="s2">;</span>
+
+  <span class="s2">public </span><span class="s1">MountItemDispatcher(MountingManager mountingManager</span><span class="s2">, </span><span class="s1">ItemDispatchListener listener) {</span>
+    <span class="s1">mMountingManager = mountingManager</span><span class="s2">;</span>
+    <span class="s1">mItemDispatchListener = listener</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@AnyThread</span>
+  <span class="s1">@ThreadConfined(ANY)</span>
+  <span class="s2">public void </span><span class="s1">dispatchCommandMountItem(DispatchCommandMountItem command) {</span>
+    <span class="s1">addViewCommandMountItem(command)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addMountItem(MountItem mountItem) {</span>
+    <span class="s1">mMountItems.add(mountItem)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addPreAllocateMountItem(PreAllocateViewMountItem mountItem) {</span>
+    <span class="s0">// We do this check only for PreAllocateViewMountItem - and not DispatchMountItem or regular</span>
+    <span class="s0">// MountItem - because PreAllocateViewMountItem is not batched, and is relatively more expensive</span>
+    <span class="s0">// both to queue, to drain, and to execute.</span>
+    <span class="s2">if </span><span class="s1">(!mMountingManager.surfaceIsStopped(mountItem.getSurfaceId())) {</span>
+      <span class="s1">mPreMountItems.add(mountItem)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(IS_DEVELOPMENT_ENVIRONMENT) {</span>
+      <span class="s1">FLog.e(</span>
+          <span class="s1">TAG</span><span class="s2">,</span>
+          <span class="s3">&quot;Not queueing PreAllocateMountItem: surfaceId stopped: [%d] - %s&quot;</span><span class="s2">,</span>
+          <span class="s1">mountItem.getSurfaceId()</span><span class="s2">,</span>
+          <span class="s1">mountItem.toString())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addViewCommandMountItem(DispatchCommandMountItem mountItem) {</span>
+    <span class="s1">mViewCommandMountItems.add(mountItem)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">/**</span>
+   <span class="s5">* Try to dispatch MountItems. Returns true if any items were dispatched, false otherwise. A</span>
+   <span class="s5">* `false` return value doesn't indicate errors, it may just indicate there was no work to be</span>
+   <span class="s5">* done.</span>
+   <span class="s5">*</span>
+   <span class="s5">* </span><span class="s6">@return</span>
+   <span class="s5">*/</span>
+  <span class="s1">@UiThread</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public boolean </span><span class="s1">tryDispatchMountItems() {</span>
+    <span class="s0">// If we're already dispatching, don't reenter.</span>
+    <span class="s0">// Reentrance can potentially happen a lot on Android in Fabric because</span>
+    <span class="s0">// `updateState` from the</span>
+    <span class="s0">// mounting layer causes mount items to be dispatched synchronously. We want to 1) make sure</span>
+    <span class="s0">// we don't reenter in those cases, but 2) still execute those queued instructions</span>
+    <span class="s0">// synchronously.</span>
+    <span class="s0">// This is a pretty blunt tool, but we might not have better options since we really don't want</span>
+    <span class="s0">// to execute anything out-of-order.</span>
+    <span class="s2">if </span><span class="s1">(mInDispatch) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">final boolean </span><span class="s1">didDispatchItems</span><span class="s2">;</span>
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s1">didDispatchItems = dispatchMountItems()</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Throwable e) {</span>
+      <span class="s1">mReDispatchCounter = </span><span class="s4">0</span><span class="s2">;</span>
+      <span class="s2">throw </span><span class="s1">e</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+      <span class="s0">// Clean up after running dispatchMountItems - even if an exception was thrown</span>
+      <span class="s1">mInDispatch = </span><span class="s2">false;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// We call didDispatchMountItems regardless of whether we actually dispatched anything, since</span>
+    <span class="s0">// NativeAnimatedModule relies on this for executing any animations that may have been scheduled</span>
+    <span class="s1">mItemDispatchListener.didDispatchMountItems()</span><span class="s2">;</span>
+
+    <span class="s0">// Decide if we want to try reentering</span>
+    <span class="s2">if </span><span class="s1">(mReDispatchCounter &lt; </span><span class="s4">10 </span><span class="s1">&amp;&amp; didDispatchItems) {</span>
+      <span class="s0">// Executing twice in a row is normal. Only log after that point.</span>
+      <span class="s2">if </span><span class="s1">(mReDispatchCounter &gt; </span><span class="s4">2</span><span class="s1">) {</span>
+        <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+            <span class="s1">TAG</span><span class="s2">,</span>
+            <span class="s2">new </span><span class="s1">ReactNoCrashSoftException(</span>
+                <span class="s3">&quot;Re-dispatched &quot;</span>
+                    <span class="s1">+ mReDispatchCounter</span>
+                    <span class="s1">+ </span><span class="s3">&quot; times. This indicates setState (?) is likely being called too many times during mounting.&quot;</span><span class="s1">))</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">mReDispatchCounter++</span><span class="s2">;</span>
+      <span class="s1">tryDispatchMountItems()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mReDispatchCounter = </span><span class="s4">0</span><span class="s2">;</span>
+    <span class="s2">return </span><span class="s1">didDispatchItems</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">dispatchMountItems(Queue&lt;MountItem&gt; mountItems) {</span>
+    <span class="s2">while </span><span class="s1">(!mountItems.isEmpty()) {</span>
+      <span class="s1">MountItem item = mountItems.poll()</span><span class="s2">;</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">item.execute(mMountingManager)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RetryableMountingLayerException e) {</span>
+        <span class="s2">if </span><span class="s1">(item </span><span class="s2">instanceof </span><span class="s1">DispatchCommandMountItem) {</span>
+          <span class="s0">// Only DispatchCommandMountItem supports retries</span>
+          <span class="s1">DispatchCommandMountItem mountItem = (DispatchCommandMountItem) item</span><span class="s2">;</span>
+          <span class="s0">// Retrying exactly once</span>
+          <span class="s2">if </span><span class="s1">(mountItem.getRetries() == </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">mountItem.incrementRetries()</span><span class="s2">;</span>
+            <span class="s0">// In case we haven't retried executing this item yet, execute in the next batch of</span>
+            <span class="s0">// items</span>
+            <span class="s1">dispatchCommandMountItem(mountItem)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+          <span class="s1">printMountItem(</span>
+              <span class="s1">item</span><span class="s2">, </span><span class="s3">&quot;dispatchExternalMountItems: mounting failed with &quot; </span><span class="s1">+ e.getMessage())</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s5">/** Nothing should call this directly except for `tryDispatchMountItems`. */</span>
+  <span class="s2">private boolean </span><span class="s1">dispatchMountItems() {</span>
+    <span class="s2">if </span><span class="s1">(mReDispatchCounter == </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">mBatchedExecutionTime = </span><span class="s4">0</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mRunStartTime = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+
+    <span class="s1">List&lt;DispatchCommandMountItem&gt; viewCommandMountItemsToDispatch =</span>
+        <span class="s1">getAndResetViewCommandMountItems()</span><span class="s2">;</span>
+    <span class="s1">List&lt;MountItem&gt; mountItemsToDispatch = getAndResetMountItems()</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(mountItemsToDispatch == </span><span class="s2">null </span><span class="s1">&amp;&amp; viewCommandMountItemsToDispatch == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mItemDispatchListener.willMountItems()</span><span class="s2">;</span>
+
+    <span class="s0">// As an optimization, execute all ViewCommands first</span>
+    <span class="s0">// This should be:</span>
+    <span class="s0">// 1) Performant: ViewCommands are often a replacement for SetNativeProps, which we've always</span>
+    <span class="s0">// wanted to be as &quot;synchronous&quot; as possible.</span>
+    <span class="s0">// 2) Safer: ViewCommands are inherently disconnected from the tree commit/diff/mount process.</span>
+    <span class="s0">// JS imperatively queues these commands.</span>
+    <span class="s0">//    If JS has queued a command, it's reasonable to assume that the more time passes, the more</span>
+    <span class="s0">// likely it is that the view disappears.</span>
+    <span class="s0">//    Thus, by executing ViewCommands early, we should actually avoid a category of</span>
+    <span class="s0">// errors/glitches.</span>
+    <span class="s2">if </span><span class="s1">(viewCommandMountItemsToDispatch != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">Systrace.beginSection(</span>
+          <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+          <span class="s3">&quot;FabricUIManager::mountViews viewCommandMountItems&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">for </span><span class="s1">(DispatchCommandMountItem command : viewCommandMountItemsToDispatch) {</span>
+        <span class="s2">if </span><span class="s1">(ENABLE_FABRIC_LOGS) {</span>
+          <span class="s1">printMountItem(command</span><span class="s2">, </span><span class="s3">&quot;dispatchMountItems: Executing viewCommandMountItem&quot;</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+        <span class="s2">try </span><span class="s1">{</span>
+          <span class="s1">executeOrEnqueue(command)</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RetryableMountingLayerException e) {</span>
+          <span class="s0">// If the exception is marked as Retryable, we retry the viewcommand exactly once, after</span>
+          <span class="s0">// the current batch of mount items has finished executing.</span>
+          <span class="s2">if </span><span class="s1">(command.getRetries() == </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">command.incrementRetries()</span><span class="s2">;</span>
+            <span class="s1">dispatchCommandMountItem(command)</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">// It's very common for commands to be executed on views that no longer exist - for</span>
+            <span class="s0">// example, a blur event on TextInput being fired because of a navigation event away</span>
+            <span class="s0">// from the current screen. If the exception is marked as Retryable, we log a soft</span>
+            <span class="s0">// exception but never crash in debug.</span>
+            <span class="s0">// It's not clear that logging this is even useful, because these events are very</span>
+            <span class="s0">// common, mundane, and there's not much we can do about them currently.</span>
+            <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+                <span class="s1">TAG</span><span class="s2">,</span>
+                <span class="s2">new </span><span class="s1">ReactNoCrashSoftException(</span>
+                    <span class="s3">&quot;Caught exception executing ViewCommand: &quot; </span><span class="s1">+ command.toString()</span><span class="s2">, </span><span class="s1">e))</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Throwable e) {</span>
+          <span class="s0">// Non-Retryable exceptions are logged as soft exceptions in prod, but crash in Debug.</span>
+          <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+              <span class="s1">TAG</span><span class="s2">,</span>
+              <span class="s2">new </span><span class="s1">RuntimeException(</span>
+                  <span class="s3">&quot;Caught exception executing ViewCommand: &quot; </span><span class="s1">+ command.toString()</span><span class="s2">, </span><span class="s1">e))</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// If there are MountItems to dispatch, we make sure all the &quot;pre mount items&quot; are executed</span>
+    <span class="s0">// first</span>
+    <span class="s1">Collection&lt;PreAllocateViewMountItem&gt; preMountItemsToDispatch = getAndResetPreMountItems()</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(preMountItemsToDispatch != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">Systrace.beginSection(</span>
+          <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s3">&quot;FabricUIManager::mountViews preMountItems&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+      <span class="s2">for </span><span class="s1">(PreAllocateViewMountItem preMountItem : preMountItemsToDispatch) {</span>
+        <span class="s1">executeOrEnqueue(preMountItem)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(mountItemsToDispatch != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">Systrace.beginSection(</span>
+          <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+          <span class="s3">&quot;FabricUIManager::mountViews mountItems to execute&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+      <span class="s2">long </span><span class="s1">batchedExecutionStartTime = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+
+      <span class="s2">for </span><span class="s1">(MountItem mountItem : mountItemsToDispatch) {</span>
+        <span class="s2">if </span><span class="s1">(ENABLE_FABRIC_LOGS) {</span>
+          <span class="s1">printMountItem(mountItem</span><span class="s2">, </span><span class="s3">&quot;dispatchMountItems: Executing mountItem&quot;</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+
+        <span class="s2">try </span><span class="s1">{</span>
+          <span class="s1">executeOrEnqueue(mountItem)</span><span class="s2">;</span>
+        <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Throwable e) {</span>
+          <span class="s0">// If there's an exception, we want to log diagnostics in prod and rethrow.</span>
+          <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s3">&quot;dispatchMountItems: caught exception, displaying mount state&quot;</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+          <span class="s2">for </span><span class="s1">(MountItem m : mountItemsToDispatch) {</span>
+            <span class="s2">if </span><span class="s1">(m == mountItem) {</span>
+              <span class="s0">// We want to mark the mount item that caused exception</span>
+              <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s3">&quot;dispatchMountItems: mountItem: next mountItem triggered exception!&quot;</span><span class="s1">)</span><span class="s2">;</span>
+            <span class="s1">}</span>
+            <span class="s1">printMountItem(m</span><span class="s2">, </span><span class="s3">&quot;dispatchMountItems: mountItem&quot;</span><span class="s1">)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+          <span class="s2">if </span><span class="s1">(mountItem.getSurfaceId() != View.NO_ID) {</span>
+            <span class="s1">SurfaceMountingManager surfaceManager =</span>
+                <span class="s1">mMountingManager.getSurfaceManager(mountItem.getSurfaceId())</span><span class="s2">;</span>
+            <span class="s2">if </span><span class="s1">(surfaceManager != </span><span class="s2">null</span><span class="s1">) {</span>
+              <span class="s1">surfaceManager.printSurfaceState()</span><span class="s2">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s2">if </span><span class="s1">(ReactIgnorableMountingException.isIgnorable(e)) {</span>
+            <span class="s1">ReactSoftExceptionLogger.logSoftException(TAG</span><span class="s2">, </span><span class="s1">e)</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s2">throw </span><span class="s1">e</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">mBatchedExecutionTime += SystemClock.uptimeMillis() - batchedExecutionStartTime</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mItemDispatchListener.didMountItems()</span><span class="s2">;</span>
+
+    <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+
+    <span class="s2">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">dispatchPreMountItems(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+    <span class="s1">Systrace.beginSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s3">&quot;FabricUIManager::premountViews&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s0">// dispatchPreMountItems cannot be reentrant, but we want to prevent dispatchMountItems from</span>
+    <span class="s0">// reentering during dispatchPreMountItems</span>
+    <span class="s1">mInDispatch = </span><span class="s2">true;</span>
+
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s2">while </span><span class="s1">(</span><span class="s2">true</span><span class="s1">) {</span>
+        <span class="s2">if </span><span class="s1">(haveExceededNonBatchedFrameTime(frameTimeNanos)) {</span>
+          <span class="s2">break;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">PreAllocateViewMountItem preMountItemToDispatch = mPreMountItems.poll()</span><span class="s2">;</span>
+        <span class="s0">// If list is empty, `poll` will return null, or var will never be set</span>
+        <span class="s2">if </span><span class="s1">(preMountItemToDispatch == </span><span class="s2">null</span><span class="s1">) {</span>
+          <span class="s2">break;</span>
+        <span class="s1">}</span>
+
+        <span class="s2">if </span><span class="s1">(ENABLE_FABRIC_LOGS) {</span>
+          <span class="s1">printMountItem(</span>
+              <span class="s1">preMountItemToDispatch</span><span class="s2">,</span>
+              <span class="s3">&quot;dispatchPreMountItems: Dispatching PreAllocateViewMountItem&quot;</span><span class="s1">)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">executeOrEnqueue(preMountItemToDispatch)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+      <span class="s1">mInDispatch = </span><span class="s2">false;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">executeOrEnqueue(MountItem item) {</span>
+    <span class="s2">if </span><span class="s1">(mMountingManager.isWaitingForViewAttach(item.getSurfaceId())) {</span>
+      <span class="s2">if </span><span class="s1">(ENABLE_FABRIC_LOGS) {</span>
+        <span class="s1">FLog.e(</span>
+            <span class="s1">TAG</span><span class="s2">,</span>
+            <span class="s3">&quot;executeOrEnqueue: Item execution delayed, surface %s is not ready yet&quot;</span><span class="s2">,</span>
+            <span class="s1">item.getSurfaceId())</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s1">SurfaceMountingManager surfaceMountingManager =</span>
+          <span class="s1">mMountingManager.getSurfaceManager(item.getSurfaceId())</span><span class="s2">;</span>
+      <span class="s1">surfaceMountingManager.executeOnViewAttach(item)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">item.execute(mMountingManager)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Nullable</span>
+  <span class="s2">private static </span><span class="s1">&lt;E </span><span class="s2">extends </span><span class="s1">MountItem&gt; List&lt;E&gt; drainConcurrentItemQueue(</span>
+      <span class="s1">ConcurrentLinkedQueue&lt;E&gt; queue) {</span>
+    <span class="s2">if </span><span class="s1">(queue.isEmpty()) {</span>
+      <span class="s2">return null;</span>
+    <span class="s1">}</span>
+    <span class="s1">List&lt;E&gt; result = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+    <span class="s2">do </span><span class="s1">{</span>
+      <span class="s1">E item = queue.poll()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(item != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">result.add(item)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">while </span><span class="s1">(!queue.isEmpty())</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(result.size() == </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s2">return null;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">result</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s5">/** Detect if we still have processing time left in this frame. */</span>
+  <span class="s2">private static boolean </span><span class="s1">haveExceededNonBatchedFrameTime(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+    <span class="s2">long </span><span class="s1">timeLeftInFrame = FRAME_TIME_MS - ((System.nanoTime() - frameTimeNanos) / </span><span class="s4">1000000</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">return </span><span class="s1">timeLeftInFrame &lt; MAX_TIME_IN_FRAME_FOR_NON_BATCHED_OPERATIONS_MS</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">private </span><span class="s1">List&lt;DispatchCommandMountItem&gt; getAndResetViewCommandMountItems() {</span>
+    <span class="s2">return </span><span class="s1">drainConcurrentItemQueue(mViewCommandMountItems)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@UiThread</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">private </span><span class="s1">List&lt;MountItem&gt; getAndResetMountItems() {</span>
+    <span class="s2">return </span><span class="s1">drainConcurrentItemQueue(mMountItems)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private </span><span class="s1">Collection&lt;PreAllocateViewMountItem&gt; getAndResetPreMountItems() {</span>
+    <span class="s2">return </span><span class="s1">drainConcurrentItemQueue(mPreMountItems)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public long </span><span class="s1">getBatchedExecutionTime() {</span>
+    <span class="s2">return </span><span class="s1">mBatchedExecutionTime</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public long </span><span class="s1">getRunStartTime() {</span>
+    <span class="s2">return </span><span class="s1">mRunStartTime</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static void </span><span class="s1">printMountItem(MountItem mountItem</span><span class="s2">, </span><span class="s1">String prefix) {</span>
+    <span class="s0">// If a MountItem description is split across multiple lines, it's because it's a</span>
+    <span class="s0">// compound MountItem. Log each line separately.</span>
+    <span class="s1">String[] mountItemLines = mountItem.toString().split(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(String m : mountItemLines) {</span>
+      <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s1">prefix + </span><span class="s3">&quot;: &quot; </span><span class="s1">+ m)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public interface </span><span class="s1">ItemDispatchListener {</span>
+    <span class="s2">void </span><span class="s1">willMountItems()</span><span class="s2">;</span>
+
+    <span class="s2">void </span><span class="s1">didMountItems()</span><span class="s2">;</span>
+
+    <span class="s2">void </span><span class="s1">didDispatchMountItems()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,388 @@
+<html>
+<head>
+<title>IncrementalBundler.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+IncrementalBundler.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {DeltaResult, Graph, MixedOutput, Module} from './DeltaBundler';</span>
+<span class="s0">import type {</span>
+  <span class="s0">Options as DeltaBundlerOptions,</span>
+  <span class="s0">ReadOnlyDependencies,</span>
+  <span class="s0">TransformInputOptions,</span>
+<span class="s0">} from './DeltaBundler/types.flow';</span>
+<span class="s0">import type {GraphId} from './lib/getGraphId';</span>
+<span class="s0">import type {ResolverInputOptions} from './shared/types.flow';</span>
+<span class="s0">import type {ConfigT} from 'metro-config/src/configTypes.flow';</span>
+
+<span class="s0">const Bundler = require('./Bundler');</span>
+<span class="s0">const DeltaBundler = require('./DeltaBundler');</span>
+<span class="s0">const ResourceNotFoundError = require('./IncrementalBundler/ResourceNotFoundError');</span>
+<span class="s0">const getGraphId = require('./lib/getGraphId');</span>
+<span class="s0">const getPrependedScripts = require('./lib/getPrependedScripts');</span>
+<span class="s0">const transformHelpers = require('./lib/transformHelpers');</span>
+<span class="s0">const crypto = require('crypto');</span>
+<span class="s0">const fs = require('fs');</span>
+<span class="s0">const path = require('path');</span>
+
+<span class="s0">export opaque type RevisionId: string = string;</span>
+
+<span class="s0">export type OutputGraph = Graph&lt;&gt;;</span>
+
+<span class="s0">type OtherOptions = $ReadOnly&lt;{</span>
+  <span class="s0">onProgress: $PropertyType&lt;DeltaBundlerOptions&lt;&gt;, 'onProgress'&gt;,</span>
+  <span class="s0">shallow: boolean,</span>
+  <span class="s0">lazy: boolean,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">export type GraphRevision = {</span>
+  <span class="s0">// Identifies the last computed revision.</span>
+  <span class="s0">+id: RevisionId,</span>
+  <span class="s0">+date: Date,</span>
+  <span class="s0">+graphId: GraphId,</span>
+  <span class="s0">+graph: OutputGraph,</span>
+  <span class="s0">+prepend: $ReadOnlyArray&lt;Module&lt;&gt;&gt;,</span>
+<span class="s0">};</span>
+
+<span class="s0">export type IncrementalBundlerOptions = $ReadOnly&lt;{</span>
+  <span class="s0">hasReducedPerformance?: boolean,</span>
+  <span class="s0">watch?: boolean,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">function createRevisionId(): RevisionId {</span>
+  <span class="s0">return crypto.randomBytes(8).toString('hex');</span>
+<span class="s0">}</span>
+
+<span class="s0">function revisionIdFromString(str: string): RevisionId {</span>
+  <span class="s0">return str;</span>
+<span class="s0">}</span>
+
+<span class="s0">class IncrementalBundler {</span>
+  <span class="s0">_config: ConfigT;</span>
+  <span class="s0">_bundler: Bundler;</span>
+  <span class="s0">_deltaBundler: DeltaBundler&lt;&gt;;</span>
+  <span class="s0">_revisionsById: Map&lt;RevisionId, Promise&lt;GraphRevision&gt;&gt; = new Map();</span>
+  <span class="s0">_revisionsByGraphId: Map&lt;GraphId, Promise&lt;GraphRevision&gt;&gt; = new Map();</span>
+
+  <span class="s0">static revisionIdFromString: (str: string) =&gt; RevisionId =</span>
+    <span class="s0">revisionIdFromString;</span>
+
+  <span class="s0">constructor(config: ConfigT, options?: IncrementalBundlerOptions) {</span>
+    <span class="s0">this._config = config;</span>
+    <span class="s0">this._bundler = new Bundler(config, options);</span>
+    <span class="s0">this._deltaBundler = new DeltaBundler(this._bundler.getWatcher());</span>
+  <span class="s0">}</span>
+
+  <span class="s0">end(): void {</span>
+    <span class="s0">this._deltaBundler.end();</span>
+    <span class="s0">// $FlowFixMe[unused-promise]</span>
+    <span class="s0">this._bundler.end();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getBundler(): Bundler {</span>
+    <span class="s0">return this._bundler;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getDeltaBundler(): DeltaBundler&lt;&gt; {</span>
+    <span class="s0">return this._deltaBundler;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getRevision(revisionId: RevisionId): ?Promise&lt;GraphRevision&gt; {</span>
+    <span class="s0">return this._revisionsById.get(revisionId);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getRevisionByGraphId(graphId: GraphId): ?Promise&lt;GraphRevision&gt; {</span>
+    <span class="s0">return this._revisionsByGraphId.get(graphId);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async buildGraphForEntries(</span>
+    <span class="s0">entryFiles: $ReadOnlyArray&lt;string&gt;,</span>
+    <span class="s0">transformOptions: TransformInputOptions,</span>
+    <span class="s0">resolverOptions: ResolverInputOptions,</span>
+    <span class="s0">otherOptions?: OtherOptions = {</span>
+      <span class="s0">onProgress: null,</span>
+      <span class="s0">shallow: false,</span>
+      <span class="s0">lazy: false,</span>
+    <span class="s0">},</span>
+  <span class="s0">): Promise&lt;OutputGraph&gt; {</span>
+    <span class="s0">const absoluteEntryFiles = await this._getAbsoluteEntryFiles(entryFiles);</span>
+
+    <span class="s0">const graph = await this._deltaBundler.buildGraph(absoluteEntryFiles, {</span>
+      <span class="s0">resolve: await transformHelpers.getResolveDependencyFn(</span>
+        <span class="s0">this._bundler,</span>
+        <span class="s0">transformOptions.platform,</span>
+        <span class="s0">resolverOptions,</span>
+      <span class="s0">),</span>
+      <span class="s0">transform: await transformHelpers.getTransformFn(</span>
+        <span class="s0">absoluteEntryFiles,</span>
+        <span class="s0">this._bundler,</span>
+        <span class="s0">this._deltaBundler,</span>
+        <span class="s0">this._config,</span>
+        <span class="s0">transformOptions,</span>
+        <span class="s0">resolverOptions,</span>
+      <span class="s0">),</span>
+      <span class="s0">transformOptions,</span>
+      <span class="s0">onProgress: otherOptions.onProgress,</span>
+      <span class="s0">lazy: otherOptions.lazy,</span>
+      <span class="s0">unstable_allowRequireContext:</span>
+        <span class="s0">this._config.transformer.unstable_allowRequireContext,</span>
+      <span class="s0">unstable_enablePackageExports:</span>
+        <span class="s0">this._config.resolver.unstable_enablePackageExports,</span>
+      <span class="s0">shallow: otherOptions.shallow,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">this._config.serializer.experimentalSerializerHook(graph, {</span>
+      <span class="s0">added: graph.dependencies,</span>
+      <span class="s0">modified: new Map(),</span>
+      <span class="s0">deleted: new Set(),</span>
+      <span class="s0">reset: true,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">return graph;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async getDependencies(</span>
+    <span class="s0">entryFiles: $ReadOnlyArray&lt;string&gt;,</span>
+    <span class="s0">transformOptions: TransformInputOptions,</span>
+    <span class="s0">resolverOptions: ResolverInputOptions,</span>
+    <span class="s0">otherOptions?: OtherOptions = {</span>
+      <span class="s0">onProgress: null,</span>
+      <span class="s0">shallow: false,</span>
+      <span class="s0">lazy: false,</span>
+    <span class="s0">},</span>
+  <span class="s0">): Promise&lt;ReadOnlyDependencies&lt;&gt;&gt; {</span>
+    <span class="s0">const absoluteEntryFiles = await this._getAbsoluteEntryFiles(entryFiles);</span>
+
+    <span class="s0">const dependencies = await this._deltaBundler.getDependencies(</span>
+      <span class="s0">absoluteEntryFiles,</span>
+      <span class="s0">{</span>
+        <span class="s0">resolve: await transformHelpers.getResolveDependencyFn(</span>
+          <span class="s0">this._bundler,</span>
+          <span class="s0">transformOptions.platform,</span>
+          <span class="s0">resolverOptions,</span>
+        <span class="s0">),</span>
+        <span class="s0">transform: await transformHelpers.getTransformFn(</span>
+          <span class="s0">absoluteEntryFiles,</span>
+          <span class="s0">this._bundler,</span>
+          <span class="s0">this._deltaBundler,</span>
+          <span class="s0">this._config,</span>
+          <span class="s0">transformOptions,</span>
+          <span class="s0">resolverOptions,</span>
+        <span class="s0">),</span>
+        <span class="s0">transformOptions,</span>
+        <span class="s0">onProgress: otherOptions.onProgress,</span>
+        <span class="s0">lazy: otherOptions.lazy,</span>
+        <span class="s0">unstable_allowRequireContext:</span>
+          <span class="s0">this._config.transformer.unstable_allowRequireContext,</span>
+        <span class="s0">unstable_enablePackageExports:</span>
+          <span class="s0">this._config.resolver.unstable_enablePackageExports,</span>
+        <span class="s0">shallow: otherOptions.shallow,</span>
+      <span class="s0">},</span>
+    <span class="s0">);</span>
+
+    <span class="s0">return dependencies;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async buildGraph(</span>
+    <span class="s0">entryFile: string,</span>
+    <span class="s0">transformOptions: TransformInputOptions,</span>
+    <span class="s0">resolverOptions: ResolverInputOptions,</span>
+    <span class="s0">otherOptions?: OtherOptions = {</span>
+      <span class="s0">onProgress: null,</span>
+      <span class="s0">shallow: false,</span>
+      <span class="s0">lazy: false,</span>
+    <span class="s0">},</span>
+  <span class="s0">): Promise&lt;{+graph: OutputGraph, +prepend: $ReadOnlyArray&lt;Module&lt;&gt;&gt;}&gt; {</span>
+    <span class="s0">const graph = await this.buildGraphForEntries(</span>
+      <span class="s0">[entryFile],</span>
+      <span class="s0">transformOptions,</span>
+      <span class="s0">resolverOptions,</span>
+      <span class="s0">otherOptions,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">const {type: _, ...transformOptionsWithoutType} = transformOptions;</span>
+
+    <span class="s0">const prepend = await getPrependedScripts(</span>
+      <span class="s0">this._config,</span>
+      <span class="s0">transformOptionsWithoutType,</span>
+      <span class="s0">resolverOptions,</span>
+      <span class="s0">this._bundler,</span>
+      <span class="s0">this._deltaBundler,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">return {</span>
+      <span class="s0">prepend,</span>
+      <span class="s0">graph,</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// TODO T34760750 (alexkirsz) Eventually, I'd like to get to a point where</span>
+  <span class="s0">// this class exposes only initializeGraph and updateGraph.</span>
+  <span class="s0">async initializeGraph(</span>
+    <span class="s0">entryFile: string,</span>
+    <span class="s0">transformOptions: TransformInputOptions,</span>
+    <span class="s0">resolverOptions: ResolverInputOptions,</span>
+    <span class="s0">otherOptions?: OtherOptions = {</span>
+      <span class="s0">onProgress: null,</span>
+      <span class="s0">shallow: false,</span>
+      <span class="s0">lazy: false,</span>
+    <span class="s0">},</span>
+  <span class="s0">): Promise&lt;{</span>
+    <span class="s0">delta: DeltaResult&lt;&gt;,</span>
+    <span class="s0">revision: GraphRevision,</span>
+    <span class="s0">...</span>
+  <span class="s0">}&gt; {</span>
+    <span class="s0">const graphId = getGraphId(entryFile, transformOptions, {</span>
+      <span class="s0">resolverOptions,</span>
+      <span class="s0">shallow: otherOptions.shallow,</span>
+      <span class="s0">lazy: otherOptions.lazy,</span>
+      <span class="s0">unstable_allowRequireContext:</span>
+        <span class="s0">this._config.transformer.unstable_allowRequireContext,</span>
+    <span class="s0">});</span>
+    <span class="s0">const revisionId = createRevisionId();</span>
+    <span class="s0">const revisionPromise = (async () =&gt; {</span>
+      <span class="s0">const {graph, prepend} = await this.buildGraph(</span>
+        <span class="s0">entryFile,</span>
+        <span class="s0">transformOptions,</span>
+        <span class="s0">resolverOptions,</span>
+        <span class="s0">otherOptions,</span>
+      <span class="s0">);</span>
+      <span class="s0">return {</span>
+        <span class="s0">id: revisionId,</span>
+        <span class="s0">date: new Date(),</span>
+        <span class="s0">graphId,</span>
+        <span class="s0">graph,</span>
+        <span class="s0">prepend,</span>
+      <span class="s0">};</span>
+    <span class="s0">})();</span>
+
+    <span class="s0">this._revisionsById.set(revisionId, revisionPromise);</span>
+    <span class="s0">this._revisionsByGraphId.set(graphId, revisionPromise);</span>
+    <span class="s0">try {</span>
+      <span class="s0">const revision = await revisionPromise;</span>
+      <span class="s0">const delta = {</span>
+        <span class="s0">added: revision.graph.dependencies,</span>
+        <span class="s0">modified: new Map&lt;string, Module&lt;MixedOutput&gt;&gt;(),</span>
+        <span class="s0">deleted: new Set&lt;string&gt;(),</span>
+        <span class="s0">reset: true,</span>
+      <span class="s0">};</span>
+      <span class="s0">return {</span>
+        <span class="s0">revision,</span>
+        <span class="s0">delta,</span>
+      <span class="s0">};</span>
+    <span class="s0">} catch (err) {</span>
+      <span class="s0">// Evict a bad revision from the cache since otherwise</span>
+      <span class="s0">// we'll keep getting it even after the build is fixed.</span>
+      <span class="s0">this._revisionsById.delete(revisionId);</span>
+      <span class="s0">this._revisionsByGraphId.delete(graphId);</span>
+      <span class="s0">throw err;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async updateGraph(</span>
+    <span class="s0">revision: GraphRevision,</span>
+    <span class="s0">reset: boolean,</span>
+  <span class="s0">): Promise&lt;{</span>
+    <span class="s0">delta: DeltaResult&lt;&gt;,</span>
+    <span class="s0">revision: GraphRevision,</span>
+    <span class="s0">...</span>
+  <span class="s0">}&gt; {</span>
+    <span class="s0">const delta = await this._deltaBundler.getDelta(revision.graph, {</span>
+      <span class="s0">reset,</span>
+      <span class="s0">shallow: false,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">this._config.serializer.experimentalSerializerHook(revision.graph, delta);</span>
+
+    <span class="s0">if (</span>
+      <span class="s0">delta.added.size &gt; 0 ||</span>
+      <span class="s0">delta.modified.size &gt; 0 ||</span>
+      <span class="s0">delta.deleted.size &gt; 0</span>
+    <span class="s0">) {</span>
+      <span class="s0">this._revisionsById.delete(revision.id);</span>
+      <span class="s0">revision = {</span>
+        <span class="s0">...revision,</span>
+        <span class="s0">// Generate a new revision id, to be used to verify the next incremental</span>
+        <span class="s0">// request.</span>
+        <span class="s0">id: crypto.randomBytes(8).toString('hex'),</span>
+        <span class="s0">date: new Date(),</span>
+      <span class="s0">};</span>
+      <span class="s0">const revisionPromise = Promise.resolve(revision);</span>
+      <span class="s0">this._revisionsById.set(revision.id, revisionPromise);</span>
+      <span class="s0">this._revisionsByGraphId.set(revision.graphId, revisionPromise);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return {revision, delta};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async endGraph(graphId: GraphId): Promise&lt;void&gt; {</span>
+    <span class="s0">const revPromise = this._revisionsByGraphId.get(graphId);</span>
+    <span class="s0">if (!revPromise) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+    <span class="s0">const revision = await revPromise;</span>
+    <span class="s0">this._deltaBundler.endGraph(revision.graph);</span>
+    <span class="s0">this._revisionsByGraphId.delete(graphId);</span>
+    <span class="s0">this._revisionsById.delete(revision.id);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async _getAbsoluteEntryFiles(</span>
+    <span class="s0">entryFiles: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">): Promise&lt;$ReadOnlyArray&lt;string&gt;&gt; {</span>
+    <span class="s0">const absoluteEntryFiles = entryFiles.map((entryFile: string) =&gt;</span>
+      <span class="s0">path.resolve(</span>
+        <span class="s0">this._config.server.unstable_serverRoot ?? this._config.projectRoot,</span>
+        <span class="s0">entryFile,</span>
+      <span class="s0">),</span>
+    <span class="s0">);</span>
+
+    <span class="s0">await Promise.all(</span>
+      <span class="s0">absoluteEntryFiles.map(</span>
+        <span class="s0">(entryFile: string) =&gt;</span>
+          <span class="s0">new Promise((resolve: void =&gt; void, reject: mixed =&gt; mixed) =&gt; {</span>
+            <span class="s0">// This should throw an error if the file doesn't exist.</span>
+            <span class="s0">// Using this instead of fs.exists to account for SimLinks.</span>
+            <span class="s0">fs.realpath(entryFile, err =&gt; {</span>
+              <span class="s0">if (err) {</span>
+                <span class="s0">reject(new ResourceNotFoundError(entryFile));</span>
+              <span class="s0">} else {</span>
+                <span class="s0">resolve();</span>
+              <span class="s0">}</span>
+            <span class="s0">});</span>
+          <span class="s0">}),</span>
+      <span class="s0">),</span>
+    <span class="s0">);</span>
+
+    <span class="s0">return absoluteEntryFiles;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Wait for the bundler to become ready.</span>
+  <span class="s0">async ready(): Promise&lt;void&gt; {</span>
+    <span class="s0">await this._bundler.ready();</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = IncrementalBundler;</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,553 @@
+<html>
+<head>
+<title>resolve.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+resolve.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">FileAndDirCandidates,</span>
+  <span class="s0">FileCandidates,</span>
+  <span class="s0">Resolution,</span>
+  <span class="s0">ResolutionContext,</span>
+  <span class="s0">Result,</span>
+<span class="s0">} from './types';</span>
+
+<span class="s0">import path from 'path';</span>
+<span class="s0">import FailedToResolveNameError from './errors/FailedToResolveNameError';</span>
+<span class="s0">import FailedToResolvePathError from './errors/FailedToResolvePathError';</span>
+<span class="s0">import InvalidPackageConfigurationError from './errors/InvalidPackageConfigurationError';</span>
+<span class="s0">import InvalidPackageError from './errors/InvalidPackageError';</span>
+<span class="s0">import PackagePathNotExportedError from './errors/PackagePathNotExportedError';</span>
+<span class="s0">import formatFileCandidates from './errors/formatFileCandidates';</span>
+<span class="s0">import {getPackageEntryPoint} from './PackageResolve';</span>
+<span class="s0">import {resolvePackageTargetFromExports} from './PackageExportsResolve';</span>
+<span class="s0">import resolveAsset from './resolveAsset';</span>
+<span class="s0">import isAssetFile from './utils/isAssetFile';</span>
+
+<span class="s0">function resolve(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): Resolution {</span>
+  <span class="s0">const resolveRequest = context.resolveRequest;</span>
+  <span class="s0">if (</span>
+    <span class="s0">resolveRequest &amp;&amp;</span>
+    <span class="s0">// Prevent infinite recursion in the trivial case</span>
+    <span class="s0">resolveRequest !== resolve</span>
+  <span class="s0">) {</span>
+    <span class="s0">return resolveRequest(</span>
+      <span class="s0">Object.freeze({...context, resolveRequest: resolve}),</span>
+      <span class="s0">moduleName,</span>
+      <span class="s0">platform,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (isRelativeImport(moduleName) || path.isAbsolute(moduleName)) {</span>
+    <span class="s0">const result = resolveModulePath(context, moduleName, platform);</span>
+    <span class="s0">if (result.type === 'failed') {</span>
+      <span class="s0">throw new FailedToResolvePathError(result.candidates);</span>
+    <span class="s0">}</span>
+    <span class="s0">return result.resolution;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const realModuleName = context.redirectModulePath(moduleName);</span>
+
+  <span class="s0">// exclude</span>
+  <span class="s0">if (realModuleName === false) {</span>
+    <span class="s0">return {type: 'empty'};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const {originModulePath} = context;</span>
+
+  <span class="s0">const isDirectImport =</span>
+    <span class="s0">isRelativeImport(realModuleName) || path.isAbsolute(realModuleName);</span>
+
+  <span class="s0">if (isDirectImport) {</span>
+    <span class="s0">// derive absolute path /.../node_modules/originModuleDir/realModuleName</span>
+    <span class="s0">const fromModuleParentIdx =</span>
+      <span class="s0">originModulePath.lastIndexOf('node_modules' + path.sep) + 13;</span>
+    <span class="s0">const originModuleDir = originModulePath.slice(</span>
+      <span class="s0">0,</span>
+      <span class="s0">originModulePath.indexOf(path.sep, fromModuleParentIdx),</span>
+    <span class="s0">);</span>
+    <span class="s0">const absPath = path.join(originModuleDir, realModuleName);</span>
+    <span class="s0">const result = resolveModulePath(context, absPath, platform);</span>
+    <span class="s0">if (result.type === 'failed') {</span>
+      <span class="s0">throw new FailedToResolvePathError(result.candidates);</span>
+    <span class="s0">}</span>
+    <span class="s0">return result.resolution;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (context.allowHaste &amp;&amp; !isDirectImport) {</span>
+    <span class="s0">const normalizedName = normalizePath(realModuleName);</span>
+    <span class="s0">const result = resolveHasteName(context, normalizedName, platform);</span>
+    <span class="s0">if (result.type === 'resolved') {</span>
+      <span class="s0">return result.resolution;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const {disableHierarchicalLookup} = context;</span>
+
+  <span class="s0">const nodeModulesPaths = [];</span>
+  <span class="s0">let next = path.dirname(originModulePath);</span>
+
+  <span class="s0">if (!disableHierarchicalLookup) {</span>
+    <span class="s0">let candidate;</span>
+    <span class="s0">do {</span>
+      <span class="s0">candidate = next;</span>
+      <span class="s0">nodeModulesPaths.push(path.join(candidate, 'node_modules'));</span>
+      <span class="s0">next = path.dirname(candidate);</span>
+    <span class="s0">} while (candidate !== next);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Fall back to `nodeModulesPaths` after hierarchical lookup, similar to $NODE_PATH</span>
+  <span class="s0">nodeModulesPaths.push(...context.nodeModulesPaths);</span>
+
+  <span class="s0">const extraPaths = [];</span>
+  <span class="s0">const {extraNodeModules} = context;</span>
+  <span class="s0">if (extraNodeModules) {</span>
+    <span class="s0">let bits = path.normalize(moduleName).split(path.sep);</span>
+    <span class="s0">let packageName;</span>
+    <span class="s0">// Normalize packageName and bits for scoped modules</span>
+    <span class="s0">if (bits.length &gt;= 2 &amp;&amp; bits[0].startsWith('@')) {</span>
+      <span class="s0">packageName = bits.slice(0, 2).join('/');</span>
+      <span class="s0">bits = bits.slice(1);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">packageName = bits[0];</span>
+    <span class="s0">}</span>
+    <span class="s0">if (extraNodeModules[packageName]) {</span>
+      <span class="s0">bits[0] = extraNodeModules[packageName];</span>
+      <span class="s0">extraPaths.push(path.join.apply(path, bits));</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const allDirPaths = nodeModulesPaths</span>
+    <span class="s0">.map(nodeModulePath =&gt; path.join(nodeModulePath, realModuleName))</span>
+    <span class="s0">.concat(extraPaths);</span>
+  <span class="s0">for (let i = 0; i &lt; allDirPaths.length; ++i) {</span>
+    <span class="s0">const candidate = context.redirectModulePath(allDirPaths[i]);</span>
+
+    <span class="s0">if (candidate === false) {</span>
+      <span class="s0">return {type: 'empty'};</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const result = resolvePackage(context, candidate, platform);</span>
+    <span class="s0">if (result.type === 'resolved') {</span>
+      <span class="s0">return result.resolution;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">throw new FailedToResolveNameError(nodeModulesPaths, extraPaths);</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Resolve any kind of module path, whether it's a file or a directory.</span>
+ <span class="s0">* For example we may want to resolve './foobar'. The closest</span>
+ <span class="s0">* `package.json` may define a redirection for this path, for example</span>
+ <span class="s0">* `/smth/lib/foobar`, that may be further resolved to</span>
+ <span class="s0">* `/smth/lib/foobar/index.ios.js`.</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolveModulePath(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">toModuleName: string,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): Result&lt;Resolution, FileAndDirCandidates&gt; {</span>
+  <span class="s0">const modulePath = path.isAbsolute(toModuleName)</span>
+    <span class="s0">? resolveWindowsPath(toModuleName)</span>
+    <span class="s0">: path.join(path.dirname(context.originModulePath), toModuleName);</span>
+  <span class="s0">const redirectedPath = context.redirectModulePath(modulePath);</span>
+  <span class="s0">if (redirectedPath === false) {</span>
+    <span class="s0">return resolvedAs({type: 'empty'});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const dirPath = path.dirname(redirectedPath);</span>
+  <span class="s0">const fileName = path.basename(redirectedPath);</span>
+  <span class="s0">const fileResult = resolveFile(context, dirPath, fileName, platform);</span>
+  <span class="s0">if (fileResult.type === 'resolved') {</span>
+    <span class="s0">return fileResult;</span>
+  <span class="s0">}</span>
+  <span class="s0">const dirResult = resolvePackageEntryPoint(context, redirectedPath, platform);</span>
+  <span class="s0">if (dirResult.type === 'resolved') {</span>
+    <span class="s0">return dirResult;</span>
+  <span class="s0">}</span>
+  <span class="s0">return failedFor({file: fileResult.candidates, dir: dirResult.candidates});</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Resolve a module as a Haste module or package. For example we might try to</span>
+ <span class="s0">* resolve `Foo`, that is provided by file `/smth/Foo.js`. Or, in the case of</span>
+ <span class="s0">* a Haste package, it could be `/smth/Foo/index.js`.</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolveHasteName(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): Result&lt;Resolution, void&gt; {</span>
+  <span class="s0">const modulePath = context.resolveHasteModule(moduleName);</span>
+  <span class="s0">if (modulePath != null) {</span>
+    <span class="s0">return resolvedAs({type: 'sourceFile', filePath: modulePath});</span>
+  <span class="s0">}</span>
+  <span class="s0">let packageName = moduleName;</span>
+  <span class="s0">let packageJsonPath = context.resolveHastePackage(packageName);</span>
+  <span class="s0">while (packageJsonPath == null &amp;&amp; packageName &amp;&amp; packageName !== '.') {</span>
+    <span class="s0">packageName = path.dirname(packageName);</span>
+    <span class="s0">packageJsonPath = context.resolveHastePackage(packageName);</span>
+  <span class="s0">}</span>
+  <span class="s0">if (packageJsonPath == null) {</span>
+    <span class="s0">return failedFor();</span>
+  <span class="s0">}</span>
+  <span class="s0">const packageDirPath = path.dirname(packageJsonPath);</span>
+  <span class="s0">const pathInModule = moduleName.substring(packageName.length + 1);</span>
+  <span class="s0">const potentialModulePath = path.join(packageDirPath, pathInModule);</span>
+  <span class="s0">const result = resolveModulePath(context, potentialModulePath, platform);</span>
+  <span class="s0">if (result.type === 'resolved') {</span>
+    <span class="s0">return result;</span>
+  <span class="s0">}</span>
+  <span class="s0">const {candidates} = result;</span>
+  <span class="s0">const opts = {moduleName, packageName, pathInModule, candidates};</span>
+  <span class="s0">throw new MissingFileInHastePackageError(opts);</span>
+<span class="s0">}</span>
+
+<span class="s0">class MissingFileInHastePackageError extends Error {</span>
+  <span class="s0">candidates: FileAndDirCandidates;</span>
+  <span class="s0">moduleName: string;</span>
+  <span class="s0">packageName: string;</span>
+  <span class="s0">pathInModule: string;</span>
+
+  <span class="s0">constructor(opts: {</span>
+    <span class="s0">+candidates: FileAndDirCandidates,</span>
+    <span class="s0">+moduleName: string,</span>
+    <span class="s0">+packageName: string,</span>
+    <span class="s0">+pathInModule: string,</span>
+  <span class="s0">}) {</span>
+    <span class="s0">super(</span>
+      <span class="s0">`While resolving module \`${opts.moduleName}\`, ` +</span>
+        <span class="s0">`the Haste package \`${opts.packageName}\` was found. However the ` +</span>
+        <span class="s0">`module \`${opts.pathInModule}\` could not be found within ` +</span>
+        <span class="s0">'the package. Indeed, none of these files exist:\n\n' +</span>
+        <span class="s0">`  * \`${formatFileCandidates(opts.candidates.file)}\`\n` +</span>
+        <span class="s0">`  * \`${formatFileCandidates(opts.candidates.dir)}\``,</span>
+    <span class="s0">);</span>
+    <span class="s0">Object.assign(this, opts);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Resolve a package entry point or subpath target.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This should be used when resolving a bare import specifier prefixed with the</span>
+ <span class="s0">* package name. Use `resolveModulePath` instead to scope to legacy &quot;browser&quot;</span>
+ <span class="s0">* spec behaviour, which is also applicable to relative and absolute imports.</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolvePackage(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">/**</span>
+   <span class="s0">* The absolute path to a file or directory that may be contained within an</span>
+   <span class="s0">* npm package, e.g. from being joined with `context.extraNodeModules`.</span>
+   <span class="s0">*/</span>
+  <span class="s0">modulePath: string,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): Result&lt;Resolution, FileAndDirCandidates&gt; {</span>
+  <span class="s0">if (context.unstable_enablePackageExports) {</span>
+    <span class="s0">const pkg = context.getPackageForModule(modulePath);</span>
+    <span class="s0">const exportsField = pkg?.packageJson.exports;</span>
+
+    <span class="s0">if (pkg != null &amp;&amp; exportsField != null) {</span>
+      <span class="s0">let conditionNamesOverride = context.unstable_conditionNames;</span>
+
+      <span class="s0">// HACK!: Do not assert the &quot;import&quot; condition for `@babel/runtime`. This</span>
+      <span class="s0">// is a workaround for ESM &lt;-&gt; CJS interop, as we need the CJS versions of</span>
+      <span class="s0">// `@babel/runtime` helpers.</span>
+      <span class="s0">// TODO(T154157178): Remove with better &quot;require&quot;/&quot;import&quot; solution</span>
+      <span class="s0">if (pkg.packageJson.name === '@babel/runtime') {</span>
+        <span class="s0">conditionNamesOverride = context.unstable_conditionNames.filter(</span>
+          <span class="s0">condition =&gt; condition !== 'import',</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">try {</span>
+        <span class="s0">const packageExportsResult = resolvePackageTargetFromExports(</span>
+          <span class="s0">{...context, unstable_conditionNames: conditionNamesOverride},</span>
+          <span class="s0">pkg.rootPath,</span>
+          <span class="s0">modulePath,</span>
+          <span class="s0">exportsField,</span>
+          <span class="s0">platform,</span>
+        <span class="s0">);</span>
+
+        <span class="s0">if (packageExportsResult != null) {</span>
+          <span class="s0">return resolvedAs(packageExportsResult);</span>
+        <span class="s0">}</span>
+      <span class="s0">} catch (e) {</span>
+        <span class="s0">if (e instanceof PackagePathNotExportedError) {</span>
+          <span class="s0">context.unstable_logWarning(</span>
+            <span class="s0">e.message +</span>
+              <span class="s0">' Falling back to file-based resolution. Consider updating the ' +</span>
+              <span class="s0">'call site or asking the package maintainer(s) to expose this API.',</span>
+          <span class="s0">);</span>
+        <span class="s0">} else if (e instanceof InvalidPackageConfigurationError) {</span>
+          <span class="s0">context.unstable_logWarning(</span>
+            <span class="s0">e.message + ' Falling back to file-based resolution.',</span>
+          <span class="s0">);</span>
+        <span class="s0">} else {</span>
+          <span class="s0">throw e;</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return resolveModulePath(context, modulePath, platform);</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Attempt to resolve a module path as an npm package entry point, or resolve as</span>
+ <span class="s0">* a file if no `package.json` file is present.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Implements legacy (non-exports) package resolution behaviour based on the</span>
+ <span class="s0">* [&quot;browser&quot; field spec](https://github.com/defunctzombie/package-browser-field-spec):</span>
+ <span class="s0">* - Looks for a &quot;main&quot; entry point based on `context.mainFields`.</span>
+ <span class="s0">* - Considers any &quot;main&quot; subpaths after expending source and platform-specific</span>
+ <span class="s0">*     extensions, e.g. `./lib/index` -&gt; `./lib/index.ios.js`.</span>
+ <span class="s0">* - Falls back to a child `index.js` file, e.g. `./lib` -&gt; `./lib/index.js`.</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolvePackageEntryPoint(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">packagePath: string,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): Result&lt;Resolution, FileCandidates&gt; {</span>
+  <span class="s0">const packageJsonPath = path.join(packagePath, 'package.json');</span>
+
+  <span class="s0">if (!context.doesFileExist(packageJsonPath)) {</span>
+    <span class="s0">return resolveFile(context, packagePath, 'index', platform);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const packageInfo = {</span>
+    <span class="s0">rootPath: path.dirname(packageJsonPath),</span>
+    <span class="s0">packageJson: context.getPackage(packageJsonPath) ?? {},</span>
+  <span class="s0">};</span>
+
+  <span class="s0">const mainModulePath = path.join(</span>
+    <span class="s0">packageInfo.rootPath,</span>
+    <span class="s0">getPackageEntryPoint(context, packageInfo, platform),</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const fileResult = resolveFile(</span>
+    <span class="s0">context,</span>
+    <span class="s0">path.dirname(mainModulePath),</span>
+    <span class="s0">path.basename(mainModulePath),</span>
+    <span class="s0">platform,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">if (fileResult.type === 'resolved') {</span>
+    <span class="s0">return fileResult;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Fallback: Attempt to resolve any file at &lt;subpath&gt;/index.js</span>
+  <span class="s0">const indexResult = resolveFile(context, mainModulePath, 'index', platform);</span>
+
+  <span class="s0">if (indexResult.type !== 'resolved') {</span>
+    <span class="s0">throw new InvalidPackageError({</span>
+      <span class="s0">packageJsonPath,</span>
+      <span class="s0">mainModulePath,</span>
+      <span class="s0">fileCandidates: fileResult.candidates,</span>
+      <span class="s0">indexCandidates: indexResult.candidates,</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return indexResult;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Given a file name for a particular directory, return a resolution result</span>
+ <span class="s0">* depending on whether or not we found the corresponding module as a file. For</span>
+ <span class="s0">* example, we might ask for `foo.png`, that resolves to</span>
+ <span class="s0">* `['/js/beep/foo.ios.png']`. Or we may ask for `boop`, that resolves to</span>
+ <span class="s0">* `/js/boop.android.ts`. On the other hand this function does not resolve</span>
+ <span class="s0">* directory-based module names: for example `boop` will not resolve to</span>
+ <span class="s0">* `/js/boop/index.js` (see `_loadAsDir` for that).</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolveFile(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">dirPath: string,</span>
+  <span class="s0">fileName: string,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): Result&lt;Resolution, FileCandidates&gt; {</span>
+  <span class="s0">if (isAssetFile(fileName, context.assetExts)) {</span>
+    <span class="s0">const assetResolutions = resolveAsset(</span>
+      <span class="s0">context,</span>
+      <span class="s0">path.join(dirPath, fileName),</span>
+    <span class="s0">);</span>
+
+    <span class="s0">if (assetResolutions == null) {</span>
+      <span class="s0">return failedFor({type: 'asset', name: fileName});</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return resolvedAs(assetResolutions);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const candidateExts: Array&lt;string&gt; = [];</span>
+  <span class="s0">const filePathPrefix = path.join(dirPath, fileName);</span>
+  <span class="s0">const sfContext = {...context, candidateExts, filePathPrefix};</span>
+  <span class="s0">const sourceFileResolution = resolveSourceFile(sfContext, platform);</span>
+  <span class="s0">if (sourceFileResolution != null) {</span>
+    <span class="s0">if (typeof sourceFileResolution === 'string') {</span>
+      <span class="s0">return resolvedAs({type: 'sourceFile', filePath: sourceFileResolution});</span>
+    <span class="s0">}</span>
+    <span class="s0">return resolvedAs(sourceFileResolution);</span>
+  <span class="s0">}</span>
+  <span class="s0">return failedFor({type: 'sourceFile', filePathPrefix, candidateExts});</span>
+<span class="s0">}</span>
+
+<span class="s0">type SourceFileContext = $ReadOnly&lt;{</span>
+  <span class="s0">...ResolutionContext,</span>
+  <span class="s0">candidateExts: Array&lt;string&gt;,</span>
+  <span class="s0">filePathPrefix: string,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">// Either a full path, or a restricted subset of Resolution.</span>
+<span class="s0">type SourceFileResolution = ?string | $ReadOnly&lt;{type: 'empty'}&gt;;</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* A particular 'base path' can resolve to a number of possibilities depending</span>
+ <span class="s0">* on the context. For example `foo/bar` could resolve to `foo/bar.ios.js`, or</span>
+ <span class="s0">* to `foo/bar.js`. If can also resolve to the bare path `foo/bar` itself, as</span>
+ <span class="s0">* supported by Node.js resolution. On the other hand it doesn't support</span>
+ <span class="s0">* `foo/bar.ios`, for historical reasons.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Return the full path of the resolved module, `null` if no resolution could</span>
+ <span class="s0">* be found, or `{type: 'empty'}` if redirected to an empty module.</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolveSourceFile(</span>
+  <span class="s0">context: SourceFileContext,</span>
+  <span class="s0">platform: ?string,</span>
+<span class="s0">): SourceFileResolution {</span>
+  <span class="s0">let filePath = resolveSourceFileForAllExts(context, '');</span>
+  <span class="s0">if (filePath) {</span>
+    <span class="s0">return filePath;</span>
+  <span class="s0">}</span>
+  <span class="s0">const {sourceExts} = context;</span>
+  <span class="s0">for (let i = 0; i &lt; sourceExts.length; i++) {</span>
+    <span class="s0">const ext = `.${sourceExts[i]}`;</span>
+    <span class="s0">filePath = resolveSourceFileForAllExts(context, ext, platform);</span>
+    <span class="s0">if (filePath != null) {</span>
+      <span class="s0">return filePath;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s0">return null;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* For a particular extension, ex. `js`, we want to try a few possibilities,</span>
+ <span class="s0">* such as `foo.ios.js`, `foo.native.js`, and of course `foo.js`. Return the</span>
+ <span class="s0">* full path of the resolved module, `null` if no resolution could be found, or</span>
+ <span class="s0">* `{type: 'empty'}` if redirected to an empty module.</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolveSourceFileForAllExts(</span>
+  <span class="s0">context: SourceFileContext,</span>
+  <span class="s0">sourceExt: string,</span>
+  <span class="s0">platform: ?string,</span>
+<span class="s0">): SourceFileResolution {</span>
+  <span class="s0">if (platform != null) {</span>
+    <span class="s0">const ext = `.${platform}${sourceExt}`;</span>
+    <span class="s0">const filePath = resolveSourceFileForExt(context, ext);</span>
+    <span class="s0">if (filePath) {</span>
+      <span class="s0">return filePath;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s0">if (context.preferNativePlatform) {</span>
+    <span class="s0">const filePath = resolveSourceFileForExt(context, `.native${sourceExt}`);</span>
+    <span class="s0">if (filePath) {</span>
+      <span class="s0">return filePath;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s0">const filePath = resolveSourceFileForExt(context, sourceExt);</span>
+  <span class="s0">return filePath;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* We try to resolve a single possible extension. If it doesn't exist, then</span>
+ <span class="s0">* we make sure to add the extension to a list of candidates for reporting.</span>
+ <span class="s0">*/</span>
+<span class="s0">function resolveSourceFileForExt(</span>
+  <span class="s0">context: SourceFileContext,</span>
+  <span class="s0">extension: string,</span>
+<span class="s0">): SourceFileResolution {</span>
+  <span class="s0">const filePath = `${context.filePathPrefix}${extension}`;</span>
+  <span class="s0">const redirectedPath =</span>
+    <span class="s0">// Any redirections for the bare path have already happened</span>
+    <span class="s0">extension !== '' ? context.redirectModulePath(filePath) : filePath;</span>
+  <span class="s0">if (redirectedPath === false) {</span>
+    <span class="s0">return {type: 'empty'};</span>
+  <span class="s0">}</span>
+  <span class="s0">if (context.unstable_getRealPath) {</span>
+    <span class="s0">const maybeRealPath = context.unstable_getRealPath(redirectedPath);</span>
+    <span class="s0">if (maybeRealPath != null) {</span>
+      <span class="s0">return maybeRealPath;</span>
+    <span class="s0">}</span>
+  <span class="s0">} else if (context.doesFileExist(redirectedPath)) {</span>
+    <span class="s0">return redirectedPath;</span>
+  <span class="s0">}</span>
+  <span class="s0">context.candidateExts.push(extension);</span>
+  <span class="s0">return null;</span>
+<span class="s0">}</span>
+
+<span class="s0">// HasteFS stores paths with backslashes on Windows, this ensures the path is in</span>
+<span class="s0">// the proper format. Will also add drive letter if not present so `/root` will</span>
+<span class="s0">// resolve to `C:\root`. Noop on other platforms.</span>
+<span class="s0">function resolveWindowsPath(modulePath: string) {</span>
+  <span class="s0">if (path.sep !== '\\') {</span>
+    <span class="s0">return modulePath;</span>
+  <span class="s0">}</span>
+  <span class="s0">return path.resolve(modulePath);</span>
+<span class="s0">}</span>
+
+<span class="s0">function isRelativeImport(filePath: string) {</span>
+  <span class="s0">return /^[.][.]?(?:[/]|$)/.test(filePath);</span>
+<span class="s0">}</span>
+
+<span class="s0">function normalizePath(modulePath: any | string) {</span>
+  <span class="s0">if (path.sep === '/') {</span>
+    <span class="s0">modulePath = path.normalize(modulePath);</span>
+  <span class="s0">} else if (path.posix) {</span>
+    <span class="s0">modulePath = path.posix.normalize(modulePath);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return modulePath.replace(/\/$/, '');</span>
+<span class="s0">}</span>
+
+<span class="s0">function resolvedAs&lt;TResolution, TCandidates&gt;(</span>
+  <span class="s0">resolution: TResolution,</span>
+<span class="s0">): Result&lt;TResolution, TCandidates&gt; {</span>
+  <span class="s0">return {type: 'resolved', resolution};</span>
+<span class="s0">}</span>
+
+<span class="s0">function failedFor&lt;TResolution, TCandidates&gt;(</span>
+  <span class="s0">candidates: TCandidates,</span>
+<span class="s0">): Result&lt;TResolution, TCandidates&gt; {</span>
+  <span class="s0">return {type: 'failed', candidates};</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = resolve;</span>
+</pre>
+</body>
+</html>

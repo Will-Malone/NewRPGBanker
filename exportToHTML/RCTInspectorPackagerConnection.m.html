@@ -1,0 +1,373 @@
+<html>
+<head>
+<title>RCTInspectorPackagerConnection.m</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTInspectorPackagerConnection.m</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTInspectorPackagerConnection.h&gt;</span>
+
+<span class="s2">#if </span><span class="s1">RCT_DEV || RCT_REMOTE_PROFILE</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTDefines.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTInspector.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTLog.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;SocketRocket/SRWebSocket.h&gt;</span>
+
+<span class="s0">// This is a port of the Android impl, at</span>
+<span class="s0">// ReactAndroid/src/main/java/com/facebook/react/devsupport/InspectorPackagerConnection.java</span>
+<span class="s0">// please keep consistent :)</span>
+
+<span class="s4">const int </span><span class="s1">RECONNECT_DELAY_MS = </span><span class="s5">2000</span><span class="s4">;</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTBundleStatus</span>
+<span class="s4">@end</span>
+
+<span class="s4">@interface </span><span class="s1">RCTInspectorPackagerConnection () &lt;SRWebSocketDelegate&gt; {</span>
+  <span class="s1">NSURL *_url</span><span class="s4">;</span>
+  <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">RCTInspectorLocalConnection *&gt; *_inspectorConnections</span><span class="s4">;</span>
+  <span class="s1">SRWebSocket *_webSocket</span><span class="s4">;</span>
+  <span class="s1">dispatch_queue_t _jsQueue</span><span class="s4">;</span>
+  <span class="s1">BOOL _closed</span><span class="s4">;</span>
+  <span class="s1">BOOL _suppressConnectionErrors</span><span class="s4">;</span>
+  <span class="s1">RCTBundleStatusProvider _bundleStatusProvider</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s4">@end</span>
+
+<span class="s4">@interface </span><span class="s1">RCTInspectorRemoteConnection () {</span>
+  <span class="s4">__weak </span><span class="s1">RCTInspectorPackagerConnection *_owningPackagerConnection</span><span class="s4">;</span>
+  <span class="s1">NSString *_pageId</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s1">- (instancetype)initWithPackagerConnection:(RCTInspectorPackagerConnection *)owningPackagerConnection</span>
+                                    <span class="s1">pageId:(NSString *)pageId</span><span class="s4">;</span>
+<span class="s4">@end</span>
+
+<span class="s4">static </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *makePageIdPayload(NSString *pageId)</span>
+<span class="s1">{</span>
+  <span class="s4">return @</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;pageId&quot; </span><span class="s1">: pageId}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTInspectorPackagerConnection</span>
+
+<span class="s1">RCT_NOT_IMPLEMENTED(-(instancetype)init)</span>
+
+<span class="s1">- (instancetype)initWithURL:(NSURL *)url</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_url = url</span><span class="s4">;</span>
+    <span class="s1">_inspectorConnections = [NSMutableDictionary new]</span><span class="s4">;</span>
+    <span class="s1">_jsQueue = dispatch_queue_create(</span><span class="s3">&quot;com.facebook.react.WebSocketExecutor&quot;</span><span class="s4">, </span><span class="s1">DISPATCH_QUEUE_SERIAL)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setBundleStatusProvider:(RCTBundleStatusProvider)bundleStatusProvider</span>
+<span class="s1">{</span>
+  <span class="s1">_bundleStatusProvider = bundleStatusProvider</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleProxyMessage:(NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)message</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *event = message[</span><span class="s4">@</span><span class="s3">&quot;event&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSDictionary *payload = message[</span><span class="s4">@</span><span class="s3">&quot;payload&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([</span><span class="s4">@</span><span class="s3">&quot;getPages&quot; </span><span class="s1">isEqualToString:event]) {</span>
+    <span class="s1">[self sendEvent:event payload:[self pages]]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">([</span><span class="s4">@</span><span class="s3">&quot;wrappedEvent&quot; </span><span class="s1">isEqualToString:event]) {</span>
+    <span class="s1">[self handleWrappedEvent:payload]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">([</span><span class="s4">@</span><span class="s3">&quot;connect&quot; </span><span class="s1">isEqualToString:event]) {</span>
+    <span class="s1">[self handleConnect:payload]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">([</span><span class="s4">@</span><span class="s3">&quot;disconnect&quot; </span><span class="s1">isEqualToString:event]) {</span>
+    <span class="s1">[self handleDisconnect:payload]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;Unknown event: %@&quot;</span><span class="s4">, </span><span class="s1">event)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendEventToAllConnections:(NSString *)event</span>
+<span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(NSString *pageId in _inspectorConnections) {</span>
+    <span class="s1">[_inspectorConnections[pageId] sendMessage:event]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)closeAllConnections</span>
+<span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(NSString *pageId in _inspectorConnections) {</span>
+    <span class="s1">[[_inspectorConnections objectForKey:pageId] disconnect]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">[_inspectorConnections removeAllObjects]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleConnect:(NSDictionary *)payload</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *pageId = payload[</span><span class="s4">@</span><span class="s3">&quot;pageId&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">RCTInspectorLocalConnection *existingConnection = _inspectorConnections[pageId]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(existingConnection) {</span>
+    <span class="s1">[_inspectorConnections removeObjectForKey:pageId]</span><span class="s4">;</span>
+    <span class="s1">[existingConnection disconnect]</span><span class="s4">;</span>
+    <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Already connected: %@&quot;</span><span class="s4">, </span><span class="s1">pageId)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTInspectorRemoteConnection *remoteConnection =</span>
+      <span class="s1">[[RCTInspectorRemoteConnection alloc] initWithPackagerConnection:self pageId:pageId]</span><span class="s4">;</span>
+
+  <span class="s1">RCTInspectorLocalConnection *inspectorConnection = [RCTInspector connectPage:[pageId integerValue]</span>
+                                                           <span class="s1">forRemoteConnection:remoteConnection]</span><span class="s4">;</span>
+  <span class="s1">_inspectorConnections[pageId] = inspectorConnection</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleDisconnect:(NSDictionary *)payload</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *pageId = payload[</span><span class="s4">@</span><span class="s3">&quot;pageId&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">RCTInspectorLocalConnection *inspectorConnection = _inspectorConnections[pageId]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(inspectorConnection) {</span>
+    <span class="s1">[self removeConnectionForPage:pageId]</span><span class="s4">;</span>
+    <span class="s1">[inspectorConnection disconnect]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)removeConnectionForPage:(NSString *)pageId</span>
+<span class="s1">{</span>
+  <span class="s1">[_inspectorConnections removeObjectForKey:pageId]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleWrappedEvent:(NSDictionary *)payload</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *pageId = payload[</span><span class="s4">@</span><span class="s3">&quot;pageId&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSString *wrappedEvent = payload[</span><span class="s4">@</span><span class="s3">&quot;wrappedEvent&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">RCTInspectorLocalConnection *inspectorConnection = _inspectorConnections[pageId]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!inspectorConnection) {</span>
+    <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Not connected to page: %@ , failed trying to handle event: %@&quot;</span><span class="s4">, </span><span class="s1">pageId</span><span class="s4">, </span><span class="s1">wrappedEvent)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">[inspectorConnection sendMessage:wrappedEvent]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSArray *)pages</span>
+<span class="s1">{</span>
+  <span class="s1">NSArray&lt;RCTInspectorPage *&gt; *pages = [RCTInspector pages]</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray *array = [NSMutableArray arrayWithCapacity:pages.count]</span><span class="s4">;</span>
+
+  <span class="s1">RCTBundleStatusProvider statusProvider = _bundleStatusProvider</span><span class="s4">;</span>
+  <span class="s1">RCTBundleStatus *bundleStatus = statusProvider == nil ? nil : statusProvider()</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(RCTInspectorPage *page in pages) {</span>
+    <span class="s1">NSDictionary *jsonPage = </span><span class="s4">@</span><span class="s1">{</span>
+      <span class="s4">@</span><span class="s3">&quot;id&quot; </span><span class="s1">: [</span><span class="s4">@</span><span class="s1">(page.id) stringValue]</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;title&quot; </span><span class="s1">: page.title</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;app&quot; </span><span class="s1">: [[NSBundle mainBundle] bundleIdentifier]</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;vm&quot; </span><span class="s1">: page.vm</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;isLastBundleDownloadSuccess&quot; </span><span class="s1">: bundleStatus == nil ? [NSNull null]</span>
+                                                           <span class="s1">: </span><span class="s4">@</span><span class="s1">(bundleStatus.isLastBundleDownloadSuccess)</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;bundleUpdateTimestamp&quot; </span><span class="s1">: bundleStatus == nil ? [NSNull null]</span>
+                                                     <span class="s1">: </span><span class="s4">@</span><span class="s1">((</span><span class="s4">long</span><span class="s1">)bundleStatus.bundleUpdateTimestamp * </span><span class="s5">1000</span><span class="s1">)</span><span class="s4">,</span>
+    <span class="s1">}</span><span class="s4">;</span>
+    <span class="s1">[array addObject:jsonPage]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">array</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendWrappedEvent:(NSString *)pageId message:(NSString *)message</span>
+<span class="s1">{</span>
+  <span class="s1">NSDictionary *payload = </span><span class="s4">@</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;pageId&quot; </span><span class="s1">: pageId</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;wrappedEvent&quot; </span><span class="s1">: message</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">[self sendEvent:</span><span class="s4">@</span><span class="s3">&quot;wrappedEvent&quot; </span><span class="s1">payload:payload]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendEvent:(NSString *)name payload:(id)payload</span>
+<span class="s1">{</span>
+  <span class="s1">NSDictionary *jsonMessage = </span><span class="s4">@</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;event&quot; </span><span class="s1">: name</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;payload&quot; </span><span class="s1">: payload</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">[self sendToPackager:jsonMessage]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// analogous to InspectorPackagerConnection.Connection.onFailure(...)</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)webSocket:(__unused SRWebSocket *)webSocket didFailWithError:(NSError *)error</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_webSocket) {</span>
+    <span class="s1">[self abort:</span><span class="s4">@</span><span class="s3">&quot;Websocket exception&quot; </span><span class="s1">withCause:error]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!_closed &amp;&amp; [error code] != ECONNREFUSED) {</span>
+    <span class="s1">[self reconnect]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// analogous to InspectorPackagerConnection.Connection.onMessage(...)</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)webSocket:(__unused SRWebSocket *)webSocket didReceiveMessage:(id)opaqueMessage</span>
+<span class="s1">{</span>
+  <span class="s0">// warn but don't die on unrecognized messages</span>
+  <span class="s4">if </span><span class="s1">(![opaqueMessage isKindOfClass:[NSString </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Unrecognized inspector message, object is of type: %@&quot;</span><span class="s4">, </span><span class="s1">[opaqueMessage </span><span class="s4">class</span><span class="s1">])</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSString *messageText = opaqueMessage</span><span class="s4">;</span>
+  <span class="s1">NSError *error = nil</span><span class="s4">;</span>
+  <span class="s1">id parsedJSON = RCTJSONParse(messageText</span><span class="s4">, </span><span class="s1">&amp;error)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(error) {</span>
+    <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Unrecognized inspector message, string was not valid JSON: %@&quot;</span><span class="s4">, </span><span class="s1">messageText)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self handleProxyMessage:parsedJSON]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// analogous to InspectorPackagerConnection.Connection.onClosed(...)</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)webSocket:(__unused SRWebSocket *)webSocket</span>
+    <span class="s1">didCloseWithCode:(__unused NSInteger)code</span>
+              <span class="s1">reason:(__unused NSString *)reason</span>
+            <span class="s1">wasClean:(__unused BOOL)wasClean</span>
+<span class="s1">{</span>
+  <span class="s1">_webSocket = nil</span><span class="s4">;</span>
+  <span class="s1">[self closeAllConnections]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!_closed) {</span>
+    <span class="s1">[self reconnect]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (bool)isConnected</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_webSocket != nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)connect</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_closed) {</span>
+    <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;Illegal state: Can't connect after having previously been closed.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// The corresponding android code has a lot of custom config options for</span>
+  <span class="s0">// timeouts, but our previous class, RCTSRWebSocket didn't have the same</span>
+  <span class="s0">// implemented options. Might be worth reinvestigating for SRWebSocket?</span>
+  <span class="s1">_webSocket = [[SRWebSocket alloc] initWithURL:_url]</span><span class="s4">;</span>
+  <span class="s1">[_webSocket setDelegateDispatchQueue:_jsQueue]</span><span class="s4">;</span>
+  <span class="s1">_webSocket.delegate = self</span><span class="s4">;</span>
+  <span class="s1">[_webSocket open]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)reconnect</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_closed) {</span>
+    <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;Illegal state: Can't reconnect after having previously been closed.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(_suppressConnectionErrors) {</span>
+    <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Couldn't connect to packager, will silently retry&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">_suppressConnectionErrors = true</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">__weak </span><span class="s1">RCTInspectorPackagerConnection *weakSelf = self</span><span class="s4">;</span>
+  <span class="s1">dispatch_after(dispatch_time(DISPATCH_TIME_NOW</span><span class="s4">, </span><span class="s1">RECONNECT_DELAY_MS * NSEC_PER_MSEC)</span><span class="s4">, </span><span class="s1">dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">RCTInspectorPackagerConnection *strongSelf = weakSelf</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(strongSelf &amp;&amp; !strongSelf-&gt;_closed) {</span>
+      <span class="s1">[strongSelf connect]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)closeQuietly</span>
+<span class="s1">{</span>
+  <span class="s1">_closed = true</span><span class="s4">;</span>
+  <span class="s1">[self disposeWebSocket]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendToPackager:(NSDictionary *)messageObject</span>
+<span class="s1">{</span>
+  <span class="s4">__weak </span><span class="s1">RCTInspectorPackagerConnection *weakSelf = self</span><span class="s4">;</span>
+  <span class="s1">dispatch_async(_jsQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">RCTInspectorPackagerConnection *strongSelf = weakSelf</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(strongSelf &amp;&amp; !strongSelf-&gt;_closed) {</span>
+      <span class="s1">NSError *error</span><span class="s4">;</span>
+      <span class="s1">NSString *messageText = RCTJSONStringify(messageObject</span><span class="s4">, </span><span class="s1">&amp;error)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(error) {</span>
+        <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Couldn't send event to packager: %@&quot;</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">[strongSelf-&gt;_webSocket sendString:messageText error:nil]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)abort:(NSString *)message withCause:(NSError *)cause</span>
+<span class="s1">{</span>
+  <span class="s0">// Don't log ECONNREFUSED at all; it's expected in cases where the server isn't listening.</span>
+  <span class="s4">if </span><span class="s1">(![cause.domain isEqual:NSPOSIXErrorDomain] || cause.code != ECONNREFUSED) {</span>
+    <span class="s1">RCTLogInfo(</span><span class="s4">@</span><span class="s3">&quot;Error occurred, shutting down websocket connection: %@ %@&quot;</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">cause)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self closeAllConnections]</span><span class="s4">;</span>
+  <span class="s1">[self disposeWebSocket]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)disposeWebSocket</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_webSocket) {</span>
+    <span class="s1">[_webSocket closeWithCode:</span><span class="s5">1000 </span><span class="s1">reason:</span><span class="s4">@</span><span class="s3">&quot;End of session&quot;</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">_webSocket.delegate = nil</span><span class="s4">;</span>
+    <span class="s1">_webSocket = nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTInspectorRemoteConnection</span>
+
+<span class="s1">RCT_NOT_IMPLEMENTED(-(instancetype)init)</span>
+
+<span class="s1">- (instancetype)initWithPackagerConnection:(RCTInspectorPackagerConnection *)owningPackagerConnection</span>
+                                    <span class="s1">pageId:(NSString *)pageId</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_owningPackagerConnection = owningPackagerConnection</span><span class="s4">;</span>
+    <span class="s1">_pageId = pageId</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)onMessage:(NSString *)message</span>
+<span class="s1">{</span>
+  <span class="s1">[_owningPackagerConnection sendWrappedEvent:_pageId message:message]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)onDisconnect</span>
+<span class="s1">{</span>
+  <span class="s1">RCTInspectorPackagerConnection *owningPackagerConnectionStrong = _owningPackagerConnection</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(owningPackagerConnectionStrong) {</span>
+    <span class="s1">[owningPackagerConnectionStrong removeConnectionForPage:_pageId]</span><span class="s4">;</span>
+    <span class="s1">[owningPackagerConnectionStrong sendEvent:</span><span class="s4">@</span><span class="s3">&quot;disconnect&quot; </span><span class="s1">payload:makePageIdPayload(_pageId)]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s2">#endif</span>
+</pre>
+</body>
+</html>

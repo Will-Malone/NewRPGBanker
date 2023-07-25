@@ -1,0 +1,320 @@
+<html>
+<head>
+<title>DeltaCalculator.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+DeltaCalculator.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s3">var </span><span class="s1">_path = _interopRequireDefault(require(</span><span class="s2">&quot;path&quot;</span><span class="s1">));</span>
+<span class="s3">var </span><span class="s1">_Graph = require(</span><span class="s2">&quot;./Graph&quot;</span><span class="s1">);</span>
+<span class="s3">function </span><span class="s1">_interopRequireDefault(obj) {</span>
+  <span class="s3">return </span><span class="s1">obj &amp;&amp; obj.__esModule ? obj : { </span><span class="s3">default</span><span class="s1">: obj };</span>
+<span class="s1">}</span>
+<span class="s1">const debug = require(</span><span class="s2">&quot;debug&quot;</span><span class="s1">)(</span><span class="s2">&quot;Metro:DeltaCalculator&quot;</span><span class="s1">);</span>
+<span class="s1">const { EventEmitter } = require(</span><span class="s2">&quot;events&quot;</span><span class="s1">);</span>
+
+<span class="s0">/** 
+ * This class is in charge of calculating the delta of changed modules that 
+ * happen between calls. To do so, it subscribes to file changes, so it can 
+ * traverse the files that have been changed between calls and avoid having to 
+ * traverse the whole dependency tree for trivial small changes. 
+ */</span>
+<span class="s1">class DeltaCalculator extends EventEmitter {</span>
+  <span class="s1">_deletedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+  <span class="s1">_modifiedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+  <span class="s1">_addedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+  <span class="s1">_requiresReset = </span><span class="s3">false</span><span class="s1">;</span>
+  <span class="s1">constructor(entryPoints, changeEventSource, options) {</span>
+    <span class="s1">super();</span>
+    <span class="s3">this</span><span class="s1">._options = options;</span>
+    <span class="s3">this</span><span class="s1">._changeEventSource = changeEventSource;</span>
+    <span class="s3">this</span><span class="s1">._graph = </span><span class="s3">new </span><span class="s1">_Graph.Graph({</span>
+      <span class="s1">entryPoints,</span>
+      <span class="s1">transformOptions: </span><span class="s3">this</span><span class="s1">._options.transformOptions,</span>
+    <span class="s1">});</span>
+    <span class="s3">this</span><span class="s1">._changeEventSource.on(</span><span class="s2">&quot;change&quot;</span><span class="s1">, </span><span class="s3">this</span><span class="s1">._handleMultipleFileChanges);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Stops listening for file changes and clears all the caches. 
+   */</span>
+  <span class="s1">end() {</span>
+    <span class="s3">this</span><span class="s1">._changeEventSource.removeListener(</span>
+      <span class="s2">&quot;change&quot;</span><span class="s1">,</span>
+      <span class="s3">this</span><span class="s1">._handleMultipleFileChanges</span>
+    <span class="s1">);</span>
+    <span class="s3">this</span><span class="s1">.removeAllListeners();</span>
+
+    <span class="s0">// Clean up all the cache data structures to deallocate memory.</span>
+    <span class="s3">this</span><span class="s1">._graph = </span><span class="s3">new </span><span class="s1">_Graph.Graph({</span>
+      <span class="s1">entryPoints: </span><span class="s3">this</span><span class="s1">._graph.entryPoints,</span>
+      <span class="s1">transformOptions: </span><span class="s3">this</span><span class="s1">._options.transformOptions,</span>
+    <span class="s1">});</span>
+    <span class="s3">this</span><span class="s1">._modifiedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+    <span class="s3">this</span><span class="s1">._deletedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+    <span class="s3">this</span><span class="s1">._addedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Main method to calculate the delta of modules. It returns a DeltaResult, 
+   * which contain the modified/added modules and the removed modules. 
+   */</span>
+  <span class="s1">async getDelta({ reset, shallow }) {</span>
+    <span class="s1">debug(</span><span class="s2">&quot;Calculating delta (reset: %s, shallow: %s)&quot;</span><span class="s1">, reset, shallow);</span>
+    <span class="s0">// If there is already a build in progress, wait until it finish to start</span>
+    <span class="s0">// processing a new one (delta server doesn't support concurrent builds).</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._currentBuildPromise) {</span>
+      <span class="s1">await </span><span class="s3">this</span><span class="s1">._currentBuildPromise;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// We don't want the modified files Set to be modified while building the</span>
+    <span class="s0">// bundle, so we isolate them by using the current instance for the bundling</span>
+    <span class="s0">// and creating a new instance for the file watcher.</span>
+    <span class="s1">const modifiedFiles = </span><span class="s3">this</span><span class="s1">._modifiedFiles;</span>
+    <span class="s3">this</span><span class="s1">._modifiedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+    <span class="s1">const deletedFiles = </span><span class="s3">this</span><span class="s1">._deletedFiles;</span>
+    <span class="s3">this</span><span class="s1">._deletedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+    <span class="s1">const addedFiles = </span><span class="s3">this</span><span class="s1">._addedFiles;</span>
+    <span class="s3">this</span><span class="s1">._addedFiles = </span><span class="s3">new </span><span class="s1">Set();</span>
+    <span class="s1">const requiresReset = </span><span class="s3">this</span><span class="s1">._requiresReset;</span>
+    <span class="s3">this</span><span class="s1">._requiresReset = </span><span class="s3">false</span><span class="s1">;</span>
+
+    <span class="s0">// Revisit all files if changes require a graph reset - resolutions may be</span>
+    <span class="s0">// invalidated but we don't yet know which. This should be optimized in the</span>
+    <span class="s0">// future.</span>
+    <span class="s3">if </span><span class="s1">(requiresReset) {</span>
+      <span class="s1">const markModified = (file) =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(!addedFiles.has(file) &amp;&amp; !deletedFiles.has(file)) {</span>
+          <span class="s1">modifiedFiles.add(file);</span>
+        <span class="s1">}</span>
+      <span class="s1">};</span>
+      <span class="s3">this</span><span class="s1">._graph.dependencies.forEach((_, key) =&gt; markModified(key));</span>
+      <span class="s3">this</span><span class="s1">._graph.entryPoints.forEach(markModified);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Concurrent requests should reuse the same bundling process. To do so,</span>
+    <span class="s0">// this method stores the promise as an instance variable, and then it's</span>
+    <span class="s0">// removed after it gets resolved.</span>
+    <span class="s3">this</span><span class="s1">._currentBuildPromise = </span><span class="s3">this</span><span class="s1">._getChangedDependencies(</span>
+      <span class="s1">modifiedFiles,</span>
+      <span class="s1">deletedFiles,</span>
+      <span class="s1">addedFiles</span>
+    <span class="s1">);</span>
+    <span class="s1">let result;</span>
+    <span class="s1">const numDependencies = </span><span class="s3">this</span><span class="s1">._graph.dependencies.size;</span>
+    <span class="s3">try </span><span class="s1">{</span>
+      <span class="s1">result = await </span><span class="s3">this</span><span class="s1">._currentBuildPromise;</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+      <span class="s0">// In case of error, we don't want to mark the modified files as</span>
+      <span class="s0">// processed (since we haven't actually created any delta). If we do not</span>
+      <span class="s0">// do so, asking for a delta after an error will produce an empty Delta,</span>
+      <span class="s0">// which is not correct.</span>
+      <span class="s1">modifiedFiles.forEach((file) =&gt; </span><span class="s3">this</span><span class="s1">._modifiedFiles.add(file));</span>
+      <span class="s1">deletedFiles.forEach((file) =&gt; </span><span class="s3">this</span><span class="s1">._deletedFiles.add(file));</span>
+      <span class="s1">addedFiles.forEach((file) =&gt; </span><span class="s3">this</span><span class="s1">._addedFiles.add(file));</span>
+
+      <span class="s0">// If after an error the number of modules has changed, we could be in</span>
+      <span class="s0">// a weird state. As a safe net we clean the dependency modules to force</span>
+      <span class="s0">// a clean traversal of the graph next time.</span>
+      <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._graph.dependencies.size !== numDependencies) {</span>
+        <span class="s3">this</span><span class="s1">._graph.dependencies.clear();</span>
+      <span class="s1">}</span>
+      <span class="s3">throw </span><span class="s1">error;</span>
+    <span class="s1">} </span><span class="s3">finally </span><span class="s1">{</span>
+      <span class="s3">this</span><span class="s1">._currentBuildPromise = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Return all the modules if the client requested a reset delta.</span>
+    <span class="s3">if </span><span class="s1">(reset) {</span>
+      <span class="s3">this</span><span class="s1">._graph.reorderGraph({</span>
+        <span class="s1">shallow,</span>
+      <span class="s1">});</span>
+      <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">added: </span><span class="s3">this</span><span class="s1">._graph.dependencies,</span>
+        <span class="s1">modified: </span><span class="s3">new </span><span class="s1">Map(),</span>
+        <span class="s1">deleted: </span><span class="s3">new </span><span class="s1">Set(),</span>
+        <span class="s1">reset: </span><span class="s3">true</span><span class="s1">,</span>
+      <span class="s1">};</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">result;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Returns the graph with all the dependencies. Each module contains the 
+   * needed information to do the traversing (dependencies, inverseDependencies) 
+   * plus some metadata. 
+   */</span>
+  <span class="s1">getGraph() {</span>
+    <span class="s3">return this</span><span class="s1">._graph;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* $FlowFixMe[missing-local-annot] The type annotation(s) required by Flow's 
+   * LTI update could not be added via codemod */</span>
+  <span class="s1">_handleMultipleFileChanges = (changeEvent) =&gt; {</span>
+    <span class="s1">changeEvent.eventsQueue.forEach((eventInfo) =&gt; {</span>
+      <span class="s3">this</span><span class="s1">._handleFileChange(eventInfo, changeEvent.logger);</span>
+    <span class="s1">});</span>
+  <span class="s1">};</span>
+
+  <span class="s0">/** 
+   * Handles a single file change. To avoid doing any work before it's needed, 
+   * the listener only stores the modified file, which will then be used later 
+   * when the delta needs to be calculated. 
+   */</span>
+  <span class="s1">_handleFileChange = ({ type, filePath, metadata }, logger) =&gt; {</span>
+    <span class="s1">debug(</span><span class="s2">&quot;Handling %s: %s (type: %s)&quot;</span><span class="s1">, type, filePath, metadata.type);</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">metadata.type === </span><span class="s2">&quot;l&quot; </span><span class="s1">||</span>
+      <span class="s1">(</span><span class="s3">this</span><span class="s1">._options.unstable_enablePackageExports &amp;&amp;</span>
+        <span class="s1">filePath.endsWith(_path.</span><span class="s3">default</span><span class="s1">.sep + </span><span class="s2">&quot;package.json&quot;</span><span class="s1">))</span>
+    <span class="s1">) {</span>
+      <span class="s3">this</span><span class="s1">._requiresReset = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s3">this</span><span class="s1">.emit(</span><span class="s2">&quot;change&quot;</span><span class="s1">, {</span>
+        <span class="s1">logger,</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+    <span class="s1">let state;</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._deletedFiles.has(filePath)) {</span>
+      <span class="s1">state = </span><span class="s2">&quot;deleted&quot;</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._modifiedFiles.has(filePath)) {</span>
+      <span class="s1">state = </span><span class="s2">&quot;modified&quot;</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._addedFiles.has(filePath)) {</span>
+      <span class="s1">state = </span><span class="s2">&quot;added&quot;</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">let nextState;</span>
+    <span class="s3">if </span><span class="s1">(type === </span><span class="s2">&quot;delete&quot;</span><span class="s1">) {</span>
+      <span class="s1">nextState = </span><span class="s2">&quot;deleted&quot;</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(type === </span><span class="s2">&quot;add&quot;</span><span class="s1">) {</span>
+      <span class="s0">// A deleted+added file is modified</span>
+      <span class="s1">nextState = state === </span><span class="s2">&quot;deleted&quot; </span><span class="s1">? </span><span class="s2">&quot;modified&quot; </span><span class="s1">: </span><span class="s2">&quot;added&quot;</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s0">// type === 'change'</span>
+      <span class="s0">// An added+modified file is added</span>
+      <span class="s1">nextState = state === </span><span class="s2">&quot;added&quot; </span><span class="s1">? </span><span class="s2">&quot;added&quot; </span><span class="s1">: </span><span class="s2">&quot;modified&quot;</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">switch </span><span class="s1">(nextState) {</span>
+      <span class="s3">case </span><span class="s2">&quot;deleted&quot;</span><span class="s1">:</span>
+        <span class="s3">this</span><span class="s1">._deletedFiles.add(filePath);</span>
+        <span class="s3">this</span><span class="s1">._modifiedFiles.</span><span class="s3">delete</span><span class="s1">(filePath);</span>
+        <span class="s3">this</span><span class="s1">._addedFiles.</span><span class="s3">delete</span><span class="s1">(filePath);</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">&quot;added&quot;</span><span class="s1">:</span>
+        <span class="s3">this</span><span class="s1">._addedFiles.add(filePath);</span>
+        <span class="s3">this</span><span class="s1">._deletedFiles.</span><span class="s3">delete</span><span class="s1">(filePath);</span>
+        <span class="s3">this</span><span class="s1">._modifiedFiles.</span><span class="s3">delete</span><span class="s1">(filePath);</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">case </span><span class="s2">&quot;modified&quot;</span><span class="s1">:</span>
+        <span class="s3">this</span><span class="s1">._modifiedFiles.add(filePath);</span>
+        <span class="s3">this</span><span class="s1">._deletedFiles.</span><span class="s3">delete</span><span class="s1">(filePath);</span>
+        <span class="s3">this</span><span class="s1">._addedFiles.</span><span class="s3">delete</span><span class="s1">(filePath);</span>
+        <span class="s3">break</span><span class="s1">;</span>
+      <span class="s3">default</span><span class="s1">:</span>
+        <span class="s1">nextState;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Notify users that there is a change in some of the bundle files. This</span>
+    <span class="s0">// way the client can choose to refetch the bundle.</span>
+    <span class="s3">this</span><span class="s1">.emit(</span><span class="s2">&quot;change&quot;</span><span class="s1">, {</span>
+      <span class="s1">logger,</span>
+    <span class="s1">});</span>
+  <span class="s1">};</span>
+  <span class="s1">async _getChangedDependencies(modifiedFiles, deletedFiles, addedFiles) {</span>
+    <span class="s3">if </span><span class="s1">(!</span><span class="s3">this</span><span class="s1">._graph.dependencies.size) {</span>
+      <span class="s1">const { added } = await </span><span class="s3">this</span><span class="s1">._graph.initialTraverseDependencies(</span>
+        <span class="s3">this</span><span class="s1">._options</span>
+      <span class="s1">);</span>
+      <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">added,</span>
+        <span class="s1">modified: </span><span class="s3">new </span><span class="s1">Map(),</span>
+        <span class="s1">deleted: </span><span class="s3">new </span><span class="s1">Set(),</span>
+        <span class="s1">reset: </span><span class="s3">true</span><span class="s1">,</span>
+      <span class="s1">};</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// If a file has been deleted, we want to invalidate any other file that</span>
+    <span class="s0">// depends on it, so we can process it and correctly return an error.</span>
+    <span class="s1">deletedFiles.forEach((filePath) =&gt; {</span>
+      <span class="s3">for </span><span class="s1">(const modifiedModulePath of </span><span class="s3">this</span><span class="s1">._graph.getModifiedModulesForDeletedPath(</span>
+        <span class="s1">filePath</span>
+      <span class="s1">)) {</span>
+        <span class="s0">// Only mark the inverse dependency as modified if it's not already</span>
+        <span class="s0">// marked as deleted (in that case we can just ignore it).</span>
+        <span class="s3">if </span><span class="s1">(!deletedFiles.has(modifiedModulePath)) {</span>
+          <span class="s1">modifiedFiles.add(modifiedModulePath);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+
+    <span class="s0">// NOTE(EvanBacon): This check adds extra complexity so we feature gate it</span>
+    <span class="s0">// to enable users to opt out.</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._options.unstable_allowRequireContext) {</span>
+      <span class="s0">// Check if any added or removed files are matched in a context module.</span>
+      <span class="s0">// We only need to do this for added files because (1) deleted files will have a context</span>
+      <span class="s0">// module as an inverse dependency, (2) modified files don't invalidate the contents</span>
+      <span class="s0">// of the context module.</span>
+      <span class="s1">addedFiles.forEach((filePath) =&gt; {</span>
+        <span class="s3">this</span><span class="s1">._graph.markModifiedContextModules(filePath, modifiedFiles);</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// We only want to process files that are in the bundle.</span>
+    <span class="s1">const modifiedDependencies = Array.from(modifiedFiles).filter((filePath) =&gt;</span>
+      <span class="s3">this</span><span class="s1">._graph.dependencies.has(filePath)</span>
+    <span class="s1">);</span>
+
+    <span class="s0">// No changes happened. Return empty delta.</span>
+    <span class="s3">if </span><span class="s1">(modifiedDependencies.length === </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">{</span>
+        <span class="s1">added: </span><span class="s3">new </span><span class="s1">Map(),</span>
+        <span class="s1">modified: </span><span class="s3">new </span><span class="s1">Map(),</span>
+        <span class="s1">deleted: </span><span class="s3">new </span><span class="s1">Set(),</span>
+        <span class="s1">reset: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">};</span>
+    <span class="s1">}</span>
+    <span class="s1">debug(</span><span class="s2">&quot;Traversing dependencies for %s paths&quot;</span><span class="s1">, modifiedDependencies.length);</span>
+    <span class="s1">const { added, modified, deleted } = await </span><span class="s3">this</span><span class="s1">._graph.traverseDependencies(</span>
+      <span class="s1">modifiedDependencies,</span>
+      <span class="s3">this</span><span class="s1">._options</span>
+    <span class="s1">);</span>
+    <span class="s1">debug(</span>
+      <span class="s2">&quot;Calculated graph delta {added: %s, modified: %d, deleted: %d}&quot;</span><span class="s1">,</span>
+      <span class="s1">added.size,</span>
+      <span class="s1">modified.size,</span>
+      <span class="s1">deleted.size</span>
+    <span class="s1">);</span>
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s1">added,</span>
+      <span class="s1">modified,</span>
+      <span class="s1">deleted,</span>
+      <span class="s1">reset: </span><span class="s3">false</span><span class="s1">,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = DeltaCalculator;</span>
+</pre>
+</body>
+</html>

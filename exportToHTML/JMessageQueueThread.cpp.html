@@ -1,0 +1,134 @@
+<html>
+<head>
+<title>JMessageQueueThread.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JMessageQueueThread.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;JMessageQueueThread.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;condition_variable&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;fb/log.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fbjni/NativeRunnable.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fbjni/fbjni.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/jsi.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">using namespace </span><span class="s1">jni</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">struct </span><span class="s1">JavaJSException : jni::JavaClass&lt;JavaJSException</span><span class="s4">, </span><span class="s1">JThrowable&gt; {</span>
+  <span class="s4">static constexpr auto </span><span class="s1">kJavaDescriptor =</span>
+      <span class="s3">&quot;Lcom/facebook/react/devsupport/JSException;&quot;</span><span class="s4">;</span>
+
+  <span class="s4">static </span><span class="s1">local_ref&lt;JavaJSException&gt;</span>
+  <span class="s1">create(</span><span class="s4">const char </span><span class="s1">*message</span><span class="s4">, const char </span><span class="s1">*stack</span><span class="s4">, const </span><span class="s1">std::exception &amp;ex) {</span>
+    <span class="s1">local_ref&lt;jthrowable&gt; cause = jni::JCppException::create(ex)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">newInstance(make_jstring(message)</span><span class="s4">, </span><span class="s1">make_jstring(stack)</span><span class="s4">, </span><span class="s1">cause.get())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; wrapRunnable(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;runnable) {</span>
+  <span class="s4">return </span><span class="s1">[runnable = std::move(runnable)]() </span><span class="s4">mutable </span><span class="s1">{</span>
+    <span class="s4">if </span><span class="s1">(!runnable) {</span>
+      <span class="s0">// Runnable is empty, nothing to run.</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">localRunnable = std::move(runnable)</span><span class="s4">;</span>
+
+    <span class="s0">// Clearing `runnable` to free all associated resources that stored lambda</span>
+    <span class="s0">// might retain.</span>
+    <span class="s1">runnable = </span><span class="s4">nullptr;</span>
+
+    <span class="s4">try </span><span class="s1">{</span>
+      <span class="s1">localRunnable()</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">jsi::JSError &amp;ex) {</span>
+      <span class="s1">throwNewJavaException(</span>
+          <span class="s1">JavaJSException::create(</span>
+              <span class="s1">ex.getMessage().c_str()</span><span class="s4">, </span><span class="s1">ex.getStack().c_str()</span><span class="s4">, </span><span class="s1">ex)</span>
+              <span class="s1">.get())</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">JMessageQueueThread::JMessageQueueThread(</span>
+    <span class="s1">alias_ref&lt;JavaMessageQueueThread::javaobject&gt; jobj)</span>
+    <span class="s1">: m_jobj(make_global(jobj)) {}</span>
+
+<span class="s4">void </span><span class="s1">JMessageQueueThread::runOnQueue(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;runnable) {</span>
+  <span class="s0">// For C++ modules, this can be called from an arbitrary thread</span>
+  <span class="s0">// managed by the module, via callJSCallback or callJSFunction.  So,</span>
+  <span class="s0">// we ensure that it is registered with the JVM.</span>
+  <span class="s1">jni::ThreadScope guard</span><span class="s4">;</span>
+  <span class="s4">static auto </span><span class="s1">method =</span>
+      <span class="s1">JavaMessageQueueThread::javaClassStatic()</span>
+          <span class="s1">-&gt;getMethod&lt;jboolean(JRunnable::javaobject)&gt;(</span><span class="s3">&quot;runOnQueue&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">jrunnable =</span>
+      <span class="s1">JNativeRunnable::newObjectCxxArgs(wrapRunnable(std::move(runnable)))</span><span class="s4">;</span>
+  <span class="s1">method(m_jobj</span><span class="s4">, </span><span class="s1">jrunnable.get())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JMessageQueueThread::runOnQueueSync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;runnable) {</span>
+  <span class="s4">static auto </span><span class="s1">jIsOnThread =</span>
+      <span class="s1">JavaMessageQueueThread::javaClassStatic()-&gt;getMethod&lt;jboolean()&gt;(</span>
+          <span class="s3">&quot;isOnThread&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(jIsOnThread(m_jobj)) {</span>
+    <span class="s1">wrapRunnable(std::move(runnable))()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">std::mutex signalMutex</span><span class="s4">;</span>
+    <span class="s1">std::condition_variable signalCv</span><span class="s4">;</span>
+    <span class="s4">bool </span><span class="s1">runnableComplete = </span><span class="s4">false;</span>
+
+    <span class="s1">runOnQueue([&amp;]() </span><span class="s4">mutable </span><span class="s1">{</span>
+      <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(signalMutex)</span><span class="s4">;</span>
+
+      <span class="s1">runnable()</span><span class="s4">;</span>
+      <span class="s1">runnableComplete = </span><span class="s4">true;</span>
+
+      <span class="s1">signalCv.notify_one()</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+
+    <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(signalMutex)</span><span class="s4">;</span>
+    <span class="s1">signalCv.wait(lock</span><span class="s4">, </span><span class="s1">[&amp;runnableComplete] { </span><span class="s4">return </span><span class="s1">runnableComplete</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JMessageQueueThread::quitSynchronous() {</span>
+  <span class="s4">static auto </span><span class="s1">method =</span>
+      <span class="s1">JavaMessageQueueThread::javaClassStatic()-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">()&gt;(</span>
+          <span class="s3">&quot;quitSynchronous&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">method(m_jobj)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

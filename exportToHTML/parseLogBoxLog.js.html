@@ -1,0 +1,383 @@
+<html>
+<head>
+<title>parseLogBoxLog.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+parseLogBoxLog.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow strict 
+ * @format 
+ */</span>
+
+<span class="s1">import type {ExceptionData} from </span><span class="s2">'../../Core/NativeExceptionsManager'</span><span class="s1">;</span>
+<span class="s1">import type {LogBoxLogData} from </span><span class="s2">'./LogBoxLog'</span><span class="s1">;</span>
+
+<span class="s1">import parseErrorStack from </span><span class="s2">'../../Core/Devtools/parseErrorStack'</span><span class="s1">;</span>
+<span class="s1">import UTFSequence from </span><span class="s2">'../../UTFSequence'</span><span class="s1">;</span>
+<span class="s1">import stringifySafe from </span><span class="s2">'../../Utilities/stringifySafe'</span><span class="s1">;</span>
+
+<span class="s1">const BABEL_TRANSFORM_ERROR_FORMAT =</span>
+  <span class="s1">/^(?:TransformError )?(?:SyntaxError: |ReferenceError: )(.*): (.*) \((\d+):(\d+)\)\n\n([\s\S]+)/;</span>
+<span class="s1">const BABEL_CODE_FRAME_ERROR_FORMAT =</span>
+  <span class="s0">// eslint-disable-next-line no-control-regex</span>
+  <span class="s1">/^(?:TransformError )?(?:.*):? (?:.*?)(\/.*): ([\s\S]+?)\n([ &gt;]{</span><span class="s3">2</span><span class="s1">}[\d\s]+ \|[\s\S]+|\u{</span><span class="s3">001</span><span class="s1">b}[\s\S]+)/u;</span>
+<span class="s1">const METRO_ERROR_FORMAT =</span>
+  <span class="s1">/^(?:InternalError Metro has encountered an error:) (.*): (.*) \((\d+):(\d+)\)\n\n([\s\S]+)/u;</span>
+
+<span class="s1">export type ExtendedExceptionData = ExceptionData &amp; {</span>
+  <span class="s1">isComponentError: boolean,</span>
+  <span class="s1">...</span>
+<span class="s1">};</span>
+<span class="s1">export type Category = string;</span>
+<span class="s1">export type CodeFrame = $ReadOnly&lt;{|</span>
+  <span class="s1">content: string,</span>
+  <span class="s1">location: ?{</span>
+    <span class="s1">row: number,</span>
+    <span class="s1">column: number,</span>
+    <span class="s1">...</span>
+  <span class="s1">},</span>
+  <span class="s1">fileName: string,</span>
+
+  <span class="s0">// TODO: When React switched to using call stack frames,</span>
+  <span class="s0">// we gained the ability to use the collapse flag, but</span>
+  <span class="s0">// it is not integrated into the LogBox UI.</span>
+  <span class="s1">collapse?: boolean,</span>
+<span class="s1">|}&gt;;</span>
+<span class="s1">export type Message = $ReadOnly&lt;{|</span>
+  <span class="s1">content: string,</span>
+  <span class="s1">substitutions: $ReadOnlyArray&lt;</span>
+    <span class="s1">$ReadOnly&lt;{|</span>
+      <span class="s1">length: number,</span>
+      <span class="s1">offset: number,</span>
+    <span class="s1">|}&gt;,</span>
+  <span class="s1">&gt;,</span>
+<span class="s1">|}&gt;;</span>
+
+<span class="s1">export type ComponentStack = $ReadOnlyArray&lt;CodeFrame&gt;;</span>
+
+<span class="s1">const SUBSTITUTION = UTFSequence.BOM + </span><span class="s2">'%s'</span><span class="s1">;</span>
+
+<span class="s1">export </span><span class="s4">function </span><span class="s1">parseInterpolation(args: $ReadOnlyArray&lt;mixed&gt;): $ReadOnly&lt;{|</span>
+  <span class="s1">category: Category,</span>
+  <span class="s1">message: Message,</span>
+<span class="s1">|}&gt; {</span>
+  <span class="s1">const categoryParts = [];</span>
+  <span class="s1">const contentParts = [];</span>
+  <span class="s1">const substitutionOffsets = [];</span>
+
+  <span class="s1">const remaining = [...args];</span>
+  <span class="s4">if </span><span class="s1">(</span><span class="s4">typeof </span><span class="s1">remaining[</span><span class="s3">0</span><span class="s1">] === </span><span class="s2">'string'</span><span class="s1">) {</span>
+    <span class="s1">const formatString = String(remaining.shift());</span>
+    <span class="s1">const formatStringParts = formatString.split(</span><span class="s2">'%s'</span><span class="s1">);</span>
+    <span class="s1">const substitutionCount = formatStringParts.length - </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">const substitutions = remaining.splice(</span><span class="s3">0</span><span class="s1">, substitutionCount);</span>
+
+    <span class="s1">let categoryString = </span><span class="s2">''</span><span class="s1">;</span>
+    <span class="s1">let contentString = </span><span class="s2">''</span><span class="s1">;</span>
+
+    <span class="s1">let substitutionIndex = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s4">for </span><span class="s1">(const formatStringPart of formatStringParts) {</span>
+      <span class="s1">categoryString += formatStringPart;</span>
+      <span class="s1">contentString += formatStringPart;</span>
+
+      <span class="s4">if </span><span class="s1">(substitutionIndex &lt; substitutionCount) {</span>
+        <span class="s4">if </span><span class="s1">(substitutionIndex &lt; substitutions.length) {</span>
+          <span class="s0">// Don't stringify a string type.</span>
+          <span class="s0">// It adds quotation mark wrappers around the string,</span>
+          <span class="s0">// which causes the LogBox to look odd.</span>
+          <span class="s1">const substitution =</span>
+            <span class="s4">typeof </span><span class="s1">substitutions[substitutionIndex] === </span><span class="s2">'string'</span>
+              <span class="s1">? substitutions[substitutionIndex]</span>
+              <span class="s1">: stringifySafe(substitutions[substitutionIndex]);</span>
+          <span class="s1">substitutionOffsets.push({</span>
+            <span class="s1">length: substitution.length,</span>
+            <span class="s1">offset: contentString.length,</span>
+          <span class="s1">});</span>
+
+          <span class="s1">categoryString += SUBSTITUTION;</span>
+          <span class="s1">contentString += substitution;</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">substitutionOffsets.push({</span>
+            <span class="s1">length: </span><span class="s3">2</span><span class="s1">,</span>
+            <span class="s1">offset: contentString.length,</span>
+          <span class="s1">});</span>
+
+          <span class="s1">categoryString += </span><span class="s2">'%s'</span><span class="s1">;</span>
+          <span class="s1">contentString += </span><span class="s2">'%s'</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">substitutionIndex++;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">categoryParts.push(categoryString);</span>
+    <span class="s1">contentParts.push(contentString);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const remainingArgs = remaining.map(arg =&gt; {</span>
+    <span class="s0">// Don't stringify a string type.</span>
+    <span class="s0">// It adds quotation mark wrappers around the string,</span>
+    <span class="s0">// which causes the LogBox to look odd.</span>
+    <span class="s4">return typeof </span><span class="s1">arg === </span><span class="s2">'string' </span><span class="s1">? arg : stringifySafe(arg);</span>
+  <span class="s1">});</span>
+  <span class="s1">categoryParts.push(...remainingArgs);</span>
+  <span class="s1">contentParts.push(...remainingArgs);</span>
+
+  <span class="s4">return </span><span class="s1">{</span>
+    <span class="s1">category: categoryParts.join(</span><span class="s2">' '</span><span class="s1">),</span>
+    <span class="s1">message: {</span>
+      <span class="s1">content: contentParts.join(</span><span class="s2">' '</span><span class="s1">),</span>
+      <span class="s1">substitutions: substitutionOffsets,</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s4">function </span><span class="s1">isComponentStack(consoleArgument: string) {</span>
+  <span class="s1">const isOldComponentStackFormat = / {</span><span class="s3">4</span><span class="s1">}</span><span class="s4">in</span><span class="s1">/.test(consoleArgument);</span>
+  <span class="s1">const isNewComponentStackFormat = / {</span><span class="s3">4</span><span class="s1">}at/.test(consoleArgument);</span>
+  <span class="s1">const isNewJSCComponentStackFormat = /@.*\n/.test(consoleArgument);</span>
+
+  <span class="s4">return </span><span class="s1">(</span>
+    <span class="s1">isOldComponentStackFormat ||</span>
+    <span class="s1">isNewComponentStackFormat ||</span>
+    <span class="s1">isNewJSCComponentStackFormat</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s4">function </span><span class="s1">parseComponentStack(message: string): ComponentStack {</span>
+  <span class="s0">// In newer versions of React, the component stack is formatted as a call stack frame.</span>
+  <span class="s0">// First try to parse the component stack as a call stack frame, and if that doesn't</span>
+  <span class="s0">// work then we'll fallback to the old custom component stack format parsing.</span>
+  <span class="s1">const stack = parseErrorStack(message);</span>
+  <span class="s4">if </span><span class="s1">(stack &amp;&amp; stack.length &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">stack.map(frame =&gt; ({</span>
+      <span class="s1">content: frame.methodName,</span>
+      <span class="s1">collapse: frame.collapse || </span><span class="s4">false</span><span class="s1">,</span>
+      <span class="s1">fileName: frame.file == </span><span class="s4">null </span><span class="s1">? </span><span class="s2">'unknown' </span><span class="s1">: frame.file,</span>
+      <span class="s1">location: {</span>
+        <span class="s1">column: frame.column == </span><span class="s4">null </span><span class="s1">? -</span><span class="s3">1 </span><span class="s1">: frame.column,</span>
+        <span class="s1">row: frame.lineNumber == </span><span class="s4">null </span><span class="s1">? -</span><span class="s3">1 </span><span class="s1">: frame.lineNumber,</span>
+      <span class="s1">},</span>
+    <span class="s1">}));</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">message</span>
+    <span class="s1">.split(/\n {</span><span class="s3">4</span><span class="s1">}</span><span class="s4">in </span><span class="s1">/g)</span>
+    <span class="s1">.map(s =&gt; {</span>
+      <span class="s4">if </span><span class="s1">(!s) {</span>
+        <span class="s4">return null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">const match = s.match(/(.*) \(at (.*\.js):([\d]+)\)/);</span>
+      <span class="s4">if </span><span class="s1">(!match) {</span>
+        <span class="s4">return null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">let [content, fileName, row] = match.slice(</span><span class="s3">1</span><span class="s1">);</span>
+      <span class="s4">return </span><span class="s1">{</span>
+        <span class="s1">content,</span>
+        <span class="s1">fileName,</span>
+        <span class="s1">location: {column: -</span><span class="s3">1</span><span class="s1">, row: parseInt(row, </span><span class="s3">10</span><span class="s1">)},</span>
+      <span class="s1">};</span>
+    <span class="s1">})</span>
+    <span class="s1">.filter(Boolean);</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s4">function </span><span class="s1">parseLogBoxException(</span>
+  <span class="s1">error: ExtendedExceptionData,</span>
+<span class="s1">): LogBoxLogData {</span>
+  <span class="s1">const message =</span>
+    <span class="s1">error.originalMessage != </span><span class="s4">null </span><span class="s1">? error.originalMessage : </span><span class="s2">'Unknown'</span><span class="s1">;</span>
+
+  <span class="s1">const metroInternalError = message.match(METRO_ERROR_FORMAT);</span>
+  <span class="s4">if </span><span class="s1">(metroInternalError) {</span>
+    <span class="s1">const [content, fileName, row, column, codeFrame] =</span>
+      <span class="s1">metroInternalError.slice(</span><span class="s3">1</span><span class="s1">);</span>
+
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">level: </span><span class="s2">'fatal'</span><span class="s1">,</span>
+      <span class="s1">type: </span><span class="s2">'Metro Error'</span><span class="s1">,</span>
+      <span class="s1">stack: [],</span>
+      <span class="s1">isComponentError: </span><span class="s4">false</span><span class="s1">,</span>
+      <span class="s1">componentStack: [],</span>
+      <span class="s1">codeFrame: {</span>
+        <span class="s1">fileName,</span>
+        <span class="s1">location: {</span>
+          <span class="s1">row: parseInt(row, </span><span class="s3">10</span><span class="s1">),</span>
+          <span class="s1">column: parseInt(column, </span><span class="s3">10</span><span class="s1">),</span>
+        <span class="s1">},</span>
+        <span class="s1">content: codeFrame,</span>
+      <span class="s1">},</span>
+      <span class="s1">message: {</span>
+        <span class="s1">content,</span>
+        <span class="s1">substitutions: [],</span>
+      <span class="s1">},</span>
+      <span class="s1">category: `${fileName}-${row}-${column}`,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const babelTransformError = message.match(BABEL_TRANSFORM_ERROR_FORMAT);</span>
+  <span class="s4">if </span><span class="s1">(babelTransformError) {</span>
+    <span class="s0">// Transform errors are thrown from inside the Babel transformer.</span>
+    <span class="s1">const [fileName, content, row, column, codeFrame] =</span>
+      <span class="s1">babelTransformError.slice(</span><span class="s3">1</span><span class="s1">);</span>
+
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">level: </span><span class="s2">'syntax'</span><span class="s1">,</span>
+      <span class="s1">stack: [],</span>
+      <span class="s1">isComponentError: </span><span class="s4">false</span><span class="s1">,</span>
+      <span class="s1">componentStack: [],</span>
+      <span class="s1">codeFrame: {</span>
+        <span class="s1">fileName,</span>
+        <span class="s1">location: {</span>
+          <span class="s1">row: parseInt(row, </span><span class="s3">10</span><span class="s1">),</span>
+          <span class="s1">column: parseInt(column, </span><span class="s3">10</span><span class="s1">),</span>
+        <span class="s1">},</span>
+        <span class="s1">content: codeFrame,</span>
+      <span class="s1">},</span>
+      <span class="s1">message: {</span>
+        <span class="s1">content,</span>
+        <span class="s1">substitutions: [],</span>
+      <span class="s1">},</span>
+      <span class="s1">category: `${fileName}-${row}-${column}`,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const babelCodeFrameError = message.match(BABEL_CODE_FRAME_ERROR_FORMAT);</span>
+
+  <span class="s4">if </span><span class="s1">(babelCodeFrameError) {</span>
+    <span class="s0">// Codeframe errors are thrown from any use of buildCodeFrameError.</span>
+    <span class="s1">const [fileName, content, codeFrame] = babelCodeFrameError.slice(</span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">level: </span><span class="s2">'syntax'</span><span class="s1">,</span>
+      <span class="s1">stack: [],</span>
+      <span class="s1">isComponentError: </span><span class="s4">false</span><span class="s1">,</span>
+      <span class="s1">componentStack: [],</span>
+      <span class="s1">codeFrame: {</span>
+        <span class="s1">fileName,</span>
+        <span class="s1">location: </span><span class="s4">null</span><span class="s1">, </span><span class="s0">// We are not given the location.</span>
+        <span class="s1">content: codeFrame,</span>
+      <span class="s1">},</span>
+      <span class="s1">message: {</span>
+        <span class="s1">content,</span>
+        <span class="s1">substitutions: [],</span>
+      <span class="s1">},</span>
+      <span class="s1">category: `${fileName}-${</span><span class="s3">1</span><span class="s1">}-${</span><span class="s3">1</span><span class="s1">}`,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(message.match(/^TransformError /)) {</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">level: </span><span class="s2">'syntax'</span><span class="s1">,</span>
+      <span class="s1">stack: error.stack,</span>
+      <span class="s1">isComponentError: error.isComponentError,</span>
+      <span class="s1">componentStack: [],</span>
+      <span class="s1">message: {</span>
+        <span class="s1">content: message,</span>
+        <span class="s1">substitutions: [],</span>
+      <span class="s1">},</span>
+      <span class="s1">category: message,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const componentStack = error.componentStack;</span>
+  <span class="s4">if </span><span class="s1">(error.isFatal || error.isComponentError) {</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">level: </span><span class="s2">'fatal'</span><span class="s1">,</span>
+      <span class="s1">stack: error.stack,</span>
+      <span class="s1">isComponentError: error.isComponentError,</span>
+      <span class="s1">componentStack:</span>
+        <span class="s1">componentStack != </span><span class="s4">null </span><span class="s1">? parseComponentStack(componentStack) : [],</span>
+      <span class="s1">...parseInterpolation([message]),</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(componentStack != </span><span class="s4">null</span><span class="s1">) {</span>
+    <span class="s0">// It is possible that console errors have a componentStack.</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">level: </span><span class="s2">'error'</span><span class="s1">,</span>
+      <span class="s1">stack: error.stack,</span>
+      <span class="s1">isComponentError: error.isComponentError,</span>
+      <span class="s1">componentStack: parseComponentStack(componentStack),</span>
+      <span class="s1">...parseInterpolation([message]),</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Most `console.error` calls won't have a componentStack. We parse them like</span>
+  <span class="s0">// regular logs which have the component stack buried in the message.</span>
+  <span class="s4">return </span><span class="s1">{</span>
+    <span class="s1">level: </span><span class="s2">'error'</span><span class="s1">,</span>
+    <span class="s1">stack: error.stack,</span>
+    <span class="s1">isComponentError: error.isComponentError,</span>
+    <span class="s1">...parseLogBoxLog([message]),</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+
+<span class="s1">export </span><span class="s4">function </span><span class="s1">parseLogBoxLog(args: $ReadOnlyArray&lt;mixed&gt;): {|</span>
+  <span class="s1">componentStack: ComponentStack,</span>
+  <span class="s1">category: Category,</span>
+  <span class="s1">message: Message,</span>
+<span class="s1">|} {</span>
+  <span class="s1">const message = args[</span><span class="s3">0</span><span class="s1">];</span>
+  <span class="s1">let argsWithoutComponentStack: Array&lt;mixed&gt; = [];</span>
+  <span class="s1">let componentStack: ComponentStack = [];</span>
+
+  <span class="s0">// Extract component stack from warnings like &quot;Some warning%s&quot;.</span>
+  <span class="s4">if </span><span class="s1">(</span>
+    <span class="s4">typeof </span><span class="s1">message === </span><span class="s2">'string' </span><span class="s1">&amp;&amp;</span>
+    <span class="s1">message.slice(-</span><span class="s3">2</span><span class="s1">) === </span><span class="s2">'%s' </span><span class="s1">&amp;&amp;</span>
+    <span class="s1">args.length &gt; </span><span class="s3">0</span>
+  <span class="s1">) {</span>
+    <span class="s1">const lastArg = args[args.length - </span><span class="s3">1</span><span class="s1">];</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">typeof </span><span class="s1">lastArg === </span><span class="s2">'string' </span><span class="s1">&amp;&amp; isComponentStack(lastArg)) {</span>
+      <span class="s1">argsWithoutComponentStack = args.slice(</span><span class="s3">0</span><span class="s1">, -</span><span class="s3">1</span><span class="s1">);</span>
+      <span class="s1">argsWithoutComponentStack[</span><span class="s3">0</span><span class="s1">] = message.slice(</span><span class="s3">0</span><span class="s1">, -</span><span class="s3">2</span><span class="s1">);</span>
+      <span class="s1">componentStack = parseComponentStack(lastArg);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(componentStack.length === </span><span class="s3">0</span><span class="s1">) {</span>
+    <span class="s0">// Try finding the component stack elsewhere.</span>
+    <span class="s4">for </span><span class="s1">(const arg of args) {</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">typeof </span><span class="s1">arg === </span><span class="s2">'string' </span><span class="s1">&amp;&amp; isComponentStack(arg)) {</span>
+        <span class="s0">// Strip out any messages before the component stack.</span>
+        <span class="s1">let messageEndIndex = arg.search(/\n {</span><span class="s3">4</span><span class="s1">}(</span><span class="s4">in</span><span class="s1">|at) /);</span>
+        <span class="s4">if </span><span class="s1">(messageEndIndex &lt; </span><span class="s3">0</span><span class="s1">) {</span>
+          <span class="s0">// Handle JSC component stacks.</span>
+          <span class="s1">messageEndIndex = arg.search(/\n/);</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(messageEndIndex &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+          <span class="s1">argsWithoutComponentStack.push(arg.slice(</span><span class="s3">0</span><span class="s1">, messageEndIndex));</span>
+        <span class="s1">}</span>
+
+        <span class="s1">componentStack = parseComponentStack(arg);</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">argsWithoutComponentStack.push(arg);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">{</span>
+    <span class="s1">...parseInterpolation(argsWithoutComponentStack),</span>
+    <span class="s1">componentStack,</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

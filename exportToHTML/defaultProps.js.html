@@ -1,0 +1,289 @@
+<html>
+<head>
+<title>defaultProps.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+defaultProps.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Common defaultProps detection functionality. 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const fromEntries = require(</span><span class="s2">'object.fromentries'</span><span class="s1">);</span>
+<span class="s1">const astUtil = require(</span><span class="s2">'./ast'</span><span class="s1">);</span>
+<span class="s1">const componentUtil = require(</span><span class="s2">'./componentUtil'</span><span class="s1">);</span>
+<span class="s1">const propsUtil = require(</span><span class="s2">'./props'</span><span class="s1">);</span>
+<span class="s1">const variableUtil = require(</span><span class="s2">'./variable'</span><span class="s1">);</span>
+<span class="s1">const propWrapperUtil = require(</span><span class="s2">'./propWrapper'</span><span class="s1">);</span>
+
+<span class="s1">const QUOTES_REGEX = /^[</span><span class="s2">&quot;']|[&quot;']$/g;</span>
+
+<span class="s1">module.exports = </span><span class="s3">function </span><span class="s1">defaultPropsInstructions(context, components, utils) {</span>
+  <span class="s1">const sourceCode = context.getSourceCode();</span>
+
+  <span class="s0">/** 
+   * Try to resolve the node passed in to a variable in the current scope. If the node passed in is not 
+   * an Identifier, then the node is simply returned. 
+   * @param   {ASTNode} node The node to resolve. 
+   * @returns {ASTNode|null} Return null if the value could not be resolved, ASTNode otherwise. 
+   */</span>
+  <span class="s3">function </span><span class="s1">resolveNodeValue(node) {</span>
+    <span class="s3">if </span><span class="s1">(node.type === </span><span class="s2">'Identifier'</span><span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">variableUtil.findVariableByName(context, node.name);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">node.type === </span><span class="s2">'CallExpression'</span>
+      <span class="s1">&amp;&amp; propWrapperUtil.isPropWrapperFunction(context, node.callee.name)</span>
+      <span class="s1">&amp;&amp; node.arguments &amp;&amp; node.arguments[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">resolveNodeValue(node.arguments[</span><span class="s4">0</span><span class="s1">]);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">node;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Extracts a DefaultProp from an ObjectExpression node. 
+   * @param   {ASTNode} objectExpression ObjectExpression node. 
+   * @returns {Object|string}            Object representation of a defaultProp, to be consumed by 
+   *                                     `addDefaultPropsToComponent`, or string &quot;unresolved&quot;, if the defaultProps 
+   *                                     from this ObjectExpression can't be resolved. 
+   */</span>
+  <span class="s3">function </span><span class="s1">getDefaultPropsFromObjectExpression(objectExpression) {</span>
+    <span class="s1">const hasSpread = objectExpression.properties.find((property) =&gt; property.type === </span><span class="s2">'ExperimentalSpreadProperty' </span><span class="s1">|| property.type === </span><span class="s2">'SpreadElement'</span><span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(hasSpread) {</span>
+      <span class="s3">return </span><span class="s2">'unresolved'</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">objectExpression.properties.map((defaultProp) =&gt; ({</span>
+      <span class="s1">name: sourceCode.getText(defaultProp.key).replace(QUOTES_REGEX, </span><span class="s2">''</span><span class="s1">),</span>
+      <span class="s1">node: defaultProp,</span>
+    <span class="s1">}));</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Marks a component's DefaultProps declaration as &quot;unresolved&quot;. A component's DefaultProps is 
+   * marked as &quot;unresolved&quot; if we cannot safely infer the values of its defaultProps declarations 
+   * without risking false negatives. 
+   * @param   {Object} component The component to mark. 
+   * @returns {void} 
+   */</span>
+  <span class="s3">function </span><span class="s1">markDefaultPropsAsUnresolved(component) {</span>
+    <span class="s1">components.set(component.node, {</span>
+      <span class="s1">defaultProps: </span><span class="s2">'unresolved'</span><span class="s1">,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Adds defaultProps to the component passed in. 
+   * @param   {ASTNode}         component    The component to add the defaultProps to. 
+   * @param   {Object[]|'unresolved'} defaultProps defaultProps to add to the component or the string &quot;unresolved&quot; 
+   *                                         if this component has defaultProps that can't be resolved. 
+   * @returns {void} 
+   */</span>
+  <span class="s3">function </span><span class="s1">addDefaultPropsToComponent(component, defaultProps) {</span>
+    <span class="s0">// Early return if this component's defaultProps is already marked as &quot;unresolved&quot;.</span>
+    <span class="s3">if </span><span class="s1">(component.defaultProps === </span><span class="s2">'unresolved'</span><span class="s1">) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(defaultProps === </span><span class="s2">'unresolved'</span><span class="s1">) {</span>
+      <span class="s1">markDefaultPropsAsUnresolved(component);</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const defaults = component.defaultProps || {};</span>
+    <span class="s1">const newDefaultProps = Object.assign(</span>
+      <span class="s1">{},</span>
+      <span class="s1">defaults,</span>
+      <span class="s1">fromEntries(defaultProps.map((prop) =&gt; [prop.name, prop]))</span>
+    <span class="s1">);</span>
+
+    <span class="s1">components.set(component.node, {</span>
+      <span class="s1">defaultProps: newDefaultProps,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">MemberExpression(node) {</span>
+      <span class="s1">const isDefaultProp = propsUtil.isDefaultPropsDeclaration(node);</span>
+
+      <span class="s3">if </span><span class="s1">(!isDefaultProp) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// find component this defaultProps belongs to</span>
+      <span class="s1">const component = utils.getRelatedComponent(node);</span>
+      <span class="s3">if </span><span class="s1">(!component) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// e.g.:</span>
+      <span class="s0">// MyComponent.propTypes = {</span>
+      <span class="s0">//   foo: React.PropTypes.string.isRequired,</span>
+      <span class="s0">//   bar: React.PropTypes.string</span>
+      <span class="s0">// };</span>
+      <span class="s0">//</span>
+      <span class="s0">// or:</span>
+      <span class="s0">//</span>
+      <span class="s0">// MyComponent.propTypes = myPropTypes;</span>
+      <span class="s3">if </span><span class="s1">(node.parent.type === </span><span class="s2">'AssignmentExpression'</span><span class="s1">) {</span>
+        <span class="s1">const expression = resolveNodeValue(node.parent.right);</span>
+        <span class="s3">if </span><span class="s1">(!expression || expression.type !== </span><span class="s2">'ObjectExpression'</span><span class="s1">) {</span>
+          <span class="s0">// If a value can't be found, we mark the defaultProps declaration as &quot;unresolved&quot;, because</span>
+          <span class="s0">// we should ignore this component and not report any errors for it, to avoid false-positives</span>
+          <span class="s0">// with e.g. external defaultProps declarations.</span>
+          <span class="s3">if </span><span class="s1">(isDefaultProp) {</span>
+            <span class="s1">markDefaultPropsAsUnresolved(component);</span>
+          <span class="s1">}</span>
+
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">addDefaultPropsToComponent(component, getDefaultPropsFromObjectExpression(expression));</span>
+
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// e.g.:</span>
+      <span class="s0">// MyComponent.propTypes.baz = React.PropTypes.string;</span>
+      <span class="s3">if </span><span class="s1">(node.parent.type === </span><span class="s2">'MemberExpression' </span><span class="s1">&amp;&amp; node.parent.parent</span>
+        <span class="s1">&amp;&amp; node.parent.parent.type === </span><span class="s2">'AssignmentExpression'</span><span class="s1">) {</span>
+        <span class="s1">addDefaultPropsToComponent(component, [{</span>
+          <span class="s1">name: node.parent.property.name,</span>
+          <span class="s1">node: node.parent.parent,</span>
+        <span class="s1">}]);</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s0">// e.g.:</span>
+    <span class="s0">// class Hello extends React.Component {</span>
+    <span class="s0">//   static get defaultProps() {</span>
+    <span class="s0">//     return {</span>
+    <span class="s0">//       name: 'Dean'</span>
+    <span class="s0">//     };</span>
+    <span class="s0">//   }</span>
+    <span class="s0">//   render() {</span>
+    <span class="s0">//     return &lt;div&gt;Hello {this.props.name}&lt;/div&gt;;</span>
+    <span class="s0">//   }</span>
+    <span class="s0">// }</span>
+    <span class="s1">MethodDefinition(node) {</span>
+      <span class="s3">if </span><span class="s1">(!node.static || node.kind !== </span><span class="s2">'get'</span><span class="s1">) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s3">if </span><span class="s1">(!propsUtil.isDefaultPropsDeclaration(node)) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// find component this propTypes/defaultProps belongs to</span>
+      <span class="s1">const component = components.get(componentUtil.getParentES6Component(context));</span>
+      <span class="s3">if </span><span class="s1">(!component) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const returnStatement = utils.findReturnStatement(node);</span>
+      <span class="s3">if </span><span class="s1">(!returnStatement) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const expression = resolveNodeValue(returnStatement.argument);</span>
+      <span class="s3">if </span><span class="s1">(!expression || expression.type !== </span><span class="s2">'ObjectExpression'</span><span class="s1">) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">addDefaultPropsToComponent(component, getDefaultPropsFromObjectExpression(expression));</span>
+    <span class="s1">},</span>
+
+    <span class="s0">// e.g.:</span>
+    <span class="s0">// class Greeting extends React.Component {</span>
+    <span class="s0">//   render() {</span>
+    <span class="s0">//     return (</span>
+    <span class="s0">//       &lt;h1&gt;Hello, {this.props.foo} {this.props.bar}&lt;/h1&gt;</span>
+    <span class="s0">//     );</span>
+    <span class="s0">//   }</span>
+    <span class="s0">//   static defaultProps = {</span>
+    <span class="s0">//     foo: 'bar',</span>
+    <span class="s0">//     bar: 'baz'</span>
+    <span class="s0">//   };</span>
+    <span class="s0">// }</span>
+    <span class="s2">'ClassProperty, PropertyDefinition'</span><span class="s1">(node) {</span>
+      <span class="s3">if </span><span class="s1">(!(node.static &amp;&amp; node.value)) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const propName = astUtil.getPropertyName(node);</span>
+      <span class="s1">const isDefaultProp = propName === </span><span class="s2">'defaultProps' </span><span class="s1">|| propName === </span><span class="s2">'getDefaultProps'</span><span class="s1">;</span>
+
+      <span class="s3">if </span><span class="s1">(!isDefaultProp) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// find component this propTypes/defaultProps belongs to</span>
+      <span class="s1">const component = components.get(componentUtil.getParentES6Component(context));</span>
+      <span class="s3">if </span><span class="s1">(!component) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const expression = resolveNodeValue(node.value);</span>
+      <span class="s3">if </span><span class="s1">(!expression || expression.type !== </span><span class="s2">'ObjectExpression'</span><span class="s1">) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">addDefaultPropsToComponent(component, getDefaultPropsFromObjectExpression(expression));</span>
+    <span class="s1">},</span>
+
+    <span class="s0">// e.g.:</span>
+    <span class="s0">// React.createClass({</span>
+    <span class="s0">//   render: function() {</span>
+    <span class="s0">//     return &lt;div&gt;{this.props.foo}&lt;/div&gt;;</span>
+    <span class="s0">//   },</span>
+    <span class="s0">//   getDefaultProps: function() {</span>
+    <span class="s0">//     return {</span>
+    <span class="s0">//       foo: 'default'</span>
+    <span class="s0">//     };</span>
+    <span class="s0">//   }</span>
+    <span class="s0">// });</span>
+    <span class="s1">ObjectExpression(node) {</span>
+      <span class="s0">// find component this propTypes/defaultProps belongs to</span>
+      <span class="s1">const component = componentUtil.isES5Component(node, context) &amp;&amp; components.get(node);</span>
+      <span class="s3">if </span><span class="s1">(!component) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Search for the proptypes declaration</span>
+      <span class="s1">node.properties.forEach((property) =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(property.type === </span><span class="s2">'ExperimentalSpreadProperty' </span><span class="s1">|| property.type === </span><span class="s2">'SpreadElement'</span><span class="s1">) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const isDefaultProp = propsUtil.isDefaultPropsDeclaration(property);</span>
+
+        <span class="s3">if </span><span class="s1">(isDefaultProp &amp;&amp; property.value.type === </span><span class="s2">'FunctionExpression'</span><span class="s1">) {</span>
+          <span class="s1">const returnStatement = utils.findReturnStatement(property);</span>
+          <span class="s3">if </span><span class="s1">(!returnStatement || returnStatement.argument.type !== </span><span class="s2">'ObjectExpression'</span><span class="s1">) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+          <span class="s1">}</span>
+
+          <span class="s1">addDefaultPropsToComponent(component, getDefaultPropsFromObjectExpression(returnStatement.argument));</span>
+        <span class="s1">}</span>
+      <span class="s1">});</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

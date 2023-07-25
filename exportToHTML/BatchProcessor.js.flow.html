@@ -1,0 +1,147 @@
+<html>
+<head>
+<title>BatchProcessor.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+BatchProcessor.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">const invariant = require('invariant');</span>
+
+<span class="s0">type ProcessBatch&lt;TItem, TResult&gt; = (</span>
+  <span class="s0">batch: Array&lt;TItem&gt;,</span>
+<span class="s0">) =&gt; Promise&lt;Array&lt;TResult&gt;&gt;;</span>
+
+<span class="s0">type BatchProcessorOptions = {</span>
+  <span class="s0">maximumDelayMs: number,</span>
+  <span class="s0">maximumItems: number,</span>
+  <span class="s0">concurrency: number,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+
+<span class="s0">type QueueItem&lt;TItem, TResult&gt; = {</span>
+  <span class="s0">item: TItem,</span>
+  <span class="s0">reject: (error: mixed) =&gt; mixed,</span>
+  <span class="s0">resolve: (result: TResult) =&gt; mixed,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* We batch items together trying to minimize their processing, for example as</span>
+ <span class="s0">* network queries. For that we wait a small moment before processing a batch.</span>
+ <span class="s0">* We limit also the number of items we try to process in a single batch so that</span>
+ <span class="s0">* if we have many items pending in a short amount of time, we can start</span>
+ <span class="s0">* processing right away.</span>
+ <span class="s0">*/</span>
+<span class="s0">class BatchProcessor&lt;TItem, TResult&gt; {</span>
+  <span class="s0">_currentProcessCount: number;</span>
+  <span class="s0">_options: BatchProcessorOptions;</span>
+  <span class="s0">_processBatch: ProcessBatch&lt;TItem, TResult&gt;;</span>
+  <span class="s0">_queue: Array&lt;QueueItem&lt;TItem, TResult&gt;&gt;;</span>
+  <span class="s0">_timeoutHandle: ?TimeoutID;</span>
+
+  <span class="s0">constructor(</span>
+    <span class="s0">options: BatchProcessorOptions,</span>
+    <span class="s0">processBatch: ProcessBatch&lt;TItem, TResult&gt;,</span>
+  <span class="s0">) {</span>
+    <span class="s0">this._options = options;</span>
+    <span class="s0">this._processBatch = processBatch;</span>
+    <span class="s0">this._queue = [];</span>
+    <span class="s0">this._timeoutHandle = null;</span>
+    <span class="s0">this._currentProcessCount = 0;</span>
+    <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+    <span class="s0">(this: any)._processQueue = this._processQueue.bind(this);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_onBatchFinished(): void {</span>
+    <span class="s0">this._currentProcessCount--;</span>
+    <span class="s0">this._processQueueOnceReady();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_onBatchResults(</span>
+    <span class="s0">jobs: Array&lt;QueueItem&lt;TItem, TResult&gt;&gt;,</span>
+    <span class="s0">results: Array&lt;TResult&gt;,</span>
+  <span class="s0">): void {</span>
+    <span class="s0">invariant(results.length === jobs.length, 'Not enough results returned.');</span>
+    <span class="s0">for (let i = 0; i &lt; jobs.length; ++i) {</span>
+      <span class="s0">jobs[i].resolve(results[i]);</span>
+    <span class="s0">}</span>
+    <span class="s0">this._onBatchFinished();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_onBatchError(jobs: Array&lt;QueueItem&lt;TItem, TResult&gt;&gt;, error: mixed): void {</span>
+    <span class="s0">for (let i = 0; i &lt; jobs.length; ++i) {</span>
+      <span class="s0">jobs[i].reject(error);</span>
+    <span class="s0">}</span>
+    <span class="s0">this._onBatchFinished();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_processQueue(): void {</span>
+    <span class="s0">this._timeoutHandle = null;</span>
+    <span class="s0">const {concurrency} = this._options;</span>
+    <span class="s0">while (this._queue.length &gt; 0 &amp;&amp; this._currentProcessCount &lt; concurrency) {</span>
+      <span class="s0">this._currentProcessCount++;</span>
+      <span class="s0">const jobs = this._queue.splice(0, this._options.maximumItems);</span>
+      <span class="s0">this._processBatch(</span>
+        <span class="s0">jobs.map((job: QueueItem&lt;TItem, TResult&gt;) =&gt; job.item),</span>
+      <span class="s0">).then(</span>
+        <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+        <span class="s0">this._onBatchResults.bind(this, jobs),</span>
+        <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+        <span class="s0">this._onBatchError.bind(this, jobs),</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_processQueueOnceReady(): void {</span>
+    <span class="s0">if (this._queue.length &gt;= this._options.maximumItems) {</span>
+      <span class="s0">clearTimeout(this._timeoutHandle);</span>
+      <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+      <span class="s0">process.nextTick(this._processQueue);</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+    <span class="s0">if (this._timeoutHandle == null) {</span>
+      <span class="s0">this._timeoutHandle = setTimeout(</span>
+        <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+        <span class="s0">this._processQueue,</span>
+        <span class="s0">this._options.maximumDelayMs,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">queue(item: TItem): Promise&lt;TResult&gt; {</span>
+    <span class="s0">return new Promise(</span>
+      <span class="s0">(</span>
+        <span class="s0">resolve: (result: TResult) =&gt; mixed,</span>
+        <span class="s0">reject: (error: mixed) =&gt; mixed,</span>
+      <span class="s0">) =&gt; {</span>
+        <span class="s0">this._queue.push({item, resolve, reject});</span>
+        <span class="s0">this._processQueueOnceReady();</span>
+      <span class="s0">},</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = BatchProcessor;</span>
+</pre>
+</body>
+</html>

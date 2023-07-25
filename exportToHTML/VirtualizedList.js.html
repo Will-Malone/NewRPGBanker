@@ -1,0 +1,2116 @@
+<html>
+<head>
+<title>VirtualizedList.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+VirtualizedList.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @flow 
+ * @format 
+ */</span>
+
+<span class="s1">import type {ScrollResponderType} from </span><span class="s2">'react-native/Libraries/Components/ScrollView/ScrollView'</span><span class="s1">;</span>
+<span class="s1">import type {ViewStyleProp} from </span><span class="s2">'react-native/Libraries/StyleSheet/StyleSheet'</span><span class="s1">;</span>
+<span class="s1">import type {</span>
+  <span class="s1">LayoutEvent,</span>
+  <span class="s1">ScrollEvent,</span>
+<span class="s1">} from </span><span class="s2">'react-native/Libraries/Types/CoreEventTypes'</span><span class="s1">;</span>
+<span class="s1">import type {ViewToken} from </span><span class="s2">'./ViewabilityHelper'</span><span class="s1">;</span>
+<span class="s1">import type {</span>
+  <span class="s1">FrameMetricProps,</span>
+  <span class="s1">Item,</span>
+  <span class="s1">Props,</span>
+  <span class="s1">RenderItemProps,</span>
+  <span class="s1">RenderItemType,</span>
+  <span class="s1">Separators,</span>
+<span class="s1">} from </span><span class="s2">'./VirtualizedListProps'</span><span class="s1">;</span>
+
+<span class="s1">import {</span>
+  <span class="s1">RefreshControl,</span>
+  <span class="s1">ScrollView,</span>
+  <span class="s1">View,</span>
+  <span class="s1">StyleSheet,</span>
+  <span class="s1">findNodeHandle,</span>
+<span class="s1">} from </span><span class="s2">'react-native'</span><span class="s1">;</span>
+<span class="s1">import Batchinator from </span><span class="s2">'../Interaction/Batchinator'</span><span class="s1">;</span>
+<span class="s1">import clamp from </span><span class="s2">'../Utilities/clamp'</span><span class="s1">;</span>
+<span class="s1">import infoLog from </span><span class="s2">'../Utilities/infoLog'</span><span class="s1">;</span>
+<span class="s1">import {CellRenderMask} from </span><span class="s2">'./CellRenderMask'</span><span class="s1">;</span>
+<span class="s1">import ChildListCollection from </span><span class="s2">'./ChildListCollection'</span><span class="s1">;</span>
+<span class="s1">import FillRateHelper from </span><span class="s2">'./FillRateHelper'</span><span class="s1">;</span>
+<span class="s1">import StateSafePureComponent from </span><span class="s2">'./StateSafePureComponent'</span><span class="s1">;</span>
+<span class="s1">import ViewabilityHelper from </span><span class="s2">'./ViewabilityHelper'</span><span class="s1">;</span>
+<span class="s1">import CellRenderer from </span><span class="s2">'./VirtualizedListCellRenderer'</span><span class="s1">;</span>
+<span class="s1">import {</span>
+  <span class="s1">VirtualizedListCellContextProvider,</span>
+  <span class="s1">VirtualizedListContext,</span>
+  <span class="s1">VirtualizedListContextProvider,</span>
+<span class="s1">} from </span><span class="s2">'./VirtualizedListContext.js'</span><span class="s1">;</span>
+<span class="s1">import {</span>
+  <span class="s1">computeWindowedRenderLimits,</span>
+  <span class="s1">keyExtractor as defaultKeyExtractor,</span>
+<span class="s1">} from </span><span class="s2">'./VirtualizeUtils'</span><span class="s1">;</span>
+<span class="s1">import invariant from </span><span class="s2">'invariant'</span><span class="s1">;</span>
+<span class="s1">import nullthrows from </span><span class="s2">'nullthrows'</span><span class="s1">;</span>
+<span class="s1">import * as React from </span><span class="s2">'react'</span><span class="s1">;</span>
+
+<span class="s1">export type {RenderItemProps, RenderItemType, Separators};</span>
+
+<span class="s1">const ON_EDGE_REACHED_EPSILON = </span><span class="s3">0.001</span><span class="s1">;</span>
+
+<span class="s1">let _usedIndexForKey = </span><span class="s4">false</span><span class="s1">;</span>
+<span class="s1">let _keylessItemComponentName: string = </span><span class="s2">''</span><span class="s1">;</span>
+
+<span class="s1">type ViewabilityHelperCallbackTuple = {</span>
+  <span class="s1">viewabilityHelper: ViewabilityHelper,</span>
+  <span class="s1">onViewableItemsChanged: (info: {</span>
+    <span class="s1">viewableItems: Array&lt;ViewToken&gt;,</span>
+    <span class="s1">changed: Array&lt;ViewToken&gt;,</span>
+    <span class="s1">...</span>
+  <span class="s1">}) =&gt; </span><span class="s4">void</span><span class="s1">,</span>
+  <span class="s1">...</span>
+<span class="s1">};</span>
+
+<span class="s1">type State = {</span>
+  <span class="s1">renderMask: CellRenderMask,</span>
+  <span class="s1">cellsAroundViewport: {first: number, last: number},</span>
+  <span class="s0">// Used to track items added at the start of the list for maintainVisibleContentPosition.</span>
+  <span class="s1">firstVisibleItemKey: ?string,</span>
+  <span class="s0">// When &gt; 0 the scroll position available in JS is considered stale and should not be used.</span>
+  <span class="s1">pendingScrollUpdateCount: number,</span>
+<span class="s1">};</span>
+
+<span class="s0">/** 
+ * Default Props Helper Functions 
+ * Use the following helper functions for default values 
+ */</span>
+
+<span class="s0">// horizontalOrDefault(this.props.horizontal)</span>
+<span class="s4">function </span><span class="s1">horizontalOrDefault(horizontal: ?boolean) {</span>
+  <span class="s4">return </span><span class="s1">horizontal ?? </span><span class="s4">false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// initialNumToRenderOrDefault(this.props.initialNumToRender)</span>
+<span class="s4">function </span><span class="s1">initialNumToRenderOrDefault(initialNumToRender: ?number) {</span>
+  <span class="s4">return </span><span class="s1">initialNumToRender ?? </span><span class="s3">10</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// maxToRenderPerBatchOrDefault(this.props.maxToRenderPerBatch)</span>
+<span class="s4">function </span><span class="s1">maxToRenderPerBatchOrDefault(maxToRenderPerBatch: ?number) {</span>
+  <span class="s4">return </span><span class="s1">maxToRenderPerBatch ?? </span><span class="s3">10</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// onStartReachedThresholdOrDefault(this.props.onStartReachedThreshold)</span>
+<span class="s4">function </span><span class="s1">onStartReachedThresholdOrDefault(onStartReachedThreshold: ?number) {</span>
+  <span class="s4">return </span><span class="s1">onStartReachedThreshold ?? </span><span class="s3">2</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// onEndReachedThresholdOrDefault(this.props.onEndReachedThreshold)</span>
+<span class="s4">function </span><span class="s1">onEndReachedThresholdOrDefault(onEndReachedThreshold: ?number) {</span>
+  <span class="s4">return </span><span class="s1">onEndReachedThreshold ?? </span><span class="s3">2</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// getScrollingThreshold(visibleLength, onEndReachedThreshold)</span>
+<span class="s4">function </span><span class="s1">getScrollingThreshold(threshold: number, visibleLength: number) {</span>
+  <span class="s4">return </span><span class="s1">(threshold * visibleLength) / </span><span class="s3">2</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// scrollEventThrottleOrDefault(this.props.scrollEventThrottle)</span>
+<span class="s4">function </span><span class="s1">scrollEventThrottleOrDefault(scrollEventThrottle: ?number) {</span>
+  <span class="s4">return </span><span class="s1">scrollEventThrottle ?? </span><span class="s3">50</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// windowSizeOrDefault(this.props.windowSize)</span>
+<span class="s4">function </span><span class="s1">windowSizeOrDefault(windowSize: ?number) {</span>
+  <span class="s4">return </span><span class="s1">windowSize ?? </span><span class="s3">21</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s4">function </span><span class="s1">findLastWhere&lt;T&gt;(</span>
+  <span class="s1">arr: $ReadOnlyArray&lt;T&gt;,</span>
+  <span class="s1">predicate: (element: T) =&gt; boolean,</span>
+<span class="s1">): T | </span><span class="s4">null </span><span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(let i = arr.length - </span><span class="s3">1</span><span class="s1">; i &gt;= </span><span class="s3">0</span><span class="s1">; i--) {</span>
+    <span class="s4">if </span><span class="s1">(predicate(arr[i])) {</span>
+      <span class="s4">return </span><span class="s1">arr[i];</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Base implementation for the more convenient [`&lt;FlatList&gt;`](https://reactnative.dev/docs/flatlist) 
+ * and [`&lt;SectionList&gt;`](https://reactnative.dev/docs/sectionlist) components, which are also better 
+ * documented. In general, this should only really be used if you need more flexibility than 
+ * `FlatList` provides, e.g. for use with immutable data instead of plain arrays. 
+ * 
+ * Virtualization massively improves memory consumption and performance of large lists by 
+ * maintaining a finite render window of active items and replacing all items outside of the render 
+ * window with appropriately sized blank space. The window adapts to scrolling behavior, and items 
+ * are rendered incrementally with low-pri (after any running interactions) if they are far from the 
+ * visible area, or with hi-pri otherwise to minimize the potential of seeing blank space. 
+ * 
+ * Some caveats: 
+ * 
+ * - Internal state is not preserved when content scrolls out of the render window. Make sure all 
+ *   your data is captured in the item data or external stores like Flux, Redux, or Relay. 
+ * - This is a `PureComponent` which means that it will not re-render if `props` remain shallow- 
+ *   equal. Make sure that everything your `renderItem` function depends on is passed as a prop 
+ *   (e.g. `extraData`) that is not `===` after updates, otherwise your UI may not update on 
+ *   changes. This includes the `data` prop and parent component state. 
+ * - In order to constrain memory and enable smooth scrolling, content is rendered asynchronously 
+ *   offscreen. This means it's possible to scroll faster than the fill rate ands momentarily see 
+ *   blank content. This is a tradeoff that can be adjusted to suit the needs of each application, 
+ *   and we are working on improving it behind the scenes. 
+ * - By default, the list looks for a `key` or `id` prop on each item and uses that for the React key. 
+ *   Alternatively, you can provide a custom `keyExtractor` prop. 
+ * - As an effort to remove defaultProps, use helper functions when referencing certain props 
+ * 
+ */</span>
+<span class="s1">class VirtualizedList extends StateSafePureComponent&lt;Props, State&gt; {</span>
+  <span class="s1">static contextType: </span><span class="s4">typeof </span><span class="s1">VirtualizedListContext = VirtualizedListContext;</span>
+
+  <span class="s0">// scrollToEnd may be janky without getItemLayout prop</span>
+  <span class="s1">scrollToEnd(params?: ?{animated?: ?boolean, ...}) {</span>
+    <span class="s1">const animated = params ? params.animated : </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s1">const veryLast = </span><span class="s4">this</span><span class="s1">.props.getItemCount(</span><span class="s4">this</span><span class="s1">.props.data) - </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s4">if </span><span class="s1">(veryLast &lt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const frame = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(veryLast, </span><span class="s4">this</span><span class="s1">.props);</span>
+    <span class="s1">const offset = Math.max(</span>
+      <span class="s3">0</span><span class="s1">,</span>
+      <span class="s1">frame.offset +</span>
+        <span class="s1">frame.length +</span>
+        <span class="s4">this</span><span class="s1">._footerLength -</span>
+        <span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength,</span>
+    <span class="s1">);</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef.scrollTo == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">console.warn(</span>
+        <span class="s2">'No scrollTo method provided. This may be because you have two nested ' </span><span class="s1">+</span>
+          <span class="s2">'VirtualizedLists with the same orientation, or because you are ' </span><span class="s1">+</span>
+          <span class="s2">'using a custom component that does not implement scrollTo.'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._scrollRef.scrollTo(</span>
+      <span class="s1">horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal)</span>
+        <span class="s1">? {x: offset, animated}</span>
+        <span class="s1">: {y: offset, animated},</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// scrollToIndex may be janky without getItemLayout prop</span>
+  <span class="s1">scrollToIndex(params: {</span>
+    <span class="s1">animated?: ?boolean,</span>
+    <span class="s1">index: number,</span>
+    <span class="s1">viewOffset?: number,</span>
+    <span class="s1">viewPosition?: number,</span>
+    <span class="s1">...</span>
+  <span class="s1">}): $FlowFixMe {</span>
+    <span class="s1">const {</span>
+      <span class="s1">data,</span>
+      <span class="s1">horizontal,</span>
+      <span class="s1">getItemCount,</span>
+      <span class="s1">getItemLayout,</span>
+      <span class="s1">onScrollToIndexFailed,</span>
+    <span class="s1">} = </span><span class="s4">this</span><span class="s1">.props;</span>
+    <span class="s1">const {animated, index, viewOffset, viewPosition} = params;</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">index &gt;= </span><span class="s3">0</span><span class="s1">,</span>
+      <span class="s1">`scrollToIndex out of range: requested index ${index} but minimum is </span><span class="s3">0</span><span class="s1">`,</span>
+    <span class="s1">);</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">getItemCount(data) &gt;= </span><span class="s3">1</span><span class="s1">,</span>
+      <span class="s1">`scrollToIndex out of range: item length ${getItemCount(</span>
+        <span class="s1">data,</span>
+      <span class="s1">)} but minimum is </span><span class="s3">1</span><span class="s1">`,</span>
+    <span class="s1">);</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">index &lt; getItemCount(data),</span>
+      <span class="s1">`scrollToIndex out of range: requested index ${index} is out of </span><span class="s3">0 </span><span class="s1">to ${</span>
+        <span class="s1">getItemCount(data) - </span><span class="s3">1</span>
+      <span class="s1">}`,</span>
+    <span class="s1">);</span>
+    <span class="s4">if </span><span class="s1">(!getItemLayout &amp;&amp; index &gt; </span><span class="s4">this</span><span class="s1">._highestMeasuredFrameIndex) {</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">!!onScrollToIndexFailed,</span>
+        <span class="s2">'scrollToIndex should be used in conjunction with getItemLayout or onScrollToIndexFailed, ' </span><span class="s1">+</span>
+          <span class="s2">'otherwise there is no way to know the location of offscreen indices or handle failures.'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+      <span class="s1">onScrollToIndexFailed({</span>
+        <span class="s1">averageItemLength: </span><span class="s4">this</span><span class="s1">._averageCellLength,</span>
+        <span class="s1">highestMeasuredFrameIndex: </span><span class="s4">this</span><span class="s1">._highestMeasuredFrameIndex,</span>
+        <span class="s1">index,</span>
+      <span class="s1">});</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const frame = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(Math.floor(index), </span><span class="s4">this</span><span class="s1">.props);</span>
+    <span class="s1">const offset =</span>
+      <span class="s1">Math.max(</span>
+        <span class="s3">0</span><span class="s1">,</span>
+        <span class="s4">this</span><span class="s1">._getOffsetApprox(index, </span><span class="s4">this</span><span class="s1">.props) -</span>
+          <span class="s1">(viewPosition || </span><span class="s3">0</span><span class="s1">) *</span>
+            <span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength - frame.length),</span>
+      <span class="s1">) - (viewOffset || </span><span class="s3">0</span><span class="s1">);</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef.scrollTo == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">console.warn(</span>
+        <span class="s2">'No scrollTo method provided. This may be because you have two nested ' </span><span class="s1">+</span>
+          <span class="s2">'VirtualizedLists with the same orientation, or because you are ' </span><span class="s1">+</span>
+          <span class="s2">'using a custom component that does not implement scrollTo.'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._scrollRef.scrollTo(</span>
+      <span class="s1">horizontal ? {x: offset, animated} : {y: offset, animated},</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// scrollToItem may be janky without getItemLayout prop. Required linear scan through items -</span>
+  <span class="s0">// use scrollToIndex instead if possible.</span>
+  <span class="s1">scrollToItem(params: {</span>
+    <span class="s1">animated?: ?boolean,</span>
+    <span class="s1">item: Item,</span>
+    <span class="s1">viewOffset?: number,</span>
+    <span class="s1">viewPosition?: number,</span>
+    <span class="s1">...</span>
+  <span class="s1">}) {</span>
+    <span class="s1">const {item} = params;</span>
+    <span class="s1">const {data, getItem, getItemCount} = </span><span class="s4">this</span><span class="s1">.props;</span>
+    <span class="s1">const itemCount = getItemCount(data);</span>
+    <span class="s4">for </span><span class="s1">(let index = </span><span class="s3">0</span><span class="s1">; index &lt; itemCount; index++) {</span>
+      <span class="s4">if </span><span class="s1">(getItem(data, index) === item) {</span>
+        <span class="s4">this</span><span class="s1">.scrollToIndex({...params, index});</span>
+        <span class="s4">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Scroll to a specific content pixel offset in the list. 
+   * 
+   * Param `offset` expects the offset to scroll to. 
+   * In case of `horizontal` is true, the offset is the x-value, 
+   * in any other case the offset is the y-value. 
+   * 
+   * Param `animated` (`true` by default) defines whether the list 
+   * should do an animation while scrolling. 
+   */</span>
+  <span class="s1">scrollToOffset(params: {animated?: ?boolean, offset: number, ...}) {</span>
+    <span class="s1">const {animated, offset} = params;</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef.scrollTo == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">console.warn(</span>
+        <span class="s2">'No scrollTo method provided. This may be because you have two nested ' </span><span class="s1">+</span>
+          <span class="s2">'VirtualizedLists with the same orientation, or because you are ' </span><span class="s1">+</span>
+          <span class="s2">'using a custom component that does not implement scrollTo.'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._scrollRef.scrollTo(</span>
+      <span class="s1">horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal)</span>
+        <span class="s1">? {x: offset, animated}</span>
+        <span class="s1">: {y: offset, animated},</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">recordInteraction() {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.forEach(childList =&gt; {</span>
+      <span class="s1">childList.recordInteraction();</span>
+    <span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">._viewabilityTuples.forEach(t =&gt; {</span>
+      <span class="s1">t.viewabilityHelper.recordInteraction();</span>
+    <span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">._updateViewableItems(</span><span class="s4">this</span><span class="s1">.props, </span><span class="s4">this</span><span class="s1">.state.cellsAroundViewport);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">flashScrollIndicators() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._scrollRef.flashScrollIndicators();</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Provides a handle to the underlying scroll responder. 
+   * Note that `this._scrollRef` might not be a `ScrollView`, so we 
+   * need to check that it responds to `getScrollResponder` before calling it. 
+   */</span>
+  <span class="s1">getScrollResponder(): ?ScrollResponderType {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef &amp;&amp; </span><span class="s4">this</span><span class="s1">._scrollRef.getScrollResponder) {</span>
+      <span class="s4">return this</span><span class="s1">._scrollRef.getScrollResponder();</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getScrollableNode(): ?number {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef &amp;&amp; </span><span class="s4">this</span><span class="s1">._scrollRef.getScrollableNode) {</span>
+      <span class="s4">return this</span><span class="s1">._scrollRef.getScrollableNode();</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">return </span><span class="s1">findNodeHandle(</span><span class="s4">this</span><span class="s1">._scrollRef);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getScrollRef():</span>
+    <span class="s1">| ?React.ElementRef&lt;</span><span class="s4">typeof </span><span class="s1">ScrollView&gt;</span>
+    <span class="s1">| ?React.ElementRef&lt;</span><span class="s4">typeof </span><span class="s1">View&gt; {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef &amp;&amp; </span><span class="s4">this</span><span class="s1">._scrollRef.getScrollRef) {</span>
+      <span class="s4">return this</span><span class="s1">._scrollRef.getScrollRef();</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">return this</span><span class="s1">._scrollRef;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">setNativeProps(props: Object) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollRef) {</span>
+      <span class="s4">this</span><span class="s1">._scrollRef.setNativeProps(props);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_getCellKey(): string {</span>
+    <span class="s4">return this</span><span class="s1">.context?.cellKey || </span><span class="s2">'rootList'</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// $FlowFixMe[missing-local-annot]</span>
+  <span class="s1">_getScrollMetrics = () =&gt; {</span>
+    <span class="s4">return this</span><span class="s1">._scrollMetrics;</span>
+  <span class="s1">};</span>
+
+  <span class="s1">hasMore(): boolean {</span>
+    <span class="s4">return this</span><span class="s1">._hasMore;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// $FlowFixMe[missing-local-annot]</span>
+  <span class="s1">_getOutermostParentListRef = () =&gt; {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._isNestedWithSameOrientation()) {</span>
+      <span class="s4">return this</span><span class="s1">.context.getOutermostParentListRef();</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">return this</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_registerAsNestedChild = (childList: {</span>
+    <span class="s1">cellKey: string,</span>
+    <span class="s1">ref: React.ElementRef&lt;</span><span class="s4">typeof </span><span class="s1">VirtualizedList&gt;,</span>
+  <span class="s1">}): </span><span class="s4">void </span><span class="s1">=&gt; {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.add(childList.ref, childList.cellKey);</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._hasInteracted) {</span>
+      <span class="s1">childList.ref.recordInteraction();</span>
+    <span class="s1">}</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_unregisterAsNestedChild = (childList: {</span>
+    <span class="s1">ref: React.ElementRef&lt;</span><span class="s4">typeof </span><span class="s1">VirtualizedList&gt;,</span>
+  <span class="s1">}): </span><span class="s4">void </span><span class="s1">=&gt; {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.remove(childList.ref);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">state: State;</span>
+
+  <span class="s1">constructor(props: Props) {</span>
+    <span class="s1">super(props);</span>
+    <span class="s4">this</span><span class="s1">._checkProps(props);</span>
+
+    <span class="s4">this</span><span class="s1">._fillRateHelper = </span><span class="s4">new </span><span class="s1">FillRateHelper(</span><span class="s4">this</span><span class="s1">._getFrameMetrics);</span>
+    <span class="s4">this</span><span class="s1">._updateCellsToRenderBatcher = </span><span class="s4">new </span><span class="s1">Batchinator(</span>
+      <span class="s4">this</span><span class="s1">._updateCellsToRender,</span>
+      <span class="s4">this</span><span class="s1">.props.updateCellsBatchingPeriod ?? </span><span class="s3">50</span><span class="s1">,</span>
+    <span class="s1">);</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.props.viewabilityConfigCallbackPairs) {</span>
+      <span class="s4">this</span><span class="s1">._viewabilityTuples = </span><span class="s4">this</span><span class="s1">.props.viewabilityConfigCallbackPairs.map(</span>
+        <span class="s1">pair =&gt; ({</span>
+          <span class="s1">viewabilityHelper: </span><span class="s4">new </span><span class="s1">ViewabilityHelper(pair.viewabilityConfig),</span>
+          <span class="s1">onViewableItemsChanged: pair.onViewableItemsChanged,</span>
+        <span class="s1">}),</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">const {onViewableItemsChanged, viewabilityConfig} = </span><span class="s4">this</span><span class="s1">.props;</span>
+      <span class="s4">if </span><span class="s1">(onViewableItemsChanged) {</span>
+        <span class="s4">this</span><span class="s1">._viewabilityTuples.push({</span>
+          <span class="s1">viewabilityHelper: </span><span class="s4">new </span><span class="s1">ViewabilityHelper(viewabilityConfig),</span>
+          <span class="s1">onViewableItemsChanged: onViewableItemsChanged,</span>
+        <span class="s1">});</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const initialRenderRegion = VirtualizedList._initialRenderRegion(props);</span>
+
+    <span class="s1">const minIndexForVisible =</span>
+      <span class="s4">this</span><span class="s1">.props.maintainVisibleContentPosition?.minIndexForVisible ?? </span><span class="s3">0</span><span class="s1">;</span>
+
+    <span class="s4">this</span><span class="s1">.state = {</span>
+      <span class="s1">cellsAroundViewport: initialRenderRegion,</span>
+      <span class="s1">renderMask: VirtualizedList._createRenderMask(props, initialRenderRegion),</span>
+      <span class="s1">firstVisibleItemKey:</span>
+        <span class="s4">this</span><span class="s1">.props.getItemCount(</span><span class="s4">this</span><span class="s1">.props.data) &gt; minIndexForVisible</span>
+          <span class="s1">? VirtualizedList._getItemKey(</span><span class="s4">this</span><span class="s1">.props, minIndexForVisible)</span>
+          <span class="s1">: </span><span class="s4">null</span><span class="s1">,</span>
+      <span class="s0">// When we have a non-zero initialScrollIndex, we will receive a</span>
+      <span class="s0">// scroll event later so this will prevent the window from updating</span>
+      <span class="s0">// until we get a valid offset.</span>
+      <span class="s1">pendingScrollUpdateCount:</span>
+        <span class="s4">this</span><span class="s1">.props.initialScrollIndex != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+        <span class="s4">this</span><span class="s1">.props.initialScrollIndex &gt; </span><span class="s3">0</span>
+          <span class="s1">? </span><span class="s3">1</span>
+          <span class="s1">: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_checkProps(props: Props) {</span>
+    <span class="s1">const {onScroll, windowSize, getItemCount, data, initialScrollIndex} =</span>
+      <span class="s1">props;</span>
+
+    <span class="s1">invariant(</span>
+      <span class="s0">// $FlowFixMe[prop-missing]</span>
+      <span class="s1">!onScroll || !onScroll.__isNative,</span>
+      <span class="s2">'Components based on VirtualizedList must be wrapped with Animated.createAnimatedComponent ' </span><span class="s1">+</span>
+        <span class="s2">'to support native onScroll events with useNativeDriver'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">windowSizeOrDefault(windowSize) &gt; </span><span class="s3">0</span><span class="s1">,</span>
+      <span class="s2">'VirtualizedList: The windowSize prop must be present and set to a value greater than 0.'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+
+    <span class="s1">invariant(</span>
+      <span class="s1">getItemCount,</span>
+      <span class="s2">'VirtualizedList: The &quot;getItemCount&quot; prop must be provided'</span><span class="s1">,</span>
+    <span class="s1">);</span>
+
+    <span class="s1">const itemCount = getItemCount(data);</span>
+
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">initialScrollIndex != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">!</span><span class="s4">this</span><span class="s1">._hasTriggeredInitialScrollToIndex &amp;&amp;</span>
+      <span class="s1">(initialScrollIndex &lt; </span><span class="s3">0 </span><span class="s1">||</span>
+        <span class="s1">(itemCount &gt; </span><span class="s3">0 </span><span class="s1">&amp;&amp; initialScrollIndex &gt;= itemCount)) &amp;&amp;</span>
+      <span class="s1">!</span><span class="s4">this</span><span class="s1">._hasWarned.initialScrollIndex</span>
+    <span class="s1">) {</span>
+      <span class="s1">console.warn(</span>
+        <span class="s1">`initialScrollIndex </span><span class="s2">&quot;${initialScrollIndex}&quot; </span><span class="s1">is not valid (list has ${itemCount} items)`,</span>
+      <span class="s1">);</span>
+      <span class="s4">this</span><span class="s1">._hasWarned.initialScrollIndex = </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(__DEV__ &amp;&amp; !</span><span class="s4">this</span><span class="s1">._hasWarned.flexWrap) {</span>
+      <span class="s0">// $FlowFixMe[underconstrained-implicit-instantiation]</span>
+      <span class="s1">const flatStyles = StyleSheet.flatten(</span><span class="s4">this</span><span class="s1">.props.contentContainerStyle);</span>
+      <span class="s4">if </span><span class="s1">(flatStyles != </span><span class="s4">null </span><span class="s1">&amp;&amp; flatStyles.flexWrap === </span><span class="s2">'wrap'</span><span class="s1">) {</span>
+        <span class="s1">console.warn(</span>
+          <span class="s2">'`flexWrap: `wrap`` is not supported with the `VirtualizedList` components.' </span><span class="s1">+</span>
+            <span class="s2">'Consider using `numColumns` with `FlatList` instead.'</span><span class="s1">,</span>
+        <span class="s1">);</span>
+        <span class="s4">this</span><span class="s1">._hasWarned.flexWrap = </span><span class="s4">true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static _findItemIndexWithKey(</span>
+    <span class="s1">props: Props,</span>
+    <span class="s1">key: string,</span>
+    <span class="s1">hint: ?number,</span>
+  <span class="s1">): ?number {</span>
+    <span class="s1">const itemCount = props.getItemCount(props.data);</span>
+    <span class="s4">if </span><span class="s1">(hint != </span><span class="s4">null </span><span class="s1">&amp;&amp; hint &gt;= </span><span class="s3">0 </span><span class="s1">&amp;&amp; hint &lt; itemCount) {</span>
+      <span class="s1">const curKey = VirtualizedList._getItemKey(props, hint);</span>
+      <span class="s4">if </span><span class="s1">(curKey === key) {</span>
+        <span class="s4">return </span><span class="s1">hint;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">for </span><span class="s1">(let ii = </span><span class="s3">0</span><span class="s1">; ii &lt; itemCount; ii++) {</span>
+      <span class="s1">const curKey = VirtualizedList._getItemKey(props, ii);</span>
+      <span class="s4">if </span><span class="s1">(curKey === key) {</span>
+        <span class="s4">return </span><span class="s1">ii;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static _getItemKey(</span>
+    <span class="s1">props: {</span>
+      <span class="s1">data: Props[</span><span class="s2">'data'</span><span class="s1">],</span>
+      <span class="s1">getItem: Props[</span><span class="s2">'getItem'</span><span class="s1">],</span>
+      <span class="s1">keyExtractor: Props[</span><span class="s2">'keyExtractor'</span><span class="s1">],</span>
+      <span class="s1">...</span>
+    <span class="s1">},</span>
+    <span class="s1">index: number,</span>
+  <span class="s1">): string {</span>
+    <span class="s1">const item = props.getItem(props.data, index);</span>
+    <span class="s4">return </span><span class="s1">VirtualizedList._keyExtractor(item, index, props);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static _createRenderMask(</span>
+    <span class="s1">props: Props,</span>
+    <span class="s1">cellsAroundViewport: {first: number, last: number},</span>
+    <span class="s1">additionalRegions?: ?$ReadOnlyArray&lt;{first: number, last: number}&gt;,</span>
+  <span class="s1">): CellRenderMask {</span>
+    <span class="s1">const itemCount = props.getItemCount(props.data);</span>
+
+    <span class="s1">invariant(</span>
+      <span class="s1">cellsAroundViewport.first &gt;= </span><span class="s3">0 </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">cellsAroundViewport.last &gt;= cellsAroundViewport.first - </span><span class="s3">1 </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">cellsAroundViewport.last &lt; itemCount,</span>
+      <span class="s1">`Invalid cells around viewport </span><span class="s2">&quot;[${cellsAroundViewport.first}, ${cellsAroundViewport.last}]&quot; </span><span class="s1">was passed to VirtualizedList._createRenderMask`,</span>
+    <span class="s1">);</span>
+
+    <span class="s1">const renderMask = </span><span class="s4">new </span><span class="s1">CellRenderMask(itemCount);</span>
+
+    <span class="s4">if </span><span class="s1">(itemCount &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">const allRegions = [cellsAroundViewport, ...(additionalRegions ?? [])];</span>
+      <span class="s4">for </span><span class="s1">(const region of allRegions) {</span>
+        <span class="s1">renderMask.addCells(region);</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// The initially rendered cells are retained as part of the</span>
+      <span class="s0">// &quot;scroll-to-top&quot; optimization</span>
+      <span class="s4">if </span><span class="s1">(props.initialScrollIndex == </span><span class="s4">null </span><span class="s1">|| props.initialScrollIndex &lt;= </span><span class="s3">0</span><span class="s1">) {</span>
+        <span class="s1">const initialRegion = VirtualizedList._initialRenderRegion(props);</span>
+        <span class="s1">renderMask.addCells(initialRegion);</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// The layout coordinates of sticker headers may be off-screen while the</span>
+      <span class="s0">// actual header is on-screen. Keep the most recent before the viewport</span>
+      <span class="s0">// rendered, even if its layout coordinates are not in viewport.</span>
+      <span class="s1">const stickyIndicesSet = </span><span class="s4">new </span><span class="s1">Set(props.stickyHeaderIndices);</span>
+      <span class="s1">VirtualizedList._ensureClosestStickyHeader(</span>
+        <span class="s1">props,</span>
+        <span class="s1">stickyIndicesSet,</span>
+        <span class="s1">renderMask,</span>
+        <span class="s1">cellsAroundViewport.first,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return </span><span class="s1">renderMask;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static _initialRenderRegion(props: Props): {first: number, last: number} {</span>
+    <span class="s1">const itemCount = props.getItemCount(props.data);</span>
+
+    <span class="s1">const firstCellIndex = Math.max(</span>
+      <span class="s3">0</span><span class="s1">,</span>
+      <span class="s1">Math.min(itemCount - </span><span class="s3">1</span><span class="s1">, Math.floor(props.initialScrollIndex ?? </span><span class="s3">0</span><span class="s1">)),</span>
+    <span class="s1">);</span>
+
+    <span class="s1">const lastCellIndex =</span>
+      <span class="s1">Math.min(</span>
+        <span class="s1">itemCount,</span>
+        <span class="s1">firstCellIndex + initialNumToRenderOrDefault(props.initialNumToRender),</span>
+      <span class="s1">) - </span><span class="s3">1</span><span class="s1">;</span>
+
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">first: firstCellIndex,</span>
+      <span class="s1">last: lastCellIndex,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static _ensureClosestStickyHeader(</span>
+    <span class="s1">props: Props,</span>
+    <span class="s1">stickyIndicesSet: Set&lt;number&gt;,</span>
+    <span class="s1">renderMask: CellRenderMask,</span>
+    <span class="s1">cellIdx: number,</span>
+  <span class="s1">) {</span>
+    <span class="s1">const stickyOffset = props.ListHeaderComponent ? </span><span class="s3">1 </span><span class="s1">: </span><span class="s3">0</span><span class="s1">;</span>
+
+    <span class="s4">for </span><span class="s1">(let itemIdx = cellIdx - </span><span class="s3">1</span><span class="s1">; itemIdx &gt;= </span><span class="s3">0</span><span class="s1">; itemIdx--) {</span>
+      <span class="s4">if </span><span class="s1">(stickyIndicesSet.has(itemIdx + stickyOffset)) {</span>
+        <span class="s1">renderMask.addCells({first: itemIdx, last: itemIdx});</span>
+        <span class="s4">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_adjustCellsAroundViewport(</span>
+    <span class="s1">props: Props,</span>
+    <span class="s1">cellsAroundViewport: {first: number, last: number},</span>
+    <span class="s1">pendingScrollUpdateCount: number,</span>
+  <span class="s1">): {first: number, last: number} {</span>
+    <span class="s1">const {data, getItemCount} = props;</span>
+    <span class="s1">const onEndReachedThreshold = onEndReachedThresholdOrDefault(</span>
+      <span class="s1">props.onEndReachedThreshold,</span>
+    <span class="s1">);</span>
+    <span class="s1">const {contentLength, offset, visibleLength} = </span><span class="s4">this</span><span class="s1">._scrollMetrics;</span>
+    <span class="s1">const distanceFromEnd = contentLength - visibleLength - offset;</span>
+
+    <span class="s0">// Wait until the scroll view metrics have been set up. And until then,</span>
+    <span class="s0">// we will trust the initialNumToRender suggestion</span>
+    <span class="s4">if </span><span class="s1">(visibleLength &lt;= </span><span class="s3">0 </span><span class="s1">|| contentLength &lt;= </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">return </span><span class="s1">cellsAroundViewport.last &gt;= getItemCount(data)</span>
+        <span class="s1">? VirtualizedList._constrainToItemCount(cellsAroundViewport, props)</span>
+        <span class="s1">: cellsAroundViewport;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let newCellsAroundViewport: {first: number, last: number};</span>
+    <span class="s4">if </span><span class="s1">(props.disableVirtualization) {</span>
+      <span class="s1">const renderAhead =</span>
+        <span class="s1">distanceFromEnd &lt; onEndReachedThreshold * visibleLength</span>
+          <span class="s1">? maxToRenderPerBatchOrDefault(props.maxToRenderPerBatch)</span>
+          <span class="s1">: </span><span class="s3">0</span><span class="s1">;</span>
+
+      <span class="s1">newCellsAroundViewport = {</span>
+        <span class="s1">first: </span><span class="s3">0</span><span class="s1">,</span>
+        <span class="s1">last: Math.min(</span>
+          <span class="s1">cellsAroundViewport.last + renderAhead,</span>
+          <span class="s1">getItemCount(data) - </span><span class="s3">1</span><span class="s1">,</span>
+        <span class="s1">),</span>
+      <span class="s1">};</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s0">// If we have a pending scroll update, we should not adjust the render window as it</span>
+      <span class="s0">// might override the correct window.</span>
+      <span class="s4">if </span><span class="s1">(pendingScrollUpdateCount &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+        <span class="s4">return </span><span class="s1">cellsAroundViewport.last &gt;= getItemCount(data)</span>
+          <span class="s1">? VirtualizedList._constrainToItemCount(cellsAroundViewport, props)</span>
+          <span class="s1">: cellsAroundViewport;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">newCellsAroundViewport = computeWindowedRenderLimits(</span>
+        <span class="s1">props,</span>
+        <span class="s1">maxToRenderPerBatchOrDefault(props.maxToRenderPerBatch),</span>
+        <span class="s1">windowSizeOrDefault(props.windowSize),</span>
+        <span class="s1">cellsAroundViewport,</span>
+        <span class="s4">this</span><span class="s1">.__getFrameMetricsApprox,</span>
+        <span class="s4">this</span><span class="s1">._scrollMetrics,</span>
+      <span class="s1">);</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">newCellsAroundViewport.last &lt; getItemCount(data),</span>
+        <span class="s2">'computeWindowedRenderLimits() should return range in-bounds'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._nestedChildLists.size() &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s0">// If some cell in the new state has a child list in it, we should only render</span>
+      <span class="s0">// up through that item, so that we give that list a chance to render.</span>
+      <span class="s0">// Otherwise there's churn from multiple child lists mounting and un-mounting</span>
+      <span class="s0">// their items.</span>
+
+      <span class="s0">// Will this prevent rendering if the nested list doesn't realize the end?</span>
+      <span class="s1">const childIdx = </span><span class="s4">this</span><span class="s1">._findFirstChildWithMore(</span>
+        <span class="s1">newCellsAroundViewport.first,</span>
+        <span class="s1">newCellsAroundViewport.last,</span>
+      <span class="s1">);</span>
+
+      <span class="s1">newCellsAroundViewport.last = childIdx ?? newCellsAroundViewport.last;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return </span><span class="s1">newCellsAroundViewport;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_findFirstChildWithMore(first: number, last: number): number | </span><span class="s4">null </span><span class="s1">{</span>
+    <span class="s4">for </span><span class="s1">(let ii = first; ii &lt;= last; ii++) {</span>
+      <span class="s1">const cellKeyForIndex = </span><span class="s4">this</span><span class="s1">._indicesToKeys.get(ii);</span>
+      <span class="s4">if </span><span class="s1">(</span>
+        <span class="s1">cellKeyForIndex != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+        <span class="s4">this</span><span class="s1">._nestedChildLists.anyInCell(cellKeyForIndex, childList =&gt;</span>
+          <span class="s1">childList.hasMore(),</span>
+        <span class="s1">)</span>
+      <span class="s1">) {</span>
+        <span class="s4">return </span><span class="s1">ii;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">componentDidMount() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._isNestedWithSameOrientation()) {</span>
+      <span class="s4">this</span><span class="s1">.context.registerAsNestedChild({</span>
+        <span class="s1">ref: </span><span class="s4">this</span><span class="s1">,</span>
+        <span class="s1">cellKey: </span><span class="s4">this</span><span class="s1">.context.cellKey,</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">componentWillUnmount() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._isNestedWithSameOrientation()) {</span>
+      <span class="s4">this</span><span class="s1">.context.unregisterAsNestedChild({ref: </span><span class="s4">this</span><span class="s1">});</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._updateCellsToRenderBatcher.dispose({abort: </span><span class="s4">true</span><span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">._viewabilityTuples.forEach(tuple =&gt; {</span>
+      <span class="s1">tuple.viewabilityHelper.dispose();</span>
+    <span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">._fillRateHelper.deactivateAndFlush();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static getDerivedStateFromProps(newProps: Props, prevState: State): State {</span>
+    <span class="s0">// first and last could be stale (e.g. if a new, shorter items props is passed in), so we make</span>
+    <span class="s0">// sure we're rendering a reasonable range here.</span>
+    <span class="s1">const itemCount = newProps.getItemCount(newProps.data);</span>
+    <span class="s4">if </span><span class="s1">(itemCount === prevState.renderMask.numCells()) {</span>
+      <span class="s4">return </span><span class="s1">prevState;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let maintainVisibleContentPositionAdjustment: ?number = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">const prevFirstVisibleItemKey = prevState.firstVisibleItemKey;</span>
+    <span class="s1">const minIndexForVisible =</span>
+      <span class="s1">newProps.maintainVisibleContentPosition?.minIndexForVisible ?? </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">const newFirstVisibleItemKey =</span>
+      <span class="s1">newProps.getItemCount(newProps.data) &gt; minIndexForVisible</span>
+        <span class="s1">? VirtualizedList._getItemKey(newProps, minIndexForVisible)</span>
+        <span class="s1">: </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">newProps.maintainVisibleContentPosition != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">prevFirstVisibleItemKey != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">newFirstVisibleItemKey != </span><span class="s4">null</span>
+    <span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(newFirstVisibleItemKey !== prevFirstVisibleItemKey) {</span>
+        <span class="s0">// Fast path if items were added at the start of the list.</span>
+        <span class="s1">const hint =</span>
+          <span class="s1">itemCount - prevState.renderMask.numCells() + minIndexForVisible;</span>
+        <span class="s1">const firstVisibleItemIndex = VirtualizedList._findItemIndexWithKey(</span>
+          <span class="s1">newProps,</span>
+          <span class="s1">prevFirstVisibleItemKey,</span>
+          <span class="s1">hint,</span>
+        <span class="s1">);</span>
+        <span class="s1">maintainVisibleContentPositionAdjustment =</span>
+          <span class="s1">firstVisibleItemIndex != </span><span class="s4">null</span>
+            <span class="s1">? firstVisibleItemIndex - minIndexForVisible</span>
+            <span class="s1">: </span><span class="s4">null</span><span class="s1">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">maintainVisibleContentPositionAdjustment = </span><span class="s4">null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const constrainedCells = VirtualizedList._constrainToItemCount(</span>
+      <span class="s1">maintainVisibleContentPositionAdjustment != </span><span class="s4">null</span>
+        <span class="s1">? {</span>
+            <span class="s1">first:</span>
+              <span class="s1">prevState.cellsAroundViewport.first +</span>
+              <span class="s1">maintainVisibleContentPositionAdjustment,</span>
+            <span class="s1">last:</span>
+              <span class="s1">prevState.cellsAroundViewport.last +</span>
+              <span class="s1">maintainVisibleContentPositionAdjustment,</span>
+          <span class="s1">}</span>
+        <span class="s1">: prevState.cellsAroundViewport,</span>
+      <span class="s1">newProps,</span>
+    <span class="s1">);</span>
+
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">cellsAroundViewport: constrainedCells,</span>
+      <span class="s1">renderMask: VirtualizedList._createRenderMask(newProps, constrainedCells),</span>
+      <span class="s1">firstVisibleItemKey: newFirstVisibleItemKey,</span>
+      <span class="s1">pendingScrollUpdateCount:</span>
+        <span class="s1">maintainVisibleContentPositionAdjustment != </span><span class="s4">null</span>
+          <span class="s1">? prevState.pendingScrollUpdateCount + </span><span class="s3">1</span>
+          <span class="s1">: prevState.pendingScrollUpdateCount,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_pushCells(</span>
+    <span class="s1">cells: Array&lt;Object&gt;,</span>
+    <span class="s1">stickyHeaderIndices: Array&lt;number&gt;,</span>
+    <span class="s1">stickyIndicesFromProps: Set&lt;number&gt;,</span>
+    <span class="s1">first: number,</span>
+    <span class="s1">last: number,</span>
+    <span class="s1">inversionStyle: ViewStyleProp,</span>
+  <span class="s1">) {</span>
+    <span class="s1">const {</span>
+      <span class="s1">CellRendererComponent,</span>
+      <span class="s1">ItemSeparatorComponent,</span>
+      <span class="s1">ListHeaderComponent,</span>
+      <span class="s1">ListItemComponent,</span>
+      <span class="s1">data,</span>
+      <span class="s1">debug,</span>
+      <span class="s1">getItem,</span>
+      <span class="s1">getItemCount,</span>
+      <span class="s1">getItemLayout,</span>
+      <span class="s1">horizontal,</span>
+      <span class="s1">renderItem,</span>
+    <span class="s1">} = </span><span class="s4">this</span><span class="s1">.props;</span>
+    <span class="s1">const stickyOffset = ListHeaderComponent ? </span><span class="s3">1 </span><span class="s1">: </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">const end = getItemCount(data) - </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">let prevCellKey;</span>
+    <span class="s1">last = Math.min(end, last);</span>
+
+    <span class="s4">for </span><span class="s1">(let ii = first; ii &lt;= last; ii++) {</span>
+      <span class="s1">const item = getItem(data, ii);</span>
+      <span class="s1">const key = VirtualizedList._keyExtractor(item, ii, </span><span class="s4">this</span><span class="s1">.props);</span>
+
+      <span class="s4">this</span><span class="s1">._indicesToKeys.set(ii, key);</span>
+      <span class="s4">if </span><span class="s1">(stickyIndicesFromProps.has(ii + stickyOffset)) {</span>
+        <span class="s1">stickyHeaderIndices.push(cells.length);</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const shouldListenForLayout =</span>
+        <span class="s1">getItemLayout == </span><span class="s4">null </span><span class="s1">|| debug || </span><span class="s4">this</span><span class="s1">._fillRateHelper.enabled();</span>
+
+      <span class="s1">cells.push(</span>
+        <span class="s1">&lt;CellRenderer</span>
+          <span class="s1">CellRendererComponent={CellRendererComponent}</span>
+          <span class="s1">ItemSeparatorComponent={ii &lt; end ? ItemSeparatorComponent : undefined}</span>
+          <span class="s1">ListItemComponent={ListItemComponent}</span>
+          <span class="s1">cellKey={key}</span>
+          <span class="s1">horizontal={horizontal}</span>
+          <span class="s1">index={ii}</span>
+          <span class="s1">inversionStyle={inversionStyle}</span>
+          <span class="s1">item={item}</span>
+          <span class="s1">key={key}</span>
+          <span class="s1">prevCellKey={prevCellKey}</span>
+          <span class="s1">onUpdateSeparators={</span><span class="s4">this</span><span class="s1">._onUpdateSeparators}</span>
+          <span class="s1">onCellFocusCapture={e =&gt; </span><span class="s4">this</span><span class="s1">._onCellFocusCapture(key)}</span>
+          <span class="s1">onUnmount={</span><span class="s4">this</span><span class="s1">._onCellUnmount}</span>
+          <span class="s1">ref={ref =&gt; {</span>
+            <span class="s4">this</span><span class="s1">._cellRefs[key] = ref;</span>
+          <span class="s1">}}</span>
+          <span class="s1">renderItem={renderItem}</span>
+          <span class="s1">{...(shouldListenForLayout &amp;&amp; {</span>
+            <span class="s1">onCellLayout: </span><span class="s4">this</span><span class="s1">._onCellLayout,</span>
+          <span class="s1">})}</span>
+        <span class="s1">/&gt;,</span>
+      <span class="s1">);</span>
+      <span class="s1">prevCellKey = key;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static _constrainToItemCount(</span>
+    <span class="s1">cells: {first: number, last: number},</span>
+    <span class="s1">props: Props,</span>
+  <span class="s1">): {first: number, last: number} {</span>
+    <span class="s1">const itemCount = props.getItemCount(props.data);</span>
+    <span class="s1">const last = Math.min(itemCount - </span><span class="s3">1</span><span class="s1">, cells.last);</span>
+
+    <span class="s1">const maxToRenderPerBatch = maxToRenderPerBatchOrDefault(</span>
+      <span class="s1">props.maxToRenderPerBatch,</span>
+    <span class="s1">);</span>
+
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">first: clamp(</span><span class="s3">0</span><span class="s1">, itemCount - </span><span class="s3">1 </span><span class="s1">- maxToRenderPerBatch, cells.first),</span>
+      <span class="s1">last,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_onUpdateSeparators = (keys: Array&lt;?string&gt;, newProps: Object) =&gt; {</span>
+    <span class="s1">keys.forEach(key =&gt; {</span>
+      <span class="s1">const ref = key != </span><span class="s4">null </span><span class="s1">&amp;&amp; </span><span class="s4">this</span><span class="s1">._cellRefs[key];</span>
+      <span class="s1">ref &amp;&amp; ref.updateSeparatorProps(newProps);</span>
+    <span class="s1">});</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_isNestedWithSameOrientation(): boolean {</span>
+    <span class="s1">const nestedContext = </span><span class="s4">this</span><span class="s1">.context;</span>
+    <span class="s4">return </span><span class="s1">!!(</span>
+      <span class="s1">nestedContext &amp;&amp;</span>
+      <span class="s1">!!nestedContext.horizontal === horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal)</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_getSpacerKey = (isVertical: boolean): string =&gt;</span>
+    <span class="s1">isVertical ? </span><span class="s2">'height' </span><span class="s1">: </span><span class="s2">'width'</span><span class="s1">;</span>
+
+  <span class="s1">static _keyExtractor(</span>
+    <span class="s1">item: Item,</span>
+    <span class="s1">index: number,</span>
+    <span class="s1">props: {</span>
+      <span class="s1">keyExtractor?: ?(item: Item, index: number) =&gt; string,</span>
+      <span class="s1">...</span>
+    <span class="s1">},</span>
+  <span class="s1">): string {</span>
+    <span class="s4">if </span><span class="s1">(props.keyExtractor != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">return </span><span class="s1">props.keyExtractor(item, index);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const key = defaultKeyExtractor(item, index);</span>
+    <span class="s4">if </span><span class="s1">(key === String(index)) {</span>
+      <span class="s1">_usedIndexForKey = </span><span class="s4">true</span><span class="s1">;</span>
+      <span class="s4">if </span><span class="s1">(item.type &amp;&amp; item.type.displayName) {</span>
+        <span class="s1">_keylessItemComponentName = item.type.displayName;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">key;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">render(): React.Node {</span>
+    <span class="s4">this</span><span class="s1">._checkProps(</span><span class="s4">this</span><span class="s1">.props);</span>
+    <span class="s1">const {ListEmptyComponent, ListFooterComponent, ListHeaderComponent} =</span>
+      <span class="s4">this</span><span class="s1">.props;</span>
+    <span class="s1">const {data, horizontal} = </span><span class="s4">this</span><span class="s1">.props;</span>
+    <span class="s1">const inversionStyle = </span><span class="s4">this</span><span class="s1">.props.inverted</span>
+      <span class="s1">? horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal)</span>
+        <span class="s1">? styles.horizontallyInverted</span>
+        <span class="s1">: styles.verticallyInverted</span>
+      <span class="s1">: </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">const cells: Array&lt;any | React.Node&gt; = [];</span>
+    <span class="s1">const stickyIndicesFromProps = </span><span class="s4">new </span><span class="s1">Set(</span><span class="s4">this</span><span class="s1">.props.stickyHeaderIndices);</span>
+    <span class="s1">const stickyHeaderIndices = [];</span>
+
+    <span class="s0">// 1. Add cell for ListHeaderComponent</span>
+    <span class="s4">if </span><span class="s1">(ListHeaderComponent) {</span>
+      <span class="s4">if </span><span class="s1">(stickyIndicesFromProps.has(</span><span class="s3">0</span><span class="s1">)) {</span>
+        <span class="s1">stickyHeaderIndices.push(</span><span class="s3">0</span><span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s1">const element = React.isValidElement(ListHeaderComponent) ? (</span>
+        <span class="s1">ListHeaderComponent</span>
+      <span class="s1">) : (</span>
+        <span class="s0">// $FlowFixMe[not-a-component]</span>
+        <span class="s0">// $FlowFixMe[incompatible-type-arg]</span>
+        <span class="s1">&lt;ListHeaderComponent /&gt;</span>
+      <span class="s1">);</span>
+      <span class="s1">cells.push(</span>
+        <span class="s1">&lt;VirtualizedListCellContextProvider</span>
+          <span class="s1">cellKey={</span><span class="s4">this</span><span class="s1">._getCellKey() + </span><span class="s2">'-header'</span><span class="s1">}</span>
+          <span class="s1">key=</span><span class="s2">&quot;$header&quot;</span><span class="s1">&gt;</span>
+          <span class="s1">&lt;View</span>
+            <span class="s0">// We expect that header component will be a single native view so make it</span>
+            <span class="s0">// not collapsable to avoid this view being flattened and make this assumption</span>
+            <span class="s0">// no longer true.</span>
+            <span class="s1">collapsable={</span><span class="s4">false</span><span class="s1">}</span>
+            <span class="s1">onLayout={</span><span class="s4">this</span><span class="s1">._onLayoutHeader}</span>
+            <span class="s1">style={StyleSheet.compose(</span>
+              <span class="s1">inversionStyle,</span>
+              <span class="s4">this</span><span class="s1">.props.ListHeaderComponentStyle,</span>
+            <span class="s1">)}&gt;</span>
+            <span class="s1">{</span>
+              <span class="s0">// $FlowFixMe[incompatible-type] - Typing ReactNativeComponent revealed errors</span>
+              <span class="s1">element</span>
+            <span class="s1">}</span>
+          <span class="s1">&lt;/View&gt;</span>
+        <span class="s1">&lt;/VirtualizedListCellContextProvider&gt;,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// 2a. Add a cell for ListEmptyComponent if applicable</span>
+    <span class="s1">const itemCount = </span><span class="s4">this</span><span class="s1">.props.getItemCount(data);</span>
+    <span class="s4">if </span><span class="s1">(itemCount === </span><span class="s3">0 </span><span class="s1">&amp;&amp; ListEmptyComponent) {</span>
+      <span class="s1">const element: React.Element&lt;any&gt; = ((React.isValidElement(</span>
+        <span class="s1">ListEmptyComponent,</span>
+      <span class="s1">) ? (</span>
+        <span class="s1">ListEmptyComponent</span>
+      <span class="s1">) : (</span>
+        <span class="s0">// $FlowFixMe[not-a-component]</span>
+        <span class="s0">// $FlowFixMe[incompatible-type-arg]</span>
+        <span class="s1">&lt;ListEmptyComponent /&gt;</span>
+      <span class="s1">)): any);</span>
+      <span class="s1">cells.push(</span>
+        <span class="s1">&lt;VirtualizedListCellContextProvider</span>
+          <span class="s1">cellKey={</span><span class="s4">this</span><span class="s1">._getCellKey() + </span><span class="s2">'-empty'</span><span class="s1">}</span>
+          <span class="s1">key=</span><span class="s2">&quot;$empty&quot;</span><span class="s1">&gt;</span>
+          <span class="s1">{React.cloneElement(element, {</span>
+            <span class="s1">onLayout: (event: LayoutEvent) =&gt; {</span>
+              <span class="s4">this</span><span class="s1">._onLayoutEmpty(event);</span>
+              <span class="s4">if </span><span class="s1">(element.props.onLayout) {</span>
+                <span class="s1">element.props.onLayout(event);</span>
+              <span class="s1">}</span>
+            <span class="s1">},</span>
+            <span class="s1">style: StyleSheet.compose(inversionStyle, element.props.style),</span>
+          <span class="s1">})}</span>
+        <span class="s1">&lt;/VirtualizedListCellContextProvider&gt;,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// 2b. Add cells and spacers for each item</span>
+    <span class="s4">if </span><span class="s1">(itemCount &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">_usedIndexForKey = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s1">_keylessItemComponentName = </span><span class="s2">''</span><span class="s1">;</span>
+      <span class="s1">const spacerKey = </span><span class="s4">this</span><span class="s1">._getSpacerKey(!horizontal);</span>
+
+      <span class="s1">const renderRegions = </span><span class="s4">this</span><span class="s1">.state.renderMask.enumerateRegions();</span>
+      <span class="s1">const lastSpacer = findLastWhere(renderRegions, r =&gt; r.isSpacer);</span>
+
+      <span class="s4">for </span><span class="s1">(const section of renderRegions) {</span>
+        <span class="s4">if </span><span class="s1">(section.isSpacer) {</span>
+          <span class="s0">// Legacy behavior is to avoid spacers when virtualization is</span>
+          <span class="s0">// disabled (including head spacers on initial render).</span>
+          <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.props.disableVirtualization) {</span>
+            <span class="s4">continue</span><span class="s1">;</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// Without getItemLayout, we limit our tail spacer to the _highestMeasuredFrameIndex to</span>
+          <span class="s0">// prevent the user for hyperscrolling into un-measured area because otherwise content will</span>
+          <span class="s0">// likely jump around as it renders in above the viewport.</span>
+          <span class="s1">const isLastSpacer = section === lastSpacer;</span>
+          <span class="s1">const constrainToMeasured = isLastSpacer &amp;&amp; !</span><span class="s4">this</span><span class="s1">.props.getItemLayout;</span>
+          <span class="s1">const last = constrainToMeasured</span>
+            <span class="s1">? clamp(</span>
+                <span class="s1">section.first - </span><span class="s3">1</span><span class="s1">,</span>
+                <span class="s1">section.last,</span>
+                <span class="s4">this</span><span class="s1">._highestMeasuredFrameIndex,</span>
+              <span class="s1">)</span>
+            <span class="s1">: section.last;</span>
+
+          <span class="s1">const firstMetrics = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(</span>
+            <span class="s1">section.first,</span>
+            <span class="s4">this</span><span class="s1">.props,</span>
+          <span class="s1">);</span>
+          <span class="s1">const lastMetrics = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(last, </span><span class="s4">this</span><span class="s1">.props);</span>
+          <span class="s1">const spacerSize =</span>
+            <span class="s1">lastMetrics.offset + lastMetrics.length - firstMetrics.offset;</span>
+          <span class="s1">cells.push(</span>
+            <span class="s1">&lt;View</span>
+              <span class="s1">key={`$spacer-${section.first}`}</span>
+              <span class="s1">style={{[spacerKey]: spacerSize}}</span>
+            <span class="s1">/&gt;,</span>
+          <span class="s1">);</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s4">this</span><span class="s1">._pushCells(</span>
+            <span class="s1">cells,</span>
+            <span class="s1">stickyHeaderIndices,</span>
+            <span class="s1">stickyIndicesFromProps,</span>
+            <span class="s1">section.first,</span>
+            <span class="s1">section.last,</span>
+            <span class="s1">inversionStyle,</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._hasWarned.keys &amp;&amp; _usedIndexForKey) {</span>
+        <span class="s1">console.warn(</span>
+          <span class="s2">'VirtualizedList: missing keys for items, make sure to specify a key or id property on each ' </span><span class="s1">+</span>
+            <span class="s2">'item or provide a custom keyExtractor.'</span><span class="s1">,</span>
+          <span class="s1">_keylessItemComponentName,</span>
+        <span class="s1">);</span>
+        <span class="s4">this</span><span class="s1">._hasWarned.keys = </span><span class="s4">true</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// 3. Add cell for ListFooterComponent</span>
+    <span class="s4">if </span><span class="s1">(ListFooterComponent) {</span>
+      <span class="s1">const element = React.isValidElement(ListFooterComponent) ? (</span>
+        <span class="s1">ListFooterComponent</span>
+      <span class="s1">) : (</span>
+        <span class="s0">// $FlowFixMe[not-a-component]</span>
+        <span class="s0">// $FlowFixMe[incompatible-type-arg]</span>
+        <span class="s1">&lt;ListFooterComponent /&gt;</span>
+      <span class="s1">);</span>
+      <span class="s1">cells.push(</span>
+        <span class="s1">&lt;VirtualizedListCellContextProvider</span>
+          <span class="s1">cellKey={</span><span class="s4">this</span><span class="s1">._getFooterCellKey()}</span>
+          <span class="s1">key=</span><span class="s2">&quot;$footer&quot;</span><span class="s1">&gt;</span>
+          <span class="s1">&lt;View</span>
+            <span class="s1">onLayout={</span><span class="s4">this</span><span class="s1">._onLayoutFooter}</span>
+            <span class="s1">style={StyleSheet.compose(</span>
+              <span class="s1">inversionStyle,</span>
+              <span class="s4">this</span><span class="s1">.props.ListFooterComponentStyle,</span>
+            <span class="s1">)}&gt;</span>
+            <span class="s1">{</span>
+              <span class="s0">// $FlowFixMe[incompatible-type] - Typing ReactNativeComponent revealed errors</span>
+              <span class="s1">element</span>
+            <span class="s1">}</span>
+          <span class="s1">&lt;/View&gt;</span>
+        <span class="s1">&lt;/VirtualizedListCellContextProvider&gt;,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// 4. Render the ScrollView</span>
+    <span class="s1">const scrollProps = {</span>
+      <span class="s1">...</span><span class="s4">this</span><span class="s1">.props,</span>
+      <span class="s1">onContentSizeChange: </span><span class="s4">this</span><span class="s1">._onContentSizeChange,</span>
+      <span class="s1">onLayout: </span><span class="s4">this</span><span class="s1">._onLayout,</span>
+      <span class="s1">onScroll: </span><span class="s4">this</span><span class="s1">._onScroll,</span>
+      <span class="s1">onScrollBeginDrag: </span><span class="s4">this</span><span class="s1">._onScrollBeginDrag,</span>
+      <span class="s1">onScrollEndDrag: </span><span class="s4">this</span><span class="s1">._onScrollEndDrag,</span>
+      <span class="s1">onMomentumScrollBegin: </span><span class="s4">this</span><span class="s1">._onMomentumScrollBegin,</span>
+      <span class="s1">onMomentumScrollEnd: </span><span class="s4">this</span><span class="s1">._onMomentumScrollEnd,</span>
+      <span class="s1">scrollEventThrottle: scrollEventThrottleOrDefault(</span>
+        <span class="s4">this</span><span class="s1">.props.scrollEventThrottle,</span>
+      <span class="s1">), </span><span class="s0">// TODO: Android support</span>
+      <span class="s1">invertStickyHeaders:</span>
+        <span class="s4">this</span><span class="s1">.props.invertStickyHeaders !== undefined</span>
+          <span class="s1">? </span><span class="s4">this</span><span class="s1">.props.invertStickyHeaders</span>
+          <span class="s1">: </span><span class="s4">this</span><span class="s1">.props.inverted,</span>
+      <span class="s1">stickyHeaderIndices,</span>
+      <span class="s1">style: inversionStyle</span>
+        <span class="s1">? [inversionStyle, </span><span class="s4">this</span><span class="s1">.props.style]</span>
+        <span class="s1">: </span><span class="s4">this</span><span class="s1">.props.style,</span>
+      <span class="s1">maintainVisibleContentPosition:</span>
+        <span class="s4">this</span><span class="s1">.props.maintainVisibleContentPosition != </span><span class="s4">null</span>
+          <span class="s1">? {</span>
+              <span class="s1">...</span><span class="s4">this</span><span class="s1">.props.maintainVisibleContentPosition,</span>
+              <span class="s0">// Adjust index to account for ListHeaderComponent.</span>
+              <span class="s1">minIndexForVisible:</span>
+                <span class="s4">this</span><span class="s1">.props.maintainVisibleContentPosition.minIndexForVisible +</span>
+                <span class="s1">(</span><span class="s4">this</span><span class="s1">.props.ListHeaderComponent ? </span><span class="s3">1 </span><span class="s1">: </span><span class="s3">0</span><span class="s1">),</span>
+            <span class="s1">}</span>
+          <span class="s1">: undefined,</span>
+    <span class="s1">};</span>
+
+    <span class="s4">this</span><span class="s1">._hasMore = </span><span class="s4">this</span><span class="s1">.state.cellsAroundViewport.last &lt; itemCount - </span><span class="s3">1</span><span class="s1">;</span>
+
+    <span class="s1">const innerRet = (</span>
+      <span class="s1">&lt;VirtualizedListContextProvider</span>
+        <span class="s1">value={{</span>
+          <span class="s1">cellKey: </span><span class="s4">null</span><span class="s1">,</span>
+          <span class="s1">getScrollMetrics: </span><span class="s4">this</span><span class="s1">._getScrollMetrics,</span>
+          <span class="s1">horizontal: horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal),</span>
+          <span class="s1">getOutermostParentListRef: </span><span class="s4">this</span><span class="s1">._getOutermostParentListRef,</span>
+          <span class="s1">registerAsNestedChild: </span><span class="s4">this</span><span class="s1">._registerAsNestedChild,</span>
+          <span class="s1">unregisterAsNestedChild: </span><span class="s4">this</span><span class="s1">._unregisterAsNestedChild,</span>
+        <span class="s1">}}&gt;</span>
+        <span class="s1">{React.cloneElement(</span>
+          <span class="s1">(</span>
+            <span class="s4">this</span><span class="s1">.props.renderScrollComponent ||</span>
+            <span class="s4">this</span><span class="s1">._defaultRenderScrollComponent</span>
+          <span class="s1">)(scrollProps),</span>
+          <span class="s1">{</span>
+            <span class="s1">ref: </span><span class="s4">this</span><span class="s1">._captureScrollRef,</span>
+          <span class="s1">},</span>
+          <span class="s1">cells,</span>
+        <span class="s1">)}</span>
+      <span class="s1">&lt;/VirtualizedListContextProvider&gt;</span>
+    <span class="s1">);</span>
+    <span class="s1">let ret: React.Node = innerRet;</span>
+    <span class="s4">if </span><span class="s1">(__DEV__) {</span>
+      <span class="s1">ret = (</span>
+        <span class="s1">&lt;ScrollView.Context.Consumer&gt;</span>
+          <span class="s1">{scrollContext =&gt; {</span>
+            <span class="s4">if </span><span class="s1">(</span>
+              <span class="s1">scrollContext != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+              <span class="s1">!scrollContext.horizontal ===</span>
+                <span class="s1">!horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal) &amp;&amp;</span>
+              <span class="s1">!</span><span class="s4">this</span><span class="s1">._hasWarned.nesting &amp;&amp;</span>
+              <span class="s4">this</span><span class="s1">.context == </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+              <span class="s4">this</span><span class="s1">.props.scrollEnabled !== </span><span class="s4">false</span>
+            <span class="s1">) {</span>
+              <span class="s0">// TODO (T46547044): use React.warn once 16.9 is sync'd: https://github.com/facebook/react/pull/15170</span>
+              <span class="s1">console.error(</span>
+                <span class="s2">'VirtualizedLists should never be nested inside plain ScrollViews with the same ' </span><span class="s1">+</span>
+                  <span class="s2">'orientation because it can break windowing and other functionality - use another ' </span><span class="s1">+</span>
+                  <span class="s2">'VirtualizedList-backed container instead.'</span><span class="s1">,</span>
+              <span class="s1">);</span>
+              <span class="s4">this</span><span class="s1">._hasWarned.nesting = </span><span class="s4">true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s4">return </span><span class="s1">innerRet;</span>
+          <span class="s1">}}</span>
+        <span class="s1">&lt;/ScrollView.Context.Consumer&gt;</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.props.debug) {</span>
+      <span class="s4">return </span><span class="s1">(</span>
+        <span class="s1">&lt;View style={styles.debug}&gt;</span>
+          <span class="s1">{ret}</span>
+          <span class="s1">{</span><span class="s4">this</span><span class="s1">._renderDebugOverlay()}</span>
+        <span class="s1">&lt;/View&gt;</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">return </span><span class="s1">ret;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">componentDidUpdate(prevProps: Props) {</span>
+    <span class="s1">const {data, extraData} = </span><span class="s4">this</span><span class="s1">.props;</span>
+    <span class="s4">if </span><span class="s1">(data !== prevProps.data || extraData !== prevProps.extraData) {</span>
+      <span class="s0">// clear the viewableIndices cache to also trigger</span>
+      <span class="s0">// the onViewableItemsChanged callback with the new data</span>
+      <span class="s4">this</span><span class="s1">._viewabilityTuples.forEach(tuple =&gt; {</span>
+        <span class="s1">tuple.viewabilityHelper.resetViewableIndices();</span>
+      <span class="s1">});</span>
+    <span class="s1">}</span>
+    <span class="s0">// The `this._hiPriInProgress` is guaranteeing a hiPri cell update will only happen</span>
+    <span class="s0">// once per fiber update. The `_scheduleCellsToRenderUpdate` will set it to true</span>
+    <span class="s0">// if a hiPri update needs to perform. If `componentDidUpdate` is triggered with</span>
+    <span class="s0">// `this._hiPriInProgress=true`, means it's triggered by the hiPri update. The</span>
+    <span class="s0">// `_scheduleCellsToRenderUpdate` will check this condition and not perform</span>
+    <span class="s0">// another hiPri update.</span>
+    <span class="s1">const hiPriInProgress = </span><span class="s4">this</span><span class="s1">._hiPriInProgress;</span>
+    <span class="s4">this</span><span class="s1">._scheduleCellsToRenderUpdate();</span>
+    <span class="s0">// Make sure setting `this._hiPriInProgress` back to false after `componentDidUpdate`</span>
+    <span class="s0">// is triggered with `this._hiPriInProgress = true`</span>
+    <span class="s4">if </span><span class="s1">(hiPriInProgress) {</span>
+      <span class="s4">this</span><span class="s1">._hiPriInProgress = </span><span class="s4">false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_averageCellLength = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_cellRefs: {[string]: </span><span class="s4">null </span><span class="s1">| CellRenderer&lt;any&gt;} = {};</span>
+  <span class="s1">_fillRateHelper: FillRateHelper;</span>
+  <span class="s1">_frames: {</span>
+    <span class="s1">[string]: {</span>
+      <span class="s1">inLayout?: boolean,</span>
+      <span class="s1">index: number,</span>
+      <span class="s1">length: number,</span>
+      <span class="s1">offset: number,</span>
+    <span class="s1">},</span>
+  <span class="s1">} = {};</span>
+  <span class="s1">_footerLength = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s0">// Used for preventing scrollToIndex from being called multiple times for initialScrollIndex</span>
+  <span class="s1">_hasTriggeredInitialScrollToIndex = </span><span class="s4">false</span><span class="s1">;</span>
+  <span class="s1">_hasInteracted = </span><span class="s4">false</span><span class="s1">;</span>
+  <span class="s1">_hasMore = </span><span class="s4">false</span><span class="s1">;</span>
+  <span class="s1">_hasWarned: {[string]: boolean} = {};</span>
+  <span class="s1">_headerLength = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_hiPriInProgress: boolean = </span><span class="s4">false</span><span class="s1">; </span><span class="s0">// flag to prevent infinite hiPri cell limit update</span>
+  <span class="s1">_highestMeasuredFrameIndex = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_indicesToKeys: Map&lt;number, string&gt; = </span><span class="s4">new </span><span class="s1">Map();</span>
+  <span class="s1">_lastFocusedCellKey: ?string = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">_nestedChildLists: ChildListCollection&lt;VirtualizedList&gt; =</span>
+    <span class="s4">new </span><span class="s1">ChildListCollection();</span>
+  <span class="s1">_offsetFromParentVirtualizedList: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_prevParentOffset: number = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s0">// $FlowFixMe[missing-local-annot]</span>
+  <span class="s1">_scrollMetrics = {</span>
+    <span class="s1">contentLength: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">dOffset: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">dt: </span><span class="s3">10</span><span class="s1">,</span>
+    <span class="s1">offset: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">timestamp: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">velocity: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">visibleLength: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">zoomScale: </span><span class="s3">1</span><span class="s1">,</span>
+  <span class="s1">};</span>
+  <span class="s1">_scrollRef: ?React.ElementRef&lt;any&gt; = </span><span class="s4">null</span><span class="s1">;</span>
+  <span class="s1">_sentStartForContentLength = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_sentEndForContentLength = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_totalCellLength = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_totalCellsMeasured = </span><span class="s3">0</span><span class="s1">;</span>
+  <span class="s1">_updateCellsToRenderBatcher: Batchinator;</span>
+  <span class="s1">_viewabilityTuples: Array&lt;ViewabilityHelperCallbackTuple&gt; = [];</span>
+
+  <span class="s0">/* $FlowFixMe[missing-local-annot] The type annotation(s) required by Flow's 
+   * LTI update could not be added via codemod */</span>
+  <span class="s1">_captureScrollRef = ref =&gt; {</span>
+    <span class="s4">this</span><span class="s1">._scrollRef = ref;</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_computeBlankness() {</span>
+    <span class="s4">this</span><span class="s1">._fillRateHelper.computeBlankness(</span>
+      <span class="s4">this</span><span class="s1">.props,</span>
+      <span class="s4">this</span><span class="s1">.state.cellsAroundViewport,</span>
+      <span class="s4">this</span><span class="s1">._scrollMetrics,</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* $FlowFixMe[missing-local-annot] The type annotation(s) required by Flow's 
+   * LTI update could not be added via codemod */</span>
+  <span class="s1">_defaultRenderScrollComponent = props =&gt; {</span>
+    <span class="s1">const onRefresh = props.onRefresh;</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._isNestedWithSameOrientation()) {</span>
+      <span class="s0">// $FlowFixMe[prop-missing] - Typing ReactNativeComponent revealed errors</span>
+      <span class="s4">return </span><span class="s1">&lt;View {...props} /&gt;;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(onRefresh) {</span>
+      <span class="s1">invariant(</span>
+        <span class="s4">typeof </span><span class="s1">props.refreshing === </span><span class="s2">'boolean'</span><span class="s1">,</span>
+        <span class="s2">'`refreshing` prop must be set as a boolean in order to use `onRefresh`, but got `' </span><span class="s1">+</span>
+          <span class="s1">JSON.stringify(props.refreshing ?? </span><span class="s2">'undefined'</span><span class="s1">) +</span>
+          <span class="s2">'`'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+      <span class="s4">return </span><span class="s1">(</span>
+        <span class="s0">// $FlowFixMe[prop-missing] Invalid prop usage</span>
+        <span class="s0">// $FlowFixMe[incompatible-use]</span>
+        <span class="s1">&lt;ScrollView</span>
+          <span class="s1">{...props}</span>
+          <span class="s1">refreshControl={</span>
+            <span class="s1">props.refreshControl == </span><span class="s4">null </span><span class="s1">? (</span>
+              <span class="s1">&lt;RefreshControl</span>
+                <span class="s0">// $FlowFixMe[incompatible-type]</span>
+                <span class="s1">refreshing={props.refreshing}</span>
+                <span class="s1">onRefresh={onRefresh}</span>
+                <span class="s1">progressViewOffset={props.progressViewOffset}</span>
+              <span class="s1">/&gt;</span>
+            <span class="s1">) : (</span>
+              <span class="s1">props.refreshControl</span>
+            <span class="s1">)</span>
+          <span class="s1">}</span>
+        <span class="s1">/&gt;</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s0">// $FlowFixMe[prop-missing] Invalid prop usage</span>
+      <span class="s0">// $FlowFixMe[incompatible-use]</span>
+      <span class="s4">return </span><span class="s1">&lt;ScrollView {...props} /&gt;;</span>
+    <span class="s1">}</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onCellLayout = (e: LayoutEvent, cellKey: string, index: number): </span><span class="s4">void </span><span class="s1">=&gt; {</span>
+    <span class="s1">const layout = e.nativeEvent.layout;</span>
+    <span class="s1">const next = {</span>
+      <span class="s1">offset: </span><span class="s4">this</span><span class="s1">._selectOffset(layout),</span>
+      <span class="s1">length: </span><span class="s4">this</span><span class="s1">._selectLength(layout),</span>
+      <span class="s1">index,</span>
+      <span class="s1">inLayout: </span><span class="s4">true</span><span class="s1">,</span>
+    <span class="s1">};</span>
+    <span class="s1">const curr = </span><span class="s4">this</span><span class="s1">._frames[cellKey];</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">!curr ||</span>
+      <span class="s1">next.offset !== curr.offset ||</span>
+      <span class="s1">next.length !== curr.length ||</span>
+      <span class="s1">index !== curr.index</span>
+    <span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._totalCellLength += next.length - (curr ? curr.length : </span><span class="s3">0</span><span class="s1">);</span>
+      <span class="s4">this</span><span class="s1">._totalCellsMeasured += curr ? </span><span class="s3">0 </span><span class="s1">: </span><span class="s3">1</span><span class="s1">;</span>
+      <span class="s4">this</span><span class="s1">._averageCellLength =</span>
+        <span class="s4">this</span><span class="s1">._totalCellLength / </span><span class="s4">this</span><span class="s1">._totalCellsMeasured;</span>
+      <span class="s4">this</span><span class="s1">._frames[cellKey] = next;</span>
+      <span class="s4">this</span><span class="s1">._highestMeasuredFrameIndex = Math.max(</span>
+        <span class="s4">this</span><span class="s1">._highestMeasuredFrameIndex,</span>
+        <span class="s1">index,</span>
+      <span class="s1">);</span>
+      <span class="s4">this</span><span class="s1">._scheduleCellsToRenderUpdate();</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._frames[cellKey].inLayout = </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._triggerRemeasureForChildListsInCell(cellKey);</span>
+
+    <span class="s4">this</span><span class="s1">._computeBlankness();</span>
+    <span class="s4">this</span><span class="s1">._updateViewableItems(</span><span class="s4">this</span><span class="s1">.props, </span><span class="s4">this</span><span class="s1">.state.cellsAroundViewport);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onCellFocusCapture(cellKey: string) {</span>
+    <span class="s4">this</span><span class="s1">._lastFocusedCellKey = cellKey;</span>
+    <span class="s4">this</span><span class="s1">._updateCellsToRender();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_onCellUnmount = (cellKey: string) =&gt; {</span>
+    <span class="s4">delete this</span><span class="s1">._cellRefs[cellKey];</span>
+    <span class="s1">const curr = </span><span class="s4">this</span><span class="s1">._frames[cellKey];</span>
+    <span class="s4">if </span><span class="s1">(curr) {</span>
+      <span class="s4">this</span><span class="s1">._frames[cellKey] = {...curr, inLayout: </span><span class="s4">false</span><span class="s1">};</span>
+    <span class="s1">}</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_triggerRemeasureForChildListsInCell(cellKey: string): </span><span class="s4">void </span><span class="s1">{</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.forEachInCell(cellKey, childList =&gt; {</span>
+      <span class="s1">childList.measureLayoutRelativeToContainingList();</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s1">measureLayoutRelativeToContainingList(): </span><span class="s4">void </span><span class="s1">{</span>
+    <span class="s0">// TODO (T35574538): findNodeHandle sometimes crashes with &quot;Unable to find</span>
+    <span class="s0">// node on an unmounted component&quot; during scrolling</span>
+    <span class="s4">try </span><span class="s1">{</span>
+      <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._scrollRef) {</span>
+        <span class="s4">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s0">// We are assuming that getOutermostParentListRef().getScrollRef()</span>
+      <span class="s0">// is a non-null reference to a ScrollView</span>
+      <span class="s4">this</span><span class="s1">._scrollRef.measureLayout(</span>
+        <span class="s4">this</span><span class="s1">.context.getOutermostParentListRef().getScrollRef(),</span>
+        <span class="s1">(x, y, width, height) =&gt; {</span>
+          <span class="s4">this</span><span class="s1">._offsetFromParentVirtualizedList = </span><span class="s4">this</span><span class="s1">._selectOffset({x, y});</span>
+          <span class="s4">this</span><span class="s1">._scrollMetrics.contentLength = </span><span class="s4">this</span><span class="s1">._selectLength({</span>
+            <span class="s1">width,</span>
+            <span class="s1">height,</span>
+          <span class="s1">});</span>
+          <span class="s1">const scrollMetrics = </span><span class="s4">this</span><span class="s1">._convertParentScrollMetrics(</span>
+            <span class="s4">this</span><span class="s1">.context.getScrollMetrics(),</span>
+          <span class="s1">);</span>
+
+          <span class="s1">const metricsChanged =</span>
+            <span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength !== scrollMetrics.visibleLength ||</span>
+            <span class="s4">this</span><span class="s1">._scrollMetrics.offset !== scrollMetrics.offset;</span>
+
+          <span class="s4">if </span><span class="s1">(metricsChanged) {</span>
+            <span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength = scrollMetrics.visibleLength;</span>
+            <span class="s4">this</span><span class="s1">._scrollMetrics.offset = scrollMetrics.offset;</span>
+
+            <span class="s0">// If metrics of the scrollView changed, then we triggered remeasure for child list</span>
+            <span class="s0">// to ensure VirtualizedList has the right information.</span>
+            <span class="s4">this</span><span class="s1">._nestedChildLists.forEach(childList =&gt; {</span>
+              <span class="s1">childList.measureLayoutRelativeToContainingList();</span>
+            <span class="s1">});</span>
+          <span class="s1">}</span>
+        <span class="s1">},</span>
+        <span class="s1">error =&gt; {</span>
+          <span class="s1">console.warn(</span>
+            <span class="s2">&quot;VirtualizedList: Encountered an error while measuring a list's&quot; </span><span class="s1">+</span>
+              <span class="s2">' offset from its containing VirtualizedList.'</span><span class="s1">,</span>
+          <span class="s1">);</span>
+        <span class="s1">},</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s4">catch </span><span class="s1">(error) {</span>
+      <span class="s1">console.warn(</span>
+        <span class="s2">'measureLayoutRelativeToContainingList threw an error'</span><span class="s1">,</span>
+        <span class="s1">error.stack,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_onLayout = (e: LayoutEvent) =&gt; {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._isNestedWithSameOrientation()) {</span>
+      <span class="s0">// Need to adjust our scroll metrics to be relative to our containing</span>
+      <span class="s0">// VirtualizedList before we can make claims about list item viewability</span>
+      <span class="s4">this</span><span class="s1">.measureLayoutRelativeToContainingList();</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength = </span><span class="s4">this</span><span class="s1">._selectLength(</span>
+        <span class="s1">e.nativeEvent.layout,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">.props.onLayout &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onLayout(e);</span>
+    <span class="s4">this</span><span class="s1">._scheduleCellsToRenderUpdate();</span>
+    <span class="s4">this</span><span class="s1">._maybeCallOnEdgeReached();</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onLayoutEmpty = (e: LayoutEvent) =&gt; {</span>
+    <span class="s4">this</span><span class="s1">.props.onLayout &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onLayout(e);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_getFooterCellKey(): string {</span>
+    <span class="s4">return this</span><span class="s1">._getCellKey() + </span><span class="s2">'-footer'</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_onLayoutFooter = (e: LayoutEvent) =&gt; {</span>
+    <span class="s4">this</span><span class="s1">._triggerRemeasureForChildListsInCell(</span><span class="s4">this</span><span class="s1">._getFooterCellKey());</span>
+    <span class="s4">this</span><span class="s1">._footerLength = </span><span class="s4">this</span><span class="s1">._selectLength(e.nativeEvent.layout);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onLayoutHeader = (e: LayoutEvent) =&gt; {</span>
+    <span class="s4">this</span><span class="s1">._headerLength = </span><span class="s4">this</span><span class="s1">._selectLength(e.nativeEvent.layout);</span>
+  <span class="s1">};</span>
+
+  <span class="s0">// $FlowFixMe[missing-local-annot]</span>
+  <span class="s1">_renderDebugOverlay() {</span>
+    <span class="s1">const normalize =</span>
+      <span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength /</span>
+      <span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollMetrics.contentLength || </span><span class="s3">1</span><span class="s1">);</span>
+    <span class="s1">const framesInLayout = [];</span>
+    <span class="s1">const itemCount = </span><span class="s4">this</span><span class="s1">.props.getItemCount(</span><span class="s4">this</span><span class="s1">.props.data);</span>
+    <span class="s4">for </span><span class="s1">(let ii = </span><span class="s3">0</span><span class="s1">; ii &lt; itemCount; ii++) {</span>
+      <span class="s1">const frame = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(ii, </span><span class="s4">this</span><span class="s1">.props);</span>
+      <span class="s0">/* $FlowFixMe[prop-missing] (&gt;=0.68.0 site=react_native_fb) This comment 
+       * suppresses an error found when Flow v0.68 was deployed. To see the 
+       * error delete this comment and run Flow. */</span>
+      <span class="s4">if </span><span class="s1">(frame.inLayout) {</span>
+        <span class="s1">framesInLayout.push(frame);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">const windowTop = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(</span>
+      <span class="s4">this</span><span class="s1">.state.cellsAroundViewport.first,</span>
+      <span class="s4">this</span><span class="s1">.props,</span>
+    <span class="s1">).offset;</span>
+    <span class="s1">const frameLast = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(</span>
+      <span class="s4">this</span><span class="s1">.state.cellsAroundViewport.last,</span>
+      <span class="s4">this</span><span class="s1">.props,</span>
+    <span class="s1">);</span>
+    <span class="s1">const windowLen = frameLast.offset + frameLast.length - windowTop;</span>
+    <span class="s1">const visTop = </span><span class="s4">this</span><span class="s1">._scrollMetrics.offset;</span>
+    <span class="s1">const visLen = </span><span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength;</span>
+
+    <span class="s4">return </span><span class="s1">(</span>
+      <span class="s1">&lt;View style={[styles.debugOverlayBase, styles.debugOverlay]}&gt;</span>
+        <span class="s1">{framesInLayout.map((f, ii) =&gt; (</span>
+          <span class="s1">&lt;View</span>
+            <span class="s1">key={</span><span class="s2">'f' </span><span class="s1">+ ii}</span>
+            <span class="s1">style={[</span>
+              <span class="s1">styles.debugOverlayBase,</span>
+              <span class="s1">styles.debugOverlayFrame,</span>
+              <span class="s1">{</span>
+                <span class="s1">top: f.offset * normalize,</span>
+                <span class="s1">height: f.length * normalize,</span>
+              <span class="s1">},</span>
+            <span class="s1">]}</span>
+          <span class="s1">/&gt;</span>
+        <span class="s1">))}</span>
+        <span class="s1">&lt;View</span>
+          <span class="s1">style={[</span>
+            <span class="s1">styles.debugOverlayBase,</span>
+            <span class="s1">styles.debugOverlayFrameLast,</span>
+            <span class="s1">{</span>
+              <span class="s1">top: windowTop * normalize,</span>
+              <span class="s1">height: windowLen * normalize,</span>
+            <span class="s1">},</span>
+          <span class="s1">]}</span>
+        <span class="s1">/&gt;</span>
+        <span class="s1">&lt;View</span>
+          <span class="s1">style={[</span>
+            <span class="s1">styles.debugOverlayBase,</span>
+            <span class="s1">styles.debugOverlayFrameVis,</span>
+            <span class="s1">{</span>
+              <span class="s1">top: visTop * normalize,</span>
+              <span class="s1">height: visLen * normalize,</span>
+            <span class="s1">},</span>
+          <span class="s1">]}</span>
+        <span class="s1">/&gt;</span>
+      <span class="s1">&lt;/View&gt;</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_selectLength(</span>
+    <span class="s1">metrics: $ReadOnly&lt;{</span>
+      <span class="s1">height: number,</span>
+      <span class="s1">width: number,</span>
+      <span class="s1">...</span>
+    <span class="s1">}&gt;,</span>
+  <span class="s1">): number {</span>
+    <span class="s4">return </span><span class="s1">!horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal)</span>
+      <span class="s1">? metrics.height</span>
+      <span class="s1">: metrics.width;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_selectOffset(</span>
+    <span class="s1">metrics: $ReadOnly&lt;{</span>
+      <span class="s1">x: number,</span>
+      <span class="s1">y: number,</span>
+      <span class="s1">...</span>
+    <span class="s1">}&gt;,</span>
+  <span class="s1">): number {</span>
+    <span class="s4">return </span><span class="s1">!horizontalOrDefault(</span><span class="s4">this</span><span class="s1">.props.horizontal) ? metrics.y : metrics.x;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_maybeCallOnEdgeReached() {</span>
+    <span class="s1">const {</span>
+      <span class="s1">data,</span>
+      <span class="s1">getItemCount,</span>
+      <span class="s1">onStartReached,</span>
+      <span class="s1">onStartReachedThreshold,</span>
+      <span class="s1">onEndReached,</span>
+      <span class="s1">onEndReachedThreshold,</span>
+    <span class="s1">} = </span><span class="s4">this</span><span class="s1">.props;</span>
+    <span class="s0">// If we have any pending scroll updates it means that the scroll metrics</span>
+    <span class="s0">// are out of date and we should not call any of the edge reached callbacks.</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.state.pendingScrollUpdateCount &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const {contentLength, visibleLength, offset} = </span><span class="s4">this</span><span class="s1">._scrollMetrics;</span>
+    <span class="s1">let distanceFromStart = offset;</span>
+    <span class="s1">let distanceFromEnd = contentLength - visibleLength - offset;</span>
+
+    <span class="s0">// Especially when oERT is zero it's necessary to 'floor' very small distance values to be 0</span>
+    <span class="s0">// since debouncing causes us to not fire this event for every single &quot;pixel&quot; we scroll and can thus</span>
+    <span class="s0">// be at the edge of the list with a distance approximating 0 but not quite there.</span>
+    <span class="s4">if </span><span class="s1">(distanceFromStart &lt; ON_EDGE_REACHED_EPSILON) {</span>
+      <span class="s1">distanceFromStart = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(distanceFromEnd &lt; ON_EDGE_REACHED_EPSILON) {</span>
+      <span class="s1">distanceFromEnd = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// TODO: T121172172 Look into why we're &quot;defaulting&quot; to a threshold of 2px</span>
+    <span class="s0">// when oERT is not present (different from 2 viewports used elsewhere)</span>
+    <span class="s1">const DEFAULT_THRESHOLD_PX = </span><span class="s3">2</span><span class="s1">;</span>
+
+    <span class="s1">const startThreshold =</span>
+      <span class="s1">onStartReachedThreshold != </span><span class="s4">null</span>
+        <span class="s1">? onStartReachedThreshold * visibleLength</span>
+        <span class="s1">: DEFAULT_THRESHOLD_PX;</span>
+    <span class="s1">const endThreshold =</span>
+      <span class="s1">onEndReachedThreshold != </span><span class="s4">null</span>
+        <span class="s1">? onEndReachedThreshold * visibleLength</span>
+        <span class="s1">: DEFAULT_THRESHOLD_PX;</span>
+    <span class="s1">const isWithinStartThreshold = distanceFromStart &lt;= startThreshold;</span>
+    <span class="s1">const isWithinEndThreshold = distanceFromEnd &lt;= endThreshold;</span>
+
+    <span class="s0">// First check if the user just scrolled within the end threshold</span>
+    <span class="s0">// and call onEndReached only once for a given content length,</span>
+    <span class="s0">// and only if onStartReached is not being executed</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">onEndReached &amp;&amp;</span>
+      <span class="s4">this</span><span class="s1">.state.cellsAroundViewport.last === getItemCount(data) - </span><span class="s3">1 </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">isWithinEndThreshold &amp;&amp;</span>
+      <span class="s4">this</span><span class="s1">._scrollMetrics.contentLength !== </span><span class="s4">this</span><span class="s1">._sentEndForContentLength</span>
+    <span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._sentEndForContentLength = </span><span class="s4">this</span><span class="s1">._scrollMetrics.contentLength;</span>
+      <span class="s1">onEndReached({distanceFromEnd});</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Next check if the user just scrolled within the start threshold</span>
+    <span class="s0">// and call onStartReached only once for a given content length,</span>
+    <span class="s0">// and only if onEndReached is not being executed</span>
+    <span class="s4">else if </span><span class="s1">(</span>
+      <span class="s1">onStartReached != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s4">this</span><span class="s1">.state.cellsAroundViewport.first === </span><span class="s3">0 </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">isWithinStartThreshold &amp;&amp;</span>
+      <span class="s4">this</span><span class="s1">._scrollMetrics.contentLength !== </span><span class="s4">this</span><span class="s1">._sentStartForContentLength</span>
+    <span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._sentStartForContentLength = </span><span class="s4">this</span><span class="s1">._scrollMetrics.contentLength;</span>
+      <span class="s1">onStartReached({distanceFromStart});</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// If the user scrolls away from the start or end and back again,</span>
+    <span class="s0">// cause onStartReached or onEndReached to be triggered again</span>
+    <span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._sentStartForContentLength = isWithinStartThreshold</span>
+        <span class="s1">? </span><span class="s4">this</span><span class="s1">._sentStartForContentLength</span>
+        <span class="s1">: </span><span class="s3">0</span><span class="s1">;</span>
+      <span class="s4">this</span><span class="s1">._sentEndForContentLength = isWithinEndThreshold</span>
+        <span class="s1">? </span><span class="s4">this</span><span class="s1">._sentEndForContentLength</span>
+        <span class="s1">: </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_onContentSizeChange = (width: number, height: number) =&gt; {</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">width &gt; </span><span class="s3">0 </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">height &gt; </span><span class="s3">0 </span><span class="s1">&amp;&amp;</span>
+      <span class="s4">this</span><span class="s1">.props.initialScrollIndex != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s4">this</span><span class="s1">.props.initialScrollIndex &gt; </span><span class="s3">0 </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">!</span><span class="s4">this</span><span class="s1">._hasTriggeredInitialScrollToIndex</span>
+    <span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.props.contentOffset == </span><span class="s4">null</span><span class="s1">) {</span>
+        <span class="s4">if </span><span class="s1">(</span>
+          <span class="s4">this</span><span class="s1">.props.initialScrollIndex &lt;</span>
+          <span class="s4">this</span><span class="s1">.props.getItemCount(</span><span class="s4">this</span><span class="s1">.props.data)</span>
+        <span class="s1">) {</span>
+          <span class="s4">this</span><span class="s1">.scrollToIndex({</span>
+            <span class="s1">animated: </span><span class="s4">false</span><span class="s1">,</span>
+            <span class="s1">index: nullthrows(</span><span class="s4">this</span><span class="s1">.props.initialScrollIndex),</span>
+          <span class="s1">});</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s4">this</span><span class="s1">.scrollToEnd({animated: </span><span class="s4">false</span><span class="s1">});</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s4">this</span><span class="s1">._hasTriggeredInitialScrollToIndex = </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.props.onContentSizeChange) {</span>
+      <span class="s4">this</span><span class="s1">.props.onContentSizeChange(width, height);</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._scrollMetrics.contentLength = </span><span class="s4">this</span><span class="s1">._selectLength({height, width});</span>
+    <span class="s4">this</span><span class="s1">._scheduleCellsToRenderUpdate();</span>
+    <span class="s4">this</span><span class="s1">._maybeCallOnEdgeReached();</span>
+  <span class="s1">};</span>
+
+  <span class="s0">/* Translates metrics from a scroll event in a parent VirtualizedList into 
+   * coordinates relative to the child list. 
+   */</span>
+  <span class="s1">_convertParentScrollMetrics = (metrics: {</span>
+    <span class="s1">visibleLength: number,</span>
+    <span class="s1">offset: number,</span>
+    <span class="s1">...</span>
+  <span class="s1">}): $FlowFixMe =&gt; {</span>
+    <span class="s0">// Offset of the top of the nested list relative to the top of its parent's viewport</span>
+    <span class="s1">const offset = metrics.offset - </span><span class="s4">this</span><span class="s1">._offsetFromParentVirtualizedList;</span>
+    <span class="s0">// Child's visible length is the same as its parent's</span>
+    <span class="s1">const visibleLength = metrics.visibleLength;</span>
+    <span class="s1">const dOffset = offset - </span><span class="s4">this</span><span class="s1">._scrollMetrics.offset;</span>
+    <span class="s1">const contentLength = </span><span class="s4">this</span><span class="s1">._scrollMetrics.contentLength;</span>
+
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">visibleLength,</span>
+      <span class="s1">contentLength,</span>
+      <span class="s1">offset,</span>
+      <span class="s1">dOffset,</span>
+    <span class="s1">};</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onScroll = (e: Object) =&gt; {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.forEach(childList =&gt; {</span>
+      <span class="s1">childList._onScroll(e);</span>
+    <span class="s1">});</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.props.onScroll) {</span>
+      <span class="s4">this</span><span class="s1">.props.onScroll(e);</span>
+    <span class="s1">}</span>
+    <span class="s1">const timestamp = e.timeStamp;</span>
+    <span class="s1">let visibleLength = </span><span class="s4">this</span><span class="s1">._selectLength(e.nativeEvent.layoutMeasurement);</span>
+    <span class="s1">let contentLength = </span><span class="s4">this</span><span class="s1">._selectLength(e.nativeEvent.contentSize);</span>
+    <span class="s1">let offset = </span><span class="s4">this</span><span class="s1">._selectOffset(e.nativeEvent.contentOffset);</span>
+    <span class="s1">let dOffset = offset - </span><span class="s4">this</span><span class="s1">._scrollMetrics.offset;</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._isNestedWithSameOrientation()) {</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._scrollMetrics.contentLength === </span><span class="s3">0</span><span class="s1">) {</span>
+        <span class="s0">// Ignore scroll events until onLayout has been called and we</span>
+        <span class="s0">// know our offset from our offset from our parent</span>
+        <span class="s4">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">({visibleLength, contentLength, offset, dOffset} =</span>
+        <span class="s4">this</span><span class="s1">._convertParentScrollMetrics({</span>
+          <span class="s1">visibleLength,</span>
+          <span class="s1">offset,</span>
+        <span class="s1">}));</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const dt = </span><span class="s4">this</span><span class="s1">._scrollMetrics.timestamp</span>
+      <span class="s1">? Math.max(</span><span class="s3">1</span><span class="s1">, timestamp - </span><span class="s4">this</span><span class="s1">._scrollMetrics.timestamp)</span>
+      <span class="s1">: </span><span class="s3">1</span><span class="s1">;</span>
+    <span class="s1">const velocity = dOffset / dt;</span>
+
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">dt &gt; </span><span class="s3">500 </span><span class="s1">&amp;&amp;</span>
+      <span class="s4">this</span><span class="s1">._scrollMetrics.dt &gt; </span><span class="s3">500 </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">contentLength &gt; </span><span class="s3">5 </span><span class="s1">* visibleLength &amp;&amp;</span>
+      <span class="s1">!</span><span class="s4">this</span><span class="s1">._hasWarned.perf</span>
+    <span class="s1">) {</span>
+      <span class="s1">infoLog(</span>
+        <span class="s2">'VirtualizedList: You have a large list that is slow to update - make sure your ' </span><span class="s1">+</span>
+          <span class="s2">'renderItem function renders components that follow React performance best practices ' </span><span class="s1">+</span>
+          <span class="s2">'like PureComponent, shouldComponentUpdate, etc.'</span><span class="s1">,</span>
+        <span class="s1">{dt, prevDt: </span><span class="s4">this</span><span class="s1">._scrollMetrics.dt, contentLength},</span>
+      <span class="s1">);</span>
+      <span class="s4">this</span><span class="s1">._hasWarned.perf = </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// For invalid negative values (w/ RTL), set this to 1.</span>
+    <span class="s1">const zoomScale = e.nativeEvent.zoomScale &lt; </span><span class="s3">0 </span><span class="s1">? </span><span class="s3">1 </span><span class="s1">: e.nativeEvent.zoomScale;</span>
+    <span class="s4">this</span><span class="s1">._scrollMetrics = {</span>
+      <span class="s1">contentLength,</span>
+      <span class="s1">dt,</span>
+      <span class="s1">dOffset,</span>
+      <span class="s1">offset,</span>
+      <span class="s1">timestamp,</span>
+      <span class="s1">velocity,</span>
+      <span class="s1">visibleLength,</span>
+      <span class="s1">zoomScale,</span>
+    <span class="s1">};</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.state.pendingScrollUpdateCount &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">.setState(state =&gt; ({</span>
+        <span class="s1">pendingScrollUpdateCount: state.pendingScrollUpdateCount - </span><span class="s3">1</span><span class="s1">,</span>
+      <span class="s1">}));</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._updateViewableItems(</span><span class="s4">this</span><span class="s1">.props, </span><span class="s4">this</span><span class="s1">.state.cellsAroundViewport);</span>
+    <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">.props) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._maybeCallOnEdgeReached();</span>
+    <span class="s4">if </span><span class="s1">(velocity !== </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._fillRateHelper.activate();</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._computeBlankness();</span>
+    <span class="s4">this</span><span class="s1">._scheduleCellsToRenderUpdate();</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_scheduleCellsToRenderUpdate() {</span>
+    <span class="s1">const {first, last} = </span><span class="s4">this</span><span class="s1">.state.cellsAroundViewport;</span>
+    <span class="s1">const {offset, visibleLength, velocity} = </span><span class="s4">this</span><span class="s1">._scrollMetrics;</span>
+    <span class="s1">const itemCount = </span><span class="s4">this</span><span class="s1">.props.getItemCount(</span><span class="s4">this</span><span class="s1">.props.data);</span>
+    <span class="s1">let hiPri = </span><span class="s4">false</span><span class="s1">;</span>
+    <span class="s1">const onStartReachedThreshold = onStartReachedThresholdOrDefault(</span>
+      <span class="s4">this</span><span class="s1">.props.onStartReachedThreshold,</span>
+    <span class="s1">);</span>
+    <span class="s1">const onEndReachedThreshold = onEndReachedThresholdOrDefault(</span>
+      <span class="s4">this</span><span class="s1">.props.onEndReachedThreshold,</span>
+    <span class="s1">);</span>
+    <span class="s0">// Mark as high priority if we're close to the start of the first item</span>
+    <span class="s0">// But only if there are items before the first rendered item</span>
+    <span class="s4">if </span><span class="s1">(first &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">const distTop =</span>
+        <span class="s1">offset - </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(first, </span><span class="s4">this</span><span class="s1">.props).offset;</span>
+      <span class="s1">hiPri =</span>
+        <span class="s1">distTop &lt; </span><span class="s3">0 </span><span class="s1">||</span>
+        <span class="s1">(velocity &lt; -</span><span class="s3">2 </span><span class="s1">&amp;&amp;</span>
+          <span class="s1">distTop &lt;</span>
+            <span class="s1">getScrollingThreshold(onStartReachedThreshold, visibleLength));</span>
+    <span class="s1">}</span>
+    <span class="s0">// Mark as high priority if we're close to the end of the last item</span>
+    <span class="s0">// But only if there are items after the last rendered item</span>
+    <span class="s4">if </span><span class="s1">(!hiPri &amp;&amp; last &gt;= </span><span class="s3">0 </span><span class="s1">&amp;&amp; last &lt; itemCount - </span><span class="s3">1</span><span class="s1">) {</span>
+      <span class="s1">const distBottom =</span>
+        <span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(last, </span><span class="s4">this</span><span class="s1">.props).offset -</span>
+        <span class="s1">(offset + visibleLength);</span>
+      <span class="s1">hiPri =</span>
+        <span class="s1">distBottom &lt; </span><span class="s3">0 </span><span class="s1">||</span>
+        <span class="s1">(velocity &gt; </span><span class="s3">2 </span><span class="s1">&amp;&amp;</span>
+          <span class="s1">distBottom &lt;</span>
+            <span class="s1">getScrollingThreshold(onEndReachedThreshold, visibleLength));</span>
+    <span class="s1">}</span>
+    <span class="s0">// Only trigger high-priority updates if we've actually rendered cells,</span>
+    <span class="s0">// and with that size estimate, accurately compute how many cells we should render.</span>
+    <span class="s0">// Otherwise, it would just render as many cells as it can (of zero dimension),</span>
+    <span class="s0">// each time through attempting to render more (limited by maxToRenderPerBatch),</span>
+    <span class="s0">// starving the renderer from actually laying out the objects and computing _averageCellLength.</span>
+    <span class="s0">// If this is triggered in an `componentDidUpdate` followed by a hiPri cellToRenderUpdate</span>
+    <span class="s0">// We shouldn't do another hipri cellToRenderUpdate</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">hiPri &amp;&amp;</span>
+      <span class="s1">(</span><span class="s4">this</span><span class="s1">._averageCellLength || </span><span class="s4">this</span><span class="s1">.props.getItemLayout) &amp;&amp;</span>
+      <span class="s1">!</span><span class="s4">this</span><span class="s1">._hiPriInProgress</span>
+    <span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._hiPriInProgress = </span><span class="s4">true</span><span class="s1">;</span>
+      <span class="s0">// Don't worry about interactions when scrolling quickly; focus on filling content as fast</span>
+      <span class="s0">// as possible.</span>
+      <span class="s4">this</span><span class="s1">._updateCellsToRenderBatcher.dispose({abort: </span><span class="s4">true</span><span class="s1">});</span>
+      <span class="s4">this</span><span class="s1">._updateCellsToRender();</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._updateCellsToRenderBatcher.schedule();</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_onScrollBeginDrag = (e: ScrollEvent): </span><span class="s4">void </span><span class="s1">=&gt; {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.forEach(childList =&gt; {</span>
+      <span class="s1">childList._onScrollBeginDrag(e);</span>
+    <span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">._viewabilityTuples.forEach(tuple =&gt; {</span>
+      <span class="s1">tuple.viewabilityHelper.recordInteraction();</span>
+    <span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">._hasInteracted = </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">.props.onScrollBeginDrag &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onScrollBeginDrag(e);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onScrollEndDrag = (e: ScrollEvent): </span><span class="s4">void </span><span class="s1">=&gt; {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.forEach(childList =&gt; {</span>
+      <span class="s1">childList._onScrollEndDrag(e);</span>
+    <span class="s1">});</span>
+    <span class="s1">const {velocity} = e.nativeEvent;</span>
+    <span class="s4">if </span><span class="s1">(velocity) {</span>
+      <span class="s4">this</span><span class="s1">._scrollMetrics.velocity = </span><span class="s4">this</span><span class="s1">._selectOffset(velocity);</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._computeBlankness();</span>
+    <span class="s4">this</span><span class="s1">.props.onScrollEndDrag &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onScrollEndDrag(e);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onMomentumScrollBegin = (e: ScrollEvent): </span><span class="s4">void </span><span class="s1">=&gt; {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.forEach(childList =&gt; {</span>
+      <span class="s1">childList._onMomentumScrollBegin(e);</span>
+    <span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">.props.onMomentumScrollBegin &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onMomentumScrollBegin(e);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_onMomentumScrollEnd = (e: ScrollEvent): </span><span class="s4">void </span><span class="s1">=&gt; {</span>
+    <span class="s4">this</span><span class="s1">._nestedChildLists.forEach(childList =&gt; {</span>
+      <span class="s1">childList._onMomentumScrollEnd(e);</span>
+    <span class="s1">});</span>
+    <span class="s4">this</span><span class="s1">._scrollMetrics.velocity = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._computeBlankness();</span>
+    <span class="s4">this</span><span class="s1">.props.onMomentumScrollEnd &amp;&amp; </span><span class="s4">this</span><span class="s1">.props.onMomentumScrollEnd(e);</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_updateCellsToRender = () =&gt; {</span>
+    <span class="s4">this</span><span class="s1">._updateViewableItems(</span><span class="s4">this</span><span class="s1">.props, </span><span class="s4">this</span><span class="s1">.state.cellsAroundViewport);</span>
+
+    <span class="s4">this</span><span class="s1">.setState((state, props) =&gt; {</span>
+      <span class="s1">const cellsAroundViewport = </span><span class="s4">this</span><span class="s1">._adjustCellsAroundViewport(</span>
+        <span class="s1">props,</span>
+        <span class="s1">state.cellsAroundViewport,</span>
+        <span class="s1">state.pendingScrollUpdateCount,</span>
+      <span class="s1">);</span>
+      <span class="s1">const renderMask = VirtualizedList._createRenderMask(</span>
+        <span class="s1">props,</span>
+        <span class="s1">cellsAroundViewport,</span>
+        <span class="s4">this</span><span class="s1">._getNonViewportRenderRegions(props),</span>
+      <span class="s1">);</span>
+
+      <span class="s4">if </span><span class="s1">(</span>
+        <span class="s1">cellsAroundViewport.first === state.cellsAroundViewport.first &amp;&amp;</span>
+        <span class="s1">cellsAroundViewport.last === state.cellsAroundViewport.last &amp;&amp;</span>
+        <span class="s1">renderMask.equals(state.renderMask)</span>
+      <span class="s1">) {</span>
+        <span class="s4">return null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s4">return </span><span class="s1">{cellsAroundViewport, renderMask};</span>
+    <span class="s1">});</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_createViewToken = (</span>
+    <span class="s1">index: number,</span>
+    <span class="s1">isViewable: boolean,</span>
+    <span class="s1">props: FrameMetricProps,</span>
+    <span class="s0">// $FlowFixMe[missing-local-annot]</span>
+  <span class="s1">) =&gt; {</span>
+    <span class="s1">const {data, getItem} = props;</span>
+    <span class="s1">const item = getItem(data, index);</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">index,</span>
+      <span class="s1">item,</span>
+      <span class="s1">key: VirtualizedList._keyExtractor(item, index, props),</span>
+      <span class="s1">isViewable,</span>
+    <span class="s1">};</span>
+  <span class="s1">};</span>
+
+  <span class="s0">/** 
+   * Gets an approximate offset to an item at a given index. Supports 
+   * fractional indices. 
+   */</span>
+  <span class="s1">_getOffsetApprox = (index: number, props: FrameMetricProps): number =&gt; {</span>
+    <span class="s4">if </span><span class="s1">(Number.isInteger(index)) {</span>
+      <span class="s4">return this</span><span class="s1">.__getFrameMetricsApprox(index, props).offset;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">const frameMetrics = </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(</span>
+        <span class="s1">Math.floor(index),</span>
+        <span class="s1">props,</span>
+      <span class="s1">);</span>
+      <span class="s1">const remainder = index - Math.floor(index);</span>
+      <span class="s4">return </span><span class="s1">frameMetrics.offset + remainder * frameMetrics.length;</span>
+    <span class="s1">}</span>
+  <span class="s1">};</span>
+
+  <span class="s1">__getFrameMetricsApprox: (</span>
+    <span class="s1">index: number,</span>
+    <span class="s1">props: FrameMetricProps,</span>
+  <span class="s1">) =&gt; {</span>
+    <span class="s1">length: number,</span>
+    <span class="s1">offset: number,</span>
+    <span class="s1">...</span>
+  <span class="s1">} = (index, props) =&gt; {</span>
+    <span class="s1">const frame = </span><span class="s4">this</span><span class="s1">._getFrameMetrics(index, props);</span>
+    <span class="s4">if </span><span class="s1">(frame &amp;&amp; frame.index === index) {</span>
+      <span class="s0">// check for invalid frames due to row re-ordering</span>
+      <span class="s4">return </span><span class="s1">frame;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">const {data, getItemCount, getItemLayout} = props;</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">index &gt;= </span><span class="s3">0 </span><span class="s1">&amp;&amp; index &lt; getItemCount(data),</span>
+        <span class="s2">'Tried to get frame for out of range index ' </span><span class="s1">+ index,</span>
+      <span class="s1">);</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">!getItemLayout,</span>
+        <span class="s2">'Should not have to estimate frames when a measurement metrics function is provided'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+      <span class="s4">return </span><span class="s1">{</span>
+        <span class="s1">length: </span><span class="s4">this</span><span class="s1">._averageCellLength,</span>
+        <span class="s1">offset: </span><span class="s4">this</span><span class="s1">._averageCellLength * index,</span>
+      <span class="s1">};</span>
+    <span class="s1">}</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_getFrameMetrics = (</span>
+    <span class="s1">index: number,</span>
+    <span class="s1">props: FrameMetricProps,</span>
+  <span class="s1">): ?{</span>
+    <span class="s1">length: number,</span>
+    <span class="s1">offset: number,</span>
+    <span class="s1">index: number,</span>
+    <span class="s1">inLayout?: boolean,</span>
+    <span class="s1">...</span>
+  <span class="s1">} =&gt; {</span>
+    <span class="s1">const {data, getItemCount, getItemLayout} = props;</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">index &gt;= </span><span class="s3">0 </span><span class="s1">&amp;&amp; index &lt; getItemCount(data),</span>
+      <span class="s2">'Tried to get frame for out of range index ' </span><span class="s1">+ index,</span>
+    <span class="s1">);</span>
+    <span class="s1">const frame = </span><span class="s4">this</span><span class="s1">._frames[VirtualizedList._getItemKey(props, index)];</span>
+    <span class="s4">if </span><span class="s1">(!frame || frame.index !== index) {</span>
+      <span class="s4">if </span><span class="s1">(getItemLayout) {</span>
+        <span class="s0">/* $FlowFixMe[prop-missing] (&gt;=0.63.0 site=react_native_fb) This comment 
+         * suppresses an error found when Flow v0.63 was deployed. To see the error 
+         * delete this comment and run Flow. */</span>
+        <span class="s4">return </span><span class="s1">getItemLayout(data, index);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">frame;</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_getNonViewportRenderRegions = (</span>
+    <span class="s1">props: FrameMetricProps,</span>
+  <span class="s1">): $ReadOnlyArray&lt;{</span>
+    <span class="s1">first: number,</span>
+    <span class="s1">last: number,</span>
+  <span class="s1">}&gt; =&gt; {</span>
+    <span class="s0">// Keep a viewport's worth of content around the last focused cell to allow</span>
+    <span class="s0">// random navigation around it without any blanking. E.g. tabbing from one</span>
+    <span class="s0">// focused item out of viewport to another.</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">!(</span><span class="s4">this</span><span class="s1">._lastFocusedCellKey &amp;&amp; </span><span class="s4">this</span><span class="s1">._cellRefs[</span><span class="s4">this</span><span class="s1">._lastFocusedCellKey])</span>
+    <span class="s1">) {</span>
+      <span class="s4">return </span><span class="s1">[];</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const lastFocusedCellRenderer = </span><span class="s4">this</span><span class="s1">._cellRefs[</span><span class="s4">this</span><span class="s1">._lastFocusedCellKey];</span>
+    <span class="s1">const focusedCellIndex = lastFocusedCellRenderer.props.index;</span>
+    <span class="s1">const itemCount = props.getItemCount(props.data);</span>
+
+    <span class="s0">// The last cell we rendered may be at a new index. Bail if we don't know</span>
+    <span class="s0">// where it is.</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">focusedCellIndex &gt;= itemCount ||</span>
+      <span class="s1">VirtualizedList._getItemKey(props, focusedCellIndex) !==</span>
+        <span class="s4">this</span><span class="s1">._lastFocusedCellKey</span>
+    <span class="s1">) {</span>
+      <span class="s4">return </span><span class="s1">[];</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let first = focusedCellIndex;</span>
+    <span class="s1">let heightOfCellsBeforeFocused = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s4">for </span><span class="s1">(</span>
+      <span class="s1">let i = first - </span><span class="s3">1</span><span class="s1">;</span>
+      <span class="s1">i &gt;= </span><span class="s3">0 </span><span class="s1">&amp;&amp; heightOfCellsBeforeFocused &lt; </span><span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength;</span>
+      <span class="s1">i--</span>
+    <span class="s1">) {</span>
+      <span class="s1">first--;</span>
+      <span class="s1">heightOfCellsBeforeFocused += </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(</span>
+        <span class="s1">i,</span>
+        <span class="s1">props,</span>
+      <span class="s1">).length;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let last = focusedCellIndex;</span>
+    <span class="s1">let heightOfCellsAfterFocused = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s4">for </span><span class="s1">(</span>
+      <span class="s1">let i = last + </span><span class="s3">1</span><span class="s1">;</span>
+      <span class="s1">i &lt; itemCount &amp;&amp;</span>
+      <span class="s1">heightOfCellsAfterFocused &lt; </span><span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength;</span>
+      <span class="s1">i++</span>
+    <span class="s1">) {</span>
+      <span class="s1">last++;</span>
+      <span class="s1">heightOfCellsAfterFocused += </span><span class="s4">this</span><span class="s1">.__getFrameMetricsApprox(</span>
+        <span class="s1">i,</span>
+        <span class="s1">props,</span>
+      <span class="s1">).length;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return </span><span class="s1">[{first, last}];</span>
+  <span class="s1">};</span>
+
+  <span class="s1">_updateViewableItems(</span>
+    <span class="s1">props: FrameMetricProps,</span>
+    <span class="s1">cellsAroundViewport: {first: number, last: number},</span>
+  <span class="s1">) {</span>
+    <span class="s0">// If we have any pending scroll updates it means that the scroll metrics</span>
+    <span class="s0">// are out of date and we should not call any of the visibility callbacks.</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.state.pendingScrollUpdateCount &gt; </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._viewabilityTuples.forEach(tuple =&gt; {</span>
+      <span class="s1">tuple.viewabilityHelper.onUpdate(</span>
+        <span class="s1">props,</span>
+        <span class="s4">this</span><span class="s1">._scrollMetrics.offset,</span>
+        <span class="s4">this</span><span class="s1">._scrollMetrics.visibleLength,</span>
+        <span class="s4">this</span><span class="s1">._getFrameMetrics,</span>
+        <span class="s4">this</span><span class="s1">._createViewToken,</span>
+        <span class="s1">tuple.onViewableItemsChanged,</span>
+        <span class="s1">cellsAroundViewport,</span>
+      <span class="s1">);</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">const styles = StyleSheet.create({</span>
+  <span class="s1">verticallyInverted: {</span>
+    <span class="s1">transform: [{scaleY: -</span><span class="s3">1</span><span class="s1">}],</span>
+  <span class="s1">},</span>
+  <span class="s1">horizontallyInverted: {</span>
+    <span class="s1">transform: [{scaleX: -</span><span class="s3">1</span><span class="s1">}],</span>
+  <span class="s1">},</span>
+  <span class="s1">debug: {</span>
+    <span class="s1">flex: </span><span class="s3">1</span><span class="s1">,</span>
+  <span class="s1">},</span>
+  <span class="s1">debugOverlayBase: {</span>
+    <span class="s1">position: </span><span class="s2">'absolute'</span><span class="s1">,</span>
+    <span class="s1">top: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">right: </span><span class="s3">0</span><span class="s1">,</span>
+  <span class="s1">},</span>
+  <span class="s1">debugOverlay: {</span>
+    <span class="s1">bottom: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">width: </span><span class="s3">20</span><span class="s1">,</span>
+    <span class="s1">borderColor: </span><span class="s2">'blue'</span><span class="s1">,</span>
+    <span class="s1">borderWidth: </span><span class="s3">1</span><span class="s1">,</span>
+  <span class="s1">},</span>
+  <span class="s1">debugOverlayFrame: {</span>
+    <span class="s1">left: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">backgroundColor: </span><span class="s2">'orange'</span><span class="s1">,</span>
+  <span class="s1">},</span>
+  <span class="s1">debugOverlayFrameLast: {</span>
+    <span class="s1">left: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">borderColor: </span><span class="s2">'green'</span><span class="s1">,</span>
+    <span class="s1">borderWidth: </span><span class="s3">2</span><span class="s1">,</span>
+  <span class="s1">},</span>
+  <span class="s1">debugOverlayFrameVis: {</span>
+    <span class="s1">left: </span><span class="s3">0</span><span class="s1">,</span>
+    <span class="s1">borderColor: </span><span class="s2">'red'</span><span class="s1">,</span>
+    <span class="s1">borderWidth: </span><span class="s3">2</span><span class="s1">,</span>
+  <span class="s1">},</span>
+<span class="s1">});</span>
+
+<span class="s1">module.exports = VirtualizedList;</span>
+</pre>
+</body>
+</html>

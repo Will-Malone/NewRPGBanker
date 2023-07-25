@@ -1,0 +1,347 @@
+<html>
+<head>
+<title>Watcher.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Watcher.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @flow strict-local</span>
+ <span class="s0">*/</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">ChangeEventMetadata,</span>
+  <span class="s0">Console,</span>
+  <span class="s0">CrawlerOptions,</span>
+  <span class="s0">FileData,</span>
+  <span class="s0">Path,</span>
+  <span class="s0">PerfLogger,</span>
+  <span class="s0">WatchmanClocks,</span>
+<span class="s0">} from './flow-types';</span>
+<span class="s0">import type {WatcherOptions as WatcherBackendOptions} from './watchers/common';</span>
+<span class="s0">import type {AbortSignal} from 'node-abort-controller';</span>
+
+<span class="s0">import watchmanCrawl from './crawlers/watchman';</span>
+<span class="s0">import nodeCrawl from './crawlers/node';</span>
+<span class="s0">import WatchmanWatcher from './watchers/WatchmanWatcher';</span>
+<span class="s0">import FSEventsWatcher from './watchers/FSEventsWatcher';</span>
+<span class="s0">import NodeWatcher from './watchers/NodeWatcher';</span>
+<span class="s0">import * as path from 'path';</span>
+<span class="s0">import * as fs from 'fs';</span>
+<span class="s0">import {ADD_EVENT, CHANGE_EVENT} from './watchers/common';</span>
+<span class="s0">import EventEmitter from 'events';</span>
+<span class="s0">import {performance} from 'perf_hooks';</span>
+<span class="s0">import nullthrows from 'nullthrows';</span>
+
+<span class="s0">const debug = require('debug')('Metro:Watcher');</span>
+
+<span class="s0">const MAX_WAIT_TIME = 240000;</span>
+
+<span class="s0">type CrawlResult = {</span>
+  <span class="s0">changedFiles: FileData,</span>
+  <span class="s0">clocks?: WatchmanClocks,</span>
+  <span class="s0">removedFiles: FileData,</span>
+<span class="s0">};</span>
+
+<span class="s0">type WatcherOptions = {</span>
+  <span class="s0">abortSignal: AbortSignal,</span>
+  <span class="s0">computeSha1: boolean,</span>
+  <span class="s0">console: Console,</span>
+  <span class="s0">enableSymlinks: boolean,</span>
+  <span class="s0">extensions: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">forceNodeFilesystemAPI: boolean,</span>
+  <span class="s0">healthCheckFilePrefix: string,</span>
+  <span class="s0">ignore: string =&gt; boolean,</span>
+  <span class="s0">ignorePattern: RegExp,</span>
+  <span class="s0">previousState: CrawlerOptions['previousState'],</span>
+  <span class="s0">perfLogger: ?PerfLogger,</span>
+  <span class="s0">roots: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">rootDir: string,</span>
+  <span class="s0">useWatchman: boolean,</span>
+  <span class="s0">watch: boolean,</span>
+  <span class="s0">watchmanDeferStates: $ReadOnlyArray&lt;string&gt;,</span>
+<span class="s0">};</span>
+
+<span class="s0">interface WatcherBackend {</span>
+  <span class="s0">getPauseReason(): ?string;</span>
+  <span class="s0">close(): Promise&lt;void&gt;;</span>
+<span class="s0">}</span>
+
+<span class="s0">let nextInstanceId = 0;</span>
+
+<span class="s0">export type HealthCheckResult =</span>
+  <span class="s0">| {type: 'error', timeout: number, error: Error, watcher: ?string}</span>
+  <span class="s0">| {type: 'success', timeout: number, timeElapsed: number, watcher: ?string}</span>
+  <span class="s0">| {type: 'timeout', timeout: number, watcher: ?string, pauseReason: ?string};</span>
+
+<span class="s0">export class Watcher extends EventEmitter {</span>
+  <span class="s0">_options: WatcherOptions;</span>
+  <span class="s0">_backends: $ReadOnlyArray&lt;WatcherBackend&gt; = [];</span>
+  <span class="s0">_instanceId: number;</span>
+  <span class="s0">_nextHealthCheckId: number = 0;</span>
+  <span class="s0">_pendingHealthChecks: Map&lt;/* basename */ string, /* resolve */ () =&gt; void&gt; =</span>
+    <span class="s0">new Map();</span>
+  <span class="s0">_activeWatcher: ?string;</span>
+
+  <span class="s0">constructor(options: WatcherOptions) {</span>
+    <span class="s0">super();</span>
+    <span class="s0">this._options = options;</span>
+    <span class="s0">this._instanceId = nextInstanceId++;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async crawl(): Promise&lt;CrawlResult&gt; {</span>
+    <span class="s0">this._options.perfLogger?.point('crawl_start');</span>
+
+    <span class="s0">const options = this._options;</span>
+    <span class="s0">const ignore = (filePath: string) =&gt;</span>
+      <span class="s0">options.ignore(filePath) ||</span>
+      <span class="s0">path.basename(filePath).startsWith(this._options.healthCheckFilePrefix);</span>
+    <span class="s0">const crawl = options.useWatchman ? watchmanCrawl : nodeCrawl;</span>
+    <span class="s0">let crawler = crawl === watchmanCrawl ? 'watchman' : 'node';</span>
+
+    <span class="s0">options.abortSignal.throwIfAborted();</span>
+
+    <span class="s0">const crawlerOptions: CrawlerOptions = {</span>
+      <span class="s0">abortSignal: options.abortSignal,</span>
+      <span class="s0">computeSha1: options.computeSha1,</span>
+      <span class="s0">includeSymlinks: options.enableSymlinks,</span>
+      <span class="s0">extensions: options.extensions,</span>
+      <span class="s0">forceNodeFilesystemAPI: options.forceNodeFilesystemAPI,</span>
+      <span class="s0">ignore,</span>
+      <span class="s0">onStatus: status =&gt; {</span>
+        <span class="s0">this.emit('status', status);</span>
+      <span class="s0">},</span>
+      <span class="s0">perfLogger: options.perfLogger,</span>
+      <span class="s0">previousState: options.previousState,</span>
+      <span class="s0">rootDir: options.rootDir,</span>
+      <span class="s0">roots: options.roots,</span>
+    <span class="s0">};</span>
+
+    <span class="s0">const retry = (error: Error): Promise&lt;CrawlResult&gt; =&gt; {</span>
+      <span class="s0">if (crawl === watchmanCrawl) {</span>
+        <span class="s0">crawler = 'node';</span>
+        <span class="s0">options.console.warn(</span>
+          <span class="s0">'metro-file-map: Watchman crawl failed. Retrying once with node ' +</span>
+            <span class="s0">'crawler.\n' +</span>
+            <span class="s0">&quot;  Usually this happens when watchman isn't running. Create an &quot; +</span>
+            <span class="s0">&quot;empty `.watchmanconfig` file in your project's root folder or &quot; +</span>
+            <span class="s0">'initialize a git or hg repository in your project.\n' +</span>
+            <span class="s0">'  ' +</span>
+            <span class="s0">error.toString(),</span>
+        <span class="s0">);</span>
+        <span class="s0">// $FlowFixMe[prop-missing] Found when updating Promise type definition</span>
+        <span class="s0">return nodeCrawl(crawlerOptions).catch&lt;CrawlResult&gt;(e =&gt; {</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">'Crawler retry failed:\n' +</span>
+              <span class="s0">`  Original error: ${error.message}\n` +</span>
+              <span class="s0">`  Retry error: ${e.message}\n`,</span>
+          <span class="s0">);</span>
+        <span class="s0">});</span>
+      <span class="s0">}</span>
+
+      <span class="s0">throw error;</span>
+    <span class="s0">};</span>
+
+    <span class="s0">const logEnd = (delta: CrawlResult): CrawlResult =&gt; {</span>
+      <span class="s0">debug(</span>
+        <span class="s0">'Crawler &quot;%s&quot; returned %d added/modified, %d removed, %d clock(s).',</span>
+        <span class="s0">crawler,</span>
+        <span class="s0">delta.changedFiles.size,</span>
+        <span class="s0">delta.removedFiles.size,</span>
+        <span class="s0">delta.clocks?.size ?? 0,</span>
+      <span class="s0">);</span>
+      <span class="s0">this._options.perfLogger?.point('crawl_end');</span>
+      <span class="s0">return delta;</span>
+    <span class="s0">};</span>
+
+    <span class="s0">debug('Beginning crawl with &quot;%s&quot;.', crawler);</span>
+    <span class="s0">try {</span>
+      <span class="s0">// $FlowFixMe[incompatible-call] Found when updating Promise type definition</span>
+      <span class="s0">return crawl(crawlerOptions).catch&lt;CrawlResult&gt;(retry).then(logEnd);</span>
+    <span class="s0">} catch (error) {</span>
+      <span class="s0">return retry(error).then(logEnd);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async watch(</span>
+    <span class="s0">onChange: (</span>
+      <span class="s0">type: string,</span>
+      <span class="s0">filePath: string,</span>
+      <span class="s0">root: string,</span>
+      <span class="s0">metadata: ChangeEventMetadata,</span>
+    <span class="s0">) =&gt; void,</span>
+  <span class="s0">) {</span>
+    <span class="s0">const {extensions, ignorePattern, useWatchman} = this._options;</span>
+
+    <span class="s0">// WatchmanWatcher &gt; FSEventsWatcher &gt; sane.NodeWatcher</span>
+    <span class="s0">const WatcherImpl = useWatchman</span>
+      <span class="s0">? WatchmanWatcher</span>
+      <span class="s0">: FSEventsWatcher.isSupported()</span>
+      <span class="s0">? FSEventsWatcher</span>
+      <span class="s0">: NodeWatcher;</span>
+
+    <span class="s0">let watcher = 'node';</span>
+    <span class="s0">if (WatcherImpl === WatchmanWatcher) {</span>
+      <span class="s0">watcher = 'watchman';</span>
+    <span class="s0">} else if (WatcherImpl === FSEventsWatcher) {</span>
+      <span class="s0">watcher = 'fsevents';</span>
+    <span class="s0">}</span>
+    <span class="s0">debug(`Using watcher: ${watcher}`);</span>
+    <span class="s0">this._options.perfLogger?.annotate({string: {watcher}});</span>
+    <span class="s0">this._activeWatcher = watcher;</span>
+
+    <span class="s0">const createWatcherBackend = (root: Path): Promise&lt;WatcherBackend&gt; =&gt; {</span>
+      <span class="s0">const watcherOptions: WatcherBackendOptions = {</span>
+        <span class="s0">dot: true,</span>
+        <span class="s0">glob: [</span>
+          <span class="s0">// Ensure we always include package.json files, which are crucial for</span>
+          <span class="s0">/// module resolution.</span>
+          <span class="s0">'**/package.json',</span>
+          <span class="s0">// Ensure we always watch any health check files</span>
+          <span class="s0">'**/' + this._options.healthCheckFilePrefix + '*',</span>
+          <span class="s0">...extensions.map(extension =&gt; '**/*.' + extension),</span>
+        <span class="s0">],</span>
+        <span class="s0">ignored: ignorePattern,</span>
+        <span class="s0">watchmanDeferStates: this._options.watchmanDeferStates,</span>
+      <span class="s0">};</span>
+      <span class="s0">const watcher = new WatcherImpl(root, watcherOptions);</span>
+
+      <span class="s0">return new Promise((resolve, reject) =&gt; {</span>
+        <span class="s0">const rejectTimeout = setTimeout(</span>
+          <span class="s0">() =&gt; reject(new Error('Failed to start watch mode.')),</span>
+          <span class="s0">MAX_WAIT_TIME,</span>
+        <span class="s0">);</span>
+
+        <span class="s0">watcher.once('ready', () =&gt; {</span>
+          <span class="s0">clearTimeout(rejectTimeout);</span>
+          <span class="s0">watcher.on(</span>
+            <span class="s0">'all',</span>
+            <span class="s0">(</span>
+              <span class="s0">type: string,</span>
+              <span class="s0">filePath: string,</span>
+              <span class="s0">root: string,</span>
+              <span class="s0">metadata: ChangeEventMetadata,</span>
+            <span class="s0">) =&gt; {</span>
+              <span class="s0">const basename = path.basename(filePath);</span>
+              <span class="s0">if (basename.startsWith(this._options.healthCheckFilePrefix)) {</span>
+                <span class="s0">if (type === ADD_EVENT || type === CHANGE_EVENT) {</span>
+                  <span class="s0">debug(</span>
+                    <span class="s0">'Observed possible health check cookie: %s in %s',</span>
+                    <span class="s0">filePath,</span>
+                    <span class="s0">root,</span>
+                  <span class="s0">);</span>
+                  <span class="s0">this._handleHealthCheckObservation(basename);</span>
+                <span class="s0">}</span>
+                <span class="s0">return;</span>
+              <span class="s0">}</span>
+              <span class="s0">onChange(type, filePath, root, metadata);</span>
+            <span class="s0">},</span>
+          <span class="s0">);</span>
+          <span class="s0">resolve(watcher);</span>
+        <span class="s0">});</span>
+      <span class="s0">});</span>
+    <span class="s0">};</span>
+
+    <span class="s0">this._backends = await Promise.all(</span>
+      <span class="s0">this._options.roots.map(createWatcherBackend),</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_handleHealthCheckObservation(basename: string) {</span>
+    <span class="s0">const resolveHealthCheck = this._pendingHealthChecks.get(basename);</span>
+    <span class="s0">if (!resolveHealthCheck) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+    <span class="s0">resolveHealthCheck();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async close() {</span>
+    <span class="s0">await Promise.all(this._backends.map(watcher =&gt; watcher.close()));</span>
+    <span class="s0">this._activeWatcher = null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async checkHealth(timeout: number): Promise&lt;HealthCheckResult&gt; {</span>
+    <span class="s0">const healthCheckId = this._nextHealthCheckId++;</span>
+    <span class="s0">if (healthCheckId === Number.MAX_SAFE_INTEGER) {</span>
+      <span class="s0">this._nextHealthCheckId = 0;</span>
+    <span class="s0">}</span>
+    <span class="s0">const watcher = this._activeWatcher;</span>
+    <span class="s0">const basename =</span>
+      <span class="s0">this._options.healthCheckFilePrefix +</span>
+      <span class="s0">'-' +</span>
+      <span class="s0">process.pid +</span>
+      <span class="s0">'-' +</span>
+      <span class="s0">this._instanceId +</span>
+      <span class="s0">'-' +</span>
+      <span class="s0">healthCheckId;</span>
+    <span class="s0">const healthCheckPath = path.join(this._options.rootDir, basename);</span>
+    <span class="s0">let result: ?HealthCheckResult;</span>
+    <span class="s0">const timeoutPromise = new Promise(resolve =&gt;</span>
+      <span class="s0">setTimeout(resolve, timeout),</span>
+    <span class="s0">).then(() =&gt; {</span>
+      <span class="s0">if (!result) {</span>
+        <span class="s0">result = {</span>
+          <span class="s0">type: 'timeout',</span>
+          <span class="s0">pauseReason: this._backends[0]?.getPauseReason(),</span>
+          <span class="s0">timeout,</span>
+          <span class="s0">watcher,</span>
+        <span class="s0">};</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+    <span class="s0">const startTime = performance.now();</span>
+    <span class="s0">debug('Creating health check cookie: %s', healthCheckPath);</span>
+    <span class="s0">const creationPromise = fs.promises</span>
+      <span class="s0">.writeFile(healthCheckPath, String(startTime))</span>
+      <span class="s0">.catch(error =&gt; {</span>
+        <span class="s0">if (!result) {</span>
+          <span class="s0">result = {</span>
+            <span class="s0">type: 'error',</span>
+            <span class="s0">error,</span>
+            <span class="s0">timeout,</span>
+            <span class="s0">watcher,</span>
+          <span class="s0">};</span>
+        <span class="s0">}</span>
+      <span class="s0">});</span>
+    <span class="s0">const observationPromise = new Promise(resolve =&gt; {</span>
+      <span class="s0">this._pendingHealthChecks.set(basename, resolve);</span>
+    <span class="s0">}).then(() =&gt; {</span>
+      <span class="s0">if (!result) {</span>
+        <span class="s0">result = {</span>
+          <span class="s0">type: 'success',</span>
+          <span class="s0">timeElapsed: performance.now() - startTime,</span>
+          <span class="s0">timeout,</span>
+          <span class="s0">watcher,</span>
+        <span class="s0">};</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+    <span class="s0">await Promise.race([</span>
+      <span class="s0">timeoutPromise,</span>
+      <span class="s0">creationPromise.then(() =&gt; observationPromise),</span>
+    <span class="s0">]);</span>
+    <span class="s0">this._pendingHealthChecks.delete(basename);</span>
+    <span class="s0">// Chain a deletion to the creation promise (which may not have even settled yet!),</span>
+    <span class="s0">// don't await it, and swallow errors. This is just best-effort cleanup.</span>
+    <span class="s0">// $FlowFixMe[unused-promise]</span>
+    <span class="s0">creationPromise.then(() =&gt;</span>
+      <span class="s0">fs.promises.unlink(healthCheckPath).catch(() =&gt; {}),</span>
+    <span class="s0">);</span>
+    <span class="s0">debug('Health check result: %o', result);</span>
+    <span class="s0">return nullthrows(result);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+</pre>
+</body>
+</html>

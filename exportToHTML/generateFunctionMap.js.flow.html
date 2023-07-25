@@ -1,0 +1,604 @@
+<html>
+<head>
+<title>generateFunctionMap.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+generateFunctionMap.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {MetroBabelFileMetadata} from 'metro-babel-transformer';</span>
+<span class="s0">import type {FBSourceFunctionMap} from './source-map';</span>
+<span class="s0">import type {PluginObj} from '@babel/core';</span>
+<span class="s0">import type {NodePath} from '@babel/traverse';</span>
+<span class="s0">import type {Node} from '@babel/types';</span>
+
+<span class="s0">import traverse from '@babel/traverse';</span>
+<span class="s0">import {</span>
+  <span class="s0">isAssignmentExpression,</span>
+  <span class="s0">isClassBody,</span>
+  <span class="s0">isClassMethod,</span>
+  <span class="s0">isClassProperty,</span>
+  <span class="s0">isExportDefaultDeclaration,</span>
+  <span class="s0">isIdentifier,</span>
+  <span class="s0">isImport,</span>
+  <span class="s0">isJSXAttribute,</span>
+  <span class="s0">isJSXElement,</span>
+  <span class="s0">isJSXExpressionContainer,</span>
+  <span class="s0">isJSXIdentifier,</span>
+  <span class="s0">isLiteral,</span>
+  <span class="s0">isNullLiteral,</span>
+  <span class="s0">isObjectExpression,</span>
+  <span class="s0">isObjectMethod,</span>
+  <span class="s0">isObjectProperty,</span>
+  <span class="s0">isProgram,</span>
+  <span class="s0">isRegExpLiteral,</span>
+  <span class="s0">isTemplateLiteral,</span>
+  <span class="s0">isTypeCastExpression,</span>
+  <span class="s0">isVariableDeclarator,</span>
+<span class="s0">} from '@babel/types';</span>
+
+<span class="s0">const B64Builder = require('./B64Builder');</span>
+<span class="s0">const t = require('@babel/types');</span>
+<span class="s0">const invariant = require('invariant');</span>
+<span class="s0">const nullthrows = require('nullthrows');</span>
+<span class="s0">const fsPath = require('path');</span>
+
+<span class="s0">type Position = {</span>
+  <span class="s0">line: number,</span>
+  <span class="s0">column: number,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+<span class="s0">type RangeMapping = {</span>
+  <span class="s0">name: string,</span>
+  <span class="s0">start: Position,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+<span class="s0">type FunctionMapVisitor = {</span>
+  <span class="s0">enter: (</span>
+    <span class="s0">path:</span>
+      <span class="s0">| NodePath&lt;BabelNodeProgram&gt;</span>
+      <span class="s0">| NodePath&lt;BabelNodeFunction&gt;</span>
+      <span class="s0">| NodePath&lt;BabelNodeClass&gt;,</span>
+  <span class="s0">) =&gt; void,</span>
+  <span class="s0">exit: (</span>
+    <span class="s0">path:</span>
+      <span class="s0">| NodePath&lt;BabelNodeProgram&gt;</span>
+      <span class="s0">| NodePath&lt;BabelNodeFunction&gt;</span>
+      <span class="s0">| NodePath&lt;BabelNodeClass&gt;,</span>
+  <span class="s0">) =&gt; void,</span>
+<span class="s0">};</span>
+<span class="s0">export type Context = {filename?: ?string, ...};</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Generate a map of source positions to function names. The names are meant to</span>
+ <span class="s0">* describe the stack frame in an error trace and may contain more contextual</span>
+ <span class="s0">* information than just the actual name of the function.</span>
+ <span class="s0">*</span>
+ <span class="s0">* The output is encoded for use in a source map. For details about the format,</span>
+ <span class="s0">* see MappingEncoder below.</span>
+ <span class="s0">*/</span>
+<span class="s0">function generateFunctionMap(</span>
+  <span class="s0">ast: BabelNode,</span>
+  <span class="s0">context?: Context,</span>
+<span class="s0">): FBSourceFunctionMap {</span>
+  <span class="s0">const encoder = new MappingEncoder();</span>
+  <span class="s0">forEachMapping(ast, context, mapping =&gt; encoder.push(mapping));</span>
+  <span class="s0">return encoder.getResult();</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Same as generateFunctionMap, but returns the raw array of mappings instead</span>
+ <span class="s0">* of encoding it for use in a source map.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Lines are 1-based and columns are 0-based.</span>
+ <span class="s0">*/</span>
+<span class="s0">function generateFunctionMappingsArray(</span>
+  <span class="s0">ast: BabelNode,</span>
+  <span class="s0">context?: Context,</span>
+<span class="s0">): $ReadOnlyArray&lt;RangeMapping&gt; {</span>
+  <span class="s0">const mappings = [];</span>
+  <span class="s0">forEachMapping(ast, context, mapping =&gt; {</span>
+    <span class="s0">mappings.push(mapping);</span>
+  <span class="s0">});</span>
+  <span class="s0">return mappings;</span>
+<span class="s0">}</span>
+
+<span class="s0">function functionMapBabelPlugin(): PluginObj&lt;&gt; {</span>
+  <span class="s0">return {</span>
+    <span class="s0">// Eagerly traverse the tree on `pre`, before any visitors have run, so</span>
+    <span class="s0">// that regardless of plugin order we're dealing with the AST before any</span>
+    <span class="s0">// mutations.</span>
+    <span class="s0">visitor: {},</span>
+    <span class="s0">pre: ({path, metadata, opts}) =&gt; {</span>
+      <span class="s0">const {filename} = nullthrows(opts);</span>
+      <span class="s0">const encoder = new MappingEncoder();</span>
+      <span class="s0">const visitor = getFunctionMapVisitor({filename}, mapping =&gt;</span>
+        <span class="s0">encoder.push(mapping),</span>
+      <span class="s0">);</span>
+      <span class="s0">invariant(</span>
+        <span class="s0">path &amp;&amp; t.isProgram(path.node),</span>
+        <span class="s0">'path missing or not a program node',</span>
+      <span class="s0">);</span>
+      <span class="s0">// $FlowFixMe[prop-missing] checked above</span>
+      <span class="s0">// $FlowFixMe[incompatible-type-arg] checked above</span>
+      <span class="s0">const programPath: NodePath&lt;BabelNodeProgram&gt; = path;</span>
+
+      <span class="s0">visitor.enter(programPath);</span>
+      <span class="s0">programPath.traverse({</span>
+        <span class="s0">Function: visitor,</span>
+        <span class="s0">Class: visitor,</span>
+      <span class="s0">});</span>
+      <span class="s0">visitor.exit(programPath);</span>
+
+      <span class="s0">// $FlowFixMe[prop-missing] Babel `File` is not generically typed</span>
+      <span class="s0">const metroMetadata: MetroBabelFileMetadata = metadata;</span>
+
+      <span class="s0">const functionMap = encoder.getResult();</span>
+
+      <span class="s0">// Set the result on a metadata property</span>
+      <span class="s0">if (!metroMetadata.metro) {</span>
+        <span class="s0">metroMetadata.metro = {functionMap};</span>
+      <span class="s0">} else {</span>
+        <span class="s0">metroMetadata.metro.functionMap = functionMap;</span>
+      <span class="s0">}</span>
+    <span class="s0">},</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">function getFunctionMapVisitor(</span>
+  <span class="s0">context: ?Context,</span>
+  <span class="s0">pushMapping: RangeMapping =&gt; void,</span>
+<span class="s0">): FunctionMapVisitor {</span>
+  <span class="s0">const nameStack: Array&lt;{loc: BabelNodeSourceLocation, name: string}&gt; = [];</span>
+  <span class="s0">let tailPos = {line: 1, column: 0};</span>
+  <span class="s0">let tailName = null;</span>
+
+  <span class="s0">function advanceToPos(pos: {column: number, line: number}) {</span>
+    <span class="s0">if (tailPos &amp;&amp; positionGreater(pos, tailPos)) {</span>
+      <span class="s0">const name = nameStack[0].name; // We always have at least Program</span>
+      <span class="s0">if (name !== tailName) {</span>
+        <span class="s0">pushMapping({</span>
+          <span class="s0">name,</span>
+          <span class="s0">start: {line: tailPos.line, column: tailPos.column},</span>
+        <span class="s0">});</span>
+        <span class="s0">tailName = name;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">tailPos = pos;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">function pushFrame(name: string, loc: BabelNodeSourceLocation) {</span>
+    <span class="s0">advanceToPos(loc.start);</span>
+    <span class="s0">nameStack.unshift({name, loc});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">function popFrame() {</span>
+    <span class="s0">const top = nameStack[0];</span>
+    <span class="s0">if (top) {</span>
+      <span class="s0">const {loc} = top;</span>
+      <span class="s0">advanceToPos(loc.end);</span>
+      <span class="s0">nameStack.shift();</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (!context) {</span>
+    <span class="s0">context = {};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const basename = context.filename</span>
+    <span class="s0">? fsPath.basename(context.filename).replace(/\..+$/, '')</span>
+    <span class="s0">: null;</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">enter(path) {</span>
+      <span class="s0">let name = getNameForPath(path);</span>
+      <span class="s0">if (basename) {</span>
+        <span class="s0">name = removeNamePrefix(name, basename);</span>
+      <span class="s0">}</span>
+      <span class="s0">pushFrame(name, nullthrows(path.node.loc));</span>
+    <span class="s0">},</span>
+
+    <span class="s0">exit(path) {</span>
+      <span class="s0">popFrame();</span>
+    <span class="s0">},</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Traverses a Babel AST and calls the supplied callback with function name</span>
+ <span class="s0">* mappings, one at a time.</span>
+ <span class="s0">*/</span>
+<span class="s0">function forEachMapping(</span>
+  <span class="s0">ast: BabelNode,</span>
+  <span class="s0">context: ?Context,</span>
+  <span class="s0">pushMapping: RangeMapping =&gt; void,</span>
+<span class="s0">) {</span>
+  <span class="s0">const visitor = getFunctionMapVisitor(context, pushMapping);</span>
+
+  <span class="s0">// Traversing populates/pollutes the path cache (`traverse.cache.path`) with</span>
+  <span class="s0">// values missing the `hub` property needed by Babel transformation, so we</span>
+  <span class="s0">// save, clear, and restore the cache around our traversal.</span>
+  <span class="s0">// See: https://github.com/facebook/metro/pull/854#issuecomment-1336499395</span>
+  <span class="s0">const previousCache = traverse.cache.path;</span>
+  <span class="s0">traverse.cache.clearPath();</span>
+  <span class="s0">traverse(ast, {</span>
+    <span class="s0">// Our visitor doesn't care about scope</span>
+    <span class="s0">noScope: true,</span>
+
+    <span class="s0">Function: visitor,</span>
+    <span class="s0">Program: visitor,</span>
+    <span class="s0">Class: visitor,</span>
+  <span class="s0">});</span>
+  <span class="s0">traverse.cache.path = previousCache;</span>
+<span class="s0">}</span>
+
+<span class="s0">const ANONYMOUS_NAME = '&lt;anonymous&gt;';</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Derive a contextual name for the given AST node (Function, Program, Class or</span>
+ <span class="s0">* ObjectExpression).</span>
+ <span class="s0">*/</span>
+<span class="s0">function getNameForPath(path: NodePath&lt;&gt;): string {</span>
+  <span class="s0">const {node, parent, parentPath} = path;</span>
+  <span class="s0">if (isProgram(node)) {</span>
+    <span class="s0">return '&lt;global&gt;';</span>
+  <span class="s0">}</span>
+
+  <span class="s0">let {id} = (path: any);</span>
+  <span class="s0">// has an `id` so we don't need to infer one</span>
+  <span class="s0">if (node.id) {</span>
+    <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+    <span class="s0">return node.id.name;</span>
+  <span class="s0">}</span>
+  <span class="s0">let propertyPath;</span>
+  <span class="s0">let kind: ?string;</span>
+
+  <span class="s0">// Find or construct an AST node that names the current node.</span>
+  <span class="s0">if (isObjectMethod(node) || isClassMethod(node)) {</span>
+    <span class="s0">// ({ foo() {} });</span>
+    <span class="s0">id = node.key;</span>
+    <span class="s0">if (node.kind !== 'method' &amp;&amp; node.kind !== 'constructor') {</span>
+      <span class="s0">// Store the method's kind so we can add it to the final name.</span>
+      <span class="s0">kind = node.kind;</span>
+    <span class="s0">}</span>
+    <span class="s0">// Also store the path to the property so we can find its context</span>
+    <span class="s0">// (object/class) later and add _its_ name to the result.</span>
+    <span class="s0">propertyPath = path;</span>
+  <span class="s0">} else if (isObjectProperty(parent) || isClassProperty(parent)) {</span>
+    <span class="s0">// ({ foo: function() {} });</span>
+    <span class="s0">id = parent.key;</span>
+    <span class="s0">// Also store the path to the property so we can find its context</span>
+    <span class="s0">// (object/class) later and add _its_ name to the result.</span>
+    <span class="s0">propertyPath = parentPath;</span>
+  <span class="s0">} else if (isVariableDeclarator(parent)) {</span>
+    <span class="s0">// let foo = function () {};</span>
+    <span class="s0">id = parent.id;</span>
+  <span class="s0">} else if (isAssignmentExpression(parent)) {</span>
+    <span class="s0">// foo = function () {};</span>
+    <span class="s0">id = parent.left;</span>
+  <span class="s0">} else if (isJSXExpressionContainer(parent)) {</span>
+    <span class="s0">const grandParentNode = parentPath?.parentPath?.node;</span>
+    <span class="s0">if (isJSXElement(grandParentNode)) {</span>
+      <span class="s0">// &lt;foo&gt;{function () {}}&lt;/foo&gt;</span>
+      <span class="s0">const openingElement = grandParentNode.openingElement;</span>
+      <span class="s0">id = t.jsxMemberExpression(</span>
+        <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+        <span class="s0">t.jsxMemberExpression(openingElement.name, t.jsxIdentifier('props')),</span>
+        <span class="s0">t.jsxIdentifier('children'),</span>
+      <span class="s0">);</span>
+    <span class="s0">} else if (isJSXAttribute(grandParentNode)) {</span>
+      <span class="s0">// &lt;foo bar={function () {}} /&gt;</span>
+      <span class="s0">const openingElement = parentPath?.parentPath?.parentPath?.node;</span>
+      <span class="s0">const prop = grandParentNode;</span>
+      <span class="s0">id = t.jsxMemberExpression(</span>
+        <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+        <span class="s0">t.jsxMemberExpression(openingElement.name, t.jsxIdentifier('props')),</span>
+        <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+        <span class="s0">prop.name,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Collapse the name AST, if any, into a string.</span>
+  <span class="s0">let name = getNameFromId(id);</span>
+
+  <span class="s0">if (name == null) {</span>
+    <span class="s0">// We couldn't find a name directly. Try the parent in certain cases.</span>
+    <span class="s0">if (isAnyCallExpression(parent)) {</span>
+      <span class="s0">// foo(function () {})</span>
+      <span class="s0">const argIndex = parent.arguments.indexOf(node);</span>
+      <span class="s0">if (argIndex !== -1) {</span>
+        <span class="s0">const calleeName = getNameFromId(parent.callee);</span>
+        <span class="s0">// var f = Object.freeze(function () {})</span>
+        <span class="s0">if (argIndex === 0 &amp;&amp; calleeName === 'Object.freeze') {</span>
+          <span class="s0">return getNameForPath(nullthrows(parentPath));</span>
+        <span class="s0">}</span>
+        <span class="s0">// var f = useCallback(function () {})</span>
+        <span class="s0">if (</span>
+          <span class="s0">argIndex === 0 &amp;&amp;</span>
+          <span class="s0">(calleeName === 'useCallback' || calleeName === 'React.useCallback')</span>
+        <span class="s0">) {</span>
+          <span class="s0">return getNameForPath(nullthrows(parentPath));</span>
+        <span class="s0">}</span>
+        <span class="s0">if (calleeName) {</span>
+          <span class="s0">return `${calleeName}$argument_${argIndex}`;</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">if (isTypeCastExpression(parent) &amp;&amp; parent.expression === node) {</span>
+      <span class="s0">return getNameForPath(nullthrows(parentPath));</span>
+    <span class="s0">}</span>
+    <span class="s0">if (isExportDefaultDeclaration(parent)) {</span>
+      <span class="s0">return 'default';</span>
+    <span class="s0">}</span>
+    <span class="s0">// We couldn't infer a name at all.</span>
+    <span class="s0">return ANONYMOUS_NAME;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Annotate getters and setters.</span>
+  <span class="s0">if (kind != null) {</span>
+    <span class="s0">name = kind + '__' + name;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Annotate members with the name of their containing object/class.</span>
+  <span class="s0">if (propertyPath) {</span>
+    <span class="s0">if (isClassBody(propertyPath.parent)) {</span>
+      <span class="s0">// $FlowFixMe Discovered when typing babel-traverse</span>
+      <span class="s0">const className = getNameForPath(propertyPath.parentPath.parentPath);</span>
+      <span class="s0">if (className !== ANONYMOUS_NAME) {</span>
+        <span class="s0">const separator = propertyPath.node.static ? '.' : '#';</span>
+        <span class="s0">name = className + separator + name;</span>
+      <span class="s0">}</span>
+    <span class="s0">} else if (isObjectExpression(propertyPath.parent)) {</span>
+      <span class="s0">const objectName = getNameForPath(nullthrows(propertyPath.parentPath));</span>
+      <span class="s0">if (objectName !== ANONYMOUS_NAME) {</span>
+        <span class="s0">name = objectName + '.' + name;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return name;</span>
+<span class="s0">}</span>
+
+<span class="s0">function isAnyCallExpression(node: Node): boolean %checks {</span>
+  <span class="s0">return (</span>
+    <span class="s0">node.type === 'CallExpression' ||</span>
+    <span class="s0">node.type === 'NewExpression' ||</span>
+    <span class="s0">node.type === 'OptionalCallExpression'</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function isAnyMemberExpression(node: Node): boolean %checks {</span>
+  <span class="s0">return (</span>
+    <span class="s0">node.type === 'MemberExpression' ||</span>
+    <span class="s0">node.type === 'JSXMemberExpression' ||</span>
+    <span class="s0">node.type === 'OptionalMemberExpression'</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function isAnyIdentifier(node: Node): boolean %checks {</span>
+  <span class="s0">return isIdentifier(node) || isJSXIdentifier(node);</span>
+<span class="s0">}</span>
+
+<span class="s0">function getNameFromId(id: Node): ?string {</span>
+  <span class="s0">const parts = getNamePartsFromId(id);</span>
+
+  <span class="s0">if (!parts.length) {</span>
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+  <span class="s0">if (parts.length &gt; 5) {</span>
+    <span class="s0">return (</span>
+      <span class="s0">parts[0] +</span>
+      <span class="s0">'.' +</span>
+      <span class="s0">parts[1] +</span>
+      <span class="s0">'...' +</span>
+      <span class="s0">parts[parts.length - 2] +</span>
+      <span class="s0">'.' +</span>
+      <span class="s0">parts[parts.length - 1]</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+  <span class="s0">return parts.join('.');</span>
+<span class="s0">}</span>
+
+<span class="s0">function getNamePartsFromId(id: Node): $ReadOnlyArray&lt;string&gt; {</span>
+  <span class="s0">if (!id) {</span>
+    <span class="s0">return [];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (isAnyCallExpression(id)) {</span>
+    <span class="s0">return getNamePartsFromId(id.callee);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (isTypeCastExpression(id)) {</span>
+    <span class="s0">return getNamePartsFromId(id.expression);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">let name;</span>
+
+  <span class="s0">if (isAnyIdentifier(id)) {</span>
+    <span class="s0">name = id.name;</span>
+  <span class="s0">} else if (isNullLiteral(id)) {</span>
+    <span class="s0">name = 'null';</span>
+  <span class="s0">} else if (isRegExpLiteral(id)) {</span>
+    <span class="s0">name = `_${id.pattern}_${id.flags ?? ''}`;</span>
+  <span class="s0">} else if (isTemplateLiteral(id)) {</span>
+    <span class="s0">name = id.quasis.map(quasi =&gt; quasi.value.raw).join('');</span>
+  <span class="s0">} else if (isLiteral(id) &amp;&amp; id.value != null) {</span>
+    <span class="s0">name = String(id.value);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (name != null) {</span>
+    <span class="s0">return [t.toBindingIdentifierName(name)];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (isImport(id)) {</span>
+    <span class="s0">name = 'import';</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (name != null) {</span>
+    <span class="s0">return [name];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (isAnyMemberExpression(id)) {</span>
+    <span class="s0">if (</span>
+      <span class="s0">isAnyIdentifier(id.object) &amp;&amp;</span>
+      <span class="s0">id.object.name === 'Symbol' &amp;&amp;</span>
+      <span class="s0">(isAnyIdentifier(id.property) || isLiteral(id.property))</span>
+    <span class="s0">) {</span>
+      <span class="s0">const propertyName = getNameFromId(id.property);</span>
+      <span class="s0">if (propertyName) {</span>
+        <span class="s0">name = '@@' + propertyName;</span>
+      <span class="s0">}</span>
+    <span class="s0">} else {</span>
+      <span class="s0">const propertyName = getNamePartsFromId(id.property);</span>
+      <span class="s0">if (propertyName.length) {</span>
+        <span class="s0">const objectName = getNamePartsFromId(id.object);</span>
+        <span class="s0">if (objectName.length) {</span>
+          <span class="s0">return [...objectName, ...propertyName];</span>
+        <span class="s0">} else {</span>
+          <span class="s0">return propertyName;</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return name ? [name] : [];</span>
+<span class="s0">}</span>
+
+<span class="s0">const DELIMITER_START_RE = /^[^A-Za-z0-9_$@]+/;</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Strip the given prefix from `name`, if it occurs there, plus any delimiter</span>
+ <span class="s0">* characters that follow (of which at least one is required). If an empty</span>
+ <span class="s0">* string would be returned, return the original name instead.</span>
+ <span class="s0">*/</span>
+<span class="s0">function removeNamePrefix(name: string, namePrefix: string): string {</span>
+  <span class="s0">if (!namePrefix.length || !name.startsWith(namePrefix)) {</span>
+    <span class="s0">return name;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const shortenedName = name.substr(namePrefix.length);</span>
+  <span class="s0">const [delimiterMatch] = shortenedName.match(DELIMITER_START_RE) || [];</span>
+  <span class="s0">if (delimiterMatch) {</span>
+    <span class="s0">return shortenedName.substr(delimiterMatch.length) || name;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return name;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Encodes function name mappings as deltas in a Base64 VLQ format inspired by</span>
+ <span class="s0">* the standard source map format.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Mappings on different lines are separated with a single `;` (even if there</span>
+ <span class="s0">* are multiple intervening lines).</span>
+ <span class="s0">* Mappings on the same line are separated with `,`.</span>
+ <span class="s0">*</span>
+ <span class="s0">* The first mapping of a line has the fields:</span>
+ <span class="s0">*  [column delta, name delta, line delta]</span>
+ <span class="s0">*</span>
+ <span class="s0">* where the column delta is relative to the beginning of the line, the name</span>
+ <span class="s0">* delta is relative to the previously occurring name, and the line delta is</span>
+ <span class="s0">* relative to the previously occurring line.</span>
+ <span class="s0">*</span>
+ <span class="s0">* The 2...nth other mappings of a line have the fields:</span>
+ <span class="s0">*  [column delta, name delta]</span>
+ <span class="s0">*</span>
+ <span class="s0">* where both fields are relative to their previous running values. The line</span>
+ <span class="s0">* delta is omitted since it is always 0 by definition.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Lines and columns are both 0-based in the serialised format. In memory,</span>
+ <span class="s0">* lines are 1-based while columns are 0-based.</span>
+ <span class="s0">*/</span>
+<span class="s0">class MappingEncoder {</span>
+  <span class="s0">_namesMap: Map&lt;string, number&gt;;</span>
+  <span class="s0">_names: Array&lt;string&gt;;</span>
+  <span class="s0">_line: RelativeValue;</span>
+  <span class="s0">_column: RelativeValue;</span>
+  <span class="s0">_nameIndex: RelativeValue;</span>
+  <span class="s0">_mappings: B64Builder;</span>
+
+  <span class="s0">constructor() {</span>
+    <span class="s0">this._namesMap = new Map();</span>
+    <span class="s0">this._names = [];</span>
+    <span class="s0">this._line = new RelativeValue(1);</span>
+    <span class="s0">this._column = new RelativeValue(0);</span>
+    <span class="s0">this._nameIndex = new RelativeValue(0);</span>
+    <span class="s0">this._mappings = new B64Builder();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getResult(): FBSourceFunctionMap {</span>
+    <span class="s0">return {names: this._names, mappings: this._mappings.toString()};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">push({name, start}: RangeMapping) {</span>
+    <span class="s0">let nameIndex = this._namesMap.get(name);</span>
+    <span class="s0">if (typeof nameIndex !== 'number') {</span>
+      <span class="s0">nameIndex = this._names.length;</span>
+      <span class="s0">this._names[nameIndex] = name;</span>
+      <span class="s0">this._namesMap.set(name, nameIndex);</span>
+    <span class="s0">}</span>
+    <span class="s0">const lineDelta = this._line.next(start.line);</span>
+    <span class="s0">const firstOfLine = this._mappings.pos === 0 || lineDelta &gt; 0;</span>
+    <span class="s0">if (lineDelta &gt; 0) {</span>
+      <span class="s0">// The next entry will have the line offset, so emit just one semicolon.</span>
+      <span class="s0">this._mappings.markLines(1);</span>
+      <span class="s0">this._column.reset(0);</span>
+    <span class="s0">}</span>
+    <span class="s0">this._mappings.startSegment(this._column.next(start.column));</span>
+    <span class="s0">this._mappings.append(this._nameIndex.next(nameIndex));</span>
+    <span class="s0">if (firstOfLine) {</span>
+      <span class="s0">this._mappings.append(lineDelta);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">class RelativeValue {</span>
+  <span class="s0">_value: number;</span>
+
+  <span class="s0">constructor(value: number = 0) {</span>
+    <span class="s0">this.reset(value);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">next(absoluteValue: number): number {</span>
+    <span class="s0">const delta = absoluteValue - this._value;</span>
+    <span class="s0">this._value = absoluteValue;</span>
+    <span class="s0">return delta;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">reset(value: number = 0) {</span>
+    <span class="s0">this._value = value;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function positionGreater(x: Position, y: Position) {</span>
+  <span class="s0">return x.line &gt; y.line || (x.line === y.line &amp;&amp; x.column &gt; y.column);</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">functionMapBabelPlugin,</span>
+  <span class="s0">generateFunctionMap,</span>
+  <span class="s0">generateFunctionMappingsArray,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

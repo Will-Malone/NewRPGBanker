@@ -1,0 +1,183 @@
+<html>
+<head>
+<title>ComponentDescriptorRegistry.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ComponentDescriptorRegistry.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ComponentDescriptorRegistry.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;componentNameByReactViewName.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/componentregistry/ComponentDescriptorProviderRegistry.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/PropsParserContext.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/ShadowNodeFragment.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;utility&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s1">ComponentDescriptorRegistry::ComponentDescriptorRegistry(</span>
+    <span class="s1">ComponentDescriptorParameters parameters</span><span class="s4">,</span>
+    <span class="s1">ComponentDescriptorProviderRegistry </span><span class="s4">const </span><span class="s1">&amp;providerRegistry</span><span class="s4">,</span>
+    <span class="s1">ContextContainer::Shared contextContainer)</span>
+    <span class="s1">: parameters_(std::move(parameters))</span><span class="s4">,</span>
+      <span class="s1">providerRegistry_(providerRegistry)</span><span class="s4">,</span>
+      <span class="s1">contextContainer_(std::move(contextContainer)) {}</span>
+
+<span class="s4">void </span><span class="s1">ComponentDescriptorRegistry::add(</span>
+    <span class="s1">ComponentDescriptorProvider componentDescriptorProvider) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::unique_lock lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">componentDescriptor = componentDescriptorProvider.constructor(</span>
+      <span class="s1">{parameters_.eventDispatcher</span><span class="s4">,</span>
+       <span class="s1">parameters_.contextContainer</span><span class="s4">,</span>
+       <span class="s1">componentDescriptorProvider.flavor})</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">componentDescriptor-&gt;getComponentHandle() ==</span>
+      <span class="s1">componentDescriptorProvider.handle)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">componentDescriptor-&gt;getComponentName() ==</span>
+      <span class="s1">componentDescriptorProvider.name)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">sharedComponentDescriptor = std::shared_ptr&lt;ComponentDescriptor </span><span class="s4">const</span><span class="s1">&gt;(</span>
+      <span class="s1">std::move(componentDescriptor))</span><span class="s4">;</span>
+  <span class="s1">_registryByHandle[componentDescriptorProvider.handle] =</span>
+      <span class="s1">sharedComponentDescriptor</span><span class="s4">;</span>
+  <span class="s1">_registryByName[componentDescriptorProvider.name] = sharedComponentDescriptor</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ComponentDescriptorRegistry::registerComponentDescriptor(</span>
+    <span class="s4">const </span><span class="s1">SharedComponentDescriptor &amp;componentDescriptor) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">ComponentHandle componentHandle = componentDescriptor-&gt;getComponentHandle()</span><span class="s4">;</span>
+  <span class="s1">_registryByHandle[componentHandle] = componentDescriptor</span><span class="s4">;</span>
+
+  <span class="s1">ComponentName componentName = componentDescriptor-&gt;getComponentName()</span><span class="s4">;</span>
+  <span class="s1">_registryByName[componentName] = componentDescriptor</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ComponentDescriptor </span><span class="s4">const </span><span class="s1">&amp;ComponentDescriptorRegistry::at(</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;componentName) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">unifiedComponentName = componentNameByReactViewName(componentName)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">it = _registryByName.find(unifiedComponentName)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(it == _registryByName.end()) {</span>
+    <span class="s1">lock.unlock()</span><span class="s4">;</span>
+    <span class="s1">providerRegistry_.request(unifiedComponentName.c_str())</span><span class="s4">;</span>
+    <span class="s1">lock.lock()</span><span class="s4">;</span>
+
+    <span class="s1">it = _registryByName.find(unifiedComponentName)</span><span class="s4">;</span>
+
+    <span class="s0">/* 
+     * TODO: T54849676 
+     * Uncomment the `assert` after the following block that checks 
+     * `_fallbackComponentDescriptor` is no longer needed. The assert assumes 
+     * that `componentDescriptorProviderRequest` is always not null and register 
+     * some component on every single request. 
+     */</span>
+    <span class="s0">// assert(it != _registryByName.end());</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(it == _registryByName.end()) {</span>
+    <span class="s4">if </span><span class="s1">(_fallbackComponentDescriptor == </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s4">throw </span><span class="s1">std::invalid_argument(</span>
+          <span class="s1">(</span><span class="s3">&quot;Unable to find componentDescriptor for &quot; </span><span class="s1">+ unifiedComponentName)</span>
+              <span class="s1">.c_str())</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">*_fallbackComponentDescriptor.get()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">*it-&gt;second</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ComponentDescriptor </span><span class="s4">const </span><span class="s1">*ComponentDescriptorRegistry::</span>
+    <span class="s1">findComponentDescriptorByHandle_DO_NOT_USE_THIS_IS_BROKEN(</span>
+        <span class="s1">ComponentHandle componentHandle) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">iterator = _registryByHandle.find(componentHandle)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(iterator == _registryByHandle.end()) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">iterator-&gt;second.get()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ComponentDescriptor </span><span class="s4">const </span><span class="s1">&amp;ComponentDescriptorRegistry::at(</span>
+    <span class="s1">ComponentHandle componentHandle) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">*_registryByHandle.at(componentHandle)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">ComponentDescriptorRegistry::hasComponentDescriptorAt(</span>
+    <span class="s1">ComponentHandle componentHandle) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">iterator = _registryByHandle.find(componentHandle)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">iterator != _registryByHandle.end()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Shared ComponentDescriptorRegistry::createNode(</span>
+    <span class="s1">Tag tag</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;viewName</span><span class="s4">,</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;propsDynamic</span><span class="s4">,</span>
+    <span class="s1">SharedEventTarget </span><span class="s4">const </span><span class="s1">&amp;eventTarget) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">unifiedComponentName = componentNameByReactViewName(viewName)</span><span class="s4">;</span>
+  <span class="s4">auto const </span><span class="s1">&amp;componentDescriptor = </span><span class="s4">this</span><span class="s1">-&gt;at(unifiedComponentName)</span><span class="s4">;</span>
+
+  <span class="s4">auto const </span><span class="s1">fragment = ShadowNodeFamilyFragment{tag</span><span class="s4">, </span><span class="s1">surfaceId</span><span class="s4">, nullptr</span><span class="s1">}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">family = componentDescriptor.createFamily(fragment</span><span class="s4">, </span><span class="s1">eventTarget)</span><span class="s4">;</span>
+  <span class="s4">auto const </span><span class="s1">props = componentDescriptor.cloneProps(</span>
+      <span class="s1">PropsParserContext{surfaceId</span><span class="s4">, </span><span class="s1">*contextContainer_.get()}</span><span class="s4">,</span>
+      <span class="s4">nullptr,</span>
+      <span class="s1">RawProps(propsDynamic))</span><span class="s4">;</span>
+  <span class="s4">auto const </span><span class="s1">state =</span>
+      <span class="s1">componentDescriptor.createInitialState(ShadowNodeFragment{props}</span><span class="s4">, </span><span class="s1">family)</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">componentDescriptor.createShadowNode(</span>
+      <span class="s1">{</span>
+          <span class="s0">/* .props = */ </span><span class="s1">props</span><span class="s4">,</span>
+          <span class="s0">/* .children = */ </span><span class="s1">ShadowNodeFragment::childrenPlaceholder()</span><span class="s4">,</span>
+          <span class="s0">/* .state = */ </span><span class="s1">state</span><span class="s4">,</span>
+      <span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">family)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ComponentDescriptorRegistry::setFallbackComponentDescriptor(</span>
+    <span class="s4">const </span><span class="s1">SharedComponentDescriptor &amp;descriptor) {</span>
+  <span class="s1">_fallbackComponentDescriptor = descriptor</span><span class="s4">;</span>
+  <span class="s1">registerComponentDescriptor(descriptor)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ComponentDescriptor::Shared</span>
+<span class="s1">ComponentDescriptorRegistry::getFallbackComponentDescriptor() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_fallbackComponentDescriptor</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

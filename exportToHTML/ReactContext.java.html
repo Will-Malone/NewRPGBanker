@@ -1,0 +1,601 @@
+<html>
+<head>
+<title>ReactContext.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #629755; font-weight: bold; font-style: italic;}
+.s5 { color: #6a8759;}
+.s6 { color: #77b767; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ReactContext.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.bridge</span><span class="s2">;</span>
+
+<span class="s2">import static </span><span class="s1">com.facebook.infer.annotation.ThreadConfined.UI</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.app.Activity</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.content.Context</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.content.ContextWrapper</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.content.Intent</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.os.Bundle</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.view.LayoutInflater</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.NonNull</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.ThreadConfined</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.proguard.annotations.DoNotStrip</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.interop.InteropModuleRegistry</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.queue.MessageQueueThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.queue.ReactQueueConfiguration</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.LifecycleState</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.ReactConstants</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.lang.ref.WeakReference</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Collection</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.CopyOnWriteArraySet</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* Abstract ContextWrapper for Android application or activity {</span><span class="s4">@link </span><span class="s3">Context} and {</span><span class="s4">@link</span>
+ <span class="s3">* CatalystInstance}</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">ReactContext </span><span class="s2">extends </span><span class="s1">ContextWrapper {</span>
+  <span class="s1">@DoNotStrip</span>
+  <span class="s2">public interface </span><span class="s1">RCTDeviceEventEmitter </span><span class="s2">extends </span><span class="s1">JavaScriptModule {</span>
+    <span class="s2">void </span><span class="s1">emit(@NonNull String eventName</span><span class="s2">, </span><span class="s1">@Nullable Object data)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static final </span><span class="s1">String TAG = </span><span class="s5">&quot;ReactContext&quot;</span><span class="s2">;</span>
+  <span class="s2">private static final </span><span class="s1">String EARLY_JS_ACCESS_EXCEPTION_MESSAGE =</span>
+      <span class="s5">&quot;Tried to access a JS module before the React instance was fully set up. Calls to &quot;</span>
+          <span class="s1">+ </span><span class="s5">&quot;ReactContext#getJSModule should only happen once initialize() has been called on your &quot;</span>
+          <span class="s1">+ </span><span class="s5">&quot;native module.&quot;</span><span class="s2">;</span>
+  <span class="s2">private static final </span><span class="s1">String LATE_JS_ACCESS_EXCEPTION_MESSAGE =</span>
+      <span class="s5">&quot;Tried to access a JS module after the React instance was destroyed.&quot;</span><span class="s2">;</span>
+  <span class="s2">private static final </span><span class="s1">String EARLY_NATIVE_MODULE_EXCEPTION_MESSAGE =</span>
+      <span class="s5">&quot;Trying to call native module before CatalystInstance has been set!&quot;</span><span class="s2">;</span>
+  <span class="s2">private static final </span><span class="s1">String LATE_NATIVE_MODULE_EXCEPTION_MESSAGE =</span>
+      <span class="s5">&quot;Trying to call native module after CatalystInstance has been destroyed!&quot;</span><span class="s2">;</span>
+
+  <span class="s2">private final </span><span class="s1">CopyOnWriteArraySet&lt;LifecycleEventListener&gt; mLifecycleEventListeners =</span>
+      <span class="s2">new </span><span class="s1">CopyOnWriteArraySet&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">CopyOnWriteArraySet&lt;ActivityEventListener&gt; mActivityEventListeners =</span>
+      <span class="s2">new </span><span class="s1">CopyOnWriteArraySet&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">CopyOnWriteArraySet&lt;WindowFocusChangeListener&gt; mWindowFocusEventListeners =</span>
+      <span class="s2">new </span><span class="s1">CopyOnWriteArraySet&lt;&gt;()</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">LifecycleState mLifecycleState = LifecycleState.BEFORE_CREATE</span><span class="s2">;</span>
+
+  <span class="s2">private volatile boolean </span><span class="s1">mDestroyed = </span><span class="s2">false;</span>
+  <span class="s2">private </span><span class="s1">@Nullable CatalystInstance mCatalystInstance</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable LayoutInflater mInflater</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable MessageQueueThread mUiMessageQueueThread</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable MessageQueueThread mNativeModulesMessageQueueThread</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable MessageQueueThread mJSMessageQueueThread</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable JSExceptionHandler mJSExceptionHandler</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable JSExceptionHandler mExceptionHandlerWrapper</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable WeakReference&lt;Activity&gt; mCurrentActivity</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">@Nullable InteropModuleRegistry mInteropModuleRegistry</span><span class="s2">;</span>
+  <span class="s2">private boolean </span><span class="s1">mIsInitialized = </span><span class="s2">false;</span>
+
+  <span class="s2">public </span><span class="s1">ReactContext(Context base) {</span>
+    <span class="s2">super</span><span class="s1">(base)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Set and initialize CatalystInstance for this Context. This should be called exactly once. */</span>
+  <span class="s2">public void </span><span class="s1">initializeWithInstance(CatalystInstance catalystInstance) {</span>
+    <span class="s2">if </span><span class="s1">(catalystInstance == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalArgumentException(</span><span class="s5">&quot;CatalystInstance cannot be null.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(mCatalystInstance != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;ReactContext has been already initialized&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(mDestroyed) {</span>
+      <span class="s1">ReactSoftExceptionLogger.logSoftException(</span>
+          <span class="s1">TAG</span><span class="s2">,</span>
+          <span class="s2">new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;Cannot initialize ReactContext after it has been destroyed.&quot;</span><span class="s1">))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">mCatalystInstance = catalystInstance</span><span class="s2">;</span>
+
+    <span class="s1">ReactQueueConfiguration queueConfig = catalystInstance.getReactQueueConfiguration()</span><span class="s2">;</span>
+    <span class="s1">initializeMessageQueueThreads(queueConfig)</span><span class="s2">;</span>
+    <span class="s1">initializeInteropModules()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Initialize message queue threads using a ReactQueueConfiguration. */</span>
+  <span class="s2">public synchronized void </span><span class="s1">initializeMessageQueueThreads(ReactQueueConfiguration queueConfig) {</span>
+    <span class="s1">FLog.w(TAG</span><span class="s2">, </span><span class="s5">&quot;initializeMessageQueueThreads() is called.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mUiMessageQueueThread != </span><span class="s2">null</span>
+        <span class="s1">|| mNativeModulesMessageQueueThread != </span><span class="s2">null</span>
+        <span class="s1">|| mJSMessageQueueThread != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;Message queue threads already initialized&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mUiMessageQueueThread = queueConfig.getUIQueueThread()</span><span class="s2">;</span>
+    <span class="s1">mNativeModulesMessageQueueThread = queueConfig.getNativeModulesQueueThread()</span><span class="s2">;</span>
+    <span class="s1">mJSMessageQueueThread = queueConfig.getJSQueueThread()</span><span class="s2">;</span>
+
+    <span class="s3">/** TODO(T85807990): Fail fast if any of the threads is null. */</span>
+    <span class="s2">if </span><span class="s1">(mUiMessageQueueThread == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;UI thread is null&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(mNativeModulesMessageQueueThread == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;NativeModules thread is null&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(mJSMessageQueueThread == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;JavaScript thread is null&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mIsInitialized = </span><span class="s2">true;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">protected void </span><span class="s1">initializeInteropModules() {</span>
+    <span class="s1">mInteropModuleRegistry = </span><span class="s2">new </span><span class="s1">InteropModuleRegistry()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">protected void </span><span class="s1">initializeInteropModules(ReactContext reactContext) {</span>
+    <span class="s1">mInteropModuleRegistry = reactContext.mInteropModuleRegistry</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">resetPerfStats() {</span>
+    <span class="s2">if </span><span class="s1">(mNativeModulesMessageQueueThread != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mNativeModulesMessageQueueThread.resetPerfStats()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(mJSMessageQueueThread != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mJSMessageQueueThread.resetPerfStats()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">setJSExceptionHandler(@Nullable JSExceptionHandler jSExceptionHandler) {</span>
+    <span class="s1">mJSExceptionHandler = jSExceptionHandler</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">raiseCatalystInstanceMissingException() {</span>
+    <span class="s2">throw new </span><span class="s1">IllegalStateException(</span>
+        <span class="s1">mDestroyed ? LATE_NATIVE_MODULE_EXCEPTION_MESSAGE : EARLY_NATIVE_MODULE_EXCEPTION_MESSAGE)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// We override the following method so that views inflated with the inflater obtained from this</span>
+  <span class="s0">// context return the ReactContext in #getContext(). The default implementation uses the base</span>
+  <span class="s0">// context instead, so it couldn't be cast to ReactContext.</span>
+  <span class="s0">// TODO: T7538796 Check requirement for Override of getSystemService ReactContext</span>
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">Object getSystemService(String name) {</span>
+    <span class="s2">if </span><span class="s1">(LAYOUT_INFLATER_SERVICE.equals(name)) {</span>
+      <span class="s2">if </span><span class="s1">(mInflater == </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">mInflater = LayoutInflater.from(getBaseContext()).cloneInContext(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s2">return </span><span class="s1">mInflater</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">getBaseContext().getSystemService(name)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* </span><span class="s4">@return </span><span class="s3">handle to the specified JS module for the CatalystInstance associated with this Context</span>
+   <span class="s3">*/</span>
+  <span class="s2">public </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">JavaScriptModule&gt; T getJSModule(Class&lt;T&gt; jsInterface) {</span>
+    <span class="s2">if </span><span class="s1">(mCatalystInstance == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">if </span><span class="s1">(mDestroyed) {</span>
+        <span class="s2">throw new </span><span class="s1">IllegalStateException(LATE_JS_ACCESS_EXCEPTION_MESSAGE)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(EARLY_JS_ACCESS_EXCEPTION_MESSAGE)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(mInteropModuleRegistry != </span><span class="s2">null</span>
+        <span class="s1">&amp;&amp; mInteropModuleRegistry.shouldReturnInteropModule(jsInterface)) {</span>
+      <span class="s2">return </span><span class="s1">mInteropModuleRegistry.getInteropModule(jsInterface)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance.getJSModule(jsInterface)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">NativeModule&gt; </span><span class="s2">boolean </span><span class="s1">hasNativeModule(Class&lt;T&gt; nativeModuleInterface) {</span>
+    <span class="s2">if </span><span class="s1">(mCatalystInstance == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">raiseCatalystInstanceMissingException()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance.hasNativeModule(nativeModuleInterface)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">Collection&lt;NativeModule&gt; getNativeModules() {</span>
+    <span class="s2">if </span><span class="s1">(mCatalystInstance == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">raiseCatalystInstanceMissingException()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance.getNativeModules()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** </span><span class="s4">@return </span><span class="s3">the instance of the specified module interface associated with this ReactContext. */</span>
+  <span class="s1">@Nullable</span>
+  <span class="s2">public </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">NativeModule&gt; T getNativeModule(Class&lt;T&gt; nativeModuleInterface) {</span>
+    <span class="s2">if </span><span class="s1">(mCatalystInstance == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">raiseCatalystInstanceMissingException()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance.getNativeModule(nativeModuleInterface)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Calls RCTDeviceEventEmitter.emit to JavaScript, with given event name and an optional list of</span>
+   <span class="s3">* arguments.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">emitDeviceEvent(String eventName</span><span class="s2">, </span><span class="s1">@Nullable Object args) {</span>
+    <span class="s1">RCTDeviceEventEmitter eventEmitter = getJSModule(RCTDeviceEventEmitter.</span><span class="s2">class</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(eventEmitter != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">eventEmitter.emit(eventName</span><span class="s2">, </span><span class="s1">args)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">emitDeviceEvent(String eventName) {</span>
+    <span class="s1">emitDeviceEvent(eventName</span><span class="s2">, null</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">CatalystInstance getCatalystInstance() {</span>
+    <span class="s2">return </span><span class="s1">Assertions.assertNotNull(mCatalystInstance)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* This API has been deprecated due to naming consideration, please use hasActiveReactInstance()</span>
+   <span class="s3">* instead</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@return</span>
+   <span class="s3">*/</span>
+  <span class="s1">@Deprecated</span>
+  <span class="s2">public boolean </span><span class="s1">hasActiveCatalystInstance() {</span>
+    <span class="s2">return </span><span class="s1">hasActiveReactInstance()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** </span><span class="s4">@return </span><span class="s3">true if there is an non-null, alive react native instance */</span>
+  <span class="s2">public boolean </span><span class="s1">hasActiveReactInstance() {</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance != </span><span class="s2">null </span><span class="s1">&amp;&amp; !mCatalystInstance.isDestroyed()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">hasCatalystInstance() {</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance != </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">LifecycleState getLifecycleState() {</span>
+    <span class="s2">return </span><span class="s1">mLifecycleState</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addLifecycleEventListener(</span><span class="s2">final </span><span class="s1">LifecycleEventListener listener) {</span>
+    <span class="s1">mLifecycleEventListeners.add(listener)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(hasActiveReactInstance() || isBridgeless()) {</span>
+      <span class="s2">switch </span><span class="s1">(mLifecycleState) {</span>
+        <span class="s2">case </span><span class="s1">BEFORE_CREATE:</span>
+        <span class="s2">case </span><span class="s1">BEFORE_RESUME:</span>
+          <span class="s2">break;</span>
+        <span class="s2">case </span><span class="s1">RESUMED:</span>
+          <span class="s1">runOnUiQueueThread(</span>
+              <span class="s2">new </span><span class="s1">Runnable() {</span>
+                <span class="s1">@Override</span>
+                <span class="s2">public void </span><span class="s1">run() {</span>
+                  <span class="s2">if </span><span class="s1">(!mLifecycleEventListeners.contains(listener)) {</span>
+                    <span class="s2">return;</span>
+                  <span class="s1">}</span>
+                  <span class="s2">try </span><span class="s1">{</span>
+                    <span class="s1">listener.onHostResume()</span><span class="s2">;</span>
+                  <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RuntimeException e) {</span>
+                    <span class="s1">handleException(e)</span><span class="s2">;</span>
+                  <span class="s1">}</span>
+                <span class="s1">}</span>
+              <span class="s1">})</span><span class="s2">;</span>
+          <span class="s2">break;</span>
+        <span class="s2">default</span><span class="s1">:</span>
+          <span class="s2">throw new </span><span class="s1">IllegalStateException(</span><span class="s5">&quot;Unhandled lifecycle state.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">removeLifecycleEventListener(LifecycleEventListener listener) {</span>
+    <span class="s1">mLifecycleEventListeners.remove(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addActivityEventListener(ActivityEventListener listener) {</span>
+    <span class="s1">mActivityEventListeners.add(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">removeActivityEventListener(ActivityEventListener listener) {</span>
+    <span class="s1">mActivityEventListeners.remove(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addWindowFocusChangeListener(WindowFocusChangeListener listener) {</span>
+    <span class="s1">mWindowFocusEventListeners.add(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">removeWindowFocusChangeListener(WindowFocusChangeListener listener) {</span>
+    <span class="s1">mWindowFocusEventListeners.remove(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Should be called by the hosting Fragment in {</span><span class="s4">@link </span><span class="s3">Fragment#onResume} */</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">onHostResume(@Nullable Activity activity) {</span>
+    <span class="s1">mLifecycleState = LifecycleState.RESUMED</span><span class="s2">;</span>
+    <span class="s1">mCurrentActivity = </span><span class="s2">new </span><span class="s1">WeakReference(activity)</span><span class="s2">;</span>
+    <span class="s1">ReactMarker.logMarker(ReactMarkerConstants.ON_HOST_RESUME_START)</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(LifecycleEventListener listener : mLifecycleEventListeners) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">listener.onHostResume()</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RuntimeException e) {</span>
+        <span class="s1">handleException(e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">ReactMarker.logMarker(ReactMarkerConstants.ON_HOST_RESUME_END)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">onNewIntent(@Nullable Activity activity</span><span class="s2">, </span><span class="s1">Intent intent) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s1">mCurrentActivity = </span><span class="s2">new </span><span class="s1">WeakReference(activity)</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(ActivityEventListener listener : mActivityEventListeners) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">listener.onNewIntent(intent)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RuntimeException e) {</span>
+        <span class="s1">handleException(e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Should be called by the hosting Fragment in {</span><span class="s4">@link </span><span class="s3">Fragment#onPause} */</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">onHostPause() {</span>
+    <span class="s1">mLifecycleState = LifecycleState.BEFORE_RESUME</span><span class="s2">;</span>
+    <span class="s1">ReactMarker.logMarker(ReactMarkerConstants.ON_HOST_PAUSE_START)</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(LifecycleEventListener listener : mLifecycleEventListeners) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">listener.onHostPause()</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RuntimeException e) {</span>
+        <span class="s1">handleException(e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">ReactMarker.logMarker(ReactMarkerConstants.ON_HOST_PAUSE_END)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Should be called by the hosting Fragment in {</span><span class="s4">@link </span><span class="s3">Fragment#onDestroy} */</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">onHostDestroy() {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s1">mLifecycleState = LifecycleState.BEFORE_CREATE</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(LifecycleEventListener listener : mLifecycleEventListeners) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">listener.onHostDestroy()</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RuntimeException e) {</span>
+        <span class="s1">handleException(e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">mCurrentActivity = </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Destroy this instance, making it unusable. */</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">destroy() {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+
+    <span class="s1">mDestroyed = </span><span class="s2">true;</span>
+    <span class="s2">if </span><span class="s1">(mCatalystInstance != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mCatalystInstance.destroy()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Should be called by the hosting Fragment in {</span><span class="s4">@link </span><span class="s3">Fragment#onActivityResult} */</span>
+  <span class="s2">public void </span><span class="s1">onActivityResult(</span>
+      <span class="s1">Activity activity</span><span class="s2">, int </span><span class="s1">requestCode</span><span class="s2">, int </span><span class="s1">resultCode</span><span class="s2">, </span><span class="s1">@Nullable Intent data) {</span>
+    <span class="s2">for </span><span class="s1">(ActivityEventListener listener : mActivityEventListeners) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">listener.onActivityResult(activity</span><span class="s2">, </span><span class="s1">requestCode</span><span class="s2">, </span><span class="s1">resultCode</span><span class="s2">, </span><span class="s1">data)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RuntimeException e) {</span>
+        <span class="s1">handleException(e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">onWindowFocusChange(</span><span class="s2">boolean </span><span class="s1">hasFocus) {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(WindowFocusChangeListener listener : mWindowFocusEventListeners) {</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">listener.onWindowFocusChange(hasFocus)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">catch </span><span class="s1">(RuntimeException e) {</span>
+        <span class="s1">handleException(e)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">assertOnUiQueueThread() {</span>
+    <span class="s1">Assertions.assertNotNull(mUiMessageQueueThread).assertIsOnThread()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">isOnUiQueueThread() {</span>
+    <span class="s2">return </span><span class="s1">Assertions.assertNotNull(mUiMessageQueueThread).isOnThread()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">runOnUiQueueThread(Runnable runnable) {</span>
+    <span class="s1">Assertions.assertNotNull(mUiMessageQueueThread).runOnQueue(runnable)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">assertOnNativeModulesQueueThread() {</span>
+    <span class="s3">/** TODO(T85807990): Fail fast if the ReactContext isn't initialized */</span>
+    <span class="s2">if </span><span class="s1">(!mIsInitialized) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span>
+          <span class="s5">&quot;Tried to call assertOnNativeModulesQueueThread() on an uninitialized ReactContext&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">Assertions.assertNotNull(mNativeModulesMessageQueueThread).assertIsOnThread()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">assertOnNativeModulesQueueThread(String message) {</span>
+    <span class="s3">/** TODO(T85807990): Fail fast if the ReactContext isn't initialized */</span>
+    <span class="s2">if </span><span class="s1">(!mIsInitialized) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span>
+          <span class="s5">&quot;Tried to call assertOnNativeModulesQueueThread(message) on an uninitialized ReactContext&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">Assertions.assertNotNull(mNativeModulesMessageQueueThread).assertIsOnThread(message)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">isOnNativeModulesQueueThread() {</span>
+    <span class="s2">return </span><span class="s1">Assertions.assertNotNull(mNativeModulesMessageQueueThread).isOnThread()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">runOnNativeModulesQueueThread(Runnable runnable) {</span>
+    <span class="s1">Assertions.assertNotNull(mNativeModulesMessageQueueThread).runOnQueue(runnable)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">assertOnJSQueueThread() {</span>
+    <span class="s1">Assertions.assertNotNull(mJSMessageQueueThread).assertIsOnThread()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">isOnJSQueueThread() {</span>
+    <span class="s2">return </span><span class="s1">Assertions.assertNotNull(mJSMessageQueueThread).isOnThread()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">runOnJSQueueThread(Runnable runnable) {</span>
+    <span class="s2">return </span><span class="s1">Assertions.assertNotNull(mJSMessageQueueThread).runOnQueue(runnable)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Passes the given exception to the current {</span><span class="s4">@link </span><span class="s3">JSExceptionHandler} if one exists, rethrowing</span>
+   <span class="s3">* otherwise.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">handleException(Exception e) {</span>
+    <span class="s2">boolean </span><span class="s1">catalystInstanceVariableExists = mCatalystInstance != </span><span class="s2">null;</span>
+    <span class="s2">boolean </span><span class="s1">isCatalystInstanceAlive =</span>
+        <span class="s1">catalystInstanceVariableExists &amp;&amp; !mCatalystInstance.isDestroyed()</span><span class="s2">;</span>
+    <span class="s2">boolean </span><span class="s1">hasExceptionHandler = mJSExceptionHandler != </span><span class="s2">null;</span>
+
+    <span class="s2">if </span><span class="s1">(isCatalystInstanceAlive &amp;&amp; hasExceptionHandler) {</span>
+      <span class="s1">mJSExceptionHandler.handleException(e)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">FLog.e(</span>
+          <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+          <span class="s5">&quot;Unable to handle Exception - catalystInstanceVariableExists: &quot;</span>
+              <span class="s1">+ catalystInstanceVariableExists</span>
+              <span class="s1">+ </span><span class="s5">&quot; - isCatalystInstanceAlive: &quot;</span>
+              <span class="s1">+ isCatalystInstanceAlive</span>
+              <span class="s1">+ </span><span class="s5">&quot; - hasExceptionHandler: &quot;</span>
+              <span class="s1">+ hasExceptionHandler</span><span class="s2">,</span>
+          <span class="s1">e)</span><span class="s2">;</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(e)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public class </span><span class="s1">ExceptionHandlerWrapper </span><span class="s2">implements </span><span class="s1">JSExceptionHandler {</span>
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">handleException(Exception e) {</span>
+      <span class="s1">ReactContext.</span><span class="s2">this</span><span class="s1">.handleException(e)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">JSExceptionHandler getExceptionHandler() {</span>
+    <span class="s2">if </span><span class="s1">(mExceptionHandlerWrapper == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mExceptionHandlerWrapper = </span><span class="s2">new </span><span class="s1">ExceptionHandlerWrapper()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mExceptionHandlerWrapper</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">JSExceptionHandler getJSExceptionHandler() {</span>
+    <span class="s2">return </span><span class="s1">mJSExceptionHandler</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">hasCurrentActivity() {</span>
+    <span class="s2">return </span><span class="s1">mCurrentActivity != </span><span class="s2">null </span><span class="s1">&amp;&amp; mCurrentActivity.get() != </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Same as {</span><span class="s4">@link </span><span class="s3">Activity#startActivityForResult(Intent, int)}, this just redirects the call to</span>
+   <span class="s3">* the current activity. Returns whether the activity was started, as this might fail if this was</span>
+   <span class="s3">* called before the context is in the right state.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public boolean </span><span class="s1">startActivityForResult(Intent intent</span><span class="s2">, int </span><span class="s1">code</span><span class="s2">, </span><span class="s1">Bundle bundle) {</span>
+    <span class="s1">Activity activity = getCurrentActivity()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(activity != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">activity.startActivityForResult(intent</span><span class="s2">, </span><span class="s1">code</span><span class="s2">, </span><span class="s1">bundle)</span><span class="s2">;</span>
+      <span class="s2">return true;</span>
+    <span class="s1">}</span>
+    <span class="s2">return false;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Get the activity to which this context is currently attached, or {</span><span class="s4">@code </span><span class="s3">null} if not attached.</span>
+   <span class="s3">* DO NOT HOLD LONG-LIVED REFERENCES TO THE OBJECT RETURNED BY THIS METHOD, AS THIS WILL CAUSE</span>
+   <span class="s3">* MEMORY LEAKS.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public </span><span class="s1">@Nullable Activity getCurrentActivity() {</span>
+    <span class="s2">if </span><span class="s1">(mCurrentActivity == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return null;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mCurrentActivity.get()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** </span><span class="s4">@deprecated </span><span class="s3">DO NOT USE, this method will be removed in the near future. */</span>
+  <span class="s2">public boolean </span><span class="s1">isBridgeless() {</span>
+    <span class="s2">return false;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Get the C pointer (as a long) to the JavaScriptCore context associated with this instance. Use</span>
+   <span class="s3">* the following pattern to ensure that the JS context is not cleared while you are using it:</span>
+   <span class="s3">* JavaScriptContextHolder jsContext = reactContext.getJavaScriptContextHolder()</span>
+   <span class="s3">* synchronized(jsContext) { nativeThingNeedingJsContext(jsContext.get()); }</span>
+   <span class="s3">*/</span>
+  <span class="s2">public </span><span class="s1">JavaScriptContextHolder getJavaScriptContextHolder() {</span>
+    <span class="s2">if </span><span class="s1">(mCatalystInstance != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return </span><span class="s1">mCatalystInstance.getJavaScriptContextHolder()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return null;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">@Nullable JSIModule getJSIModule(JSIModuleType moduleType) {</span>
+    <span class="s2">if </span><span class="s1">(!hasActiveReactInstance()) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalStateException(</span>
+          <span class="s5">&quot;Unable to retrieve a JSIModule if CatalystInstance is not active.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance.getJSIModule(moduleType)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Get the sourceURL for the JS bundle from the CatalystInstance. This method is needed for</span>
+   <span class="s3">* compatibility with bridgeless mode, which has no CatalystInstance.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@return </span><span class="s3">The JS bundle URL set when the bundle was loaded</span>
+   <span class="s3">*/</span>
+  <span class="s2">public </span><span class="s1">@Nullable String getSourceURL() {</span>
+    <span class="s2">return </span><span class="s1">mCatalystInstance.getSourceURL()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Register a JS segment after loading it from cache or server, make sure mCatalystInstance is</span>
+   <span class="s3">* properly initialised and not null before calling.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">segmentId</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">path</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">registerSegment(</span><span class="s2">int </span><span class="s1">segmentId</span><span class="s2">, </span><span class="s1">String path</span><span class="s2">, </span><span class="s1">Callback callback) {</span>
+    <span class="s1">Assertions.assertNotNull(mCatalystInstance).registerSegment(segmentId</span><span class="s2">, </span><span class="s1">path)</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertNotNull(callback).invoke()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Register a {</span><span class="s4">@link </span><span class="s3">JavaScriptModule} within the Interop Layer so that can be consumed whenever</span>
+   <span class="s3">* getJSModule is invoked.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s6">&lt;p&gt;</span><span class="s3">This method is internal to React Native and should not be used externally.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">JavaScriptModule&gt; </span><span class="s2">void </span><span class="s1">internal_registerInteropModule(</span>
+      <span class="s1">Class&lt;T&gt; interopModuleInterface</span><span class="s2">, </span><span class="s1">Object interopModule) {</span>
+    <span class="s2">if </span><span class="s1">(mInteropModuleRegistry != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mInteropModuleRegistry.registerInteropModule(interopModuleInterface</span><span class="s2">, </span><span class="s1">interopModule)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,1683 @@
+<html>
+<head>
+<title>LayoutAnimationKeyFrameManager.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+LayoutAnimationKeyFrameManager.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;LayoutAnimationKeyFrameManager.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;algorithm&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;sstream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;utility&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/flags.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/animations/conversions.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/animations/utils.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/componentregistry/ComponentDescriptorFactory.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/components/image/ImageProps.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/components/view/ViewProps.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/ComponentDescriptor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/LayoutMetrics.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/Props.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/PropsParserContext.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/RawValue.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/MountingCoordinator.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/ShadowView.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/ShadowViewMutation.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+<span class="s4">static </span><span class="s1">std::string GetMutationInstructionString(</span>
+    <span class="s1">ShadowViewMutation </span><span class="s4">const </span><span class="s1">&amp;mutation) {</span>
+  <span class="s1">Tag tag = mutation.type == ShadowViewMutation::Type::Insert ||</span>
+          <span class="s1">mutation.type == ShadowViewMutation::Type::Create</span>
+      <span class="s1">? mutation.newChildShadowView.tag</span>
+      <span class="s1">: mutation.oldChildShadowView.tag</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">getDebugName(mutation) + </span><span class="s3">&quot; [&quot; </span><span class="s1">+ std::to_string(tag) + </span><span class="s3">&quot;]-&gt;[&quot; </span><span class="s1">+</span>
+      <span class="s1">std::to_string(mutation.parentShadowView.tag) + </span><span class="s3">&quot;] @&quot; </span><span class="s1">+</span>
+      <span class="s1">std::to_string(mutation.index)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PrintMutationInstruction(</span>
+    <span class="s1">std::string message</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutation </span><span class="s4">const </span><span class="s1">&amp;mutation) {</span>
+  <span class="s1">[&amp;](std::ostream &amp;stream) -&gt; std::ostream &amp; {</span>
+    <span class="s1">stream &lt;&lt; message</span>
+           <span class="s1">&lt;&lt; </span><span class="s3">&quot; Mutation: &quot; </span><span class="s1">&lt;&lt; GetMutationInstructionString(mutation)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(mutation.oldChildShadowView.tag != </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">stream &lt;&lt; </span><span class="s3">&quot; old hash: ##&quot;</span>
+             <span class="s1">&lt;&lt; std::hash&lt;ShadowView&gt;{}(mutation.oldChildShadowView)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(mutation.newChildShadowView.tag != </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">stream &lt;&lt; </span><span class="s3">&quot; new hash: ##&quot;</span>
+             <span class="s1">&lt;&lt; std::hash&lt;ShadowView&gt;{}(mutation.newChildShadowView)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">stream</span><span class="s4">;</span>
+  <span class="s1">}(LOG(ERROR))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">PrintMutationInstructionRelative(</span>
+    <span class="s1">std::string message</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutation </span><span class="s4">const </span><span class="s1">&amp;mutation</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutation </span><span class="s4">const </span><span class="s1">&amp;relativeMutation) {</span>
+  <span class="s1">LOG(ERROR) &lt;&lt; message</span>
+             <span class="s1">&lt;&lt; </span><span class="s3">&quot; Mutation: &quot; </span><span class="s1">&lt;&lt; GetMutationInstructionString(mutation)</span>
+             <span class="s1">&lt;&lt; </span><span class="s3">&quot; RelativeMutation: &quot;</span>
+             <span class="s1">&lt;&lt; GetMutationInstructionString(relativeMutation)</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s2">#endif</span>
+
+<span class="s4">static inline </span><span class="s1">Float</span>
+<span class="s1">interpolateFloats(Float coefficient</span><span class="s4">, </span><span class="s1">Float oldValue</span><span class="s4">, </span><span class="s1">Float newValue) {</span>
+  <span class="s4">return </span><span class="s1">oldValue + (newValue - oldValue) * coefficient</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark -</span>
+
+<span class="s1">LayoutAnimationKeyFrameManager::LayoutAnimationKeyFrameManager(</span>
+    <span class="s1">RuntimeExecutor runtimeExecutor</span><span class="s4">,</span>
+    <span class="s1">ContextContainer::Shared &amp;contextContainer</span><span class="s4">,</span>
+    <span class="s1">LayoutAnimationStatusDelegate *delegate)</span>
+    <span class="s1">: runtimeExecutor_(std::move(runtimeExecutor))</span><span class="s4">,</span>
+      <span class="s1">contextContainer_(contextContainer)</span><span class="s4">,</span>
+      <span class="s1">layoutAnimationStatusDelegate_(delegate)</span><span class="s4">,</span>
+      <span class="s1">now_([]() {</span>
+        <span class="s4">return </span><span class="s1">std::chrono::duration_cast&lt;std::chrono::milliseconds&gt;(</span>
+                   <span class="s1">std::chrono::high_resolution_clock::now().time_since_epoch())</span>
+            <span class="s1">.count()</span><span class="s4">;</span>
+      <span class="s1">}) {}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark UIManagerAnimationDelegate methods</span>
+
+<span class="s0">/** 
+ * Globally configure next LayoutAnimation. 
+ * This is guaranteed to be called only on the JS thread. 
+ */</span>
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::uiManagerDidConfigureNextLayoutAnimation(</span>
+    <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+    <span class="s1">RawValue </span><span class="s4">const </span><span class="s1">&amp;config</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value &amp;successCallbackValue</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">jsi::Value &amp;failureCallbackValue) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">bool </span><span class="s1">hasSuccessCallback = successCallbackValue.isObject() &amp;&amp;</span>
+      <span class="s1">successCallbackValue.getObject(runtime).isFunction(runtime)</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">hasFailureCallback = failureCallbackValue.isObject() &amp;&amp;</span>
+      <span class="s1">failureCallbackValue.getObject(runtime).isFunction(runtime)</span><span class="s4">;</span>
+  <span class="s1">LayoutAnimationCallbackWrapper successCallback = hasSuccessCallback</span>
+      <span class="s1">? LayoutAnimationCallbackWrapper(</span>
+            <span class="s1">successCallbackValue.getObject(runtime).getFunction(runtime))</span>
+      <span class="s1">: LayoutAnimationCallbackWrapper()</span><span class="s4">;</span>
+  <span class="s1">LayoutAnimationCallbackWrapper failureCallback = hasFailureCallback</span>
+      <span class="s1">? LayoutAnimationCallbackWrapper(</span>
+            <span class="s1">failureCallbackValue.getObject(runtime).getFunction(runtime))</span>
+      <span class="s1">: LayoutAnimationCallbackWrapper()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">layoutAnimationConfig =</span>
+      <span class="s1">parseLayoutAnimationConfig((folly::dynamic)config)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(layoutAnimationConfig) {</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(currentAnimationMutex_)</span><span class="s4">;</span>
+
+    <span class="s1">uiManagerDidConfigureNextLayoutAnimation(LayoutAnimation{</span>
+        <span class="s1">-</span><span class="s5">1</span><span class="s4">,</span>
+        <span class="s5">0</span><span class="s4">,</span>
+        <span class="s4">false,</span>
+        <span class="s1">*layoutAnimationConfig</span><span class="s4">,</span>
+        <span class="s1">successCallback</span><span class="s4">,</span>
+        <span class="s1">failureCallback</span><span class="s4">,</span>
+        <span class="s1">{}})</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Parsing LayoutAnimationConfig failed: &quot;</span>
+               <span class="s1">&lt;&lt; (folly::dynamic)config</span><span class="s4">;</span>
+
+    <span class="s1">callCallback(failureCallback)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::setComponentDescriptorRegistry(</span>
+    <span class="s4">const </span><span class="s1">SharedComponentDescriptorRegistry &amp;componentDescriptorRegistry) {</span>
+  <span class="s1">componentDescriptorRegistry_ = componentDescriptorRegistry</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::setReduceDeleteCreateMutation(</span>
+    <span class="s4">const bool </span><span class="s1">reduceDeleteCreateMutation) {</span>
+  <span class="s1">reduceDeleteCreateMutation_ = reduceDeleteCreateMutation</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">LayoutAnimationKeyFrameManager::shouldAnimateFrame() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(currentAnimationMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">currentAnimation_ || !inflightAnimations_.empty()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::stopSurface(SurfaceId surfaceId) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(surfaceIdsToStopMutex_)</span><span class="s4">;</span>
+  <span class="s1">surfaceIdsToStop_.insert(surfaceId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - MountingOverrideDelegate methods</span>
+
+<span class="s4">bool </span><span class="s1">LayoutAnimationKeyFrameManager::shouldOverridePullTransaction() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">shouldAnimateFrame()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::optional&lt;MountingTransaction&gt;</span>
+<span class="s1">LayoutAnimationKeyFrameManager::pullTransaction(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">MountingTransaction::Number transactionNumber</span><span class="s4">,</span>
+    <span class="s1">TransactionTelemetry </span><span class="s4">const </span><span class="s1">&amp;telemetry</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutationList mutations) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s0">// Current time in milliseconds</span>
+  <span class="s1">uint64_t now = now_()</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">inflightAnimationsExistInitially = !inflightAnimations_.empty()</span><span class="s4">;</span>
+  <span class="s1">deleteAnimationsForStoppedSurfaces()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!mutations.empty()) {</span>
+<span class="s2">#ifdef </span><span class="s1">RN_SHADOW_TREE_INTROSPECTION</span>
+    <span class="s1">{</span>
+      <span class="s1">std::stringstream ss(getDebugDescription(mutations</span><span class="s4">, </span><span class="s1">{}))</span><span class="s4">;</span>
+      <span class="s1">std::string to</span><span class="s4">;</span>
+      <span class="s4">while </span><span class="s1">(std::getline(ss</span><span class="s4">, </span><span class="s1">to</span><span class="s4">, </span><span class="s3">'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">)) {</span>
+        <span class="s1">LOG(ERROR)</span>
+            <span class="s1">&lt;&lt; </span><span class="s3">&quot;LayoutAnimationKeyFrameManager.cpp: got mutation list: Line: &quot;</span>
+            <span class="s1">&lt;&lt; to</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+      <span class="s0">// DEBUG ONLY: list existing inflight animations</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;BEGINNING DISPLAYING ONGOING inflightAnimations_!&quot;</span><span class="s4">;</span>
+    <span class="s4">int </span><span class="s1">i = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s4">int </span><span class="s1">j = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;inflightAnimation : inflightAnimations_) {</span>
+      <span class="s1">i++</span><span class="s4">;</span>
+      <span class="s1">j = </span><span class="s5">0</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(inflightAnimation.completed) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;keyframe : inflightAnimation.keyFrames) {</span>
+        <span class="s1">j++</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(keyframe.invalidated) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+        <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;finalMutationForKeyFrame :</span>
+             <span class="s1">keyframe.finalMutationsForKeyFrame) {</span>
+          <span class="s4">if </span><span class="s1">(finalMutationForKeyFrame.mutatedViewIsVirtual()) {</span>
+            <span class="s1">std::string msg = </span><span class="s3">&quot;Animation &quot; </span><span class="s1">+ std::to_string(i) + </span><span class="s3">&quot; keyframe &quot; </span><span class="s1">+</span>
+                <span class="s1">std::to_string(j) + </span><span class="s3">&quot;: Final Animation&quot;</span><span class="s4">;</span>
+            <span class="s1">PrintMutationInstruction(msg</span><span class="s4">, </span><span class="s1">finalMutationForKeyFrame)</span><span class="s4">;</span>
+          <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+            <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Animation &quot; </span><span class="s1">&lt;&lt; i &lt;&lt; </span><span class="s3">&quot; keyframe &quot; </span><span class="s1">&lt;&lt; j</span>
+                       <span class="s1">&lt;&lt; </span><span class="s3">&quot;: on tag: [&quot; </span><span class="s1">&lt;&lt; keyframe.viewStart.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;BEGINNING DONE DISPLAYING ONGOING inflightAnimations_!&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+    <span class="s1">PropsParserContext propsParserContext{surfaceId</span><span class="s4">, </span><span class="s1">*contextContainer_}</span><span class="s4">;</span>
+
+    <span class="s0">// What to do if we detect a conflict? Get current value and make</span>
+    <span class="s0">// that the baseline of the next animation. Scale the remaining time</span>
+    <span class="s0">// in the animation</span>
+    <span class="s0">// Types of conflicts and how we handle them:</span>
+    <span class="s0">// Update -&gt; update: remove the previous update, make it the baseline of the</span>
+    <span class="s0">// next update (with current progress) Update -&gt; remove: same, with final</span>
+    <span class="s0">// mutation being a remove Insert -&gt; update: treat as update-&gt;update Insert</span>
+    <span class="s0">// -&gt; remove: same, as update-&gt;remove Remove -&gt; update/insert: not possible</span>
+    <span class="s0">// We just collect pairs here of &lt;Mutation, AnimationConfig&gt; and delete them</span>
+    <span class="s0">// from active animations. If another animation is queued up from the</span>
+    <span class="s0">// current mutations then these deleted mutations will serve as the baseline</span>
+    <span class="s0">// for the next animation. If not, the current mutations are executed</span>
+    <span class="s0">// immediately without issues.</span>
+    <span class="s1">std::vector&lt;AnimationKeyFrame&gt; conflictingAnimations{}</span><span class="s4">;</span>
+    <span class="s1">getAndEraseConflictingAnimations(</span>
+        <span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">mutations</span><span class="s4">, </span><span class="s1">conflictingAnimations)</span><span class="s4">;</span>
+
+    <span class="s0">// Are we animating this list of mutations?</span>
+    <span class="s1">std::optional&lt;LayoutAnimation&gt; currentAnimation{}</span><span class="s4">;</span>
+    <span class="s1">{</span>
+      <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(currentAnimationMutex_)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(currentAnimation_) {</span>
+        <span class="s1">currentAnimation = std::move(currentAnimation_)</span><span class="s4">;</span>
+        <span class="s1">currentAnimation_.reset()</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(currentAnimation.has_value()) {</span>
+      <span class="s1">LayoutAnimation animation = std::move(currentAnimation).value()</span><span class="s4">;</span>
+      <span class="s1">animation.surfaceId = surfaceId</span><span class="s4">;</span>
+      <span class="s1">animation.startTime = now</span><span class="s4">;</span>
+
+      <span class="s0">// Pre-process list to:</span>
+      <span class="s0">//   Catch remove+reinsert (reorders)</span>
+      <span class="s0">//   Catch delete+create (reparenting) (this should be optimized away at</span>
+      <span class="s0">//   the diffing level eventually?)</span>
+      <span class="s0">// TODO: to prevent this step we could tag Remove/Insert mutations as</span>
+      <span class="s0">// being moves on the Differ level, since we know that there? We could use</span>
+      <span class="s0">// TinyMap here, but it's not exposed by Differentiator (yet).</span>
+      <span class="s1">butter::set&lt;Tag&gt; insertedTags</span><span class="s4">;</span>
+      <span class="s1">butter::set&lt;Tag&gt; deletedTags</span><span class="s4">;</span>
+      <span class="s1">butter::set&lt;Tag&gt; reparentedTags</span><span class="s4">; </span><span class="s0">// tags that are deleted and recreated</span>
+      <span class="s1">std::unordered_map&lt;Tag</span><span class="s4">, </span><span class="s1">ShadowViewMutation&gt; movedTags</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mutation : mutations) {</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Insert) {</span>
+          <span class="s1">insertedTags.insert(mutation.newChildShadowView.tag)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Delete) {</span>
+          <span class="s1">deletedTags.insert(mutation.oldChildShadowView.tag)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Create) {</span>
+          <span class="s4">if </span><span class="s1">(deletedTags.find(mutation.newChildShadowView.tag) !=</span>
+              <span class="s1">deletedTags.end()) {</span>
+            <span class="s1">reparentedTags.insert(mutation.newChildShadowView.tag)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Process mutations list into operations that can be sent to platform</span>
+      <span class="s0">// immediately, and those that need to be animated Deletions, removals,</span>
+      <span class="s0">// updates are delayed and animated. Creations and insertions are sent to</span>
+      <span class="s0">// platform and then &quot;animated in&quot; with opacity updates. Upon completion,</span>
+      <span class="s0">// removals and deletions are sent to platform</span>
+      <span class="s1">ShadowViewMutation::List immediateMutations</span><span class="s4">;</span>
+
+      <span class="s0">// Remove operations that are actually moves should be copied to</span>
+      <span class="s0">// &quot;immediate mutations&quot;. The corresponding &quot;insert&quot; will also be executed</span>
+      <span class="s0">// immediately and animated as an update.</span>
+      <span class="s1">std::vector&lt;AnimationKeyFrame&gt; keyFramesToAnimate</span><span class="s4">;</span>
+      <span class="s4">auto const </span><span class="s1">layoutAnimationConfig = animation.layoutAnimationConfig</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;mutation : mutations) {</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::RemoveDeleteTree) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">ShadowView baselineShadowView =</span>
+            <span class="s1">(mutation.type == ShadowViewMutation::Type::Delete ||</span>
+                     <span class="s1">mutation.type == ShadowViewMutation::Type::Remove ||</span>
+                     <span class="s1">mutation.type == ShadowViewMutation::Type::Update</span>
+                 <span class="s1">? mutation.oldChildShadowView</span>
+                 <span class="s1">: mutation.newChildShadowView)</span><span class="s4">;</span>
+        <span class="s1">react_native_assert(baselineShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s4">bool </span><span class="s1">haveComponentDescriptor =</span>
+            <span class="s1">hasComponentDescriptorForShadowView(baselineShadowView)</span><span class="s4">;</span>
+
+        <span class="s0">// Immediately execute any mutations on a root node</span>
+        <span class="s4">if </span><span class="s1">(baselineShadowView.traits.check(</span>
+                <span class="s1">ShadowNodeTraits::Trait::RootNodeKind)) {</span>
+          <span class="s1">immediateMutations.push_back(mutation)</span><span class="s4">;</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">std::optional&lt;ShadowViewMutation&gt; executeMutationImmediately{}</span><span class="s4">;</span>
+
+        <span class="s4">bool </span><span class="s1">isRemoveReinserted =</span>
+            <span class="s1">mutation.type == ShadowViewMutation::Type::Remove &amp;&amp;</span>
+            <span class="s1">insertedTags.find(mutation.oldChildShadowView.tag) !=</span>
+                <span class="s1">insertedTags.end()</span><span class="s4">;</span>
+
+        <span class="s0">// Reparenting can result in a node being removed, inserted (moved) and</span>
+        <span class="s0">// also deleted and created in the same frame, with the same props etc.</span>
+        <span class="s0">// This should eventually be optimized out of the diffing algorithm, but</span>
+        <span class="s0">// for now we detect reparenting and prevent the corresponding</span>
+        <span class="s0">// Delete/Create instructions from being animated.</span>
+        <span class="s4">bool </span><span class="s1">isReparented =</span>
+            <span class="s1">reparentedTags.find(baselineShadowView.tag) != reparentedTags.end()</span><span class="s4">;</span>
+
+        <span class="s4">if </span><span class="s1">(isRemoveReinserted) {</span>
+          <span class="s1">movedTags.insert({mutation.oldChildShadowView.tag</span><span class="s4">, </span><span class="s1">mutation})</span><span class="s4">;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Inserts that follow a &quot;remove&quot; of the same tag should be treated as</span>
+        <span class="s0">// an update (move) animation.</span>
+        <span class="s4">bool </span><span class="s1">wasInsertedTagRemoved = </span><span class="s4">false;</span>
+        <span class="s4">auto </span><span class="s1">movedIt = movedTags.end()</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Insert) {</span>
+          <span class="s0">// If this is a move, we actually don't want to copy this insert</span>
+          <span class="s0">// instruction to animated instructions - we want to</span>
+          <span class="s0">// generate an Update mutation for Remove+Insert pairs to animate</span>
+          <span class="s0">// the layout.</span>
+          <span class="s0">// The corresponding Remove and Insert instructions will instead</span>
+          <span class="s0">// be treated as &quot;immediate&quot; instructions.</span>
+          <span class="s1">movedIt = movedTags.find(mutation.newChildShadowView.tag)</span><span class="s4">;</span>
+          <span class="s1">wasInsertedTagRemoved = movedIt != movedTags.end()</span><span class="s4">;</span>
+        <span class="s1">}</span>
+
+        <span class="s4">auto const </span><span class="s1">&amp;mutationConfig =</span>
+            <span class="s1">(mutation.type == ShadowViewMutation::Type::Delete ||</span>
+                     <span class="s1">(mutation.type == ShadowViewMutation::Type::Remove &amp;&amp;</span>
+                      <span class="s1">!wasInsertedTagRemoved)</span>
+                 <span class="s1">? layoutAnimationConfig.deleteConfig</span>
+                 <span class="s1">: (mutation.type == ShadowViewMutation::Type::Insert &amp;&amp;</span>
+                            <span class="s1">!wasInsertedTagRemoved</span>
+                        <span class="s1">? layoutAnimationConfig.createConfig</span>
+                        <span class="s1">: layoutAnimationConfig.updateConfig))</span><span class="s4">;</span>
+        <span class="s4">bool </span><span class="s1">haveConfiguration =</span>
+            <span class="s1">mutationConfig.animationType != AnimationType::None</span><span class="s4">;</span>
+
+        <span class="s0">// Creates and inserts should also be executed immediately.</span>
+        <span class="s0">// Mutations that would otherwise be animated, but have no</span>
+        <span class="s0">// configuration, are also executed immediately.</span>
+        <span class="s4">if </span><span class="s1">(isRemoveReinserted || !haveConfiguration || isReparented ||</span>
+            <span class="s1">mutation.type == ShadowViewMutation::Type::Create ||</span>
+            <span class="s1">mutation.type == ShadowViewMutation::Type::Insert) {</span>
+          <span class="s1">executeMutationImmediately = mutation</span><span class="s4">;</span>
+
+          <span class="s0">// It is possible, especially in the case of &quot;moves&quot;, that we have a</span>
+          <span class="s0">// sequence of operations like:</span>
+          <span class="s0">// UPDATE X</span>
+          <span class="s0">// REMOVE X</span>
+          <span class="s0">// INSERT X</span>
+          <span class="s0">// In these cases, we will have queued up an animation for the UPDATE</span>
+          <span class="s0">// and delayed its execution; the REMOVE and INSERT will be executed</span>
+          <span class="s0">// first; and then the UPDATE will be animating to/from ShadowViews</span>
+          <span class="s0">// that are out-of-sync with what's on the mounting layer. Thus, for</span>
+          <span class="s0">// any UPDATE animations already queued up for this tag, we adjust the</span>
+          <span class="s0">// &quot;previous&quot; ShadowView.</span>
+          <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Insert) {</span>
+            <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;keyframe : keyFramesToAnimate) {</span>
+              <span class="s4">if </span><span class="s1">(keyframe.tag == baselineShadowView.tag) {</span>
+                <span class="s0">// If there's already an animation queued up, followed by this</span>
+                <span class="s0">// Insert, it *must* be an Update mutation animation. Other</span>
+                <span class="s0">// sequences should not be possible.</span>
+                <span class="s1">react_native_assert(</span>
+                    <span class="s1">keyframe.type == AnimationConfigurationType::Update)</span><span class="s4">;</span>
+
+                <span class="s0">// The mutation is an &quot;insert&quot;, so it must have a</span>
+                <span class="s0">// &quot;newChildShadowView&quot;</span>
+                <span class="s1">react_native_assert(mutation.newChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+                <span class="s0">// Those asserts don't run in prod. If there's some edge-case</span>
+                <span class="s0">// that we haven't caught yet, we'd crash in debug; make sure we</span>
+                <span class="s0">// don't mutate the prevView in prod.</span>
+                <span class="s4">if </span><span class="s1">(keyframe.type == AnimationConfigurationType::Update &amp;&amp;</span>
+                    <span class="s1">mutation.newChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+                  <span class="s1">keyframe.viewPrev = mutation.newChildShadowView</span><span class="s4">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Remove) {</span>
+            <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;keyframe : keyFramesToAnimate) {</span>
+              <span class="s4">if </span><span class="s1">(keyframe.tag == baselineShadowView.tag) {</span>
+                <span class="s0">// If there's already an animation queued up, followed by this</span>
+                <span class="s0">// Insert, it *must* be an Update mutation animation. Other</span>
+                <span class="s0">// sequences should not be possible.</span>
+                <span class="s1">react_native_assert(</span>
+                    <span class="s1">keyframe.type == AnimationConfigurationType::Update)</span><span class="s4">;</span>
+
+                <span class="s0">// The mutation is a &quot;remove&quot;, so it must have a</span>
+                <span class="s0">// &quot;oldChildShadowView&quot;</span>
+                <span class="s1">react_native_assert(mutation.oldChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+                <span class="s0">// Those asserts don't run in prod. If there's some edge-case</span>
+                <span class="s0">// that we haven't caught yet, we'd crash in debug; make sure we</span>
+                <span class="s0">// don't mutate the prevView in prod.</span>
+                <span class="s0">// Since normally the UPDATE would have been executed first and</span>
+                <span class="s0">// now it's deferred, we need to change the `oldChildShadowView`</span>
+                <span class="s0">// that is being referenced by the REMOVE mutation.</span>
+                <span class="s4">if </span><span class="s1">(keyframe.type == AnimationConfigurationType::Update &amp;&amp;</span>
+                    <span class="s1">mutation.oldChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+                  <span class="s1">executeMutationImmediately =</span>
+                      <span class="s1">ShadowViewMutation::RemoveMutation(</span>
+                          <span class="s1">mutation.parentShadowView</span><span class="s4">,</span>
+                          <span class="s1">keyframe.viewPrev</span><span class="s4">,</span>
+                          <span class="s1">mutation.index)</span><span class="s4">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Deletes, non-move inserts, updates get animated</span>
+        <span class="s4">if </span><span class="s1">(!wasInsertedTagRemoved &amp;&amp; !isRemoveReinserted &amp;&amp; !isReparented &amp;&amp;</span>
+            <span class="s1">haveConfiguration &amp;&amp;</span>
+            <span class="s1">mutation.type != ShadowViewMutation::Type::Create) {</span>
+          <span class="s1">ShadowView viewStart = ShadowView(</span>
+              <span class="s1">mutation.type == ShadowViewMutation::Type::Insert</span>
+                  <span class="s1">? mutation.newChildShadowView</span>
+                  <span class="s1">: mutation.oldChildShadowView)</span><span class="s4">;</span>
+          <span class="s1">react_native_assert(viewStart.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+          <span class="s1">ShadowView viewFinal = ShadowView(</span>
+              <span class="s1">mutation.type == ShadowViewMutation::Type::Update</span>
+                  <span class="s1">? mutation.newChildShadowView</span>
+                  <span class="s1">: viewStart)</span><span class="s4">;</span>
+          <span class="s1">react_native_assert(viewFinal.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+          <span class="s1">ShadowView parent = mutation.parentShadowView</span><span class="s4">;</span>
+          <span class="s1">react_native_assert(</span>
+              <span class="s1">parent.tag &gt; </span><span class="s5">0 </span><span class="s1">||</span>
+              <span class="s1">mutation.type == ShadowViewMutation::Type::Update ||</span>
+              <span class="s1">mutation.type == ShadowViewMutation::Type::Delete)</span><span class="s4">;</span>
+          <span class="s1">Tag tag = viewStart.tag</span><span class="s4">;</span>
+
+          <span class="s1">AnimationKeyFrame keyFrame{}</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Insert) {</span>
+            <span class="s4">if </span><span class="s1">(mutationConfig.animationProperty ==</span>
+                    <span class="s1">AnimationProperty::Opacity &amp;&amp;</span>
+                <span class="s1">haveComponentDescriptor) {</span>
+              <span class="s4">auto </span><span class="s1">props =</span>
+                  <span class="s1">getComponentDescriptorForShadowView(baselineShadowView)</span>
+                      <span class="s1">.cloneProps(propsParserContext</span><span class="s4">, </span><span class="s1">viewStart.props</span><span class="s4">, </span><span class="s1">{})</span><span class="s4">;</span>
+
+              <span class="s4">if </span><span class="s1">(baselineShadowView.traits.check(</span>
+                      <span class="s1">ShadowNodeTraits::Trait::ViewKind)) {</span>
+                <span class="s4">auto const </span><span class="s1">&amp;viewProps =</span>
+                    <span class="s1">*std::static_pointer_cast&lt;ViewProps </span><span class="s4">const</span><span class="s1">&gt;(props)</span><span class="s4">;</span>
+                <span class="s4">const_cast</span><span class="s1">&lt;ViewProps &amp;&gt;(viewProps).opacity = </span><span class="s5">0</span><span class="s4">;</span>
+              <span class="s1">}</span>
+
+              <span class="s1">react_native_assert(props != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+              <span class="s4">if </span><span class="s1">(props != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+                <span class="s1">viewStart.props = props</span><span class="s4">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+            <span class="s4">bool </span><span class="s1">isScaleX =</span>
+                <span class="s1">mutationConfig.animationProperty == AnimationProperty::ScaleX ||</span>
+                <span class="s1">mutationConfig.animationProperty == AnimationProperty::ScaleXY</span><span class="s4">;</span>
+            <span class="s4">bool </span><span class="s1">isScaleY =</span>
+                <span class="s1">mutationConfig.animationProperty == AnimationProperty::ScaleY ||</span>
+                <span class="s1">mutationConfig.animationProperty == AnimationProperty::ScaleXY</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">((isScaleX || isScaleY) &amp;&amp; haveComponentDescriptor) {</span>
+              <span class="s4">auto </span><span class="s1">props =</span>
+                  <span class="s1">getComponentDescriptorForShadowView(baselineShadowView)</span>
+                      <span class="s1">.cloneProps(propsParserContext</span><span class="s4">, </span><span class="s1">viewStart.props</span><span class="s4">, </span><span class="s1">{})</span><span class="s4">;</span>
+              <span class="s4">if </span><span class="s1">(baselineShadowView.traits.check(</span>
+                      <span class="s1">ShadowNodeTraits::Trait::ViewKind)) {</span>
+                <span class="s4">auto const </span><span class="s1">&amp;viewProps =</span>
+                    <span class="s1">*std::static_pointer_cast&lt;ViewProps </span><span class="s4">const</span><span class="s1">&gt;(props)</span><span class="s4">;</span>
+                <span class="s4">const_cast</span><span class="s1">&lt;ViewProps &amp;&gt;(viewProps).transform =</span>
+                    <span class="s1">Transform::Scale(isScaleX ? </span><span class="s5">0 </span><span class="s1">: </span><span class="s5">1</span><span class="s4">, </span><span class="s1">isScaleY ? </span><span class="s5">0 </span><span class="s1">: </span><span class="s5">1</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+              <span class="s1">}</span>
+
+              <span class="s1">react_native_assert(props != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+              <span class="s4">if </span><span class="s1">(props != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+                <span class="s1">viewStart.props = props</span><span class="s4">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s1">PrintMutationInstruction(</span>
+                <span class="s3">&quot;Setting up animation KeyFrame for INSERT mutation (Create animation)&quot;</span><span class="s4">,</span>
+                <span class="s1">mutation)</span><span class="s4">;</span>
+
+            <span class="s1">keyFrame = AnimationKeyFrame{</span>
+                <span class="s0">/* .finalMutationsForKeyFrame = */ </span><span class="s1">{}</span><span class="s4">,</span>
+                <span class="s0">/* .type = */ </span><span class="s1">AnimationConfigurationType::Create</span><span class="s4">,</span>
+                <span class="s0">/* .tag = */ </span><span class="s1">tag</span><span class="s4">,</span>
+                <span class="s0">/* .parentView = */ </span><span class="s1">parent</span><span class="s4">,</span>
+                <span class="s0">/* .viewStart = */ </span><span class="s1">viewStart</span><span class="s4">,</span>
+                <span class="s0">/* .viewEnd = */ </span><span class="s1">viewFinal</span><span class="s4">,</span>
+                <span class="s0">/* .viewPrev = */ </span><span class="s1">baselineShadowView</span><span class="s4">,</span>
+                <span class="s0">/* .initialProgress = */ </span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+          <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Delete) {</span>
+<span class="s0">// This is just for assertion purposes.</span>
+<span class="s0">// The NDEBUG check here is to satisfy the compiler in certain environments</span>
+<span class="s0">// complaining about correspondingRemoveIt being unused.</span>
+<span class="s2">#ifdef </span><span class="s1">REACT_NATIVE_DEBUG</span>
+<span class="s2">#ifndef </span><span class="s1">NDEBUG</span>
+<span class="s0">// This block is temporarily disabled to fix some internal builds.</span>
+<span class="s0">// In some build configurations, we get a compiler error that</span>
+<span class="s0">// `correspondingRemoveIt` is unused.</span>
+<span class="s0">/*            Tag deleteTag = mutation.oldChildShadowView.tag; 
+            auto correspondingRemoveIt = std::find_if( 
+                mutations.begin(), 
+                mutations.end(), 
+                [&amp;deleteTag](auto &amp;mutation) { 
+                  return mutation.type == ShadowViewMutation::Type::Remove &amp;&amp; 
+                      mutation.oldChildShadowView.tag == deleteTag; 
+                }); 
+            react_native_assert(correspondingRemoveIt != mutations.end()); 
+*/</span>
+<span class="s2">#endif</span>
+<span class="s2">#endif</span>
+            <span class="s4">continue;</span>
+          <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Update) {</span>
+            <span class="s1">viewFinal = ShadowView(mutation.newChildShadowView)</span><span class="s4">;</span>
+
+            <span class="s1">PrintMutationInstruction(</span>
+                <span class="s3">&quot;Setting up animation KeyFrame for UPDATE mutation (Update animation)&quot;</span><span class="s4">,</span>
+                <span class="s1">mutation)</span><span class="s4">;</span>
+
+            <span class="s1">keyFrame = AnimationKeyFrame{</span>
+                <span class="s0">/* .finalMutationsForKeyFrame = */ </span><span class="s1">{mutation}</span><span class="s4">,</span>
+                <span class="s0">/* .type = */ </span><span class="s1">AnimationConfigurationType::Update</span><span class="s4">,</span>
+                <span class="s0">/* .tag = */ </span><span class="s1">tag</span><span class="s4">,</span>
+                <span class="s0">/* .parentView = */ </span><span class="s1">parent</span><span class="s4">,</span>
+                <span class="s0">/* .viewStart = */ </span><span class="s1">viewStart</span><span class="s4">,</span>
+                <span class="s0">/* .viewEnd = */ </span><span class="s1">viewFinal</span><span class="s4">,</span>
+                <span class="s0">/* .viewPrev = */ </span><span class="s1">baselineShadowView</span><span class="s4">,</span>
+                <span class="s0">/* .initialProgress = */ </span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+          <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+            <span class="s0">// This should just be &quot;Remove&quot; instructions that are not animated</span>
+            <span class="s0">// (either this is a &quot;move&quot;, or there's a corresponding &quot;Delete&quot;</span>
+            <span class="s0">// that is animated).</span>
+            <span class="s1">react_native_assert(</span>
+                <span class="s1">mutation.type == ShadowViewMutation::Type::Remove)</span><span class="s4">;</span>
+
+            <span class="s1">Tag removeTag = mutation.oldChildShadowView.tag</span><span class="s4">;</span>
+            <span class="s4">auto </span><span class="s1">correspondingInsertIt = std::find_if(</span>
+                <span class="s1">mutations.begin()</span><span class="s4">,</span>
+                <span class="s1">mutations.end()</span><span class="s4">,</span>
+                <span class="s1">[&amp;removeTag](</span><span class="s4">auto </span><span class="s1">&amp;mutation) {</span>
+                  <span class="s4">return </span><span class="s1">mutation.type == ShadowViewMutation::Type::Insert &amp;&amp;</span>
+                      <span class="s1">mutation.newChildShadowView.tag == removeTag</span><span class="s4">;</span>
+                <span class="s1">})</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">(correspondingInsertIt == mutations.end()) {</span>
+              <span class="s0">// This is a REMOVE not paired with an INSERT (move), so it must</span>
+              <span class="s0">// be paired with a DELETE.</span>
+              <span class="s4">auto </span><span class="s1">correspondingDeleteIt = std::find_if(</span>
+                  <span class="s1">mutations.begin()</span><span class="s4">,</span>
+                  <span class="s1">mutations.end()</span><span class="s4">,</span>
+                  <span class="s1">[&amp;removeTag](</span><span class="s4">auto </span><span class="s1">&amp;mutation) {</span>
+                    <span class="s4">return </span><span class="s1">mutation.type == ShadowViewMutation::Type::Delete &amp;&amp;</span>
+                        <span class="s1">mutation.oldChildShadowView.tag == removeTag</span><span class="s4">;</span>
+                  <span class="s1">})</span><span class="s4">;</span>
+              <span class="s1">react_native_assert(correspondingDeleteIt != mutations.end())</span><span class="s4">;</span>
+
+              <span class="s4">auto </span><span class="s1">deleteMutation = *correspondingDeleteIt</span><span class="s4">;</span>
+
+              <span class="s4">if </span><span class="s1">(mutationConfig.animationProperty ==</span>
+                      <span class="s1">AnimationProperty::Opacity &amp;&amp;</span>
+                  <span class="s1">haveComponentDescriptor) {</span>
+                <span class="s4">auto </span><span class="s1">props =</span>
+                    <span class="s1">getComponentDescriptorForShadowView(baselineShadowView)</span>
+                        <span class="s1">.cloneProps(propsParserContext</span><span class="s4">, </span><span class="s1">viewFinal.props</span><span class="s4">, </span><span class="s1">{})</span><span class="s4">;</span>
+
+                <span class="s4">if </span><span class="s1">(baselineShadowView.traits.check(</span>
+                        <span class="s1">ShadowNodeTraits::Trait::ViewKind)) {</span>
+                  <span class="s4">auto const </span><span class="s1">&amp;viewProps =</span>
+                      <span class="s1">*std::static_pointer_cast&lt;ViewProps </span><span class="s4">const</span><span class="s1">&gt;(props)</span><span class="s4">;</span>
+                  <span class="s4">const_cast</span><span class="s1">&lt;ViewProps &amp;&gt;(viewProps).opacity = </span><span class="s5">0</span><span class="s4">;</span>
+                <span class="s1">}</span>
+
+                <span class="s1">react_native_assert(props != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+                <span class="s4">if </span><span class="s1">(props != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+                  <span class="s1">viewFinal.props = props</span><span class="s4">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+              <span class="s4">bool </span><span class="s1">isScaleX = mutationConfig.animationProperty ==</span>
+                      <span class="s1">AnimationProperty::ScaleX ||</span>
+                  <span class="s1">mutationConfig.animationProperty ==</span>
+                      <span class="s1">AnimationProperty::ScaleXY</span><span class="s4">;</span>
+              <span class="s4">bool </span><span class="s1">isScaleY = mutationConfig.animationProperty ==</span>
+                      <span class="s1">AnimationProperty::ScaleY ||</span>
+                  <span class="s1">mutationConfig.animationProperty ==</span>
+                      <span class="s1">AnimationProperty::ScaleXY</span><span class="s4">;</span>
+              <span class="s4">if </span><span class="s1">((isScaleX || isScaleY) &amp;&amp; haveComponentDescriptor) {</span>
+                <span class="s4">auto </span><span class="s1">props =</span>
+                    <span class="s1">getComponentDescriptorForShadowView(baselineShadowView)</span>
+                        <span class="s1">.cloneProps(propsParserContext</span><span class="s4">, </span><span class="s1">viewFinal.props</span><span class="s4">, </span><span class="s1">{})</span><span class="s4">;</span>
+
+                <span class="s4">if </span><span class="s1">(baselineShadowView.traits.check(</span>
+                        <span class="s1">ShadowNodeTraits::Trait::ViewKind)) {</span>
+                  <span class="s4">auto const </span><span class="s1">&amp;viewProps =</span>
+                      <span class="s1">*std::static_pointer_cast&lt;ViewProps </span><span class="s4">const</span><span class="s1">&gt;(props)</span><span class="s4">;</span>
+                  <span class="s4">const_cast</span><span class="s1">&lt;ViewProps &amp;&gt;(viewProps).transform =</span>
+                      <span class="s1">Transform::Scale(isScaleX ? </span><span class="s5">0 </span><span class="s1">: </span><span class="s5">1</span><span class="s4">, </span><span class="s1">isScaleY ? </span><span class="s5">0 </span><span class="s1">: </span><span class="s5">1</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+                <span class="s1">}</span>
+
+                <span class="s1">react_native_assert(props != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+                <span class="s4">if </span><span class="s1">(props != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+                  <span class="s1">viewFinal.props = props</span><span class="s4">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+
+              <span class="s1">PrintMutationInstruction(</span>
+                  <span class="s3">&quot;Setting up animation KeyFrame for REMOVE mutation (Delete animation)&quot;</span><span class="s4">,</span>
+                  <span class="s1">mutation)</span><span class="s4">;</span>
+
+              <span class="s1">keyFrame = AnimationKeyFrame{</span>
+                  <span class="s0">/* .finalMutationsForKeyFrame */ </span><span class="s1">{mutation</span><span class="s4">, </span><span class="s1">deleteMutation}</span><span class="s4">,</span>
+                  <span class="s0">/* .type */ </span><span class="s1">AnimationConfigurationType::Delete</span><span class="s4">,</span>
+                  <span class="s0">/* .tag */ </span><span class="s1">tag</span><span class="s4">,</span>
+                  <span class="s0">/* .parentView */ </span><span class="s1">parent</span><span class="s4">,</span>
+                  <span class="s0">/* .viewStart */ </span><span class="s1">viewStart</span><span class="s4">,</span>
+                  <span class="s0">/* .viewEnd */ </span><span class="s1">viewFinal</span><span class="s4">,</span>
+                  <span class="s0">/* .viewPrev */ </span><span class="s1">baselineShadowView</span><span class="s4">,</span>
+                  <span class="s0">/* .initialProgress */ </span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+              <span class="s1">PrintMutationInstruction(</span>
+                  <span class="s3">&quot;Executing Remove Immediately, due to reordering operation&quot;</span><span class="s4">,</span>
+                  <span class="s1">mutation)</span><span class="s4">;</span>
+              <span class="s1">immediateMutations.push_back(mutation)</span><span class="s4">;</span>
+              <span class="s4">continue;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// Handle conflicting animations</span>
+          <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;conflictingKeyFrame : conflictingAnimations) {</span>
+            <span class="s4">auto const </span><span class="s1">&amp;conflictingMutationBaselineShadowView =</span>
+                <span class="s1">conflictingKeyFrame.viewStart</span><span class="s4">;</span>
+
+            <span class="s0">// We've found a conflict.</span>
+            <span class="s4">if </span><span class="s1">(conflictingMutationBaselineShadowView.tag == tag) {</span>
+              <span class="s1">conflictingKeyFrame.generateFinalSyntheticMutations = </span><span class="s4">false;</span>
+
+              <span class="s0">// Do NOT update viewStart for a CREATE animation.</span>
+              <span class="s4">if </span><span class="s1">(keyFrame.type == AnimationConfigurationType::Create) {</span>
+                <span class="s4">break;</span>
+              <span class="s1">}</span>
+
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+              <span class="s1">LOG(ERROR)</span>
+                  <span class="s1">&lt;&lt; </span><span class="s3">&quot;Due to conflict, replacing 'viewStart' of animated keyframe: [&quot;</span>
+                  <span class="s1">&lt;&lt; conflictingKeyFrame.viewPrev.tag &lt;&lt; </span><span class="s3">&quot;] with ##&quot;</span>
+                  <span class="s1">&lt;&lt; std::hash&lt;ShadowView&gt;{}(conflictingKeyFrame.viewPrev)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+              <span class="s0">// Pick a Prop or layout property, depending on the current</span>
+              <span class="s0">// animation configuration. Figure out how much progress we've</span>
+              <span class="s0">// already made in the current animation, and start the animation</span>
+              <span class="s0">// from this point.</span>
+              <span class="s1">keyFrame.viewPrev = conflictingKeyFrame.viewPrev</span><span class="s4">;</span>
+              <span class="s1">keyFrame.viewStart = conflictingKeyFrame.viewPrev</span><span class="s4">;</span>
+              <span class="s1">react_native_assert(keyFrame.viewStart.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+              <span class="s1">keyFrame.initialProgress = </span><span class="s5">0</span><span class="s4">;</span>
+
+              <span class="s0">// We're guaranteed that a tag only has one animation associated</span>
+              <span class="s0">// with it, so we can break here. If we support multiple</span>
+              <span class="s0">// animations and animation curves over the same tag in the</span>
+              <span class="s0">// future, this will need to be modified to support that.</span>
+              <span class="s4">break;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+          <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Checking validity of keyframe: [&quot;</span>
+                     <span class="s1">&lt;&lt; keyFrame.viewStart.tag &lt;&lt; </span><span class="s3">&quot;] [&quot; </span><span class="s1">&lt;&lt; keyFrame.viewEnd.tag</span>
+                     <span class="s1">&lt;&lt; </span><span class="s3">&quot;] [&quot; </span><span class="s1">&lt;&lt; keyFrame.viewPrev.tag</span>
+                     <span class="s1">&lt;&lt; </span><span class="s3">&quot;] animation type: &quot; </span><span class="s1">&lt;&lt; (</span><span class="s4">int</span><span class="s1">)keyFrame.type</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+          <span class="s1">react_native_assert(keyFrame.viewStart.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+          <span class="s1">react_native_assert(keyFrame.viewEnd.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+          <span class="s1">react_native_assert(keyFrame.viewPrev.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+          <span class="s1">keyFramesToAnimate.push_back(keyFrame)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+
+        <span class="s4">if </span><span class="s1">(executeMutationImmediately.has_value()) {</span>
+          <span class="s1">PrintMutationInstruction(</span>
+              <span class="s3">&quot;Queue Up For Immediate Execution&quot;</span><span class="s4">, </span><span class="s1">*executeMutationImmediately)</span><span class="s4">;</span>
+          <span class="s1">immediateMutations.push_back(*executeMutationImmediately)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+<span class="s2">#ifdef </span><span class="s1">RN_SHADOW_TREE_INTROSPECTION</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+      <span class="s1">{</span>
+        <span class="s4">int </span><span class="s1">idx = </span><span class="s5">0</span><span class="s4">;</span>
+        <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;mutation : immediateMutations) {</span>
+          <span class="s1">PrintMutationInstruction(</span>
+              <span class="s1">std::string(</span><span class="s3">&quot;IMMEDIATE list: &quot;</span><span class="s1">) + std::to_string(idx) + </span><span class="s3">&quot;/&quot; </span><span class="s1">+</span>
+                  <span class="s1">std::to_string(immediateMutations.size())</span><span class="s4">,</span>
+              <span class="s1">mutation)</span><span class="s4">;</span>
+          <span class="s1">idx++</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s1">{</span>
+        <span class="s4">int </span><span class="s1">idx = </span><span class="s5">0</span><span class="s4">;</span>
+        <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;keyframe : keyFramesToAnimate) {</span>
+          <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;finalMutationForKeyFrame :</span>
+               <span class="s1">keyframe.finalMutationsForKeyFrame) {</span>
+            <span class="s1">PrintMutationInstruction(</span>
+                <span class="s1">std::string(</span><span class="s3">&quot;FINAL list: &quot;</span><span class="s1">) + std::to_string(idx) + </span><span class="s3">&quot;/&quot; </span><span class="s1">+</span>
+                    <span class="s1">std::to_string(keyFramesToAnimate.size())</span><span class="s4">,</span>
+                <span class="s1">finalMutationForKeyFrame)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s1">idx++</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+<span class="s2">#endif</span>
+<span class="s2">#endif</span>
+
+      <span class="s4">auto </span><span class="s1">finalConflictingMutations = ShadowViewMutationList{}</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;keyFrame : conflictingAnimations) {</span>
+        <span class="s0">// Special-case: if the next conflicting animation contain &quot;delete&quot;,</span>
+        <span class="s0">// while the final mutation has the same tag with &quot;create&quot;, we should</span>
+        <span class="s0">// remove both the delete and create as they have no effect when</span>
+        <span class="s0">// combined in the same frame. The Fabric mount layer assumes no such</span>
+        <span class="s0">// combinations in the final mutations either.</span>
+        <span class="s4">if </span><span class="s1">(reduceDeleteCreateMutation_) {</span>
+          <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">itMutation = immediateMutations.begin()</span><span class="s4">;</span>
+               <span class="s1">itMutation != immediateMutations.end()</span><span class="s4">;</span><span class="s1">) {</span>
+            <span class="s4">auto </span><span class="s1">&amp;mutation = *itMutation</span><span class="s4">;</span>
+            <span class="s4">bool </span><span class="s1">hasCreateMutationDeletedWithSameTag = </span><span class="s4">false;</span>
+            <span class="s4">if </span><span class="s1">(mutation.newChildShadowView.tag == keyFrame.tag &amp;&amp;</span>
+                <span class="s1">mutation.type == ShadowViewMutation::Create) {</span>
+              <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">itKeyFrame = keyFrame.finalMutationsForKeyFrame.begin()</span><span class="s4">;</span>
+                   <span class="s1">itKeyFrame != keyFrame.finalMutationsForKeyFrame.end()</span><span class="s4">;</span><span class="s1">) {</span>
+                <span class="s4">auto </span><span class="s1">&amp;conflictFinalMutation = *itKeyFrame</span><span class="s4">;</span>
+                <span class="s4">if </span><span class="s1">(conflictFinalMutation.type == ShadowViewMutation::Delete) {</span>
+                  <span class="s1">itKeyFrame =</span>
+                      <span class="s1">keyFrame.finalMutationsForKeyFrame.erase(itKeyFrame)</span><span class="s4">;</span>
+                  <span class="s1">hasCreateMutationDeletedWithSameTag = </span><span class="s4">true;</span>
+                  <span class="s4">break;</span>
+                <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+                  <span class="s1">itKeyFrame++</span><span class="s4">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s4">if </span><span class="s1">(hasCreateMutationDeletedWithSameTag) {</span>
+              <span class="s1">itMutation = immediateMutations.erase(itMutation)</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+              <span class="s1">itMutation++</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Special-case: if we have some (1) ongoing UPDATE animation,</span>
+        <span class="s0">// (2) it conflicted with a new MOVE operation (REMOVE+INSERT)</span>
+        <span class="s0">// without another corresponding UPDATE, we should re-queue the</span>
+        <span class="s0">// keyframe so that its position/props don't suddenly &quot;jump&quot;.</span>
+        <span class="s4">if </span><span class="s1">(keyFrame.type == AnimationConfigurationType::Update) {</span>
+          <span class="s4">auto </span><span class="s1">movedIt = movedTags.find(keyFrame.tag)</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">(movedIt != movedTags.end()) {</span>
+            <span class="s4">auto </span><span class="s1">newKeyFrameForUpdate = std::find_if(</span>
+                <span class="s1">keyFramesToAnimate.begin()</span><span class="s4">,</span>
+                <span class="s1">keyFramesToAnimate.end()</span><span class="s4">,</span>
+                <span class="s1">[&amp;](</span><span class="s4">auto const </span><span class="s1">&amp;newKeyFrame) {</span>
+                  <span class="s4">return </span><span class="s1">newKeyFrame.type ==</span>
+                      <span class="s1">AnimationConfigurationType::Update &amp;&amp;</span>
+                      <span class="s1">newKeyFrame.tag == keyFrame.tag</span><span class="s4">;</span>
+                <span class="s1">})</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">(newKeyFrameForUpdate == keyFramesToAnimate.end()) {</span>
+              <span class="s1">keyFrame.invalidated = </span><span class="s4">false;</span>
+
+              <span class="s0">// The animation will continue from the current position - we</span>
+              <span class="s0">// restart viewStart to make sure there are no sudden jumps</span>
+              <span class="s1">keyFrame.viewStart = keyFrame.viewPrev</span><span class="s4">;</span>
+
+              <span class="s0">// Find the insert mutation that conflicted with this update</span>
+              <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;mutation : immediateMutations) {</span>
+                <span class="s4">if </span><span class="s1">(mutation.newChildShadowView.tag == keyFrame.tag &amp;&amp;</span>
+                    <span class="s1">(mutation.type == ShadowViewMutation::Insert ||</span>
+                     <span class="s1">mutation.type == ShadowViewMutation::Create)) {</span>
+                  <span class="s1">keyFrame.viewPrev = mutation.newChildShadowView</span><span class="s4">;</span>
+                  <span class="s1">keyFrame.viewEnd = mutation.newChildShadowView</span><span class="s4">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+              <span class="s1">keyFramesToAnimate.push_back(keyFrame)</span><span class="s4">;</span>
+              <span class="s4">continue;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// If the &quot;final&quot; mutation is already accounted for, by previously</span>
+        <span class="s0">// setting the correct &quot;viewPrev&quot; of the next conflicting animation, we</span>
+        <span class="s0">// don't want to queue up any final UPDATE mutations here.</span>
+        <span class="s4">bool </span><span class="s1">shouldGenerateSyntheticMutations =</span>
+            <span class="s1">keyFrame.generateFinalSyntheticMutations</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">numFinalMutations = keyFrame.finalMutationsForKeyFrame.size()</span><span class="s4">;</span>
+        <span class="s4">bool </span><span class="s1">onlyMutationIsUpdate =</span>
+            <span class="s1">(numFinalMutations == </span><span class="s5">1 </span><span class="s1">&amp;&amp;</span>
+             <span class="s1">keyFrame.finalMutationsForKeyFrame[</span><span class="s5">0</span><span class="s1">].type ==</span>
+                 <span class="s1">ShadowViewMutation::Update)</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(!shouldGenerateSyntheticMutations &amp;&amp;</span>
+            <span class="s1">(numFinalMutations == </span><span class="s5">0 </span><span class="s1">|| onlyMutationIsUpdate)) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">queueFinalMutationsForCompletedKeyFrame(</span>
+            <span class="s1">keyFrame</span><span class="s4">,</span>
+            <span class="s1">finalConflictingMutations</span><span class="s4">,</span>
+            <span class="s4">true,</span>
+            <span class="s3">&quot;KeyFrameManager: Finished Conflicting Keyframe&quot;</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Make sure that all operations execute in the proper order, since</span>
+      <span class="s0">// conflicting animations are not sorted in any reasonable way.</span>
+      <span class="s1">std::stable_sort(</span>
+          <span class="s1">finalConflictingMutations.begin()</span><span class="s4">,</span>
+          <span class="s1">finalConflictingMutations.end()</span><span class="s4">,</span>
+          <span class="s1">&amp;shouldFirstComeBeforeSecondMutation)</span><span class="s4">;</span>
+
+      <span class="s1">std::stable_sort(</span>
+          <span class="s1">immediateMutations.begin()</span><span class="s4">,</span>
+          <span class="s1">immediateMutations.end()</span><span class="s4">,</span>
+          <span class="s1">&amp;shouldFirstComeBeforeSecondRemovesOnly)</span><span class="s4">;</span>
+
+      <span class="s1">animation.keyFrames = keyFramesToAnimate</span><span class="s4">;</span>
+      <span class="s1">inflightAnimations_.push_back(std::move(animation))</span><span class="s4">;</span>
+
+      <span class="s0">// At this point, we have the following information and knowledge graph:</span>
+      <span class="s0">// Knowledge Graph:</span>
+      <span class="s0">// [ImmediateMutations] -&gt; assumes [FinalConflicting], [FrameDelayed],</span>
+      <span class="s0">// [Delayed] already executed [FrameDelayed] -&gt; assumes</span>
+      <span class="s0">// [FinalConflicting], [Delayed] already executed [FinalConflicting] -&gt;</span>
+      <span class="s0">// is adjusted based on [Delayed], no dependency on [FinalConflicting],</span>
+      <span class="s0">// [FrameDelayed] [Delayed] -&gt; assumes [FinalConflicting],</span>
+      <span class="s0">// [ImmediateMutations] not executed yet</span>
+
+      <span class="s0">// Adjust [Delayed] based on [FinalConflicting]</span>
+      <span class="s0">// Knowledge Graph:</span>
+      <span class="s0">// [ImmediateMutations] -&gt; assumes [FinalConflicting], [FrameDelayed],</span>
+      <span class="s0">// [Delayed] already executed [FrameDelayed] -&gt; assumes</span>
+      <span class="s0">// [FinalConflicting], [Delayed] already executed [FinalConflicting] -&gt;</span>
+      <span class="s0">// is adjusted based on [Delayed], no dependency on [FinalConflicting],</span>
+      <span class="s0">// [FrameDelayed] [Delayed] -&gt; adjusted for [FinalConflicting]; assumes</span>
+      <span class="s0">// [ImmediateMutations] not executed yet</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Adjust [Delayed] based on [FinalConflicting]&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;mutation : finalConflictingMutations) {</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Insert ||</span>
+            <span class="s1">mutation.type == ShadowViewMutation::Type::Remove) {</span>
+          <span class="s1">adjustDelayedMutationIndicesForMutation(surfaceId</span><span class="s4">, </span><span class="s1">mutation</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Adjust [FrameDelayed] based on [Delayed]</span>
+      <span class="s0">// Knowledge Graph:</span>
+      <span class="s0">// [ImmediateExecutions] -&gt; assumes [FinalConflicting], [Delayed],</span>
+      <span class="s0">// [FrameDelayed] already executed [FrameDelayed] -&gt; adjusted for</span>
+      <span class="s0">// [Delayed]; assumes [FinalConflicting] already executed</span>
+      <span class="s0">// [FinalConflicting] -&gt; is adjusted based on [Delayed], no dependency</span>
+      <span class="s0">// on [FinalConflicting], [FrameDelayed] [Delayed] -&gt; adjusted for</span>
+      <span class="s0">// [FinalConflicting]; assumes [ImmediateExecutions] not executed yet</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Adjust [FrameDelayed] based on [Delayed]&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;keyframe : inflightAnimations_.back().keyFrames) {</span>
+        <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;finalMutation : keyframe.finalMutationsForKeyFrame) {</span>
+          <span class="s4">if </span><span class="s1">(finalMutation.type == ShadowViewMutation::Type::Insert ||</span>
+              <span class="s1">finalMutation.type == ShadowViewMutation::Type::Remove) {</span>
+            <span class="s0">// When adjusting, skip adjusting against last animation - because</span>
+            <span class="s0">// all `mutation`s here come from the last animation, so we can't</span>
+            <span class="s0">// adjust a batch against itself.</span>
+            <span class="s1">adjustImmediateMutationIndicesForDelayedMutations(</span>
+                <span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">finalMutation</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Adjust [ImmediateExecutions] based on [Delayed]</span>
+      <span class="s0">// Knowledge Graph:</span>
+      <span class="s0">// [ImmediateExecutions] -&gt; adjusted for [FrameDelayed], [Delayed];</span>
+      <span class="s0">// assumes [FinalConflicting] already executed [FrameDelayed] -&gt;</span>
+      <span class="s0">// adjusted for [Delayed]; assumes [FinalConflicting] already executed</span>
+      <span class="s0">// [FinalConflicting] -&gt; is adjusted based on [Delayed], no dependency</span>
+      <span class="s0">// on [FinalConflicting], [FrameDelayed] [Delayed] -&gt; adjusted for</span>
+      <span class="s0">// [FinalConflicting]; assumes [ImmediateExecutions] not executed yet</span>
+      <span class="s0">//</span>
+      <span class="s0">// THEN,</span>
+      <span class="s0">// Adjust [Delayed] based on [ImmediateExecutions] and</span>
+      <span class="s0">// [FinalConflicting] Knowledge Graph: [ImmediateExecutions] -&gt; adjusted</span>
+      <span class="s0">// for [FrameDelayed], [Delayed]; assumes [FinalConflicting] already</span>
+      <span class="s0">// executed [FrameDelayed] -&gt; adjusted for [Delayed]; assumes</span>
+      <span class="s0">// [FinalConflicting] already executed [FinalConflicting] -&gt; is adjusted</span>
+      <span class="s0">// based on [Delayed], no dependency on [FinalConflicting],</span>
+      <span class="s0">// [FrameDelayed] [Delayed] -&gt; adjusted for [FinalConflicting],</span>
+      <span class="s0">// [ImmediateExecutions]</span>
+      <span class="s0">//</span>
+      <span class="s0">// We do these in the same loop because each immediate execution is</span>
+      <span class="s0">// impacted by each delayed mutation, and also can impact each delayed</span>
+      <span class="s0">// mutation, and these effects compound.</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+      <span class="s1">LOG(ERROR)</span>
+          <span class="s1">&lt;&lt; </span><span class="s3">&quot;Adjust each [ImmediateExecution] based on [Delayed] and [Delayed] based on each [ImmediateExecution]&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;mutation : immediateMutations) {</span>
+        <span class="s0">// Note: when adjusting [ImmediateExecutions] based on [FrameDelayed],</span>
+        <span class="s0">// we need only adjust Inserts. Since inserts are executed</span>
+        <span class="s0">// highest-index-first, lower indices being delayed does not impact</span>
+        <span class="s0">// the higher-index removals; and conversely, higher indices being</span>
+        <span class="s0">// delayed cannot impact lower index removal, regardless of order.</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Insert ||</span>
+            <span class="s1">mutation.type == ShadowViewMutation::Type::Remove) {</span>
+          <span class="s1">adjustImmediateMutationIndicesForDelayedMutations(</span>
+              <span class="s1">surfaceId</span><span class="s4">,</span>
+              <span class="s1">mutation</span><span class="s4">,</span>
+              <span class="s1">mutation.type == ShadowViewMutation::Type::Remove)</span><span class="s4">;</span>
+          <span class="s0">// Here we need to adjust both Delayed and FrameDelayed mutations.</span>
+          <span class="s0">// Delayed Removes can be impacted by non-delayed Inserts from the</span>
+          <span class="s0">// same frame.</span>
+          <span class="s1">adjustDelayedMutationIndicesForMutation(surfaceId</span><span class="s4">, </span><span class="s1">mutation)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// If the knowledge graph progression above is correct, it is now safe</span>
+      <span class="s0">// to execute finalConflictingMutations and immediateMutations in that</span>
+      <span class="s0">// order, and to queue the delayed animations from this frame.</span>
+      <span class="s0">//</span>
+      <span class="s0">// Execute the conflicting, delayed operations immediately. Any UPDATE</span>
+      <span class="s0">// operations that smoothly transition into another animation will be</span>
+      <span class="s0">// overridden by generated UPDATE operations at the end of the list, and</span>
+      <span class="s0">// we want any REMOVE or DELETE operations to execute immediately.</span>
+      <span class="s0">// Additionally, this should allow us to avoid performing index</span>
+      <span class="s0">// adjustment between this list of conflicting animations and the batch</span>
+      <span class="s0">// we're about to execute.</span>
+      <span class="s1">finalConflictingMutations.insert(</span>
+          <span class="s1">finalConflictingMutations.end()</span><span class="s4">,</span>
+          <span class="s1">immediateMutations.begin()</span><span class="s4">,</span>
+          <span class="s1">immediateMutations.end())</span><span class="s4">;</span>
+      <span class="s1">mutations = finalConflictingMutations</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s0">/* if (currentAnimation) */</span>
+    <span class="s4">else </span><span class="s1">{</span>
+      <span class="s0">// If there's no &quot;next&quot; animation, make sure we queue up &quot;final&quot;</span>
+      <span class="s0">// operations from all ongoing, conflicting animations.</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;No Animation: Queue up final conflicting animations&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+      <span class="s1">ShadowViewMutationList finalMutationsForConflictingAnimations{}</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;keyFrame : conflictingAnimations) {</span>
+        <span class="s1">queueFinalMutationsForCompletedKeyFrame(</span>
+            <span class="s1">keyFrame</span><span class="s4">,</span>
+            <span class="s1">finalMutationsForConflictingAnimations</span><span class="s4">,</span>
+            <span class="s4">true,</span>
+            <span class="s3">&quot;Conflict with non-animated mutation&quot;</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Make sure that all operations execute in the proper order.</span>
+      <span class="s0">// REMOVE operations with highest indices must operate first.</span>
+      <span class="s1">std::stable_sort(</span>
+          <span class="s1">finalMutationsForConflictingAnimations.begin()</span><span class="s4">,</span>
+          <span class="s1">finalMutationsForConflictingAnimations.end()</span><span class="s4">,</span>
+          <span class="s1">&amp;shouldFirstComeBeforeSecondMutation)</span><span class="s4">;</span>
+
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+      <span class="s1">LOG(ERROR)</span>
+          <span class="s1">&lt;&lt; </span><span class="s3">&quot;No Animation: Adjust delayed mutations based on all finalMutationsForConflictingAnimations&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;mutation : finalMutationsForConflictingAnimations) {</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Remove ||</span>
+            <span class="s1">mutation.type == ShadowViewMutation::Type::Insert) {</span>
+          <span class="s1">adjustDelayedMutationIndicesForMutation(surfaceId</span><span class="s4">, </span><span class="s1">mutation)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// The ShadowTree layer doesn't realize that certain operations have</span>
+      <span class="s0">// been delayed, so we must adjust all Remove and Insert operations</span>
+      <span class="s0">// based on what else has been deferred, whether we are executing this</span>
+      <span class="s0">// immediately or later.</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+      <span class="s1">LOG(ERROR)</span>
+          <span class="s1">&lt;&lt; </span><span class="s3">&quot;No Animation: Adjust mutations based on remaining delayed mutations / adjust delayed, based on each&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;mutation : mutations) {</span>
+        <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Remove ||</span>
+            <span class="s1">mutation.type == ShadowViewMutation::Type::Insert) {</span>
+          <span class="s1">adjustImmediateMutationIndicesForDelayedMutations(</span>
+              <span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">mutation)</span><span class="s4">;</span>
+          <span class="s1">adjustDelayedMutationIndicesForMutation(surfaceId</span><span class="s4">, </span><span class="s1">mutation)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Append mutations to this list and swap - so that the final</span>
+      <span class="s0">// conflicting mutations happen before any other mutations</span>
+      <span class="s1">finalMutationsForConflictingAnimations.insert(</span>
+          <span class="s1">finalMutationsForConflictingAnimations.end()</span><span class="s4">,</span>
+          <span class="s1">mutations.begin()</span><span class="s4">,</span>
+          <span class="s1">mutations.end())</span><span class="s4">;</span>
+      <span class="s1">mutations = finalMutationsForConflictingAnimations</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s0">// if (mutations)</span>
+
+  <span class="s0">// We never commit a different root or modify anything -</span>
+  <span class="s0">// we just send additional mutations to the mounting layer until the</span>
+  <span class="s0">// animations are finished and the mounting layer (view) represents exactly</span>
+  <span class="s0">// what is in the most recent shadow tree</span>
+  <span class="s0">// Add animation mutations to the end of our existing mutations list in this</span>
+  <span class="s0">// function.</span>
+  <span class="s1">ShadowViewMutationList mutationsForAnimation{}</span><span class="s4">;</span>
+  <span class="s1">animationMutationsForFrame(surfaceId</span><span class="s4">, </span><span class="s1">mutationsForAnimation</span><span class="s4">, </span><span class="s1">now)</span><span class="s4">;</span>
+
+  <span class="s0">// If any delayed removes were executed, update remaining delayed keyframes</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+  <span class="s1">LOG(ERROR)</span>
+      <span class="s1">&lt;&lt; </span><span class="s3">&quot;Adjust all delayed mutations based on final mutations generated by animation driver&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;mutation : mutationsForAnimation) {</span>
+    <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::Remove) {</span>
+      <span class="s1">adjustDelayedMutationIndicesForMutation(surfaceId</span><span class="s4">, </span><span class="s1">mutation)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">mutations.insert(</span>
+      <span class="s1">mutations.end()</span><span class="s4">,</span>
+      <span class="s1">mutationsForAnimation.begin()</span><span class="s4">,</span>
+      <span class="s1">mutationsForAnimation.end())</span><span class="s4">;</span>
+
+  <span class="s0">// DEBUG ONLY: list existing inflight animations</span>
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+  <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;FINISHING DISPLAYING ONGOING inflightAnimations_!&quot;</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">i = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">j = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;inflightAnimation : inflightAnimations_) {</span>
+    <span class="s1">i++</span><span class="s4">;</span>
+    <span class="s1">j = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(inflightAnimation.completed) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;keyframe : inflightAnimation.keyFrames) {</span>
+      <span class="s1">j++</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(keyframe.invalidated) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;finalMutation : keyframe.finalMutationsForKeyFrame) {</span>
+        <span class="s4">if </span><span class="s1">(!finalMutation.mutatedViewIsVirtual()) {</span>
+          <span class="s1">std::string msg = </span><span class="s3">&quot;Animation &quot; </span><span class="s1">+ std::to_string(i) + </span><span class="s3">&quot; keyframe &quot; </span><span class="s1">+</span>
+              <span class="s1">std::to_string(j) + </span><span class="s3">&quot;: Final Animation&quot;</span><span class="s4">;</span>
+          <span class="s1">PrintMutationInstruction(msg</span><span class="s4">, </span><span class="s1">finalMutation)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;FINISHING DONE DISPLAYING ONGOING inflightAnimations_!&quot;</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s0">// Signal to delegate if all animations are complete, or if we were not</span>
+  <span class="s0">// animating anything and now some animation exists.</span>
+  <span class="s4">if </span><span class="s1">(inflightAnimationsExistInitially &amp;&amp; inflightAnimations_.empty()) {</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(layoutAnimationStatusDelegateMutex_)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(layoutAnimationStatusDelegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s1">layoutAnimationStatusDelegate_-&gt;onAllAnimationsComplete()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(</span>
+      <span class="s1">!inflightAnimationsExistInitially &amp;&amp; !inflightAnimations_.empty()) {</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(layoutAnimationStatusDelegateMutex_)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(layoutAnimationStatusDelegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s1">layoutAnimationStatusDelegate_-&gt;onAnimationStarted()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">MountingTransaction{</span>
+      <span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">transactionNumber</span><span class="s4">, </span><span class="s1">std::move(mutations)</span><span class="s4">, </span><span class="s1">telemetry}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::uiManagerDidConfigureNextLayoutAnimation(</span>
+    <span class="s1">LayoutAnimation layoutAnimation) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">currentAnimation_ = std::optional&lt;LayoutAnimation&gt;{layoutAnimation}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::setLayoutAnimationStatusDelegate(</span>
+    <span class="s1">LayoutAnimationStatusDelegate *delegate) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(layoutAnimationStatusDelegateMutex_)</span><span class="s4">;</span>
+  <span class="s1">layoutAnimationStatusDelegate_ = delegate</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::setClockNow(</span>
+    <span class="s1">std::function&lt;uint64_t()&gt; now) {</span>
+  <span class="s1">now_ = std::move(now)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Protected</span>
+
+<span class="s4">bool </span><span class="s1">LayoutAnimationKeyFrameManager::hasComponentDescriptorForShadowView(</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">componentDescriptorRegistry_-&gt;hasComponentDescriptorAt(</span>
+      <span class="s1">shadowView.componentHandle)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ComponentDescriptor </span><span class="s4">const </span><span class="s1">&amp;</span>
+<span class="s1">LayoutAnimationKeyFrameManager::getComponentDescriptorForShadowView(</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">componentDescriptorRegistry_-&gt;at(shadowView.componentHandle)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowView LayoutAnimationKeyFrameManager::createInterpolatedShadowView(</span>
+    <span class="s1">Float progress</span><span class="s4">,</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;startingView</span><span class="s4">,</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;finalView) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">react_native_assert(startingView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(finalView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!hasComponentDescriptorForShadowView(startingView)) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;No ComponentDescriptor for ShadowView being animated: [&quot;</span>
+               <span class="s1">&lt;&lt; startingView.tag &lt;&lt; </span><span class="s3">&quot;]&quot;</span><span class="s4">;</span>
+    <span class="s1">react_native_assert(</span><span class="s4">false</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">finalView</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">ComponentDescriptor </span><span class="s4">const </span><span class="s1">&amp;componentDescriptor =</span>
+      <span class="s1">getComponentDescriptorForShadowView(startingView)</span><span class="s4">;</span>
+
+  <span class="s0">// Base the mutated view on the finalView, so that the following stay</span>
+  <span class="s0">// consistent:</span>
+  <span class="s0">// - state</span>
+  <span class="s0">// - eventEmitter</span>
+  <span class="s0">// For now, we do not allow interpolation of state. And we probably never</span>
+  <span class="s0">// will, so make sure we always keep the mounting layer consistent with the</span>
+  <span class="s0">// &quot;final&quot; state.</span>
+  <span class="s4">auto </span><span class="s1">mutatedShadowView = ShadowView(finalView)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(mutatedShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">react_native_assert(startingView.props != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(finalView.props != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(startingView.props == </span><span class="s4">nullptr </span><span class="s1">|| finalView.props == </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">finalView</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Animate opacity or scale/transform</span>
+  <span class="s1">PropsParserContext propsParserContext{</span>
+      <span class="s1">finalView.surfaceId</span><span class="s4">, </span><span class="s1">*contextContainer_}</span><span class="s4">;</span>
+  <span class="s1">mutatedShadowView.props = componentDescriptor.interpolateProps(</span>
+      <span class="s1">propsParserContext</span><span class="s4">, </span><span class="s1">progress</span><span class="s4">, </span><span class="s1">startingView.props</span><span class="s4">, </span><span class="s1">finalView.props)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(mutatedShadowView.props != </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(mutatedShadowView.props == </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">finalView</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Interpolate LayoutMetrics</span>
+  <span class="s1">LayoutMetrics </span><span class="s4">const </span><span class="s1">&amp;finalLayoutMetrics = finalView.layoutMetrics</span><span class="s4">;</span>
+  <span class="s1">LayoutMetrics </span><span class="s4">const </span><span class="s1">&amp;baselineLayoutMetrics = startingView.layoutMetrics</span><span class="s4">;</span>
+  <span class="s1">LayoutMetrics interpolatedLayoutMetrics = finalLayoutMetrics</span><span class="s4">;</span>
+  <span class="s1">interpolatedLayoutMetrics.frame.origin.x = interpolateFloats(</span>
+      <span class="s1">progress</span><span class="s4">,</span>
+      <span class="s1">baselineLayoutMetrics.frame.origin.x</span><span class="s4">,</span>
+      <span class="s1">finalLayoutMetrics.frame.origin.x)</span><span class="s4">;</span>
+  <span class="s1">interpolatedLayoutMetrics.frame.origin.y = interpolateFloats(</span>
+      <span class="s1">progress</span><span class="s4">,</span>
+      <span class="s1">baselineLayoutMetrics.frame.origin.y</span><span class="s4">,</span>
+      <span class="s1">finalLayoutMetrics.frame.origin.y)</span><span class="s4">;</span>
+  <span class="s1">interpolatedLayoutMetrics.frame.size.width = interpolateFloats(</span>
+      <span class="s1">progress</span><span class="s4">,</span>
+      <span class="s1">baselineLayoutMetrics.frame.size.width</span><span class="s4">,</span>
+      <span class="s1">finalLayoutMetrics.frame.size.width)</span><span class="s4">;</span>
+  <span class="s1">interpolatedLayoutMetrics.frame.size.height = interpolateFloats(</span>
+      <span class="s1">progress</span><span class="s4">,</span>
+      <span class="s1">baselineLayoutMetrics.frame.size.height</span><span class="s4">,</span>
+      <span class="s1">finalLayoutMetrics.frame.size.height)</span><span class="s4">;</span>
+  <span class="s1">mutatedShadowView.layoutMetrics = interpolatedLayoutMetrics</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">mutatedShadowView</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::callCallback(</span>
+    <span class="s1">LayoutAnimationCallbackWrapper </span><span class="s4">const </span><span class="s1">&amp;callback) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">runtimeExecutor_(</span>
+      <span class="s1">[callback](jsi::Runtime &amp;runtime) { callback.call(runtime)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::queueFinalMutationsForCompletedKeyFrame(</span>
+    <span class="s1">AnimationKeyFrame </span><span class="s4">const </span><span class="s1">&amp;keyframe</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutation::List &amp;mutationsList</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">interrupted</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp; </span><span class="s0">/*logPrefix*/</span><span class="s1">) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!keyframe.finalMutationsForKeyFrame.empty()) {</span>
+    <span class="s0">// TODO: modularize this segment, it is repeated 2x in KeyFrameManager</span>
+    <span class="s0">// as well.</span>
+    <span class="s1">ShadowView prev = keyframe.viewPrev</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;finalMutation : keyframe.finalMutationsForKeyFrame) {</span>
+      <span class="s1">PrintMutationInstruction(</span>
+          <span class="s1">logPrefix + </span><span class="s3">&quot;: Queuing up Final Mutation:&quot;</span><span class="s4">, </span><span class="s1">finalMutation)</span><span class="s4">;</span>
+      <span class="s0">// Copy so that if something else mutates the inflight animations,</span>
+      <span class="s0">// it won't change this mutation after this point.</span>
+      <span class="s4">switch </span><span class="s1">(finalMutation.type) {</span>
+          <span class="s0">// For CREATE/INSERT this will contain CREATE, INSERT in that order.</span>
+          <span class="s0">// For REMOVE/DELETE, same.</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Type::Create:</span>
+          <span class="s1">mutationsList.push_back(ShadowViewMutation::CreateMutation(</span>
+              <span class="s1">finalMutation.newChildShadowView))</span><span class="s4">;</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Type::Delete:</span>
+          <span class="s1">mutationsList.push_back(ShadowViewMutation::DeleteMutation(prev))</span><span class="s4">;</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Type::Insert:</span>
+          <span class="s1">mutationsList.push_back(ShadowViewMutation::InsertMutation(</span>
+              <span class="s1">finalMutation.parentShadowView</span><span class="s4">,</span>
+              <span class="s1">finalMutation.newChildShadowView</span><span class="s4">,</span>
+              <span class="s1">finalMutation.index))</span><span class="s4">;</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Type::Remove:</span>
+          <span class="s1">mutationsList.push_back(ShadowViewMutation::RemoveMutation(</span>
+              <span class="s1">finalMutation.parentShadowView</span><span class="s4">, </span><span class="s1">prev</span><span class="s4">, </span><span class="s1">finalMutation.index))</span><span class="s4">;</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Type::RemoveDeleteTree:</span>
+          <span class="s0">// Note: Currently, there is a guarantee that if RemoveDeleteTree</span>
+          <span class="s0">// operations are generated, we /also/ generate corresponding</span>
+          <span class="s0">// Remove/Delete operations that are marked as &quot;redundant&quot;.</span>
+          <span class="s0">// LayoutAnimations will process the redundant operations here, and</span>
+          <span class="s0">// ignore this mega-op. In the future for perf reasons it would be</span>
+          <span class="s0">// nice to remove the redundant operations entirely but we would need</span>
+          <span class="s0">// to find a way to make the RemoveDeleteTree operation work with</span>
+          <span class="s0">// LayoutAnimations (that might not be possible).</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Type::Update:</span>
+          <span class="s1">mutationsList.push_back(ShadowViewMutation::UpdateMutation(</span>
+              <span class="s1">prev</span><span class="s4">,</span>
+              <span class="s1">finalMutation.newChildShadowView</span><span class="s4">,</span>
+              <span class="s1">finalMutation.parentShadowView))</span><span class="s4">;</span>
+          <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">(finalMutation.newChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s1">prev = finalMutation.newChildShadowView</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s0">// If there's no final mutation associated, create a mutation that</span>
+    <span class="s0">// corresponds to the animation being 100% complete. This is</span>
+    <span class="s0">// important for, for example, INSERT mutations being animated from</span>
+    <span class="s0">// opacity 0 to 1. If the animation is interrupted we must force the</span>
+    <span class="s0">// View to be at opacity 1. For Android - since it passes along only</span>
+    <span class="s0">// deltas, not an entire bag of props - generate an &quot;animation&quot;</span>
+    <span class="s0">// frame corresponding to a final update for this view. Only then,</span>
+    <span class="s0">// generate an update that will cause the ShadowTree to be</span>
+    <span class="s0">// consistent with the Mounting layer by passing viewEnd,</span>
+    <span class="s0">// unmodified, to the mounting layer. This helps with, for example,</span>
+    <span class="s0">// opacity animations.</span>
+    <span class="s0">// This is necessary for INSERT (create) and UPDATE (update) mutations, but</span>
+    <span class="s0">// not REMOVE/DELETE mutations (&quot;delete&quot; animations).</span>
+    <span class="s4">if </span><span class="s1">(interrupted) {</span>
+      <span class="s4">auto </span><span class="s1">mutatedShadowView =</span>
+          <span class="s1">createInterpolatedShadowView(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">keyframe.viewStart</span><span class="s4">, </span><span class="s1">keyframe.viewEnd)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">generatedPenultimateMutation = ShadowViewMutation::UpdateMutation(</span>
+          <span class="s1">keyframe.viewPrev</span><span class="s4">, </span><span class="s1">mutatedShadowView</span><span class="s4">, </span><span class="s1">keyframe.parentView)</span><span class="s4">;</span>
+      <span class="s1">react_native_assert(</span>
+          <span class="s1">generatedPenultimateMutation.oldChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">react_native_assert(</span>
+          <span class="s1">generatedPenultimateMutation.newChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">PrintMutationInstruction(</span>
+          <span class="s3">&quot;Queueing up penultimate mutation instruction - synthetic&quot;</span><span class="s4">,</span>
+          <span class="s1">generatedPenultimateMutation)</span><span class="s4">;</span>
+      <span class="s1">mutationsList.push_back(generatedPenultimateMutation)</span><span class="s4">;</span>
+
+      <span class="s4">auto </span><span class="s1">generatedMutation = ShadowViewMutation::UpdateMutation(</span>
+          <span class="s1">mutatedShadowView</span><span class="s4">, </span><span class="s1">keyframe.viewEnd</span><span class="s4">, </span><span class="s1">keyframe.parentView)</span><span class="s4">;</span>
+      <span class="s1">react_native_assert(generatedMutation.oldChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">react_native_assert(generatedMutation.newChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">PrintMutationInstruction(</span>
+          <span class="s3">&quot;Queueing up final mutation instruction - synthetic&quot;</span><span class="s4">,</span>
+          <span class="s1">generatedMutation)</span><span class="s4">;</span>
+      <span class="s1">mutationsList.push_back(generatedMutation)</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">auto </span><span class="s1">mutation = ShadowViewMutation::UpdateMutation(</span>
+          <span class="s1">keyframe.viewPrev</span><span class="s4">, </span><span class="s1">keyframe.viewEnd</span><span class="s4">, </span><span class="s1">keyframe.parentView)</span><span class="s4">;</span>
+      <span class="s1">PrintMutationInstruction(</span>
+          <span class="s1">logPrefix +</span>
+              <span class="s3">&quot;Animation Complete: Queuing up Final Synthetic Mutation:&quot;</span><span class="s4">,</span>
+          <span class="s1">mutation)</span><span class="s4">;</span>
+      <span class="s1">react_native_assert(mutation.oldChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">react_native_assert(mutation.newChildShadowView.tag &gt; </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">mutationsList.push_back(std::move(mutation))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::</span>
+    <span class="s1">adjustImmediateMutationIndicesForDelayedMutations(</span>
+        <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+        <span class="s1">ShadowViewMutation &amp;mutation</span><span class="s4">,</span>
+        <span class="s4">bool </span><span class="s1">skipLastAnimation</span><span class="s4">,</span>
+        <span class="s4">bool </span><span class="s1">lastAnimationOnly) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">bool </span><span class="s1">isRemoveMutation = mutation.type == ShadowViewMutation::Type::Remove</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">isRemoveMutation || mutation.type == ShadowViewMutation::Type::Insert)</span><span class="s4">;</span>
+
+  <span class="s0">// TODO: turn all of this into a lambda and share code?</span>
+  <span class="s4">if </span><span class="s1">(mutation.mutatedViewIsVirtual()) {</span>
+    <span class="s1">PrintMutationInstruction(</span>
+        <span class="s3">&quot;[IndexAdjustment] Not calling adjustImmediateMutationIndicesForDelayedMutations, is virtual, for:&quot;</span><span class="s4">,</span>
+        <span class="s1">mutation)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">PrintMutationInstruction(</span>
+      <span class="s3">&quot;[IndexAdjustment] Calling adjustImmediateMutationIndicesForDelayedMutations for:&quot;</span><span class="s4">,</span>
+      <span class="s1">mutation)</span><span class="s4">;</span>
+
+  <span class="s0">// First, collect all final mutations that could impact this immediate</span>
+  <span class="s0">// mutation.</span>
+  <span class="s1">std::vector&lt;ShadowViewMutation </span><span class="s4">const </span><span class="s1">*&gt; candidateMutations{}</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">inflightAnimationIt =</span>
+           <span class="s1">inflightAnimations_.rbegin() + (skipLastAnimation ? </span><span class="s5">1 </span><span class="s1">: </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+       <span class="s1">inflightAnimationIt != inflightAnimations_.rend()</span><span class="s4">;</span>
+       <span class="s1">inflightAnimationIt++) {</span>
+    <span class="s4">auto </span><span class="s1">&amp;inflightAnimation = *inflightAnimationIt</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(inflightAnimation.surfaceId != surfaceId) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(inflightAnimation.completed) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;animatedKeyFrame : inflightAnimation.keyFrames) {</span>
+      <span class="s4">if </span><span class="s1">(animatedKeyFrame.invalidated) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Detect if they're in the same view hierarchy, but not equivalent</span>
+      <span class="s0">// We've already detected direct conflicts and removed them.</span>
+      <span class="s4">if </span><span class="s1">(animatedKeyFrame.parentView.tag != mutation.parentShadowView.tag) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;delayedMutation :</span>
+           <span class="s1">animatedKeyFrame.finalMutationsForKeyFrame) {</span>
+        <span class="s4">if </span><span class="s1">(delayedMutation.type != ShadowViewMutation::Type::Remove) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(delayedMutation.mutatedViewIsVirtual()) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(delayedMutation.oldChildShadowView.tag ==</span>
+            <span class="s1">(isRemoveMutation ? mutation.oldChildShadowView.tag</span>
+                              <span class="s1">: mutation.newChildShadowView.tag)) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">PrintMutationInstructionRelative(</span>
+            <span class="s3">&quot;[IndexAdjustment] adjustImmediateMutationIndicesForDelayedMutations CANDIDATE for:&quot;</span><span class="s4">,</span>
+            <span class="s1">mutation</span><span class="s4">,</span>
+            <span class="s1">delayedMutation)</span><span class="s4">;</span>
+        <span class="s1">candidateMutations.push_back(&amp;delayedMutation)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(lastAnimationOnly) {</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// While the mutation keeps being affected, keep checking. We use the vector</span>
+  <span class="s0">// so we only perform one adjustment per delayed mutation. See comments at</span>
+  <span class="s0">// bottom of adjustDelayedMutationIndicesForMutation for further explanation.</span>
+  <span class="s4">bool </span><span class="s1">changed = </span><span class="s4">true;</span>
+  <span class="s4">int </span><span class="s1">adjustedDelta = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">while </span><span class="s1">(changed) {</span>
+    <span class="s1">changed = </span><span class="s4">false;</span>
+    <span class="s1">candidateMutations.erase(</span>
+        <span class="s1">std::remove_if(</span>
+            <span class="s1">candidateMutations.begin()</span><span class="s4">,</span>
+            <span class="s1">candidateMutations.end()</span><span class="s4">,</span>
+            <span class="s1">[&amp;changed</span><span class="s4">, </span><span class="s1">&amp;mutation</span><span class="s4">, </span><span class="s1">&amp;adjustedDelta</span><span class="s4">, </span><span class="s1">&amp;isRemoveMutation](</span>
+                <span class="s1">ShadowViewMutation </span><span class="s4">const </span><span class="s1">*candidateMutation) {</span>
+              <span class="s4">bool </span><span class="s1">indexConflicts =</span>
+                  <span class="s1">(candidateMutation-&gt;index &lt; mutation.index ||</span>
+                   <span class="s1">(isRemoveMutation &amp;&amp;</span>
+                    <span class="s1">candidateMutation-&gt;index == mutation.index))</span><span class="s4">;</span>
+              <span class="s4">if </span><span class="s1">(indexConflicts) {</span>
+                <span class="s1">mutation.index++</span><span class="s4">;</span>
+                <span class="s1">adjustedDelta++</span><span class="s4">;</span>
+                <span class="s1">changed = </span><span class="s4">true;</span>
+                <span class="s1">PrintMutationInstructionRelative(</span>
+                    <span class="s3">&quot;[IndexAdjustment] adjustImmediateMutationIndicesForDelayedMutations: Adjusting mutation UPWARD&quot;</span><span class="s4">,</span>
+                    <span class="s1">mutation</span><span class="s4">,</span>
+                    <span class="s1">*candidateMutation)</span><span class="s4">;</span>
+                <span class="s4">return true;</span>
+              <span class="s1">}</span>
+              <span class="s4">return false;</span>
+            <span class="s1">})</span><span class="s4">,</span>
+        <span class="s1">candidateMutations.end())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::adjustDelayedMutationIndicesForMutation(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutation </span><span class="s4">const </span><span class="s1">&amp;mutation</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">skipLastAnimation) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">bool </span><span class="s1">isRemoveMutation = mutation.type == ShadowViewMutation::Type::Remove</span><span class="s4">;</span>
+  <span class="s4">bool </span><span class="s1">isInsertMutation = mutation.type == ShadowViewMutation::Type::Insert</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">tag = isRemoveMutation ? mutation.oldChildShadowView.tag</span>
+                              <span class="s1">: mutation.newChildShadowView.tag</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(isRemoveMutation || isInsertMutation)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(mutation.mutatedViewIsVirtual()) {</span>
+    <span class="s1">PrintMutationInstruction(</span>
+        <span class="s3">&quot;[IndexAdjustment] Not calling adjustDelayedMutationIndicesForMutation, is virtual, for:&quot;</span><span class="s4">,</span>
+        <span class="s1">mutation)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// First, collect all final mutations that could impact this immediate</span>
+  <span class="s0">// mutation.</span>
+  <span class="s1">std::vector&lt;ShadowViewMutation *&gt; candidateMutations{}</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">inflightAnimationIt =</span>
+           <span class="s1">inflightAnimations_.rbegin() + (skipLastAnimation ? </span><span class="s5">1 </span><span class="s1">: </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+       <span class="s1">inflightAnimationIt != inflightAnimations_.rend()</span><span class="s4">;</span>
+       <span class="s1">inflightAnimationIt++) {</span>
+    <span class="s4">auto </span><span class="s1">&amp;inflightAnimation = *inflightAnimationIt</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(inflightAnimation.surfaceId != surfaceId) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(inflightAnimation.completed) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;animatedKeyFrame : inflightAnimation.keyFrames) {</span>
+      <span class="s4">if </span><span class="s1">(animatedKeyFrame.invalidated) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Detect if they're in the same view hierarchy, but not equivalent</span>
+      <span class="s0">// (We've already detected direct conflicts and handled them above)</span>
+      <span class="s4">if </span><span class="s1">(animatedKeyFrame.parentView.tag != mutation.parentShadowView.tag) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;finalAnimationMutation :</span>
+           <span class="s1">animatedKeyFrame.finalMutationsForKeyFrame) {</span>
+        <span class="s4">if </span><span class="s1">(finalAnimationMutation.oldChildShadowView.tag == tag) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s4">if </span><span class="s1">(finalAnimationMutation.type != ShadowViewMutation::Type::Remove) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(finalAnimationMutation.mutatedViewIsVirtual()) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">PrintMutationInstructionRelative(</span>
+            <span class="s3">&quot;[IndexAdjustment] adjustDelayedMutationIndicesForMutation: CANDIDATE:&quot;</span><span class="s4">,</span>
+            <span class="s1">mutation</span><span class="s4">,</span>
+            <span class="s1">finalAnimationMutation)</span><span class="s4">;</span>
+        <span class="s1">candidateMutations.push_back(&amp;finalAnimationMutation)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Because the finalAnimations are not sorted in any way, it is possible to</span>
+  <span class="s0">// have some sequence like:</span>
+  <span class="s0">// * DELAYED REMOVE 10 from {TAG}</span>
+  <span class="s0">// * DELAYED REMOVE 9 from {TAG}</span>
+  <span class="s0">// * ...</span>
+  <span class="s0">// * DELAYED REMOVE 5 from {TAG}</span>
+  <span class="s0">// with mutation: INSERT 6/REMOVE 6. This would cause the first few mutations</span>
+  <span class="s0">// to *not* be adjusted, even though they would be impacted by mutation or</span>
+  <span class="s0">// vice-versa after later adjustments are applied. Therefore, we just keep</span>
+  <span class="s0">// recursing while there are any changes. This isn't great, but is good enough</span>
+  <span class="s0">// for now until we change these data-structures.</span>
+  <span class="s4">bool </span><span class="s1">changed = </span><span class="s4">true;</span>
+  <span class="s4">while </span><span class="s1">(changed) {</span>
+    <span class="s1">changed = </span><span class="s4">false;</span>
+    <span class="s1">candidateMutations.erase(</span>
+        <span class="s1">std::remove_if(</span>
+            <span class="s1">candidateMutations.begin()</span><span class="s4">,</span>
+            <span class="s1">candidateMutations.end()</span><span class="s4">,</span>
+            <span class="s1">[&amp;mutation</span><span class="s4">, </span><span class="s1">&amp;isRemoveMutation</span><span class="s4">, </span><span class="s1">&amp;isInsertMutation</span><span class="s4">, </span><span class="s1">&amp;changed](</span>
+                <span class="s1">ShadowViewMutation *candidateMutation) {</span>
+              <span class="s4">if </span><span class="s1">(isRemoveMutation &amp;&amp;</span>
+                  <span class="s1">mutation.index &lt;= candidateMutation-&gt;index) {</span>
+                <span class="s1">candidateMutation-&gt;index--</span><span class="s4">;</span>
+                <span class="s1">changed = </span><span class="s4">true;</span>
+                <span class="s1">PrintMutationInstructionRelative(</span>
+                    <span class="s3">&quot;[IndexAdjustment] adjustDelayedMutationIndicesForMutation: Adjusting mutation DOWNWARD&quot;</span><span class="s4">,</span>
+                    <span class="s1">mutation</span><span class="s4">,</span>
+                    <span class="s1">*candidateMutation)</span><span class="s4">;</span>
+                <span class="s4">return true;</span>
+              <span class="s1">} </span><span class="s4">else if </span><span class="s1">(</span>
+                  <span class="s1">isInsertMutation &amp;&amp;</span>
+                  <span class="s1">mutation.index &lt;= candidateMutation-&gt;index) {</span>
+                <span class="s1">candidateMutation-&gt;index++</span><span class="s4">;</span>
+                <span class="s1">changed = </span><span class="s4">true;</span>
+                <span class="s1">PrintMutationInstructionRelative(</span>
+                    <span class="s3">&quot;[IndexAdjustment] adjustDelayedMutationIndicesForMutation: Adjusting mutation UPWARD&quot;</span><span class="s4">,</span>
+                    <span class="s1">mutation</span><span class="s4">,</span>
+                    <span class="s1">*candidateMutation)</span><span class="s4">;</span>
+                <span class="s4">return true;</span>
+              <span class="s1">}</span>
+              <span class="s4">return false;</span>
+            <span class="s1">})</span><span class="s4">,</span>
+        <span class="s1">candidateMutations.end())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::getAndEraseConflictingAnimations(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutationList </span><span class="s4">const </span><span class="s1">&amp;mutations</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;AnimationKeyFrame&gt; &amp;conflictingAnimations) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">ShadowViewMutationList localConflictingMutations{}</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;mutation : mutations) {</span>
+    <span class="s4">if </span><span class="s1">(mutation.type == ShadowViewMutation::Type::RemoveDeleteTree) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">bool </span><span class="s1">mutationIsCreateOrDelete =</span>
+        <span class="s1">mutation.type == ShadowViewMutation::Type::Create ||</span>
+        <span class="s1">mutation.type == ShadowViewMutation::Type::Delete</span><span class="s4">;</span>
+    <span class="s4">auto const </span><span class="s1">&amp;baselineShadowView =</span>
+        <span class="s1">(mutation.type == ShadowViewMutation::Type::Insert ||</span>
+         <span class="s1">mutation.type == ShadowViewMutation::Type::Create)</span>
+        <span class="s1">? mutation.newChildShadowView</span>
+        <span class="s1">: mutation.oldChildShadowView</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">baselineTag = baselineShadowView.tag</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;inflightAnimation : inflightAnimations_) {</span>
+      <span class="s4">if </span><span class="s1">(inflightAnimation.surfaceId != surfaceId) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">(inflightAnimation.completed) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">it = inflightAnimation.keyFrames.begin()</span><span class="s4">;</span>
+           <span class="s1">it != inflightAnimation.keyFrames.end()</span><span class="s4">;</span><span class="s1">) {</span>
+        <span class="s4">auto </span><span class="s1">&amp;animatedKeyFrame = *it</span><span class="s4">;</span>
+
+        <span class="s4">if </span><span class="s1">(animatedKeyFrame.invalidated) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// A conflict is when either: the animated node itself is mutated</span>
+        <span class="s0">// directly; or, the parent of the node is created or deleted. In cases</span>
+        <span class="s0">// of reparenting - say, the parent is deleted but the node was moved to</span>
+        <span class="s0">// a different parent first - the reparenting (remove/insert) conflict</span>
+        <span class="s0">// will be detected before we process the parent DELETE.</span>
+        <span class="s0">// Parent deletion is important because deleting a parent recursively</span>
+        <span class="s0">// deletes all children. If we previously deferred deletion of a child,</span>
+        <span class="s0">// we need to force deletion/removal to happen immediately.</span>
+        <span class="s4">bool </span><span class="s1">conflicting = animatedKeyFrame.tag == baselineTag ||</span>
+            <span class="s1">(mutationIsCreateOrDelete &amp;&amp;</span>
+             <span class="s1">animatedKeyFrame.parentView.tag == baselineTag &amp;&amp;</span>
+             <span class="s1">animatedKeyFrame.parentView.tag != </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s0">// Conflicting animation detected: if we're mutating a tag under</span>
+        <span class="s0">// animation, or deleting the parent of a tag under animation, or</span>
+        <span class="s0">// reparenting.</span>
+        <span class="s4">if </span><span class="s1">(conflicting) {</span>
+          <span class="s1">animatedKeyFrame.invalidated = </span><span class="s4">true;</span>
+
+          <span class="s0">// We construct a list of all conflicting animations, whether or not</span>
+          <span class="s0">// they have a &quot;final mutation&quot; to execute. This is important with,</span>
+          <span class="s0">// for example, &quot;insert&quot; mutations where the final update needs to set</span>
+          <span class="s0">// opacity to &quot;1&quot;, even if there's no final ShadowNode update.</span>
+          <span class="s0">// TODO: don't animate virtual views in the first place?</span>
+          <span class="s4">bool </span><span class="s1">isVirtual = </span><span class="s4">false;</span>
+          <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;finalMutationForKeyFrame :</span>
+               <span class="s1">animatedKeyFrame.finalMutationsForKeyFrame) {</span>
+            <span class="s1">isVirtual =</span>
+                <span class="s1">isVirtual || finalMutationForKeyFrame.mutatedViewIsVirtual()</span><span class="s4">;</span>
+
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+            <span class="s1">PrintMutationInstructionRelative(</span>
+                <span class="s3">&quot;Found mutation that conflicts with existing in-flight animation:&quot;</span><span class="s4">,</span>
+                <span class="s1">mutation</span><span class="s4">,</span>
+                <span class="s1">finalMutationForKeyFrame)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+          <span class="s1">}</span>
+
+          <span class="s1">conflictingAnimations.push_back(animatedKeyFrame)</span><span class="s4">;</span>
+          <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;finalMutationForKeyFrame :</span>
+               <span class="s1">animatedKeyFrame.finalMutationsForKeyFrame) {</span>
+            <span class="s4">if </span><span class="s1">(!isVirtual ||</span>
+                <span class="s1">finalMutationForKeyFrame.type ==</span>
+                    <span class="s1">ShadowViewMutation::Type::Delete) {</span>
+              <span class="s1">localConflictingMutations.push_back(finalMutationForKeyFrame)</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// Delete from existing animation</span>
+          <span class="s1">it = inflightAnimation.keyFrames.erase(it)</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">it++</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Recurse, in case conflicting mutations conflict with other existing</span>
+  <span class="s0">// animations</span>
+  <span class="s4">if </span><span class="s1">(!localConflictingMutations.empty()) {</span>
+    <span class="s1">getAndEraseConflictingAnimations(</span>
+        <span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">localConflictingMutations</span><span class="s4">, </span><span class="s1">conflictingAnimations)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationKeyFrameManager::deleteAnimationsForStoppedSurfaces()</span>
+    <span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">bool </span><span class="s1">inflightAnimationsExistInitially = !inflightAnimations_.empty()</span><span class="s4">;</span>
+
+  <span class="s0">// Execute stopSurface on any ongoing animations</span>
+  <span class="s4">if </span><span class="s1">(inflightAnimationsExistInitially) {</span>
+    <span class="s1">butter::set&lt;SurfaceId&gt; surfaceIdsToStop{}</span><span class="s4">;</span>
+    <span class="s1">{</span>
+      <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(surfaceIdsToStopMutex_)</span><span class="s4">;</span>
+      <span class="s1">surfaceIdsToStop = surfaceIdsToStop_</span><span class="s4">;</span>
+      <span class="s1">surfaceIdsToStop_.clear()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+<span class="s2">#ifdef </span><span class="s1">LAYOUT_ANIMATION_VERBOSE_LOGGING</span>
+    <span class="s1">std::ostringstream surfaceIdsStr</span><span class="s4">;</span>
+    <span class="s1">std::copy(</span>
+        <span class="s1">surfaceIdsToStop.begin()</span><span class="s4">,</span>
+        <span class="s1">surfaceIdsToStop.end()</span><span class="s4">,</span>
+        <span class="s1">std::ostream_iterator&lt;SurfaceId&gt;(surfaceIdsStr</span><span class="s4">, </span><span class="s3">&quot;, &quot;</span><span class="s1">))</span><span class="s4">;</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;LayoutAnimations: stopping animations due to stopSurface on &quot;</span>
+               <span class="s1">&lt;&lt; surfaceIdsStr.str()</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">it = inflightAnimations_.begin()</span><span class="s4">;</span>
+         <span class="s1">it != inflightAnimations_.end()</span><span class="s4">;</span><span class="s1">) {</span>
+      <span class="s4">const auto </span><span class="s1">&amp;animation = *it</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(surfaceIdsToStop.find(animation.surfaceId) !=</span>
+          <span class="s1">surfaceIdsToStop.end()) {</span>
+        <span class="s1">it = inflightAnimations_.erase(it)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">it++</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

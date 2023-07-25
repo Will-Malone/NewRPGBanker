@@ -1,0 +1,705 @@
+<html>
+<head>
+<title>GestureHandlerOrchestrator.kt</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #629755; font-weight: bold; font-style: italic;}
+.s6 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+GestureHandlerOrchestrator.kt</font>
+</center></td></tr></table>
+<pre><span class="s0">package </span><span class="s1">com.swmansion.gesturehandler.core</span>
+
+<span class="s1">import android.graphics.Matrix</span>
+<span class="s1">import android.graphics.PointF</span>
+<span class="s1">import android.view.MotionEvent</span>
+<span class="s1">import android.view.View</span>
+<span class="s1">import android.view.ViewGroup</span>
+<span class="s1">import android.widget.EditText</span>
+<span class="s1">import java.util.*</span>
+
+<span class="s0">class </span><span class="s1">GestureHandlerOrchestrator(</span>
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">wrapperView: ViewGroup</span><span class="s0">,</span>
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">handlerRegistry: GestureHandlerRegistry</span><span class="s0">,</span>
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">viewConfigHelper: ViewConfigurationHelper</span><span class="s0">,</span>
+<span class="s1">) {</span>
+  <span class="s2">/**</span>
+   <span class="s2">* Minimum alpha (value from 0 to 1) that should be set to a view so that it can be treated as a</span>
+   <span class="s2">* gesture target. E.g. if set to 0.1 then views that less than 10% opaque will be ignored when</span>
+   <span class="s2">* traversing view hierarchy and looking for gesture handlers.</span>
+   <span class="s2">*/</span>
+  <span class="s0">var </span><span class="s1">minimumAlphaForTraversal = DEFAULT_MIN_ALPHA_FOR_TRAVERSAL</span>
+
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">gestureHandlers = arrayOfNulls&lt;GestureHandler&lt;*&gt;?&gt;(SIMULTANEOUS_GESTURE_HANDLER_LIMIT)</span>
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">awaitingHandlers = arrayOfNulls&lt;GestureHandler&lt;*&gt;?&gt;(SIMULTANEOUS_GESTURE_HANDLER_LIMIT)</span>
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">preparedHandlers = arrayOfNulls&lt;GestureHandler&lt;*&gt;?&gt;(SIMULTANEOUS_GESTURE_HANDLER_LIMIT)</span>
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">handlersToCancel = arrayOfNulls&lt;GestureHandler&lt;*&gt;?&gt;(SIMULTANEOUS_GESTURE_HANDLER_LIMIT)</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">gestureHandlersCount = </span><span class="s3">0</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">awaitingHandlersCount = </span><span class="s3">0</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">isHandlingTouch = </span><span class="s0">false</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">handlingChangeSemaphore = </span><span class="s3">0</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">finishedHandlersCleanupScheduled = </span><span class="s0">false</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">activationIndex = </span><span class="s3">0</span>
+
+  <span class="s2">/**</span>
+   <span class="s2">* Should be called from the view wrapper</span>
+   <span class="s2">*/</span>
+  <span class="s0">fun </span><span class="s1">onTouchEvent(event: MotionEvent): Boolean {</span>
+    <span class="s1">isHandlingTouch = </span><span class="s0">true</span>
+    <span class="s0">val </span><span class="s1">action = event.actionMasked</span>
+    <span class="s0">if </span><span class="s1">(action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {</span>
+      <span class="s1">extractGestureHandlers(event)</span>
+    <span class="s1">} </span><span class="s0">else if </span><span class="s1">(action == MotionEvent.ACTION_CANCEL) {</span>
+      <span class="s1">cancelAll()</span>
+    <span class="s1">}</span>
+    <span class="s1">deliverEventToGestureHandlers(event)</span>
+    <span class="s1">isHandlingTouch = </span><span class="s0">false</span>
+    <span class="s0">if </span><span class="s1">(finishedHandlersCleanupScheduled &amp;&amp; handlingChangeSemaphore == </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">cleanupFinishedHandlers()</span>
+    <span class="s1">}</span>
+    <span class="s0">return true</span>
+  <span class="s1">}</span>
+
+  <span class="s0">fun </span><span class="s1">getHandlersForView(view: View) = handlerRegistry.getHandlersForView(view)</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">scheduleFinishedHandlersCleanup() {</span>
+    <span class="s0">if </span><span class="s1">(isHandlingTouch || handlingChangeSemaphore != </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">finishedHandlersCleanupScheduled = </span><span class="s0">true</span>
+    <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+      <span class="s1">cleanupFinishedHandlers()</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private inline </span><span class="s0">fun </span><span class="s1">compactHandlersIf(handlers: Array&lt;GestureHandler&lt;*&gt;?&gt;</span><span class="s0">, </span><span class="s1">count: Int</span><span class="s0">, </span><span class="s1">predicate: (handler: GestureHandler&lt;*&gt;?) -&gt; Boolean): Int {</span>
+    <span class="s0">var </span><span class="s1">out = </span><span class="s3">0</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until count) {</span>
+      <span class="s0">if </span><span class="s1">(predicate(handlers[i])) {</span>
+        <span class="s1">handlers[out++] = handlers[i]</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">return </span><span class="s1">out</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">cleanupFinishedHandlers() {</span>
+    <span class="s0">var </span><span class="s1">shouldCleanEmptyCells = </span><span class="s0">false</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s1">gestureHandlersCount - </span><span class="s3">1 </span><span class="s1">downTo </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s0">val </span><span class="s1">handler = gestureHandlers[i]!!</span>
+      <span class="s0">if </span><span class="s1">(isFinished(handler.state) &amp;&amp; !handler.isAwaiting) {</span>
+        <span class="s1">gestureHandlers[i] = </span><span class="s0">null</span>
+        <span class="s1">shouldCleanEmptyCells = </span><span class="s0">true</span>
+        <span class="s1">handler.reset()</span>
+        <span class="s1">handler.apply {</span>
+          <span class="s1">isActive = </span><span class="s0">false</span>
+          <span class="s1">isAwaiting = </span><span class="s0">false</span>
+          <span class="s1">activationIndex = Int.MAX_VALUE</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">(shouldCleanEmptyCells) {</span>
+      <span class="s1">gestureHandlersCount = compactHandlersIf(gestureHandlers</span><span class="s0">, </span><span class="s1">gestureHandlersCount) { handler -&gt;</span>
+        <span class="s1">handler != </span><span class="s0">null</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">finishedHandlersCleanupScheduled = </span><span class="s0">false</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">hasOtherHandlerToWaitFor(handler: GestureHandler&lt;*&gt;): Boolean {</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until gestureHandlersCount) {</span>
+      <span class="s0">val </span><span class="s1">otherHandler = gestureHandlers[i]!!</span>
+      <span class="s0">if </span><span class="s1">(!isFinished(otherHandler.state) &amp;&amp; shouldHandlerWaitForOther(handler</span><span class="s0">, </span><span class="s1">otherHandler)) {</span>
+        <span class="s0">return true</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">return false</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">tryActivate(handler: GestureHandler&lt;*&gt;) {</span>
+    <span class="s4">// see if there is anyone else who we need to wait for</span>
+    <span class="s0">if </span><span class="s1">(hasOtherHandlerToWaitFor(handler)) {</span>
+      <span class="s1">addAwaitingHandler(handler)</span>
+    <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+      <span class="s4">// we can activate handler right away</span>
+      <span class="s1">makeActive(handler)</span>
+      <span class="s1">handler.isAwaiting = </span><span class="s0">false</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">cleanupAwaitingHandlers() {</span>
+    <span class="s1">awaitingHandlersCount = compactHandlersIf(awaitingHandlers</span><span class="s0">, </span><span class="s1">awaitingHandlersCount) { handler -&gt;</span>
+      <span class="s1">handler!!.isAwaiting</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">/*package*/</span>
+  <span class="s0">fun </span><span class="s1">onHandlerStateChange(handler: GestureHandler&lt;*&gt;</span><span class="s0">, </span><span class="s1">newState: Int</span><span class="s0">, </span><span class="s1">prevState: Int) {</span>
+    <span class="s1">handlingChangeSemaphore += </span><span class="s3">1</span>
+    <span class="s0">if </span><span class="s1">(isFinished(newState)) {</span>
+      <span class="s4">// if there were handlers awaiting completion of this handler, we can trigger active state</span>
+      <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until awaitingHandlersCount) {</span>
+        <span class="s0">val </span><span class="s1">otherHandler = awaitingHandlers[i]</span>
+        <span class="s0">if </span><span class="s1">(shouldHandlerWaitForOther(otherHandler!!</span><span class="s0">, </span><span class="s1">handler)) {</span>
+          <span class="s0">if </span><span class="s1">(newState == GestureHandler.STATE_END) {</span>
+            <span class="s4">// gesture has ended, we need to kill the awaiting handler</span>
+            <span class="s1">otherHandler.cancel()</span>
+            <span class="s0">if </span><span class="s1">(otherHandler.state == GestureHandler.STATE_END) {</span>
+              <span class="s4">// Handle edge case, where discrete gestures end immediately after activation thus</span>
+              <span class="s4">// their state is set to END and when the gesture they are waiting for activates they</span>
+              <span class="s4">// should be cancelled, however `cancel` was never sent as gestures were already in the END state.</span>
+              <span class="s4">// Send synthetic BEGAN -&gt; CANCELLED to properly handle JS logic</span>
+              <span class="s1">otherHandler.dispatchStateChange(</span>
+                <span class="s1">GestureHandler.STATE_CANCELLED</span><span class="s0">,</span>
+                <span class="s1">GestureHandler.STATE_BEGAN</span>
+              <span class="s1">)</span>
+            <span class="s1">}</span>
+            <span class="s1">otherHandler.isAwaiting = </span><span class="s0">false</span>
+          <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+            <span class="s4">// gesture has failed recognition, we may try activating</span>
+            <span class="s1">tryActivate(otherHandler)</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">cleanupAwaitingHandlers()</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">(newState == GestureHandler.STATE_ACTIVE) {</span>
+      <span class="s1">tryActivate(handler)</span>
+    <span class="s1">} </span><span class="s0">else if </span><span class="s1">(prevState == GestureHandler.STATE_ACTIVE || prevState == GestureHandler.STATE_END) {</span>
+      <span class="s0">if </span><span class="s1">(handler.isActive) {</span>
+        <span class="s1">handler.dispatchStateChange(newState</span><span class="s0">, </span><span class="s1">prevState)</span>
+      <span class="s1">} </span><span class="s0">else if </span><span class="s1">(prevState == GestureHandler.STATE_ACTIVE &amp;&amp; (newState == GestureHandler.STATE_CANCELLED || newState == GestureHandler.STATE_FAILED)) {</span>
+        <span class="s4">// Handle edge case where handler awaiting for another one tries to activate but finishes</span>
+        <span class="s4">// before the other would not send state change event upon ending. Note that we only want</span>
+        <span class="s4">// to do this if the newState is either CANCELLED or FAILED, if it is END we still want to</span>
+        <span class="s4">// wait for the other handler to finish as in that case synthetic events will be sent by the</span>
+        <span class="s4">// makeActive method.</span>
+        <span class="s1">handler.dispatchStateChange(newState</span><span class="s0">, </span><span class="s1">GestureHandler.STATE_BEGAN)</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s0">else if </span><span class="s1">(prevState != GestureHandler.STATE_UNDETERMINED || newState != GestureHandler.STATE_CANCELLED) {</span>
+      <span class="s4">// If handler is changing state from UNDETERMINED to CANCELLED, the state change event shouldn't</span>
+      <span class="s4">// be sent. Handler hasn't yet began so it may not be initialized which results in crashes.</span>
+      <span class="s4">// If it doesn't crash, there may be some weird behavior on JS side, as `onFinalize` will be</span>
+      <span class="s4">// called without calling `onBegin` first.</span>
+      <span class="s1">handler.dispatchStateChange(newState</span><span class="s0">, </span><span class="s1">prevState)</span>
+    <span class="s1">}</span>
+    <span class="s1">handlingChangeSemaphore -= </span><span class="s3">1</span>
+    <span class="s1">scheduleFinishedHandlersCleanup()</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">makeActive(handler: GestureHandler&lt;*&gt;) {</span>
+    <span class="s0">val </span><span class="s1">currentState = handler.state</span>
+    <span class="s1">with(handler) {</span>
+      <span class="s1">isAwaiting = </span><span class="s0">false</span>
+      <span class="s1">isActive = </span><span class="s0">true</span>
+      <span class="s1">shouldResetProgress = </span><span class="s0">true</span>
+      <span class="s1">activationIndex = </span><span class="s0">this</span><span class="s1">@GestureHandlerOrchestrator.activationIndex++</span>
+    <span class="s1">}</span>
+    <span class="s0">var </span><span class="s1">toCancelCount = </span><span class="s3">0</span>
+    <span class="s4">// Cancel all handlers that are required to be cancel upon current handler's activation</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until gestureHandlersCount) {</span>
+      <span class="s0">val </span><span class="s1">otherHandler = gestureHandlers[i]!!</span>
+      <span class="s0">if </span><span class="s1">(shouldHandlerBeCancelledBy(otherHandler</span><span class="s0">, </span><span class="s1">handler)) {</span>
+        <span class="s1">handlersToCancel[toCancelCount++] = otherHandler</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s1">toCancelCount - </span><span class="s3">1 </span><span class="s1">downTo </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">handlersToCancel[i]!!.cancel()</span>
+    <span class="s1">}</span>
+
+    <span class="s4">// Clear all awaiting handlers waiting for the current handler to fail</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s1">awaitingHandlersCount - </span><span class="s3">1 </span><span class="s1">downTo </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s0">val </span><span class="s1">otherHandler = awaitingHandlers[i]!!</span>
+      <span class="s0">if </span><span class="s1">(shouldHandlerBeCancelledBy(otherHandler</span><span class="s0">, </span><span class="s1">handler)) {</span>
+        <span class="s1">otherHandler.cancel()</span>
+        <span class="s1">otherHandler.isAwaiting = </span><span class="s0">false</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">cleanupAwaitingHandlers()</span>
+
+    <span class="s4">// Dispatch state change event if handler is no longer in the active state we should also</span>
+    <span class="s4">// trigger END state change and UNDETERMINED state change if necessary</span>
+    <span class="s1">handler.dispatchStateChange(GestureHandler.STATE_ACTIVE</span><span class="s0">, </span><span class="s1">GestureHandler.STATE_BEGAN)</span>
+    <span class="s0">if </span><span class="s1">(currentState != GestureHandler.STATE_ACTIVE) {</span>
+      <span class="s1">handler.dispatchStateChange(GestureHandler.STATE_END</span><span class="s0">, </span><span class="s1">GestureHandler.STATE_ACTIVE)</span>
+      <span class="s0">if </span><span class="s1">(currentState != GestureHandler.STATE_END) {</span>
+        <span class="s1">handler.dispatchStateChange(GestureHandler.STATE_UNDETERMINED</span><span class="s0">, </span><span class="s1">GestureHandler.STATE_END)</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">deliverEventToGestureHandlers(event: MotionEvent) {</span>
+    <span class="s4">// Copy handlers to &quot;prepared handlers&quot; array, because the list of active handlers can change</span>
+    <span class="s4">// as a result of state updates</span>
+    <span class="s0">val </span><span class="s1">handlersCount = gestureHandlersCount</span>
+
+    <span class="s1">gestureHandlers.copyInto(preparedHandlers</span><span class="s0">, </span><span class="s3">0</span><span class="s0">, </span><span class="s3">0</span><span class="s0">, </span><span class="s1">handlersCount)</span>
+    <span class="s4">// We want to deliver events to active handlers first in order of their activation (handlers</span>
+    <span class="s4">// that activated first will first get event delivered). Otherwise we deliver events in the</span>
+    <span class="s4">// order in which handlers has been added (&quot;most direct&quot; children goes first). Therefore we rely</span>
+    <span class="s4">// on Arrays.sort providing a stable sort (as children are registered in order in which they</span>
+    <span class="s4">// should be tested)</span>
+    <span class="s1">preparedHandlers.sortWith(handlersComparator</span><span class="s0">, </span><span class="s3">0</span><span class="s0">, </span><span class="s1">handlersCount)</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until handlersCount) {</span>
+      <span class="s1">deliverEventToGestureHandler(preparedHandlers[i]!!</span><span class="s0">, </span><span class="s1">event)</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">cancelAll() {</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s1">awaitingHandlersCount - </span><span class="s3">1 </span><span class="s1">downTo </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">awaitingHandlers[i]!!.cancel()</span>
+    <span class="s1">}</span>
+    <span class="s4">// Copy handlers to &quot;prepared handlers&quot; array, because the list of active handlers can change</span>
+    <span class="s4">// as a result of state updates</span>
+    <span class="s0">val </span><span class="s1">handlersCount = gestureHandlersCount</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until handlersCount) {</span>
+      <span class="s1">preparedHandlers[i] = gestureHandlers[i]</span>
+    <span class="s1">}</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s1">handlersCount - </span><span class="s3">1 </span><span class="s1">downTo </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">preparedHandlers[i]!!.cancel()</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">deliverEventToGestureHandler(handler: GestureHandler&lt;*&gt;</span><span class="s0">, </span><span class="s1">sourceEvent: MotionEvent) {</span>
+    <span class="s0">if </span><span class="s1">(!isViewAttachedUnderWrapper(handler.view)) {</span>
+      <span class="s1">handler.cancel()</span>
+      <span class="s0">return</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">(!handler.wantEvents()) {</span>
+      <span class="s0">return</span>
+    <span class="s1">}</span>
+
+    <span class="s0">val </span><span class="s1">action = sourceEvent.actionMasked</span>
+    <span class="s0">val </span><span class="s1">event = transformEventToViewCoords(handler.view</span><span class="s0">, </span><span class="s1">MotionEvent.obtain(sourceEvent))</span>
+
+    <span class="s4">// Touch events are sent before the handler itself has a chance to process them,</span>
+    <span class="s4">// mainly because `onTouchesUp` shoul be send befor gesture finishes. This means that</span>
+    <span class="s4">// the first `onTouchesDown` event is sent before a gesture begins, activation in</span>
+    <span class="s4">// callback for this event causes problems because the handler doesn't have a chance</span>
+    <span class="s4">// to initialize itself with starting values of pointer (in pan this causes translation</span>
+    <span class="s4">// to be equal to the coordinates of the pointer). The simplest solution is to send</span>
+    <span class="s4">// the first `onTouchesDown` event after the handler processes it and changes state</span>
+    <span class="s4">// to `BEGAN`.</span>
+    <span class="s0">if </span><span class="s1">(handler.needsPointerData &amp;&amp; handler.state != </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s1">handler.updatePointerData(event)</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(!handler.isAwaiting || action != MotionEvent.ACTION_MOVE) {</span>
+      <span class="s0">val </span><span class="s1">isFirstEvent = handler.state == </span><span class="s3">0</span>
+      <span class="s1">handler.handle(event</span><span class="s0">, </span><span class="s1">sourceEvent)</span>
+      <span class="s0">if </span><span class="s1">(handler.isActive) {</span>
+        <span class="s4">// After handler is done waiting for other one to fail its progress should be</span>
+        <span class="s4">// reset, otherwise there may be a visible jump in values sent by the handler.</span>
+        <span class="s4">// When handler is waiting it's already activated but the `isAwaiting` flag</span>
+        <span class="s4">// prevents it from receiving touch stream. When the flag is changed, the</span>
+        <span class="s4">// difference between this event and the last one may be large enough to be</span>
+        <span class="s4">// visible in interactions based on this gesture. This makes it consistent with</span>
+        <span class="s4">// the behavior on iOS.</span>
+        <span class="s0">if </span><span class="s1">(handler.shouldResetProgress) {</span>
+          <span class="s1">handler.shouldResetProgress = </span><span class="s0">false</span>
+          <span class="s1">handler.resetProgress()</span>
+        <span class="s1">}</span>
+        <span class="s1">handler.dispatchHandlerUpdate(event)</span>
+      <span class="s1">}</span>
+
+      <span class="s0">if </span><span class="s1">(handler.needsPointerData &amp;&amp; isFirstEvent) {</span>
+        <span class="s1">handler.updatePointerData(event)</span>
+      <span class="s1">}</span>
+
+      <span class="s4">// if event was of type UP or POINTER_UP we request handler to stop tracking now that</span>
+      <span class="s4">// the event has been dispatched</span>
+      <span class="s0">if </span><span class="s1">(action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {</span>
+        <span class="s0">val </span><span class="s1">pointerId = event.getPointerId(event.actionIndex)</span>
+        <span class="s1">handler.stopTrackingPointer(pointerId)</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">event.recycle()</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/**</span>
+   <span class="s2">* isViewAttachedUnderWrapper checks whether all of parents for view related to handler</span>
+   <span class="s2">* view are attached. Since there might be an issue rarely observed when view</span>
+   <span class="s2">* has been detached and handler's state hasn't been change to canceled, failed or</span>
+   <span class="s2">* ended yet. Probably it's a result of some race condition and stopping delivering</span>
+   <span class="s2">* for this handler and changing its state to failed of end appear to be good enough solution.</span>
+   <span class="s2">*/</span>
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">isViewAttachedUnderWrapper(view: View?): Boolean {</span>
+    <span class="s0">if </span><span class="s1">(view == </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s0">return false</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">(view === wrapperView) {</span>
+      <span class="s0">return true</span>
+    <span class="s1">}</span>
+    <span class="s0">var </span><span class="s1">parent = view.parent</span>
+    <span class="s0">while </span><span class="s1">(parent != </span><span class="s0">null </span><span class="s1">&amp;&amp; parent !== wrapperView) {</span>
+      <span class="s1">parent = parent.parent</span>
+    <span class="s1">}</span>
+    <span class="s0">return </span><span class="s1">parent === wrapperView</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/**</span>
+   <span class="s2">* Transforms an event in the coordinates of wrapperView into the coordinate space of the received view.</span>
+   <span class="s2">*</span>
+   <span class="s2">* This modifies and returns the same event as it receives</span>
+   <span class="s2">*</span>
+   <span class="s2">* </span><span class="s5">@param </span><span class="s2">view - view to which coordinate space the event should be transformed</span>
+   <span class="s2">* </span><span class="s5">@param </span><span class="s2">event - event to transform</span>
+   <span class="s2">*/</span>
+  <span class="s0">fun </span><span class="s1">transformEventToViewCoords(view: View?</span><span class="s0">, </span><span class="s1">event: MotionEvent): MotionEvent {</span>
+    <span class="s0">if </span><span class="s1">(view == </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s0">return </span><span class="s1">event</span>
+    <span class="s1">}</span>
+
+    <span class="s0">val </span><span class="s1">parent = view.parent </span><span class="s0">as? </span><span class="s1">ViewGroup</span>
+    <span class="s4">// Events are passed down to the orchestrator by the wrapperView, so they are already in the</span>
+    <span class="s4">// relevant coordinate space. We want to stop traversing the tree when we reach it.</span>
+    <span class="s0">if </span><span class="s1">(parent != wrapperView) {</span>
+      <span class="s1">transformEventToViewCoords(parent</span><span class="s0">, </span><span class="s1">event)</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(parent != </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s0">val </span><span class="s1">localX = event.x + parent.scrollX - view.left</span>
+      <span class="s0">val </span><span class="s1">localY = event.y + parent.scrollY - view.top</span>
+      <span class="s1">event.setLocation(localX</span><span class="s0">, </span><span class="s1">localY)</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(!view.matrix.isIdentity) {</span>
+      <span class="s1">view.matrix.invert(inverseMatrix)</span>
+      <span class="s1">event.transform(inverseMatrix)</span>
+    <span class="s1">}</span>
+
+    <span class="s0">return </span><span class="s1">event</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/**</span>
+   <span class="s2">* Transforms a point in the coordinates of wrapperView into the coordinate space of the received view.</span>
+   <span class="s2">*</span>
+   <span class="s2">* This modifies and returns the same point as it receives</span>
+   <span class="s2">*</span>
+   <span class="s2">* </span><span class="s5">@param </span><span class="s2">view - view to which coordinate space the point should be transformed</span>
+   <span class="s2">* </span><span class="s5">@param </span><span class="s2">point - point to transform</span>
+   <span class="s2">*/</span>
+  <span class="s0">fun </span><span class="s1">transformPointToViewCoords(view: View?</span><span class="s0">, </span><span class="s1">point: PointF): PointF {</span>
+    <span class="s0">if </span><span class="s1">(view == </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s0">return </span><span class="s1">point</span>
+    <span class="s1">}</span>
+
+    <span class="s0">val </span><span class="s1">parent = view.parent </span><span class="s0">as? </span><span class="s1">ViewGroup</span>
+    <span class="s4">// Events are passed down to the orchestrator by the wrapperView, so they are already in the</span>
+    <span class="s4">// relevant coordinate space. We want to stop traversing the tree when we reach it.</span>
+    <span class="s0">if </span><span class="s1">(parent != wrapperView) {</span>
+      <span class="s1">transformPointToViewCoords(parent</span><span class="s0">, </span><span class="s1">point)</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(parent != </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s1">point.x += parent.scrollX - view.left</span>
+      <span class="s1">point.y += parent.scrollY - view.top</span>
+    <span class="s1">}</span>
+
+    <span class="s0">if </span><span class="s1">(!view.matrix.isIdentity) {</span>
+      <span class="s1">view.matrix.invert(inverseMatrix)</span>
+      <span class="s1">tempCoords[</span><span class="s3">0</span><span class="s1">] = point.x</span>
+      <span class="s1">tempCoords[</span><span class="s3">1</span><span class="s1">] = point.y</span>
+      <span class="s1">inverseMatrix.mapPoints(tempCoords)</span>
+      <span class="s1">point.x = tempCoords[</span><span class="s3">0</span><span class="s1">]</span>
+      <span class="s1">point.y = tempCoords[</span><span class="s3">1</span><span class="s1">]</span>
+    <span class="s1">}</span>
+
+    <span class="s0">return </span><span class="s1">point</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">addAwaitingHandler(handler: GestureHandler&lt;*&gt;) {</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until awaitingHandlersCount) {</span>
+      <span class="s0">if </span><span class="s1">(awaitingHandlers[i] === handler) {</span>
+        <span class="s0">return</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">check(awaitingHandlersCount &lt; awaitingHandlers.size) { </span><span class="s6">&quot;Too many recognizers&quot; </span><span class="s1">}</span>
+    <span class="s1">awaitingHandlers[awaitingHandlersCount++] = handler</span>
+    <span class="s1">with(handler) {</span>
+      <span class="s1">isAwaiting = </span><span class="s0">true</span>
+      <span class="s1">activationIndex = </span><span class="s0">this</span><span class="s1">@GestureHandlerOrchestrator.activationIndex++</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">recordHandlerIfNotPresent(handler: GestureHandler&lt;*&gt;</span><span class="s0">, </span><span class="s1">view: View) {</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s3">0 </span><span class="s1">until gestureHandlersCount) {</span>
+      <span class="s0">if </span><span class="s1">(gestureHandlers[i] === handler) {</span>
+        <span class="s0">return</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">check(gestureHandlersCount &lt; gestureHandlers.size) { </span><span class="s6">&quot;Too many recognizers&quot; </span><span class="s1">}</span>
+    <span class="s1">gestureHandlers[gestureHandlersCount++] = handler</span>
+    <span class="s1">handler.isActive = </span><span class="s0">false</span>
+    <span class="s1">handler.isAwaiting = </span><span class="s0">false</span>
+    <span class="s1">handler.activationIndex = Int.MAX_VALUE</span>
+    <span class="s1">handler.prepare(view</span><span class="s0">, this</span><span class="s1">)</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">isViewOverflowingParent(view: View): Boolean {</span>
+    <span class="s0">val </span><span class="s1">parent = view.parent </span><span class="s0">as? </span><span class="s1">ViewGroup ?: </span><span class="s0">return false</span>
+    <span class="s0">val </span><span class="s1">matrix = view.matrix</span>
+    <span class="s0">val </span><span class="s1">localXY = matrixTransformCoords</span>
+    <span class="s1">localXY[</span><span class="s3">0</span><span class="s1">] = </span><span class="s3">0f</span>
+    <span class="s1">localXY[</span><span class="s3">1</span><span class="s1">] = </span><span class="s3">0f</span>
+    <span class="s1">matrix.mapPoints(localXY)</span>
+    <span class="s0">val </span><span class="s1">left = localXY[</span><span class="s3">0</span><span class="s1">] + view.left</span>
+    <span class="s0">val </span><span class="s1">top = localXY[</span><span class="s3">1</span><span class="s1">] + view.top</span>
+
+    <span class="s0">return </span><span class="s1">left &lt; </span><span class="s3">0f </span><span class="s1">|| left + view.width &gt; parent.width || top &lt; </span><span class="s3">0f </span><span class="s1">|| top + view.height &gt; parent.height</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">extractAncestorHandlers(view: View</span><span class="s0">, </span><span class="s1">coords: FloatArray</span><span class="s0">, </span><span class="s1">pointerId: Int): Boolean {</span>
+    <span class="s0">var </span><span class="s1">found = </span><span class="s0">false</span>
+    <span class="s0">var </span><span class="s1">parent = view.parent</span>
+
+    <span class="s0">while </span><span class="s1">(parent != </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s0">if </span><span class="s1">(parent </span><span class="s0">is </span><span class="s1">ViewGroup) {</span>
+        <span class="s0">val </span><span class="s1">parentViewGroup: ViewGroup = parent</span>
+
+        <span class="s1">handlerRegistry.getHandlersForView(parent)?.let {</span>
+          <span class="s1">synchronized(it) {</span>
+            <span class="s0">for </span><span class="s1">(handler </span><span class="s0">in </span><span class="s1">it) {</span>
+              <span class="s0">if </span><span class="s1">(handler.isEnabled &amp;&amp; handler.isWithinBounds(view</span><span class="s0">, </span><span class="s1">coords[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">coords[</span><span class="s3">1</span><span class="s1">])) {</span>
+                <span class="s1">found = </span><span class="s0">true</span>
+                <span class="s1">recordHandlerIfNotPresent(handler</span><span class="s0">, </span><span class="s1">parentViewGroup)</span>
+                <span class="s1">handler.startTrackingPointer(pointerId)</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s1">parent = parent.parent</span>
+    <span class="s1">}</span>
+
+    <span class="s0">return </span><span class="s1">found</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">recordViewHandlersForPointer(view: View</span><span class="s0">, </span><span class="s1">coords: FloatArray</span><span class="s0">, </span><span class="s1">pointerId: Int): Boolean {</span>
+    <span class="s0">var </span><span class="s1">found = </span><span class="s0">false</span>
+    <span class="s1">handlerRegistry.getHandlersForView(view)?.let {</span>
+      <span class="s1">synchronized(it) {</span>
+        <span class="s0">for </span><span class="s1">(handler </span><span class="s0">in </span><span class="s1">it) {</span>
+          <span class="s0">if </span><span class="s1">(handler.isEnabled &amp;&amp; handler.isWithinBounds(view</span><span class="s0">, </span><span class="s1">coords[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">coords[</span><span class="s3">1</span><span class="s1">])) {</span>
+            <span class="s1">recordHandlerIfNotPresent(handler</span><span class="s0">, </span><span class="s1">view)</span>
+            <span class="s1">handler.startTrackingPointer(pointerId)</span>
+            <span class="s1">found = </span><span class="s0">true</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">// if the pointer is inside the view but it overflows its parent, handlers attached to the parent</span>
+    <span class="s4">// might not have been extracted (pointer might be in a child, but may be outside parent)</span>
+    <span class="s0">if </span><span class="s1">(coords[</span><span class="s3">0</span><span class="s1">] </span><span class="s0">in </span><span class="s3">0f</span><span class="s1">..view.width.toFloat() &amp;&amp; coords[</span><span class="s3">1</span><span class="s1">] </span><span class="s0">in </span><span class="s3">0f</span><span class="s1">..view.height.toFloat() &amp;&amp;</span>
+      <span class="s1">isViewOverflowingParent(view) &amp;&amp; extractAncestorHandlers(view</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId)</span>
+    <span class="s1">) {</span>
+      <span class="s1">found = </span><span class="s0">true</span>
+    <span class="s1">}</span>
+
+    <span class="s0">return </span><span class="s1">found</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">extractGestureHandlers(event: MotionEvent) {</span>
+    <span class="s0">val </span><span class="s1">actionIndex = event.actionIndex</span>
+    <span class="s0">val </span><span class="s1">pointerId = event.getPointerId(actionIndex)</span>
+    <span class="s1">tempCoords[</span><span class="s3">0</span><span class="s1">] = event.getX(actionIndex)</span>
+    <span class="s1">tempCoords[</span><span class="s3">1</span><span class="s1">] = event.getY(actionIndex)</span>
+    <span class="s1">traverseWithPointerEvents(wrapperView</span><span class="s0">, </span><span class="s1">tempCoords</span><span class="s0">, </span><span class="s1">pointerId)</span>
+    <span class="s1">extractGestureHandlers(wrapperView</span><span class="s0">, </span><span class="s1">tempCoords</span><span class="s0">, </span><span class="s1">pointerId)</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">extractGestureHandlers(viewGroup: ViewGroup</span><span class="s0">, </span><span class="s1">coords: FloatArray</span><span class="s0">, </span><span class="s1">pointerId: Int): Boolean {</span>
+    <span class="s0">val </span><span class="s1">childrenCount = viewGroup.childCount</span>
+    <span class="s0">for </span><span class="s1">(i </span><span class="s0">in </span><span class="s1">childrenCount - </span><span class="s3">1 </span><span class="s1">downTo </span><span class="s3">0</span><span class="s1">) {</span>
+      <span class="s0">val </span><span class="s1">child = viewConfigHelper.getChildInDrawingOrderAtIndex(viewGroup</span><span class="s0">, </span><span class="s1">i)</span>
+      <span class="s0">if </span><span class="s1">(canReceiveEvents(child)) {</span>
+        <span class="s0">val </span><span class="s1">childPoint = tempPoint</span>
+        <span class="s1">transformPointToChildViewCoords(coords[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">coords[</span><span class="s3">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">viewGroup</span><span class="s0">, </span><span class="s1">child</span><span class="s0">, </span><span class="s1">childPoint)</span>
+        <span class="s0">val </span><span class="s1">restoreX = coords[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s0">val </span><span class="s1">restoreY = coords[</span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s1">coords[</span><span class="s3">0</span><span class="s1">] = childPoint.x</span>
+        <span class="s1">coords[</span><span class="s3">1</span><span class="s1">] = childPoint.y</span>
+        <span class="s0">var </span><span class="s1">found = </span><span class="s0">false</span>
+        <span class="s0">if </span><span class="s1">(!isClipping(child) || isTransformedTouchPointInView(coords[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">coords[</span><span class="s3">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">child)) {</span>
+          <span class="s4">// we only consider the view if touch is inside the view bounds or if the view's children</span>
+          <span class="s4">// can render outside of the view bounds (overflow visible)</span>
+          <span class="s1">found = traverseWithPointerEvents(child</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId)</span>
+        <span class="s1">}</span>
+        <span class="s1">coords[</span><span class="s3">0</span><span class="s1">] = restoreX</span>
+        <span class="s1">coords[</span><span class="s3">1</span><span class="s1">] = restoreY</span>
+        <span class="s0">if </span><span class="s1">(found) {</span>
+          <span class="s0">return true</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">return false</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">traverseWithPointerEvents(view: View</span><span class="s0">, </span><span class="s1">coords: FloatArray</span><span class="s0">, </span><span class="s1">pointerId: Int): Boolean =</span>
+    <span class="s0">when </span><span class="s1">(viewConfigHelper.getPointerEventsConfigForView(view)) {</span>
+      <span class="s1">PointerEventsConfig.NONE -&gt; {</span>
+        <span class="s4">// This view and its children can't be the target</span>
+        <span class="s0">false</span>
+      <span class="s1">}</span>
+      <span class="s1">PointerEventsConfig.BOX_ONLY -&gt; {</span>
+        <span class="s4">// This view is the target, its children don't matter</span>
+        <span class="s1">(</span>
+          <span class="s1">recordViewHandlersForPointer(view</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId) ||</span>
+            <span class="s1">shouldHandlerlessViewBecomeTouchTarget(view</span><span class="s0">, </span><span class="s1">coords)</span>
+          <span class="s1">)</span>
+      <span class="s1">}</span>
+      <span class="s1">PointerEventsConfig.BOX_NONE -&gt; {</span>
+        <span class="s4">// This view can't be the target, but its children might</span>
+        <span class="s0">when </span><span class="s1">(view) {</span>
+          <span class="s0">is </span><span class="s1">ViewGroup -&gt; {</span>
+            <span class="s1">extractGestureHandlers(view</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId).also { found -&gt;</span>
+              <span class="s4">// A child view is handling touch, also extract handlers attached to this view</span>
+              <span class="s0">if </span><span class="s1">(found) {</span>
+                <span class="s1">recordViewHandlersForPointer(view</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId)</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+          <span class="s4">// When &lt;TextInput&gt; has editable set to `false` getPointerEventsConfigForView returns</span>
+          <span class="s4">// `BOX_NONE` as it's `isEnabled` property is false. In this case we still want to extract</span>
+          <span class="s4">// handlers attached to the text input, as it makes sense that gestures would work on a</span>
+          <span class="s4">// non-editable TextInput.</span>
+          <span class="s0">is </span><span class="s1">EditText -&gt; {</span>
+            <span class="s1">recordViewHandlersForPointer(view</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId)</span>
+          <span class="s1">}</span>
+          <span class="s0">else </span><span class="s1">-&gt; </span><span class="s0">false</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">PointerEventsConfig.AUTO -&gt; {</span>
+        <span class="s4">// Either this view or one of its children is the target</span>
+        <span class="s0">val </span><span class="s1">found = </span><span class="s0">if </span><span class="s1">(view </span><span class="s0">is </span><span class="s1">ViewGroup) {</span>
+          <span class="s1">extractGestureHandlers(view</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId)</span>
+        <span class="s1">} </span><span class="s0">else false</span>
+
+        <span class="s1">(</span>
+          <span class="s1">recordViewHandlersForPointer(view</span><span class="s0">, </span><span class="s1">coords</span><span class="s0">, </span><span class="s1">pointerId) ||</span>
+            <span class="s1">found || shouldHandlerlessViewBecomeTouchTarget(view</span><span class="s0">, </span><span class="s1">coords)</span>
+          <span class="s1">)</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">canReceiveEvents(view: View) =</span>
+    <span class="s1">view.visibility == View.VISIBLE &amp;&amp; view.alpha &gt;= minimumAlphaForTraversal</span>
+
+  <span class="s4">// if view is not a view group it is clipping, otherwise we check for `getClipChildren` flag to</span>
+  <span class="s4">// be turned on and also confirm with the ViewConfigHelper implementation</span>
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">isClipping(view: View) =</span>
+    <span class="s1">view </span><span class="s0">!is </span><span class="s1">ViewGroup || viewConfigHelper.isViewClippingChildren(view)</span>
+
+  <span class="s1">companion </span><span class="s0">object </span><span class="s1">{</span>
+    <span class="s4">// The limit doesn't necessarily need to exists, it was just simpler to implement it that way</span>
+    <span class="s4">// it is also more allocation-wise efficient to have a fixed limit</span>
+    <span class="s1">private const </span><span class="s0">val </span><span class="s1">SIMULTANEOUS_GESTURE_HANDLER_LIMIT = </span><span class="s3">20</span>
+
+    <span class="s4">// Be default fully transparent views can receive touch</span>
+    <span class="s1">private const </span><span class="s0">val </span><span class="s1">DEFAULT_MIN_ALPHA_FOR_TRAVERSAL = </span><span class="s3">0f</span>
+    <span class="s1">private </span><span class="s0">val </span><span class="s1">tempPoint = PointF()</span>
+    <span class="s1">private </span><span class="s0">val </span><span class="s1">matrixTransformCoords = FloatArray(</span><span class="s3">2</span><span class="s1">)</span>
+    <span class="s1">private </span><span class="s0">val </span><span class="s1">inverseMatrix = Matrix()</span>
+    <span class="s1">private </span><span class="s0">val </span><span class="s1">tempCoords = FloatArray(</span><span class="s3">2</span><span class="s1">)</span>
+    <span class="s1">private </span><span class="s0">val </span><span class="s1">handlersComparator = Comparator&lt;GestureHandler&lt;*&gt;?&gt; { a</span><span class="s0">, </span><span class="s1">b -&gt;</span>
+      <span class="s0">return</span><span class="s1">@Comparator </span><span class="s0">if </span><span class="s1">(a.isActive &amp;&amp; b.isActive || a.isAwaiting &amp;&amp; b.isAwaiting) {</span>
+        <span class="s4">// both A and B are either active or awaiting activation, in which case we prefer one that</span>
+        <span class="s4">// has activated (or turned into &quot;awaiting&quot; state) earlier</span>
+        <span class="s1">Integer.signum(b.activationIndex - a.activationIndex)</span>
+      <span class="s1">} </span><span class="s0">else if </span><span class="s1">(a.isActive) {</span>
+        <span class="s1">-</span><span class="s3">1 </span><span class="s4">// only A is active</span>
+      <span class="s1">} </span><span class="s0">else if </span><span class="s1">(b.isActive) {</span>
+        <span class="s3">1 </span><span class="s4">// only B is active</span>
+      <span class="s1">} </span><span class="s0">else if </span><span class="s1">(a.isAwaiting) {</span>
+        <span class="s1">-</span><span class="s3">1 </span><span class="s4">// only A is awaiting, B is inactive</span>
+      <span class="s1">} </span><span class="s0">else if </span><span class="s1">(b.isAwaiting) {</span>
+        <span class="s3">1 </span><span class="s4">// only B is awaiting, A is inactive</span>
+      <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+        <span class="s3">0 </span><span class="s4">// both A and B are inactive, stable order matters</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">private </span><span class="s0">fun </span><span class="s1">shouldHandlerlessViewBecomeTouchTarget(view: View</span><span class="s0">, </span><span class="s1">coords: FloatArray): Boolean {</span>
+      <span class="s4">// The following code is to match the iOS behavior where transparent parts of the views can</span>
+      <span class="s4">// pass touch events through them allowing sibling nodes to handle them.</span>
+
+      <span class="s4">// TODO: this is not an ideal solution as we only consider ViewGroups that has no background set</span>
+      <span class="s4">// TODO: ideally we should determine the pixel color under the given coordinates and return</span>
+      <span class="s4">// false if the color is transparent</span>
+      <span class="s0">val </span><span class="s1">isLeafOrTransparent = view </span><span class="s0">!is </span><span class="s1">ViewGroup || view.getBackground() != </span><span class="s0">null</span>
+      <span class="s0">return </span><span class="s1">isLeafOrTransparent &amp;&amp; isTransformedTouchPointInView(coords[</span><span class="s3">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">coords[</span><span class="s3">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">view)</span>
+    <span class="s1">}</span>
+
+    <span class="s1">private </span><span class="s0">fun </span><span class="s1">transformPointToChildViewCoords(</span>
+      <span class="s1">x: Float</span><span class="s0">,</span>
+      <span class="s1">y: Float</span><span class="s0">,</span>
+      <span class="s1">parent: ViewGroup</span><span class="s0">,</span>
+      <span class="s1">child: View</span><span class="s0">,</span>
+      <span class="s1">outLocalPoint: PointF</span><span class="s0">,</span>
+    <span class="s1">) {</span>
+      <span class="s0">var </span><span class="s1">localX = x + parent.scrollX - child.left</span>
+      <span class="s0">var </span><span class="s1">localY = y + parent.scrollY - child.top</span>
+      <span class="s0">val </span><span class="s1">matrix = child.matrix</span>
+      <span class="s0">if </span><span class="s1">(!matrix.isIdentity) {</span>
+        <span class="s0">val </span><span class="s1">localXY = matrixTransformCoords</span>
+        <span class="s1">localXY[</span><span class="s3">0</span><span class="s1">] = localX</span>
+        <span class="s1">localXY[</span><span class="s3">1</span><span class="s1">] = localY</span>
+        <span class="s1">matrix.invert(inverseMatrix)</span>
+        <span class="s1">inverseMatrix.mapPoints(localXY)</span>
+        <span class="s1">localX = localXY[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">localY = localXY[</span><span class="s3">1</span><span class="s1">]</span>
+      <span class="s1">}</span>
+      <span class="s1">outLocalPoint[localX] = localY</span>
+    <span class="s1">}</span>
+
+    <span class="s1">private </span><span class="s0">fun </span><span class="s1">isTransformedTouchPointInView(x: Float</span><span class="s0">, </span><span class="s1">y: Float</span><span class="s0">, </span><span class="s1">child: View) =</span>
+      <span class="s1">x </span><span class="s0">in </span><span class="s3">0f</span><span class="s1">..child.width.toFloat() &amp;&amp; y </span><span class="s0">in </span><span class="s3">0f</span><span class="s1">..child.height.toFloat()</span>
+
+    <span class="s1">private </span><span class="s0">fun </span><span class="s1">shouldHandlerWaitForOther(handler: GestureHandler&lt;*&gt;</span><span class="s0">, </span><span class="s1">other: GestureHandler&lt;*&gt;): Boolean {</span>
+      <span class="s0">return </span><span class="s1">handler !== other &amp;&amp; (</span>
+        <span class="s1">handler.shouldWaitForHandlerFailure(other) ||</span>
+          <span class="s1">other.shouldRequireToWaitForFailure(handler)</span>
+        <span class="s1">)</span>
+    <span class="s1">}</span>
+
+    <span class="s1">private </span><span class="s0">fun </span><span class="s1">canRunSimultaneously(a: GestureHandler&lt;*&gt;</span><span class="s0">, </span><span class="s1">b: GestureHandler&lt;*&gt;) =</span>
+      <span class="s1">a === b || a.shouldRecognizeSimultaneously(b) || b.shouldRecognizeSimultaneously(a)</span>
+
+    <span class="s1">private </span><span class="s0">fun </span><span class="s1">shouldHandlerBeCancelledBy(handler: GestureHandler&lt;*&gt;</span><span class="s0">, </span><span class="s1">other: GestureHandler&lt;*&gt;): Boolean {</span>
+      <span class="s0">if </span><span class="s1">(!handler.hasCommonPointers(other)) {</span>
+        <span class="s4">// if two handlers share no common pointer one can never trigger cancel for the other</span>
+        <span class="s0">return false</span>
+      <span class="s1">}</span>
+      <span class="s0">if </span><span class="s1">(canRunSimultaneously(handler</span><span class="s0">, </span><span class="s1">other)) {</span>
+        <span class="s4">// if handlers are allowed to run simultaneously, when first activates second can still remain</span>
+        <span class="s4">// in began state</span>
+        <span class="s0">return false</span>
+      <span class="s1">}</span>
+      <span class="s0">return if </span><span class="s1">(handler !== other &amp;&amp;</span>
+        <span class="s1">(handler.isAwaiting || handler.state == GestureHandler.STATE_ACTIVE)</span>
+      <span class="s1">) {</span>
+        <span class="s4">// in every other case as long as the handler is about to be activated or already in active</span>
+        <span class="s4">// state, we delegate the decision to the implementation of GestureHandler#shouldBeCancelledBy</span>
+        <span class="s1">handler.shouldBeCancelledBy(other)</span>
+      <span class="s1">} </span><span class="s0">else true</span>
+    <span class="s1">}</span>
+
+    <span class="s1">private </span><span class="s0">fun </span><span class="s1">isFinished(state: Int) =</span>
+      <span class="s1">state == GestureHandler.STATE_CANCELLED ||</span>
+        <span class="s1">state == GestureHandler.STATE_FAILED ||</span>
+        <span class="s1">state == GestureHandler.STATE_END</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

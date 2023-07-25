@@ -1,0 +1,147 @@
+<html>
+<head>
+<title>planQuery.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #6a8759;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+planQuery.js</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">Object.defineProperty(exports, </span><span class="s0">&quot;__esModule&quot;</span><span class="s1">, {</span>
+  <span class="s1">value: </span><span class="s2">true</span><span class="s1">,</span>
+<span class="s1">});</span>
+<span class="s1">exports.planQuery = planQuery;</span>
+<span class="s3">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @format 
+ * 
+ */</span>
+
+<span class="s2">function </span><span class="s1">planQuery({</span>
+  <span class="s1">since,</span>
+  <span class="s1">directoryFilters,</span>
+  <span class="s1">extensions,</span>
+  <span class="s1">includeSha1,</span>
+  <span class="s1">includeSymlinks,</span>
+<span class="s1">}) {</span>
+  <span class="s1">const fields = [</span><span class="s0">&quot;name&quot;</span><span class="s1">, </span><span class="s0">&quot;exists&quot;</span><span class="s1">, </span><span class="s0">&quot;mtime_ms&quot;</span><span class="s1">, </span><span class="s0">&quot;size&quot;</span><span class="s1">];</span>
+  <span class="s2">if </span><span class="s1">(includeSha1) {</span>
+    <span class="s1">fields.push(</span><span class="s0">&quot;content.sha1hex&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Note on symlink_target: 
+   * 
+   * Watchman supports requesting the symlink_target field, which is 
+   * *potentially* more efficient if targets can be read from metadata without 
+   * reading/materialising files. However, at the time of writing, Watchman has 
+   * issues reporting symlink_target on some backends[1]. Additionally, though 
+   * the Eden watcher is known to work, it reads links serially[2] on demand[3] 
+   *  - less efficiently than we can do ourselves. 
+   * [1] https://github.com/facebook/watchman/issues/1084 
+   * [2] https://github.com/facebook/watchman/blob/v2023.01.02.00/watchman/watcher/eden.cpp#L476-L485 
+   * [3] https://github.com/facebook/watchman/blob/v2023.01.02.00/watchman/watcher/eden.cpp#L433-L434 
+   */</span>
+  <span class="s2">if </span><span class="s1">(includeSymlinks) {</span>
+    <span class="s1">fields.push(</span><span class="s0">&quot;type&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">const allOfTerms = includeSymlinks</span>
+    <span class="s1">? [</span>
+        <span class="s1">[</span>
+          <span class="s0">&quot;anyof&quot;</span><span class="s1">,</span>
+          <span class="s1">[</span><span class="s0">&quot;allof&quot;</span><span class="s1">, [</span><span class="s0">&quot;type&quot;</span><span class="s1">, </span><span class="s0">&quot;f&quot;</span><span class="s1">], [</span><span class="s0">&quot;suffix&quot;</span><span class="s1">, extensions]],</span>
+          <span class="s1">[</span><span class="s0">&quot;type&quot;</span><span class="s1">, </span><span class="s0">&quot;l&quot;</span><span class="s1">],</span>
+        <span class="s1">],</span>
+      <span class="s1">]</span>
+    <span class="s1">: [[</span><span class="s0">&quot;type&quot;</span><span class="s1">, </span><span class="s0">&quot;f&quot;</span><span class="s1">]];</span>
+  <span class="s1">const query = {</span>
+    <span class="s1">fields,</span>
+  <span class="s1">};</span>
+
+  <span class="s3">/** 
+   * Watchman &quot;query planner&quot;. 
+   * 
+   * Watchman file queries consist of 1 or more generators that feed 
+   * files through the expression evaluator. 
+   * 
+   * Strategy: 
+   * 1. Select the narrowest possible generator so that the expression 
+   *    evaluator has fewer candidates to process. 
+   * 2. Evaluate expressions from narrowest to broadest. 
+   * 3. Don't use an expression to recheck a condition that the 
+   *    generator already guarantees. 
+   * 4. Compose expressions to avoid combinatorial explosions in the 
+   *    number of terms. 
+   * 
+   * The ordering of generators/filters, from narrow to broad, is: 
+   * - since          = O(changes) 
+   * - glob / dirname = O(files in a subtree of the repo) 
+   * - suffix         = O(files in the repo) 
+   * 
+   * We assume that file extensions are ~uniformly distributed in the 
+   * repo but Haste map projects are focused on a handful of 
+   * directories. Therefore `glob` &lt; `suffix`. 
+   */</span>
+  <span class="s1">let queryGenerator;</span>
+  <span class="s2">if </span><span class="s1">(since != </span><span class="s2">null</span><span class="s1">) {</span>
+    <span class="s3">// Prefer the since generator whenever we have a clock</span>
+    <span class="s1">query.since = since;</span>
+    <span class="s1">queryGenerator = </span><span class="s0">&quot;since&quot;</span><span class="s1">;</span>
+
+    <span class="s3">// Filter on directories using an anyof expression</span>
+    <span class="s2">if </span><span class="s1">(directoryFilters.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">allOfTerms.push([</span>
+        <span class="s0">&quot;anyof&quot;</span><span class="s1">,</span>
+        <span class="s1">...directoryFilters.map((dir) =&gt; [</span><span class="s0">&quot;dirname&quot;</span><span class="s1">, dir]),</span>
+      <span class="s1">]);</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s2">else if </span><span class="s1">(directoryFilters.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+    <span class="s3">// Use the `glob` generator and filter only by extension.</span>
+    <span class="s1">query.glob = directoryFilters.map((directory) =&gt; `${directory}</span><span class="s3">/**`); 
+    query.glob_includedotfiles = true; 
+    queryGenerator = &quot;glob&quot;; 
+  } else if (!includeSymlinks) { 
+    // Use the `suffix` generator with no path/extension filtering, as long 
+    // as we don't need (suffixless) directory symlinks. 
+    query.suffix = extensions; 
+    queryGenerator = &quot;suffix&quot;; 
+  } else { 
+    // Fall back to `all` if we need symlinks and don't have a clock or 
+    // directory filters. 
+    queryGenerator = &quot;all&quot;; 
+  } 
+ 
+  // `includeSymlinks` implies we need (suffixless) directory links. In the 
+  // case of the `suffix` generator, a suffix expression would be redundant. 
+  if (!includeSymlinks &amp;&amp; queryGenerator !== &quot;suffix&quot;) { 
+    allOfTerms.push([&quot;suffix&quot;, extensions]); 
+  } 
+ 
+  // If we only have one &quot;all of&quot; expression we can use it directly, otherwise 
+  // wrap in ['allof', ...expressions]. By construction we should never have 
+  // length 0. 
+  query.expression = 
+    allOfTerms.length === 1 ? allOfTerms[0] : [&quot;allof&quot;, ...allOfTerms]; 
+  return { 
+    query, 
+    queryGenerator, 
+  }; 
+} 
+</span></pre>
+</body>
+</html>

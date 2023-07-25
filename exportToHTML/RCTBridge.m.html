@@ -1,0 +1,432 @@
+<html>
+<head>
+<title>RCTBridge.m</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTBridge.m</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge+Private.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;objc/runtime.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTConvert.h&quot;</span>
+<span class="s2">#if </span><span class="s1">RCT_ENABLE_INSPECTOR</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTInspectorDevServerHelper.h&quot;</span>
+<span class="s2">#endif</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTDevLoadingViewProtocol.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTJSThread.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTLog.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTModuleData.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTPerformanceLogger.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTProfile.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTReloadCommand.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUtils.h&quot;</span>
+
+<span class="s4">static </span><span class="s1">NSMutableArray&lt;Class&gt; *RCTModuleClasses</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">dispatch_queue_t RCTModuleClassesSyncQueue</span><span class="s4">;</span>
+<span class="s1">NSArray&lt;Class&gt; *RCTGetModuleClasses(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s1">__block NSArray&lt;Class&gt; *result</span><span class="s4">;</span>
+  <span class="s1">dispatch_sync(RCTModuleClassesSyncQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">result = [RCTModuleClasses copy]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Register the given class as a bridge module. All modules must be registered 
+ * prior to the first bridge initialization. 
+ * TODO: (T115656171) Refactor RCTRegisterModule out of Bridge.m since it doesn't use the Bridge. 
+ */</span>
+<span class="s4">void </span><span class="s1">RCTRegisterModule(Class)</span><span class="s4">;</span>
+<span class="s4">void </span><span class="s1">RCTRegisterModule(Class moduleClass)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">RCTModuleClasses = [NSMutableArray new]</span><span class="s4">;</span>
+    <span class="s1">RCTModuleClassesSyncQueue =</span>
+        <span class="s1">dispatch_queue_create(</span><span class="s3">&quot;com.facebook.react.ModuleClassesSyncQueue&quot;</span><span class="s4">, </span><span class="s1">DISPATCH_QUEUE_CONCURRENT)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">RCTAssert(</span>
+      <span class="s1">[moduleClass conformsToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTBridgeModule)]</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;%@ does not conform to the RCTBridgeModule protocol&quot;</span><span class="s4">,</span>
+      <span class="s1">moduleClass)</span><span class="s4">;</span>
+
+  <span class="s0">// Register module</span>
+  <span class="s1">dispatch_barrier_async(RCTModuleClassesSyncQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">[RCTModuleClasses addObject:moduleClass]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * This function returns the module name for a given class. 
+ */</span>
+<span class="s1">NSString *RCTBridgeModuleNameForClass(Class cls)</span>
+<span class="s1">{</span>
+<span class="s2">#if </span><span class="s1">RCT_DEBUG</span>
+  <span class="s1">RCTAssert(</span>
+      <span class="s1">[cls conformsToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTBridgeModule)]</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;Bridge module `%@` does not conform to RCTBridgeModule&quot;</span><span class="s4">,</span>
+      <span class="s1">cls)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s1">NSString *name = [cls moduleName]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(name.length == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">name = NSStringFromClass(cls)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">RCTDropReactPrefixes(name)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">BOOL turboModuleEnabled = NO</span><span class="s4">;</span>
+<span class="s1">BOOL RCTTurboModuleEnabled(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+<span class="s2">#if </span><span class="s1">RCT_DEBUG</span>
+  <span class="s0">// TODO(T53341772): Allow TurboModule for test environment. Right now this breaks RNTester tests if enabled.</span>
+  <span class="s4">if </span><span class="s1">(RCTRunningInTestEnvironment()) {</span>
+    <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s2">#endif</span>
+  <span class="s4">return </span><span class="s1">turboModuleEnabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTEnableTurboModule(BOOL enabled)</span>
+<span class="s1">{</span>
+  <span class="s1">turboModuleEnabled = enabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">BOOL turboModuleEagerInitEnabled = NO</span><span class="s4">;</span>
+<span class="s1">BOOL RCTTurboModuleEagerInitEnabled(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">turboModuleEagerInitEnabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTEnableTurboModuleEagerInit(BOOL enabled)</span>
+<span class="s1">{</span>
+  <span class="s1">turboModuleEagerInitEnabled = enabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// Turn off TurboModule delegate locking</span>
+<span class="s4">static </span><span class="s1">BOOL turboModuleManagerDelegateLockingDisabled = YES</span><span class="s4">;</span>
+<span class="s1">BOOL RCTTurboModuleManagerDelegateLockingDisabled(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">turboModuleManagerDelegateLockingDisabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTDisableTurboModuleManagerDelegateLocking(BOOL disabled)</span>
+<span class="s1">{</span>
+  <span class="s1">turboModuleManagerDelegateLockingDisabled = disabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@interface </span><span class="s1">RCTBridge () &lt;RCTReloadListener&gt;</span>
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTBridge {</span>
+  <span class="s1">NSURL *_delegateBundleURL</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (</span><span class="s4">void</span><span class="s1">)initialize</span>
+<span class="s1">{</span>
+  <span class="s1">_RCTInitializeJSThreadConstantInternal()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">RCTBridge *RCTCurrentBridgeInstance = nil</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * The last current active bridge instance. This is set automatically whenever 
+ * the bridge is accessed. It can be useful for static functions or singletons 
+ * that need to access the bridge for purposes such as logging, but should not 
+ * be relied upon to return any particular instance, due to race conditions. 
+ */</span>
+<span class="s1">+ (instancetype)currentBridge</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTCurrentBridgeInstance</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (</span><span class="s4">void</span><span class="s1">)setCurrentBridge:(RCTBridge *)currentBridge</span>
+<span class="s1">{</span>
+  <span class="s1">RCTCurrentBridgeInstance = currentBridge</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithDelegate:(id&lt;RCTBridgeDelegate&gt;)delegate launchOptions:(NSDictionary *)launchOptions</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self initWithDelegate:delegate bundleURL:nil moduleProvider:nil launchOptions:launchOptions]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithBundleURL:(NSURL *)bundleURL</span>
+                   <span class="s1">moduleProvider:(RCTBridgeModuleListProvider)block</span>
+                    <span class="s1">launchOptions:(NSDictionary *)launchOptions</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self initWithDelegate:nil bundleURL:bundleURL moduleProvider:block launchOptions:launchOptions]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithDelegate:(id&lt;RCTBridgeDelegate&gt;)delegate</span>
+                       <span class="s1">bundleURL:(NSURL *)bundleURL</span>
+                  <span class="s1">moduleProvider:(RCTBridgeModuleListProvider)block</span>
+                   <span class="s1">launchOptions:(NSDictionary *)launchOptions</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">RCTEnforceNewArchitectureValidation(RCTNotAllowedInBridgeless</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s1">_delegate = delegate</span><span class="s4">;</span>
+    <span class="s1">_bundleURL = bundleURL</span><span class="s4">;</span>
+    <span class="s1">_moduleProvider = block</span><span class="s4">;</span>
+    <span class="s1">_launchOptions = [launchOptions copy]</span><span class="s4">;</span>
+
+    <span class="s1">[self setUp]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_NOT_IMPLEMENTED(-(instancetype)init)</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dealloc</span>
+<span class="s1">{</span>
+  <span class="s0">/** 
+   * This runs only on the main thread, but crashes the subclass 
+   * RCTAssertMainQueue(); 
+   */</span>
+  <span class="s1">[self invalidate]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setRCTTurboModuleRegistry:(id&lt;RCTTurboModuleRegistry&gt;)turboModuleRegistry</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge setRCTTurboModuleRegistry:turboModuleRegistry]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)attachBridgeAPIsToTurboModule:(id&lt;RCTTurboModule&gt;)module</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge attachBridgeAPIsToTurboModule:module]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)didReceiveReloadCommand</span>
+<span class="s1">{</span>
+<span class="s2">#if </span><span class="s1">RCT_ENABLE_INSPECTOR</span>
+  <span class="s0">// Disable debugger to resume the JsVM &amp; avoid thread locks while reloading</span>
+  <span class="s1">[RCTInspectorDevServerHelper disableDebugger]</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s1">[[NSNotificationCenter defaultCenter] postNotificationName:RCTBridgeWillReloadNotification object:self userInfo:nil]</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Any thread 
+   */</span>
+  <span class="s1">dispatch_async(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s0">// WARNING: Invalidation is async, so it may not finish before re-setting up the bridge,</span>
+    <span class="s0">// causing some issues. TODO: revisit this post-Fabric/TurboModule.</span>
+    <span class="s1">[self invalidate]</span><span class="s4">;</span>
+    <span class="s0">// Reload is a special case, do not preserve launchOptions and treat reload as a fresh start</span>
+    <span class="s1">self-&gt;_launchOptions = nil</span><span class="s4">;</span>
+    <span class="s1">[self setUp]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTModuleRegistry *)moduleRegistry</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">self.batchedBridge.moduleRegistry</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSArray&lt;Class&gt; *)moduleClasses</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">self.batchedBridge.moduleClasses</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id)moduleForName:(NSString *)moduleName</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self.batchedBridge moduleForName:moduleName]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id)moduleForName:(NSString *)moduleName lazilyLoadIfNecessary:(BOOL)lazilyLoad</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self.batchedBridge moduleForName:moduleName lazilyLoadIfNecessary:lazilyLoad]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id)moduleForClass:(Class)moduleClass</span>
+<span class="s1">{</span>
+  <span class="s1">id module = [self.batchedBridge moduleForClass:moduleClass]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!module) {</span>
+    <span class="s1">module = [self moduleForName:RCTBridgeModuleNameForClass(moduleClass)]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">module</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSArray *)modulesConformingToProtocol:(Protocol *)</span><span class="s4">protocol</span>
+<span class="s1">{</span>
+  <span class="s1">NSMutableArray *modules = [NSMutableArray new]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(Class moduleClass in [self.moduleClasses copy]) {</span>
+    <span class="s4">if </span><span class="s1">([moduleClass conformsToProtocol:</span><span class="s4">protocol</span><span class="s1">]) {</span>
+      <span class="s1">id module = [self moduleForClass:moduleClass]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(module) {</span>
+        <span class="s1">[modules addObject:module]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">[modules copy]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)moduleIsInitialized:(Class)moduleClass</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self.batchedBridge moduleIsInitialized:moduleClass]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * DEPRECATED - please use RCTReloadCommand. 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)reload</span>
+<span class="s1">{</span>
+  <span class="s1">RCTTriggerReloadCommandListeners(</span><span class="s4">@</span><span class="s3">&quot;Unknown from bridge&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * DEPRECATED - please use RCTReloadCommand. 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)reloadWithReason:(NSString *)reason</span>
+<span class="s1">{</span>
+  <span class="s1">RCTTriggerReloadCommandListeners(reason)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)onFastRefresh</span>
+<span class="s1">{</span>
+  <span class="s1">[[NSNotificationCenter defaultCenter] postNotificationName:RCTBridgeFastRefreshNotification object:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * DEPRECATED - please use RCTReloadCommand. 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)requestReload</span>
+<span class="s1">{</span>
+  <span class="s1">[self reloadWithReason:</span><span class="s4">@</span><span class="s3">&quot;Requested from bridge&quot;</span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (Class)bridgeClass</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[RCTCxxBridge </span><span class="s4">class</span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setUp</span>
+<span class="s1">{</span>
+  <span class="s1">RCT_PROFILE_BEGIN_EVENT(</span><span class="s5">0</span><span class="s4">, @</span><span class="s3">&quot;-[RCTBridge setUp]&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+
+  <span class="s1">_performanceLogger = [RCTPerformanceLogger new]</span><span class="s4">;</span>
+  <span class="s1">[_performanceLogger markStartForTag:RCTPLBridgeStartup]</span><span class="s4">;</span>
+  <span class="s1">[_performanceLogger markStartForTag:RCTPLTTI]</span><span class="s4">;</span>
+
+  <span class="s1">Class bridgeClass = self.bridgeClass</span><span class="s4">;</span>
+
+  <span class="s0">// Only update bundleURL from delegate if delegate bundleURL has changed</span>
+  <span class="s1">NSURL *previousDelegateURL = _delegateBundleURL</span><span class="s4">;</span>
+  <span class="s1">_delegateBundleURL = [self.delegate sourceURLForBridge:self]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(_delegateBundleURL &amp;&amp; ![_delegateBundleURL isEqual:previousDelegateURL]) {</span>
+    <span class="s1">_bundleURL = _delegateBundleURL</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Sanitize the bundle URL</span>
+  <span class="s1">_bundleURL = [RCTConvert NSURL:_bundleURL.absoluteString]</span><span class="s4">;</span>
+
+  <span class="s1">RCTExecuteOnMainQueue(^{</span>
+    <span class="s1">RCTRegisterReloadCommandListener(self)</span><span class="s4">;</span>
+    <span class="s1">RCTReloadCommandSetBundleURL(self-&gt;_bundleURL)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">self.batchedBridge = [[bridgeClass alloc] initWithParentBridge:self]</span><span class="s4">;</span>
+  <span class="s1">[self.batchedBridge start]</span><span class="s4">;</span>
+
+  <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)isLoading</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">self.batchedBridge.loading</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)isValid</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">self.batchedBridge.valid</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)isBatchActive</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[_batchedBridge isBatchActive]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)invalidate</span>
+<span class="s1">{</span>
+  <span class="s1">[[NSNotificationCenter defaultCenter] postNotificationName:RCTBridgeWillBeInvalidatedNotification object:self]</span><span class="s4">;</span>
+
+  <span class="s1">RCTBridge *batchedBridge = self.batchedBridge</span><span class="s4">;</span>
+  <span class="s1">self.batchedBridge = nil</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(batchedBridge) {</span>
+    <span class="s1">RCTExecuteOnMainQueue(^{</span>
+      <span class="s1">[batchedBridge invalidate]</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)updateModuleWithInstance:(id&lt;RCTBridgeModule&gt;)instance</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge updateModuleWithInstance:instance]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)registerAdditionalModuleClasses:(NSArray&lt;Class&gt; *)modules</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge registerAdditionalModuleClasses:modules]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)enqueueJSCall:(NSString *)moduleDotMethod args:(NSArray *)args</span>
+<span class="s1">{</span>
+  <span class="s1">NSArray&lt;NSString *&gt; *ids = [moduleDotMethod componentsSeparatedByString:</span><span class="s4">@</span><span class="s3">&quot;.&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSString *module = ids[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSString *method = ids[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">[self enqueueJSCall:module method:method args:args completion:NULL]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)enqueueJSCall:(NSString *)module</span>
+               <span class="s1">method:(NSString *)method</span>
+                 <span class="s1">args:(NSArray *)args</span>
+           <span class="s1">completion:(dispatch_block_t)completion</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge enqueueJSCall:module method:method args:args completion:completion]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)enqueueCallback:(NSNumber *)cbID args:(NSArray *)args</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge enqueueCallback:cbID args:args]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)registerSegmentWithId:(NSUInteger)segmentId path:(NSString *)path</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge registerSegmentWithId:segmentId path:path]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)loadAndExecuteSplitBundleURL:(NSURL *)bundleURL</span>
+                             <span class="s1">onError:(RCTLoadAndExecuteErrorBlock)onError</span>
+                          <span class="s1">onComplete:(dispatch_block_t)onComplete</span>
+<span class="s1">{</span>
+  <span class="s1">[self.batchedBridge loadAndExecuteSplitBundleURL:bundleURL onError:onError onComplete:onComplete]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

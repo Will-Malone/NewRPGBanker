@@ -1,0 +1,736 @@
+<html>
+<head>
+<title>CatalystInstanceImpl.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+.s6 { color: #629755; font-weight: bold; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+CatalystInstanceImpl.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.bridge</span><span class="s2">;</span>
+
+<span class="s2">import static </span><span class="s1">com.facebook.infer.annotation.ThreadConfined.UI</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.systrace.Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.content.res.AssetManager</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.os.AsyncTask</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.ThreadConfined</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.jni.HybridData</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.proguard.annotations.DoNotStrip</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.queue.MessageQueueThread</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.queue.QueueThreadExceptionHandler</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.queue.ReactQueueConfiguration</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.queue.ReactQueueConfigurationImpl</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.queue.ReactQueueConfigurationSpec</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.ReactConstants</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.annotations.VisibleForTesting</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.config.ReactFeatureFlags</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.module.annotations.ReactModule</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.turbomodule.core.CallInvokerHolderImpl</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.turbomodule.core.interfaces.TurboModule</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.turbomodule.core.interfaces.TurboModuleRegistry</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.systrace.Systrace</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.systrace.TraceListener</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.lang.ref.WeakReference</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Collection</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.List</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.CopyOnWriteArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.atomic.AtomicInteger</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* This provides an implementation of the public CatalystInstance instance. It is public because it</span>
+ <span class="s3">* is built by XReactInstanceManager which is in a different package.</span>
+ <span class="s3">*/</span>
+<span class="s1">@DoNotStrip</span>
+<span class="s2">public class </span><span class="s1">CatalystInstanceImpl </span><span class="s2">implements </span><span class="s1">CatalystInstance {</span>
+  <span class="s2">static </span><span class="s1">{</span>
+    <span class="s1">ReactBridge.staticInit()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static final </span><span class="s1">AtomicInteger sNextInstanceIdForTrace = </span><span class="s2">new </span><span class="s1">AtomicInteger(</span><span class="s4">1</span><span class="s1">)</span><span class="s2">;</span>
+
+  <span class="s2">public static class </span><span class="s1">PendingJSCall {</span>
+
+    <span class="s2">public </span><span class="s1">String mModule</span><span class="s2">;</span>
+    <span class="s2">public </span><span class="s1">String mMethod</span><span class="s2">;</span>
+    <span class="s2">public </span><span class="s1">@Nullable NativeArray mArguments</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">PendingJSCall(String module</span><span class="s2">, </span><span class="s1">String method</span><span class="s2">, </span><span class="s1">@Nullable NativeArray arguments) {</span>
+      <span class="s1">mModule = module</span><span class="s2">;</span>
+      <span class="s1">mMethod = method</span><span class="s2">;</span>
+      <span class="s1">mArguments = arguments</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">void </span><span class="s1">call(CatalystInstanceImpl catalystInstance) {</span>
+      <span class="s1">NativeArray arguments = mArguments != </span><span class="s2">null </span><span class="s1">? mArguments : </span><span class="s2">new </span><span class="s1">WritableNativeArray()</span><span class="s2">;</span>
+      <span class="s1">catalystInstance.jniCallJSFunction(mModule</span><span class="s2">, </span><span class="s1">mMethod</span><span class="s2">, </span><span class="s1">arguments)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public </span><span class="s1">String toString() {</span>
+      <span class="s2">return </span><span class="s1">mModule</span>
+          <span class="s1">+ </span><span class="s5">&quot;.&quot;</span>
+          <span class="s1">+ mMethod</span>
+          <span class="s1">+ </span><span class="s5">&quot;(&quot;</span>
+          <span class="s1">+ (mArguments == </span><span class="s2">null </span><span class="s1">? </span><span class="s5">&quot;&quot; </span><span class="s1">: mArguments.toString())</span>
+          <span class="s1">+ </span><span class="s5">&quot;)&quot;</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Access from any thread</span>
+  <span class="s2">private final </span><span class="s1">ReactQueueConfigurationImpl mReactQueueConfiguration</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">CopyOnWriteArrayList&lt;NotThreadSafeBridgeIdleDebugListener&gt; mBridgeIdleListeners</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">AtomicInteger mPendingJSCalls = </span><span class="s2">new </span><span class="s1">AtomicInteger(</span><span class="s4">0</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">String mJsPendingCallsTitleForTrace =</span>
+      <span class="s5">&quot;pending_js_calls_instance&quot; </span><span class="s1">+ sNextInstanceIdForTrace.getAndIncrement()</span><span class="s2">;</span>
+  <span class="s2">private volatile boolean </span><span class="s1">mDestroyed = </span><span class="s2">false;</span>
+  <span class="s2">private final </span><span class="s1">TraceListener mTraceListener</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">JavaScriptModuleRegistry mJSModuleRegistry</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">JSBundleLoader mJSBundleLoader</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ArrayList&lt;PendingJSCall&gt; mJSCallsPendingInit = </span><span class="s2">new </span><span class="s1">ArrayList&lt;PendingJSCall&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Object mJSCallsPendingInitLock = </span><span class="s2">new </span><span class="s1">Object()</span><span class="s2">;</span>
+
+  <span class="s2">private final </span><span class="s1">NativeModuleRegistry mNativeModuleRegistry</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">JSIModuleRegistry mJSIModuleRegistry = </span><span class="s2">new </span><span class="s1">JSIModuleRegistry()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">JSExceptionHandler mJSExceptionHandler</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">MessageQueueThread mNativeModulesQueueThread</span><span class="s2">;</span>
+  <span class="s2">private boolean </span><span class="s1">mInitialized = </span><span class="s2">false;</span>
+  <span class="s2">private volatile boolean </span><span class="s1">mAcceptCalls = </span><span class="s2">false;</span>
+
+  <span class="s2">private boolean </span><span class="s1">mJSBundleHasLoaded</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable String mSourceURL</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">JavaScriptContextHolder mJavaScriptContextHolder</span><span class="s2">;</span>
+  <span class="s2">private volatile </span><span class="s1">@Nullable TurboModuleRegistry mTurboModuleRegistry = </span><span class="s2">null;</span>
+  <span class="s2">private </span><span class="s1">@Nullable JSIModule mTurboModuleManagerJSIModule = </span><span class="s2">null;</span>
+
+  <span class="s0">// C++ parts</span>
+  <span class="s2">private final </span><span class="s1">HybridData mHybridData</span><span class="s2">;</span>
+
+  <span class="s2">private static native </span><span class="s1">HybridData initHybrid()</span><span class="s2">;</span>
+
+  <span class="s2">public native </span><span class="s1">CallInvokerHolderImpl getJSCallInvokerHolder()</span><span class="s2">;</span>
+
+  <span class="s2">public native </span><span class="s1">CallInvokerHolderImpl getNativeCallInvokerHolder()</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">CatalystInstanceImpl(</span>
+      <span class="s2">final </span><span class="s1">ReactQueueConfigurationSpec reactQueueConfigurationSpec</span><span class="s2">,</span>
+      <span class="s2">final </span><span class="s1">JavaScriptExecutor jsExecutor</span><span class="s2">,</span>
+      <span class="s2">final </span><span class="s1">NativeModuleRegistry nativeModuleRegistry</span><span class="s2">,</span>
+      <span class="s2">final </span><span class="s1">JSBundleLoader jsBundleLoader</span><span class="s2">,</span>
+      <span class="s1">JSExceptionHandler jSExceptionHandler) {</span>
+    <span class="s1">FLog.d(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;Initializing React Xplat Bridge.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Systrace.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s5">&quot;createCatalystInstanceImpl&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s1">mHybridData = initHybrid()</span><span class="s2">;</span>
+
+    <span class="s1">mReactQueueConfiguration =</span>
+        <span class="s1">ReactQueueConfigurationImpl.create(</span>
+            <span class="s1">reactQueueConfigurationSpec</span><span class="s2">, new </span><span class="s1">NativeExceptionHandler())</span><span class="s2">;</span>
+    <span class="s1">mBridgeIdleListeners = </span><span class="s2">new </span><span class="s1">CopyOnWriteArrayList&lt;&gt;()</span><span class="s2">;</span>
+    <span class="s1">mNativeModuleRegistry = nativeModuleRegistry</span><span class="s2">;</span>
+    <span class="s1">mJSModuleRegistry = </span><span class="s2">new </span><span class="s1">JavaScriptModuleRegistry()</span><span class="s2">;</span>
+    <span class="s1">mJSBundleLoader = jsBundleLoader</span><span class="s2">;</span>
+    <span class="s1">mJSExceptionHandler = jSExceptionHandler</span><span class="s2">;</span>
+    <span class="s1">mNativeModulesQueueThread = mReactQueueConfiguration.getNativeModulesQueueThread()</span><span class="s2">;</span>
+    <span class="s1">mTraceListener = </span><span class="s2">new </span><span class="s1">JSProfilerTraceListener(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Systrace.endSection(TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+
+    <span class="s1">FLog.d(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;Initializing React Xplat Bridge before initializeBridge&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Systrace.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s5">&quot;initializeCxxBridge&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(ReactFeatureFlags.warnOnLegacyNativeModuleSystemUse) {</span>
+      <span class="s1">warnOnLegacyNativeModuleSystemUse()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">initializeBridge(</span>
+        <span class="s2">new </span><span class="s1">BridgeCallback(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">,</span>
+        <span class="s1">jsExecutor</span><span class="s2">,</span>
+        <span class="s1">mReactQueueConfiguration.getJSQueueThread()</span><span class="s2">,</span>
+        <span class="s1">mNativeModulesQueueThread</span><span class="s2">,</span>
+        <span class="s1">mNativeModuleRegistry.getJavaModules(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">,</span>
+        <span class="s1">mNativeModuleRegistry.getCxxModules())</span><span class="s2">;</span>
+    <span class="s1">FLog.d(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;Initializing React Xplat Bridge after initializeBridge&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Systrace.endSection(TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+
+    <span class="s1">mJavaScriptContextHolder = </span><span class="s2">new </span><span class="s1">JavaScriptContextHolder(getJavaScriptContext())</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static class </span><span class="s1">BridgeCallback </span><span class="s2">implements </span><span class="s1">ReactCallback {</span>
+    <span class="s0">// We do this so the callback doesn't keep the CatalystInstanceImpl alive.</span>
+    <span class="s0">// In this case, the callback is held in C++ code, so the GC can't see it</span>
+    <span class="s0">// and determine there's an inaccessible cycle.</span>
+    <span class="s2">private final </span><span class="s1">WeakReference&lt;CatalystInstanceImpl&gt; mOuter</span><span class="s2">;</span>
+
+    <span class="s1">BridgeCallback(CatalystInstanceImpl outer) {</span>
+      <span class="s1">mOuter = </span><span class="s2">new </span><span class="s1">WeakReference&lt;&gt;(outer)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">onBatchComplete() {</span>
+      <span class="s1">CatalystInstanceImpl impl = mOuter.get()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(impl != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">impl.mNativeModuleRegistry.onBatchComplete()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">incrementPendingJSCalls() {</span>
+      <span class="s1">CatalystInstanceImpl impl = mOuter.get()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(impl != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">impl.incrementPendingJSCalls()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">decrementPendingJSCalls() {</span>
+      <span class="s1">CatalystInstanceImpl impl = mOuter.get()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(impl != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">impl.decrementPendingJSCalls()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* This method and the native below permits a CatalystInstance to extend the known Native modules.</span>
+   <span class="s3">* This registry contains only the new modules to load. The registry {</span><span class="s6">@code </span><span class="s3">mNativeModuleRegistry}</span>
+   <span class="s3">* updates internally to contain all the new modules, and generates the new registry for</span>
+   <span class="s3">* extracting just the new collections.</span>
+   <span class="s3">*/</span>
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">extendNativeModules(NativeModuleRegistry modules) {</span>
+    <span class="s0">// Extend the Java-visible registry of modules</span>
+    <span class="s1">mNativeModuleRegistry.registerModules(modules)</span><span class="s2">;</span>
+    <span class="s1">Collection&lt;JavaModuleWrapper&gt; javaModules = modules.getJavaModules(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Collection&lt;ModuleHolder&gt; cxxModules = modules.getCxxModules()</span><span class="s2">;</span>
+    <span class="s0">// Extend the Cxx-visible registry of modules wrapped in appropriate interfaces</span>
+    <span class="s1">jniExtendNativeModules(javaModules</span><span class="s2">, </span><span class="s1">cxxModules)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private native void </span><span class="s1">jniExtendNativeModules(</span>
+      <span class="s1">Collection&lt;JavaModuleWrapper&gt; javaModules</span><span class="s2">, </span><span class="s1">Collection&lt;ModuleHolder&gt; cxxModules)</span><span class="s2">;</span>
+
+  <span class="s2">private native void </span><span class="s1">warnOnLegacyNativeModuleSystemUse()</span><span class="s2">;</span>
+
+  <span class="s2">private native void </span><span class="s1">initializeBridge(</span>
+      <span class="s1">ReactCallback callback</span><span class="s2">,</span>
+      <span class="s1">JavaScriptExecutor jsExecutor</span><span class="s2">,</span>
+      <span class="s1">MessageQueueThread jsQueue</span><span class="s2">,</span>
+      <span class="s1">MessageQueueThread moduleQueue</span><span class="s2">,</span>
+      <span class="s1">Collection&lt;JavaModuleWrapper&gt; javaModules</span><span class="s2">,</span>
+      <span class="s1">Collection&lt;ModuleHolder&gt; cxxModules)</span><span class="s2">;</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">setSourceURLs(String deviceURL</span><span class="s2">, </span><span class="s1">String remoteURL) {</span>
+    <span class="s1">mSourceURL = deviceURL</span><span class="s2">;</span>
+    <span class="s1">jniSetSourceURL(remoteURL)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">registerSegment(</span><span class="s2">int </span><span class="s1">segmentId</span><span class="s2">, </span><span class="s1">String path) {</span>
+    <span class="s1">jniRegisterSegment(segmentId</span><span class="s2">, </span><span class="s1">path)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">loadScriptFromAssets(</span>
+      <span class="s1">AssetManager assetManager</span><span class="s2">, </span><span class="s1">String assetURL</span><span class="s2">, boolean </span><span class="s1">loadSynchronously) {</span>
+    <span class="s1">mSourceURL = assetURL</span><span class="s2">;</span>
+    <span class="s1">jniLoadScriptFromAssets(assetManager</span><span class="s2">, </span><span class="s1">assetURL</span><span class="s2">, </span><span class="s1">loadSynchronously)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">loadScriptFromFile(String fileName</span><span class="s2">, </span><span class="s1">String sourceURL</span><span class="s2">, boolean </span><span class="s1">loadSynchronously) {</span>
+    <span class="s1">mSourceURL = sourceURL</span><span class="s2">;</span>
+    <span class="s1">jniLoadScriptFromFile(fileName</span><span class="s2">, </span><span class="s1">sourceURL</span><span class="s2">, </span><span class="s1">loadSynchronously)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">loadSplitBundleFromFile(String fileName</span><span class="s2">, </span><span class="s1">String sourceURL) {</span>
+    <span class="s1">jniLoadScriptFromFile(fileName</span><span class="s2">, </span><span class="s1">sourceURL</span><span class="s2">, false</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private native void </span><span class="s1">jniSetSourceURL(String sourceURL)</span><span class="s2">;</span>
+
+  <span class="s2">private native void </span><span class="s1">jniRegisterSegment(</span><span class="s2">int </span><span class="s1">segmentId</span><span class="s2">, </span><span class="s1">String path)</span><span class="s2">;</span>
+
+  <span class="s2">private native void </span><span class="s1">jniLoadScriptFromAssets(</span>
+      <span class="s1">AssetManager assetManager</span><span class="s2">, </span><span class="s1">String assetURL</span><span class="s2">, boolean </span><span class="s1">loadSynchronously)</span><span class="s2">;</span>
+
+  <span class="s2">private native void </span><span class="s1">jniLoadScriptFromFile(</span>
+      <span class="s1">String fileName</span><span class="s2">, </span><span class="s1">String sourceURL</span><span class="s2">, boolean </span><span class="s1">loadSynchronously)</span><span class="s2">;</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">runJSBundle() {</span>
+    <span class="s1">FLog.d(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;CatalystInstanceImpl.runJSBundle()&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertCondition(!mJSBundleHasLoaded</span><span class="s2">, </span><span class="s5">&quot;JS bundle was already loaded!&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s0">// incrementPendingJSCalls();</span>
+    <span class="s1">mJSBundleLoader.loadScript(CatalystInstanceImpl.</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s2">synchronized </span><span class="s1">(mJSCallsPendingInitLock) {</span>
+
+      <span class="s0">// Loading the bundle is queued on the JS thread, but may not have</span>
+      <span class="s0">// run yet.  It's safe to set this here, though, since any work it</span>
+      <span class="s0">// gates will be queued on the JS thread behind the load.</span>
+      <span class="s1">mAcceptCalls = </span><span class="s2">true;</span>
+
+      <span class="s2">for </span><span class="s1">(PendingJSCall function : mJSCallsPendingInit) {</span>
+        <span class="s1">function.call(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s1">mJSCallsPendingInit.clear()</span><span class="s2">;</span>
+      <span class="s1">mJSBundleHasLoaded = </span><span class="s2">true;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// This is registered after JS starts since it makes a JS call</span>
+    <span class="s1">Systrace.registerListener(mTraceListener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public boolean </span><span class="s1">hasRunJSBundle() {</span>
+    <span class="s2">synchronized </span><span class="s1">(mJSCallsPendingInitLock) {</span>
+      <span class="s2">return </span><span class="s1">mJSBundleHasLoaded &amp;&amp; mAcceptCalls</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">@Nullable String getSourceURL() {</span>
+    <span class="s2">return </span><span class="s1">mSourceURL</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private native void </span><span class="s1">jniCallJSFunction(String module</span><span class="s2">, </span><span class="s1">String method</span><span class="s2">, </span><span class="s1">NativeArray arguments)</span><span class="s2">;</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">callFunction(</span><span class="s2">final </span><span class="s1">String module</span><span class="s2">, final </span><span class="s1">String method</span><span class="s2">, final </span><span class="s1">NativeArray arguments) {</span>
+    <span class="s1">callFunction(</span><span class="s2">new </span><span class="s1">PendingJSCall(module</span><span class="s2">, </span><span class="s1">method</span><span class="s2">, </span><span class="s1">arguments))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">callFunction(PendingJSCall function) {</span>
+    <span class="s2">if </span><span class="s1">(mDestroyed) {</span>
+      <span class="s2">final </span><span class="s1">String call = function.toString()</span><span class="s2">;</span>
+      <span class="s1">FLog.w(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;Calling JS function after bridge has been destroyed: &quot; </span><span class="s1">+ call)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!mAcceptCalls) {</span>
+      <span class="s0">// Most of the time the instance is initialized and we don't need to acquire the lock</span>
+      <span class="s2">synchronized </span><span class="s1">(mJSCallsPendingInitLock) {</span>
+        <span class="s2">if </span><span class="s1">(!mAcceptCalls) {</span>
+          <span class="s1">mJSCallsPendingInit.add(function)</span><span class="s2">;</span>
+          <span class="s2">return;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">function.call(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private native void </span><span class="s1">jniCallJSCallback(</span><span class="s2">int </span><span class="s1">callbackID</span><span class="s2">, </span><span class="s1">NativeArray arguments)</span><span class="s2">;</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">invokeCallback(</span><span class="s2">final int </span><span class="s1">callbackID</span><span class="s2">, final </span><span class="s1">NativeArrayInterface arguments) {</span>
+    <span class="s2">if </span><span class="s1">(mDestroyed) {</span>
+      <span class="s1">FLog.w(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;Invoking JS callback after bridge has been destroyed.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">jniCallJSCallback(callbackID</span><span class="s2">, </span><span class="s1">(NativeArray) arguments)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Destroys this catalyst instance, waiting for any other threads in ReactQueueConfiguration</span>
+   <span class="s3">* (besides the UI thread) to finish running. Must be called from the UI thread so that we can</span>
+   <span class="s3">* fully shut down other threads.</span>
+   <span class="s3">*/</span>
+  <span class="s1">@Override</span>
+  <span class="s1">@ThreadConfined(UI)</span>
+  <span class="s2">public void </span><span class="s1">destroy() {</span>
+    <span class="s1">FLog.d(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;CatalystInstanceImpl.destroy() start&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mDestroyed) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// TODO: tell all APIs to shut down</span>
+    <span class="s1">ReactMarker.logMarker(ReactMarkerConstants.DESTROY_CATALYST_INSTANCE_START)</span><span class="s2">;</span>
+    <span class="s1">mDestroyed = </span><span class="s2">true;</span>
+
+    <span class="s1">mNativeModulesQueueThread.runOnQueue(</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s1">mNativeModuleRegistry.notifyJSInstanceDestroy()</span><span class="s2">;</span>
+            <span class="s1">mJSIModuleRegistry.notifyJSInstanceDestroy()</span><span class="s2">;</span>
+            <span class="s2">boolean </span><span class="s1">wasIdle = (mPendingJSCalls.getAndSet(</span><span class="s4">0</span><span class="s1">) == </span><span class="s4">0</span><span class="s1">)</span><span class="s2">;</span>
+            <span class="s2">if </span><span class="s1">(!mBridgeIdleListeners.isEmpty()) {</span>
+              <span class="s2">for </span><span class="s1">(NotThreadSafeBridgeIdleDebugListener listener : mBridgeIdleListeners) {</span>
+                <span class="s2">if </span><span class="s1">(!wasIdle) {</span>
+                  <span class="s1">listener.onTransitionToBridgeIdle()</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s1">listener.onBridgeDestroyed()</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s1">getReactQueueConfiguration()</span>
+                <span class="s1">.getJSQueueThread()</span>
+                <span class="s1">.runOnQueue(</span>
+                    <span class="s2">new </span><span class="s1">Runnable() {</span>
+                      <span class="s1">@Override</span>
+                      <span class="s2">public void </span><span class="s1">run() {</span>
+                        <span class="s0">// We need to destroy the TurboModuleManager on the JS Thread</span>
+                        <span class="s2">if </span><span class="s1">(mTurboModuleManagerJSIModule != </span><span class="s2">null</span><span class="s1">) {</span>
+                          <span class="s1">mTurboModuleManagerJSIModule.onCatalystInstanceDestroy()</span><span class="s2">;</span>
+                        <span class="s1">}</span>
+
+                        <span class="s1">getReactQueueConfiguration()</span>
+                            <span class="s1">.getUIQueueThread()</span>
+                            <span class="s1">.runOnQueue(</span>
+                                <span class="s2">new </span><span class="s1">Runnable() {</span>
+                                  <span class="s1">@Override</span>
+                                  <span class="s2">public void </span><span class="s1">run() {</span>
+                                    <span class="s0">// AsyncTask.execute must be executed from the UI Thread</span>
+                                    <span class="s1">AsyncTask.execute(</span>
+                                        <span class="s2">new </span><span class="s1">Runnable() {</span>
+                                          <span class="s1">@Override</span>
+                                          <span class="s2">public void </span><span class="s1">run() {</span>
+                                            <span class="s0">// Kill non-UI threads from neutral third party</span>
+                                            <span class="s0">// potentially expensive, so don't run on UI thread</span>
+
+                                            <span class="s0">// contextHolder is used as a lock to guard against</span>
+                                            <span class="s0">// other users of the JS VM having the VM destroyed</span>
+                                            <span class="s0">// underneath them, so notify them before we reset</span>
+                                            <span class="s0">// Native</span>
+                                            <span class="s1">mJavaScriptContextHolder.clear()</span><span class="s2">;</span>
+
+                                            <span class="s1">mHybridData.resetNative()</span><span class="s2">;</span>
+                                            <span class="s1">getReactQueueConfiguration().destroy()</span><span class="s2">;</span>
+                                            <span class="s1">FLog.d(</span>
+                                                <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+                                                <span class="s5">&quot;CatalystInstanceImpl.destroy() end&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                                            <span class="s1">ReactMarker.logMarker(</span>
+                                                <span class="s1">ReactMarkerConstants.DESTROY_CATALYST_INSTANCE_END)</span><span class="s2">;</span>
+                                          <span class="s1">}</span>
+                                        <span class="s1">})</span><span class="s2">;</span>
+                                  <span class="s1">}</span>
+                                <span class="s1">})</span><span class="s2">;</span>
+                      <span class="s1">}</span>
+                    <span class="s1">})</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+
+    <span class="s0">// This is a noop if the listener was not yet registered.</span>
+    <span class="s1">Systrace.unregisterListener(mTraceListener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public boolean </span><span class="s1">isDestroyed() {</span>
+    <span class="s2">return </span><span class="s1">mDestroyed</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Initialize all the native modules */</span>
+  <span class="s1">@VisibleForTesting</span>
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">initialize() {</span>
+    <span class="s1">FLog.d(ReactConstants.TAG</span><span class="s2">, </span><span class="s5">&quot;CatalystInstanceImpl.initialize()&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertCondition(</span>
+        <span class="s1">!mInitialized</span><span class="s2">, </span><span class="s5">&quot;This catalyst instance has already been initialized&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s0">// We assume that the instance manager blocks on running the JS bundle. If</span>
+    <span class="s0">// that changes, then we need to set mAcceptCalls just after posting the</span>
+    <span class="s0">// task that will run the js bundle.</span>
+    <span class="s1">Assertions.assertCondition(mAcceptCalls</span><span class="s2">, </span><span class="s5">&quot;RunJSBundle hasn't completed.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">mInitialized = </span><span class="s2">true;</span>
+    <span class="s1">mNativeModulesQueueThread.runOnQueue(</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s1">mNativeModuleRegistry.notifyJSInstanceInitialized()</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">ReactQueueConfiguration getReactQueueConfiguration() {</span>
+    <span class="s2">return </span><span class="s1">mReactQueueConfiguration</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">JavaScriptModule&gt; T getJSModule(Class&lt;T&gt; jsInterface) {</span>
+    <span class="s2">return </span><span class="s1">mJSModuleRegistry.getJavaScriptModule(</span><span class="s2">this, </span><span class="s1">jsInterface)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">NativeModule&gt; </span><span class="s2">boolean </span><span class="s1">hasNativeModule(Class&lt;T&gt; nativeModuleInterface) {</span>
+    <span class="s1">String moduleName = getNameFromAnnotation(nativeModuleInterface)</span><span class="s2">;</span>
+    <span class="s2">return </span><span class="s1">getTurboModuleRegistry() != </span><span class="s2">null </span><span class="s1">&amp;&amp; getTurboModuleRegistry().hasModule(moduleName)</span>
+        <span class="s1">? </span><span class="s2">true</span>
+        <span class="s1">: mNativeModuleRegistry.hasModule(moduleName)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s1">@Nullable</span>
+  <span class="s2">public </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">NativeModule&gt; T getNativeModule(Class&lt;T&gt; nativeModuleInterface) {</span>
+    <span class="s2">return </span><span class="s1">(T) getNativeModule(getNameFromAnnotation(nativeModuleInterface))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private </span><span class="s1">TurboModuleRegistry getTurboModuleRegistry() {</span>
+    <span class="s2">if </span><span class="s1">(ReactFeatureFlags.useTurboModules) {</span>
+      <span class="s2">return </span><span class="s1">Assertions.assertNotNull(</span>
+          <span class="s1">mTurboModuleRegistry</span><span class="s2">,</span>
+          <span class="s5">&quot;TurboModules are enabled, but mTurboModuleRegistry hasn't been set.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return null;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s1">@Nullable</span>
+  <span class="s2">public </span><span class="s1">NativeModule getNativeModule(String moduleName) {</span>
+    <span class="s2">if </span><span class="s1">(getTurboModuleRegistry() != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">TurboModule turboModule = getTurboModuleRegistry().getModule(moduleName)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(turboModule != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">return </span><span class="s1">(NativeModule) turboModule</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">mNativeModuleRegistry.hasModule(moduleName)</span>
+        <span class="s1">? mNativeModuleRegistry.getModule(moduleName)</span>
+        <span class="s1">: </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private </span><span class="s1">&lt;T </span><span class="s2">extends </span><span class="s1">NativeModule&gt; String getNameFromAnnotation(Class&lt;T&gt; nativeModuleInterface) {</span>
+    <span class="s1">ReactModule annotation = nativeModuleInterface.getAnnotation(ReactModule.</span><span class="s2">class</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(annotation == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">throw new </span><span class="s1">IllegalArgumentException(</span>
+          <span class="s5">&quot;Could not find @ReactModule annotation in &quot; </span><span class="s1">+ nativeModuleInterface.getCanonicalName())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">annotation.name()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// This is only used by com.facebook.react.modules.common.ModuleDataCleaner</span>
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">Collection&lt;NativeModule&gt; getNativeModules() {</span>
+    <span class="s1">Collection&lt;NativeModule&gt; nativeModules = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+    <span class="s1">nativeModules.addAll(mNativeModuleRegistry.getAllModules())</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(getTurboModuleRegistry() != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">for </span><span class="s1">(TurboModule turboModule : getTurboModuleRegistry().getModules()) {</span>
+        <span class="s1">nativeModules.add((NativeModule) turboModule)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return </span><span class="s1">nativeModules</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private native void </span><span class="s1">jniHandleMemoryPressure(</span><span class="s2">int </span><span class="s1">level)</span><span class="s2">;</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">handleMemoryPressure(</span><span class="s2">int </span><span class="s1">level) {</span>
+    <span class="s2">if </span><span class="s1">(mDestroyed) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">jniHandleMemoryPressure(level)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Adds a idle listener for this Catalyst instance. The listener will receive notifications</span>
+   <span class="s3">* whenever the bridge transitions from idle to busy and vice-versa, where the busy state is</span>
+   <span class="s3">* defined as there being some non-zero number of calls to JS that haven't resolved via a</span>
+   <span class="s3">* onBatchComplete call. The listener should be purely passive and not affect application logic.</span>
+   <span class="s3">*/</span>
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">addBridgeIdleDebugListener(NotThreadSafeBridgeIdleDebugListener listener) {</span>
+    <span class="s1">mBridgeIdleListeners.add(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Removes a NotThreadSafeBridgeIdleDebugListener previously added with {</span><span class="s6">@link</span>
+   <span class="s3">* #addBridgeIdleDebugListener}</span>
+   <span class="s3">*/</span>
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">removeBridgeIdleDebugListener(NotThreadSafeBridgeIdleDebugListener listener) {</span>
+    <span class="s1">mBridgeIdleListeners.remove(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public native void </span><span class="s1">setGlobalVariable(String propName</span><span class="s2">, </span><span class="s1">String jsonValue)</span><span class="s2">;</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">JavaScriptContextHolder getJavaScriptContextHolder() {</span>
+    <span class="s2">return </span><span class="s1">mJavaScriptContextHolder</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public native </span><span class="s1">RuntimeExecutor getRuntimeExecutor()</span><span class="s2">;</span>
+
+  <span class="s2">public native </span><span class="s1">RuntimeScheduler getRuntimeScheduler()</span><span class="s2">;</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">addJSIModules(List&lt;JSIModuleSpec&gt; jsiModules) {</span>
+    <span class="s1">mJSIModuleRegistry.registerModules(jsiModules)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public </span><span class="s1">JSIModule getJSIModule(JSIModuleType moduleType) {</span>
+    <span class="s2">return </span><span class="s1">mJSIModuleRegistry.getModule(moduleType)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private native long </span><span class="s1">getJavaScriptContext()</span><span class="s2">;</span>
+
+  <span class="s2">private void </span><span class="s1">incrementPendingJSCalls() {</span>
+    <span class="s2">int </span><span class="s1">oldPendingCalls = mPendingJSCalls.getAndIncrement()</span><span class="s2">;</span>
+    <span class="s2">boolean </span><span class="s1">wasIdle = oldPendingCalls == </span><span class="s4">0</span><span class="s2">;</span>
+    <span class="s1">Systrace.traceCounter(</span>
+        <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s1">mJsPendingCallsTitleForTrace</span><span class="s2">, </span><span class="s1">oldPendingCalls + </span><span class="s4">1</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(wasIdle &amp;&amp; !mBridgeIdleListeners.isEmpty()) {</span>
+      <span class="s1">mNativeModulesQueueThread.runOnQueue(</span>
+          <span class="s2">new </span><span class="s1">Runnable() {</span>
+            <span class="s1">@Override</span>
+            <span class="s2">public void </span><span class="s1">run() {</span>
+              <span class="s2">for </span><span class="s1">(NotThreadSafeBridgeIdleDebugListener listener : mBridgeIdleListeners) {</span>
+                <span class="s1">listener.onTransitionToBridgeBusy()</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">})</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">setTurboModuleManager(JSIModule module) {</span>
+    <span class="s1">mTurboModuleRegistry = (TurboModuleRegistry) module</span><span class="s2">;</span>
+    <span class="s1">mTurboModuleManagerJSIModule = module</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">decrementPendingJSCalls() {</span>
+    <span class="s2">int </span><span class="s1">newPendingCalls = mPendingJSCalls.decrementAndGet()</span><span class="s2">;</span>
+    <span class="s0">// TODO(9604406): handle case of web workers injecting messages to main thread</span>
+    <span class="s0">// Assertions.assertCondition(newPendingCalls &gt;= 0);</span>
+    <span class="s2">boolean </span><span class="s1">isNowIdle = newPendingCalls == </span><span class="s4">0</span><span class="s2">;</span>
+    <span class="s1">Systrace.traceCounter(</span>
+        <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s1">mJsPendingCallsTitleForTrace</span><span class="s2">, </span><span class="s1">newPendingCalls)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(isNowIdle &amp;&amp; !mBridgeIdleListeners.isEmpty()) {</span>
+      <span class="s1">mNativeModulesQueueThread.runOnQueue(</span>
+          <span class="s2">new </span><span class="s1">Runnable() {</span>
+            <span class="s1">@Override</span>
+            <span class="s2">public void </span><span class="s1">run() {</span>
+              <span class="s2">for </span><span class="s1">(NotThreadSafeBridgeIdleDebugListener listener : mBridgeIdleListeners) {</span>
+                <span class="s1">listener.onTransitionToBridgeIdle()</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">})</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">onNativeException(Exception e) {</span>
+    <span class="s1">mJSExceptionHandler.handleException(e)</span><span class="s2">;</span>
+    <span class="s1">mReactQueueConfiguration</span>
+        <span class="s1">.getUIQueueThread()</span>
+        <span class="s1">.runOnQueue(</span>
+            <span class="s2">new </span><span class="s1">Runnable() {</span>
+              <span class="s1">@Override</span>
+              <span class="s2">public void </span><span class="s1">run() {</span>
+                <span class="s1">destroy()</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">})</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">NativeExceptionHandler </span><span class="s2">implements </span><span class="s1">QueueThreadExceptionHandler {</span>
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">handleException(Exception e) {</span>
+      <span class="s0">// Any Exception caught here is because of something in JS. Even if it's a bug in the</span>
+      <span class="s0">// framework/native code, it was triggered by JS and theoretically since we were able</span>
+      <span class="s0">// to set up the bridge, JS could change its logic, reload, and not trigger that crash.</span>
+      <span class="s1">onNativeException(e)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static class </span><span class="s1">JSProfilerTraceListener </span><span class="s2">implements </span><span class="s1">TraceListener {</span>
+    <span class="s0">// We do this so the callback doesn't keep the CatalystInstanceImpl alive.</span>
+    <span class="s0">// In this case, Systrace will keep the registered listener around forever</span>
+    <span class="s0">// if the CatalystInstanceImpl is not explicitly destroyed. These instances</span>
+    <span class="s0">// can still leak, but they are at least small.</span>
+    <span class="s2">private final </span><span class="s1">WeakReference&lt;CatalystInstanceImpl&gt; mOuter</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">JSProfilerTraceListener(CatalystInstanceImpl outer) {</span>
+      <span class="s1">mOuter = </span><span class="s2">new </span><span class="s1">WeakReference&lt;CatalystInstanceImpl&gt;(outer)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">onTraceStarted() {</span>
+      <span class="s1">CatalystInstanceImpl impl = mOuter.get()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(impl != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">impl.getJSModule(com.facebook.react.bridge.Systrace.</span><span class="s2">class</span><span class="s1">).setEnabled(</span><span class="s2">true</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">onTraceStopped() {</span>
+      <span class="s1">CatalystInstanceImpl impl = mOuter.get()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(impl != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">impl.getJSModule(com.facebook.react.bridge.Systrace.</span><span class="s2">class</span><span class="s1">).setEnabled(</span><span class="s2">false</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public static class </span><span class="s1">Builder {</span>
+
+    <span class="s2">private </span><span class="s1">@Nullable ReactQueueConfigurationSpec mReactQueueConfigurationSpec</span><span class="s2">;</span>
+    <span class="s2">private </span><span class="s1">@Nullable JSBundleLoader mJSBundleLoader</span><span class="s2">;</span>
+    <span class="s2">private </span><span class="s1">@Nullable NativeModuleRegistry mRegistry</span><span class="s2">;</span>
+    <span class="s2">private </span><span class="s1">@Nullable JavaScriptExecutor mJSExecutor</span><span class="s2">;</span>
+    <span class="s2">private </span><span class="s1">@Nullable JSExceptionHandler mJSExceptionHandler</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">Builder setReactQueueConfigurationSpec(</span>
+        <span class="s1">ReactQueueConfigurationSpec ReactQueueConfigurationSpec) {</span>
+      <span class="s1">mReactQueueConfigurationSpec = ReactQueueConfigurationSpec</span><span class="s2">;</span>
+      <span class="s2">return this;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public </span><span class="s1">Builder setRegistry(NativeModuleRegistry registry) {</span>
+      <span class="s1">mRegistry = registry</span><span class="s2">;</span>
+      <span class="s2">return this;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public </span><span class="s1">Builder setJSBundleLoader(JSBundleLoader jsBundleLoader) {</span>
+      <span class="s1">mJSBundleLoader = jsBundleLoader</span><span class="s2">;</span>
+      <span class="s2">return this;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public </span><span class="s1">Builder setJSExecutor(JavaScriptExecutor jsExecutor) {</span>
+      <span class="s1">mJSExecutor = jsExecutor</span><span class="s2">;</span>
+      <span class="s2">return this;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public </span><span class="s1">Builder setJSExceptionHandler(JSExceptionHandler handler) {</span>
+      <span class="s1">mJSExceptionHandler = handler</span><span class="s2">;</span>
+      <span class="s2">return this;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public </span><span class="s1">CatalystInstanceImpl build() {</span>
+      <span class="s2">return new </span><span class="s1">CatalystInstanceImpl(</span>
+          <span class="s1">Assertions.assertNotNull(mReactQueueConfigurationSpec)</span><span class="s2">,</span>
+          <span class="s1">Assertions.assertNotNull(mJSExecutor)</span><span class="s2">,</span>
+          <span class="s1">Assertions.assertNotNull(mRegistry)</span><span class="s2">,</span>
+          <span class="s1">Assertions.assertNotNull(mJSBundleLoader)</span><span class="s2">,</span>
+          <span class="s1">Assertions.assertNotNull(mJSExceptionHandler))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

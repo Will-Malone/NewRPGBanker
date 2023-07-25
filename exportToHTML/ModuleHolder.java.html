@@ -1,0 +1,273 @@
+<html>
+<head>
+<title>ModuleHolder.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #77b767; font-style: italic;}
+.s5 { color: #629755; font-weight: bold; font-style: italic;}
+.s6 { color: #6897bb;}
+.s7 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ModuleHolder.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.bridge</span><span class="s2">;</span>
+
+<span class="s2">import static </span><span class="s1">com.facebook.infer.annotation.Assertions.assertNotNull</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.react.bridge.ReactMarkerConstants.CREATE_MODULE_END</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.react.bridge.ReactMarkerConstants.CREATE_MODULE_START</span><span class="s2">;</span>
+<span class="s2">import static </span><span class="s1">com.facebook.systrace.Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">androidx.annotation.GuardedBy</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.debug.holder.PrinterHolder</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.debug.tags.ReactDebugOverlayTags</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.proguard.annotations.DoNotStrip</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.module.model.ReactModuleInfo</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.turbomodule.core.interfaces.TurboModule</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.systrace.SystraceMessage</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.atomic.AtomicInteger</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">javax.inject.Provider</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* Holder to enable us to lazy create native modules.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">This works by taking a provider instead of an instance, when it is first required we'll create</span>
+ <span class="s3">* and initialize it. Initialization currently always happens on the UI thread but this is due to</span>
+ <span class="s3">* change for performance reasons.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">Lifecycle events via a {</span><span class="s5">@link </span><span class="s3">LifecycleEventListener} will still always happen on the UI</span>
+ <span class="s3">* thread.</span>
+ <span class="s3">*/</span>
+<span class="s1">@DoNotStrip</span>
+<span class="s2">public class </span><span class="s1">ModuleHolder {</span>
+
+  <span class="s2">private static final </span><span class="s1">AtomicInteger sInstanceKeyCounter = </span><span class="s2">new </span><span class="s1">AtomicInteger(</span><span class="s6">1</span><span class="s1">)</span><span class="s2">;</span>
+
+  <span class="s2">private final int </span><span class="s1">mInstanceKey = sInstanceKeyCounter.getAndIncrement()</span><span class="s2">;</span>
+
+  <span class="s2">private final </span><span class="s1">String mName</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ReactModuleInfo mReactModuleInfo</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">@Nullable Provider&lt;? </span><span class="s2">extends </span><span class="s1">NativeModule&gt; mProvider</span><span class="s2">;</span>
+  <span class="s0">// Outside of the constructor, these should only be checked or set when synchronized on this</span>
+  <span class="s2">private </span><span class="s1">@Nullable @GuardedBy(</span><span class="s7">&quot;this&quot;</span><span class="s1">) NativeModule mModule</span><span class="s2">;</span>
+
+  <span class="s0">// These are used to communicate phases of creation and initialization across threads</span>
+  <span class="s2">private </span><span class="s1">@GuardedBy(</span><span class="s7">&quot;this&quot;</span><span class="s1">) </span><span class="s2">boolean </span><span class="s1">mInitializable</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@GuardedBy(</span><span class="s7">&quot;this&quot;</span><span class="s1">) </span><span class="s2">boolean </span><span class="s1">mIsCreating</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@GuardedBy(</span><span class="s7">&quot;this&quot;</span><span class="s1">) </span><span class="s2">boolean </span><span class="s1">mIsInitializing</span><span class="s2">;</span>
+
+  <span class="s2">public </span><span class="s1">ModuleHolder(ReactModuleInfo moduleInfo</span><span class="s2">, </span><span class="s1">Provider&lt;? </span><span class="s2">extends </span><span class="s1">NativeModule&gt; provider) {</span>
+    <span class="s1">mName = moduleInfo.name()</span><span class="s2">;</span>
+    <span class="s1">mProvider = provider</span><span class="s2">;</span>
+    <span class="s1">mReactModuleInfo = moduleInfo</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(moduleInfo.needsEagerInit()) {</span>
+      <span class="s1">mModule = create()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">ModuleHolder(NativeModule nativeModule) {</span>
+    <span class="s1">mName = nativeModule.getName()</span><span class="s2">;</span>
+    <span class="s1">mReactModuleInfo =</span>
+        <span class="s2">new </span><span class="s1">ReactModuleInfo(</span>
+            <span class="s1">nativeModule.getName()</span><span class="s2">,</span>
+            <span class="s1">nativeModule.getClass().getSimpleName()</span><span class="s2">,</span>
+            <span class="s1">nativeModule.canOverrideExistingModule()</span><span class="s2">,</span>
+            <span class="s2">true,</span>
+            <span class="s2">true,</span>
+            <span class="s1">CxxModuleWrapper.</span><span class="s2">class</span><span class="s1">.isAssignableFrom(nativeModule.getClass())</span><span class="s2">,</span>
+            <span class="s1">TurboModule.</span><span class="s2">class</span><span class="s1">.isAssignableFrom(nativeModule.getClass()))</span><span class="s2">;</span>
+
+    <span class="s1">mModule = nativeModule</span><span class="s2">;</span>
+    <span class="s1">PrinterHolder.getPrinter()</span>
+        <span class="s1">.logMessage(ReactDebugOverlayTags.NATIVE_MODULE</span><span class="s2">, </span><span class="s7">&quot;NativeModule init: %s&quot;</span><span class="s2">, </span><span class="s1">mName)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* 
+   * Checks if mModule has been created, and if so tries to initialize the module unless another 
+   * thread is already doing the initialization. 
+   * If mModule has not been created, records that initialization is needed 
+   */</span>
+  <span class="s0">/* package */ </span><span class="s2">void </span><span class="s1">markInitializable() {</span>
+    <span class="s2">boolean </span><span class="s1">shouldInitializeNow = </span><span class="s2">false;</span>
+    <span class="s1">NativeModule module = </span><span class="s2">null;</span>
+    <span class="s2">synchronized </span><span class="s1">(</span><span class="s2">this</span><span class="s1">) {</span>
+      <span class="s1">mInitializable = </span><span class="s2">true;</span>
+      <span class="s2">if </span><span class="s1">(mModule != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">Assertions.assertCondition(!mIsInitializing)</span><span class="s2">;</span>
+        <span class="s1">shouldInitializeNow = </span><span class="s2">true;</span>
+        <span class="s1">module = mModule</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(shouldInitializeNow) {</span>
+      <span class="s1">doInitialize(module)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/* package */ </span><span class="s2">synchronized boolean </span><span class="s1">hasInstance() {</span>
+    <span class="s2">return </span><span class="s1">mModule != </span><span class="s2">null;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public synchronized void </span><span class="s1">destroy() {</span>
+    <span class="s2">if </span><span class="s1">(mModule != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">mModule.invalidate()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@DoNotStrip</span>
+  <span class="s2">public </span><span class="s1">String getName() {</span>
+    <span class="s2">return </span><span class="s1">mName</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">getCanOverrideExistingModule() {</span>
+    <span class="s2">return </span><span class="s1">mReactModuleInfo.canOverrideExistingModule()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">getHasConstants() {</span>
+    <span class="s2">return </span><span class="s1">mReactModuleInfo.hasConstants()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">isTurboModule() {</span>
+    <span class="s2">return </span><span class="s1">mReactModuleInfo.isTurboModule()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public boolean </span><span class="s1">isCxxModule() {</span>
+    <span class="s2">return </span><span class="s1">mReactModuleInfo.isCxxModule()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">String getClassName() {</span>
+    <span class="s2">return </span><span class="s1">mReactModuleInfo.className()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@DoNotStrip</span>
+  <span class="s2">public </span><span class="s1">NativeModule getModule() {</span>
+    <span class="s1">NativeModule module</span><span class="s2">;</span>
+    <span class="s2">boolean </span><span class="s1">shouldCreate = </span><span class="s2">false;</span>
+    <span class="s2">synchronized </span><span class="s1">(</span><span class="s2">this</span><span class="s1">) {</span>
+      <span class="s2">if </span><span class="s1">(mModule != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">return </span><span class="s1">mModule</span><span class="s2">;</span>
+        <span class="s0">// if mModule has not been set, and no one is creating it. Then this thread should call</span>
+        <span class="s0">// create</span>
+      <span class="s1">} </span><span class="s2">else if </span><span class="s1">(!mIsCreating) {</span>
+        <span class="s1">shouldCreate = </span><span class="s2">true;</span>
+        <span class="s1">mIsCreating = </span><span class="s2">true;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s0">// Wait for mModule to be created by another thread</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(shouldCreate) {</span>
+      <span class="s1">module = create()</span><span class="s2">;</span>
+      <span class="s0">// Once module is built (and initialized if markInitializable has been called), modify mModule</span>
+      <span class="s0">// And signal any waiting threads that it is acceptable to read the field now</span>
+      <span class="s2">synchronized </span><span class="s1">(</span><span class="s2">this</span><span class="s1">) {</span>
+        <span class="s1">mIsCreating = </span><span class="s2">false;</span>
+        <span class="s2">this</span><span class="s1">.notifyAll()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s2">return </span><span class="s1">module</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s2">synchronized </span><span class="s1">(</span><span class="s2">this</span><span class="s1">) {</span>
+        <span class="s0">// Block waiting for another thread to build mModule instance</span>
+        <span class="s0">// Since mIsCreating is true until after creation and instantiation (if needed), we wait</span>
+        <span class="s0">// until the module is ready to use.</span>
+        <span class="s2">while </span><span class="s1">(mModule == </span><span class="s2">null </span><span class="s1">&amp;&amp; mIsCreating) {</span>
+          <span class="s2">try </span><span class="s1">{</span>
+            <span class="s2">this</span><span class="s1">.wait()</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">catch </span><span class="s1">(InterruptedException e) {</span>
+            <span class="s2">continue;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">Assertions.assertNotNull(mModule)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private </span><span class="s1">NativeModule create() {</span>
+    <span class="s1">SoftAssertions.assertCondition(mModule == </span><span class="s2">null, </span><span class="s7">&quot;Creating an already created module.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">ReactMarker.logMarker(CREATE_MODULE_START</span><span class="s2">, </span><span class="s1">mName</span><span class="s2">, </span><span class="s1">mInstanceKey)</span><span class="s2">;</span>
+    <span class="s1">SystraceMessage.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;ModuleHolder.createModule&quot;</span><span class="s1">)</span>
+        <span class="s1">.arg(</span><span class="s7">&quot;name&quot;</span><span class="s2">, </span><span class="s1">mName)</span>
+        <span class="s1">.flush()</span><span class="s2">;</span>
+    <span class="s1">PrinterHolder.getPrinter()</span>
+        <span class="s1">.logMessage(ReactDebugOverlayTags.NATIVE_MODULE</span><span class="s2">, </span><span class="s7">&quot;NativeModule init: %s&quot;</span><span class="s2">, </span><span class="s1">mName)</span><span class="s2">;</span>
+    <span class="s1">NativeModule module</span><span class="s2">;</span>
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s1">module = assertNotNull(mProvider).get()</span><span class="s2">;</span>
+      <span class="s1">mProvider = </span><span class="s2">null;</span>
+      <span class="s2">boolean </span><span class="s1">shouldInitializeNow = </span><span class="s2">false;</span>
+      <span class="s2">synchronized </span><span class="s1">(</span><span class="s2">this</span><span class="s1">) {</span>
+        <span class="s1">mModule = module</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(mInitializable &amp;&amp; !mIsInitializing) {</span>
+          <span class="s1">shouldInitializeNow = </span><span class="s2">true;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(shouldInitializeNow) {</span>
+        <span class="s1">doInitialize(module)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Throwable ex) {</span>
+      <span class="s3">/**</span>
+       <span class="s3">* When NativeModules are created from JavaScript, any exception that occurs in the creation</span>
+       <span class="s3">* process will have its stack trace swallowed before we display a RedBox to the user. Really,</span>
+       <span class="s3">* we should have our HostObjects on Android understand JniExceptions and log the stack trace</span>
+       <span class="s3">* to logcat. For now, logging to Logcat directly when creation fails is sufficient.</span>
+       <span class="s3">*</span>
+       <span class="s3">* </span><span class="s5">@todo(T53311351)</span>
+       <span class="s3">*/</span>
+      <span class="s1">FLog.e(</span><span class="s7">&quot;NativeModuleInitError&quot;</span><span class="s2">, </span><span class="s7">&quot;Failed to create NativeModule </span><span class="s2">\&quot;</span><span class="s7">&quot; </span><span class="s1">+ getName() + </span><span class="s7">&quot;</span><span class="s2">\&quot;</span><span class="s7">&quot;</span><span class="s2">, </span><span class="s1">ex)</span><span class="s2">;</span>
+      <span class="s2">throw </span><span class="s1">ex</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+      <span class="s1">ReactMarker.logMarker(CREATE_MODULE_END</span><span class="s2">, </span><span class="s1">mName</span><span class="s2">, </span><span class="s1">mInstanceKey)</span><span class="s2">;</span>
+      <span class="s1">SystraceMessage.endSection(TRACE_TAG_REACT_JAVA_BRIDGE).flush()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">module</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">doInitialize(NativeModule module) {</span>
+    <span class="s1">SystraceMessage.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;ModuleHolder.initialize&quot;</span><span class="s1">)</span>
+        <span class="s1">.arg(</span><span class="s7">&quot;name&quot;</span><span class="s2">, </span><span class="s1">mName)</span>
+        <span class="s1">.flush()</span><span class="s2">;</span>
+    <span class="s1">ReactMarker.logMarker(ReactMarkerConstants.INITIALIZE_MODULE_START</span><span class="s2">, </span><span class="s1">mName</span><span class="s2">, </span><span class="s1">mInstanceKey)</span><span class="s2">;</span>
+    <span class="s2">try </span><span class="s1">{</span>
+      <span class="s2">boolean </span><span class="s1">shouldInitialize = </span><span class="s2">false;</span>
+      <span class="s0">// Check to see if another thread is initializing the object, if not claim the responsibility</span>
+      <span class="s2">synchronized </span><span class="s1">(</span><span class="s2">this</span><span class="s1">) {</span>
+        <span class="s2">if </span><span class="s1">(mInitializable &amp;&amp; !mIsInitializing) {</span>
+          <span class="s1">shouldInitialize = </span><span class="s2">true;</span>
+          <span class="s1">mIsInitializing = </span><span class="s2">true;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(shouldInitialize) {</span>
+        <span class="s1">module.initialize()</span><span class="s2">;</span>
+        <span class="s0">// Once finished, set flags accordingly, but we don't expect anyone to wait for this to</span>
+        <span class="s0">// finish</span>
+        <span class="s0">// So no need to notify other threads</span>
+        <span class="s2">synchronized </span><span class="s1">(</span><span class="s2">this</span><span class="s1">) {</span>
+          <span class="s1">mIsInitializing = </span><span class="s2">false;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+      <span class="s1">ReactMarker.logMarker(ReactMarkerConstants.INITIALIZE_MODULE_END</span><span class="s2">, </span><span class="s1">mName</span><span class="s2">, </span><span class="s1">mInstanceKey)</span><span class="s2">;</span>
+      <span class="s1">SystraceMessage.endSection(TRACE_TAG_REACT_JAVA_BRIDGE).flush()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

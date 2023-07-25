@@ -1,0 +1,628 @@
+<html>
+<head>
+<title>RCTSurface.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTSurface.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTSurface.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfaceView+Internal.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;mutex&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;stdatomic.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTAssert.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge+Private.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTConstants.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTShadowView+Layout.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfaceDelegate.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfaceRootShadowView.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfaceRootShadowViewDelegate.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfaceRootView.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfaceView.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTTouchHandler.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUIManager.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUIManagerObserverCoordinator.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUIManagerUtils.h&quot;</span>
+
+<span class="s4">@interface </span><span class="s1">RCTSurface () &lt;RCTSurfaceRootShadowViewDelegate</span><span class="s4">, </span><span class="s1">RCTUIManagerObserver&gt;</span>
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTSurface {</span>
+  <span class="s0">// Immutable</span>
+  <span class="s1">RCTBridge *_bridge</span><span class="s4">;</span>
+  <span class="s1">NSString *_moduleName</span><span class="s4">;</span>
+  <span class="s1">NSNumber *_rootViewTag</span><span class="s4">;</span>
+
+  <span class="s0">// Protected by the `_mutex`</span>
+  <span class="s1">std::mutex _mutex</span><span class="s4">;</span>
+  <span class="s1">RCTBridge *_batchedBridge</span><span class="s4">;</span>
+  <span class="s1">RCTSurfaceStage _stage</span><span class="s4">;</span>
+  <span class="s1">NSDictionary *_properties</span><span class="s4">;</span>
+  <span class="s1">CGSize _minimumSize</span><span class="s4">;</span>
+  <span class="s1">CGSize _maximumSize</span><span class="s4">;</span>
+  <span class="s1">CGSize _intrinsicSize</span><span class="s4">;</span>
+  <span class="s1">RCTUIManagerMountingBlock _mountingBlock</span><span class="s4">;</span>
+
+  <span class="s0">// The Main thread only</span>
+  <span class="s1">RCTSurfaceView *</span><span class="s4">_Nullable </span><span class="s1">_view</span><span class="s4">;</span>
+  <span class="s1">RCTTouchHandler *</span><span class="s4">_Nullable </span><span class="s1">_touchHandler</span><span class="s4">;</span>
+
+  <span class="s0">// Semaphores</span>
+  <span class="s1">dispatch_semaphore_t _rootShadowViewDidStartRenderingSemaphore</span><span class="s4">;</span>
+  <span class="s1">dispatch_semaphore_t _rootShadowViewDidStartLayingOutSemaphore</span><span class="s4">;</span>
+  <span class="s1">dispatch_semaphore_t _uiManagerDidPerformMountingSemaphore</span><span class="s4">;</span>
+
+  <span class="s0">// Atomics</span>
+  <span class="s1">atomic_bool _waitingForMountingStageOnMainQueue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@synthesize </span><span class="s1">delegate = _delegate</span><span class="s4">;</span>
+
+<span class="s1">- (instancetype)initWithBridge:(RCTBridge *)bridge</span>
+                    <span class="s1">moduleName:(NSString *)moduleName</span>
+             <span class="s1">initialProperties:(NSDictionary *)initialProperties</span>
+<span class="s1">{</span>
+  <span class="s1">RCTErrorNewArchitectureValidation(RCTNotAllowedInFabricWithoutLegacy</span><span class="s4">, @</span><span class="s3">&quot;RCTSurface&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+  <span class="s1">RCTAssert(bridge.valid</span><span class="s4">, @</span><span class="s3">&quot;Valid bridge is required to instantiate `RCTSurface`.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_bridge = bridge</span><span class="s4">;</span>
+    <span class="s1">_batchedBridge = [_bridge batchedBridge] ?: _bridge</span><span class="s4">;</span>
+    <span class="s1">_moduleName = moduleName</span><span class="s4">;</span>
+    <span class="s1">_properties = [initialProperties copy]</span><span class="s4">;</span>
+    <span class="s1">_rootViewTag = RCTAllocateRootViewTag()</span><span class="s4">;</span>
+
+    <span class="s1">_rootShadowViewDidStartRenderingSemaphore = dispatch_semaphore_create(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">_rootShadowViewDidStartLayingOutSemaphore = dispatch_semaphore_create(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">_uiManagerDidPerformMountingSemaphore = dispatch_semaphore_create(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">_minimumSize = CGSizeZero</span><span class="s4">;</span>
+    <span class="s1">_maximumSize = CGSizeMake(CGFLOAT_MAX</span><span class="s4">, </span><span class="s1">CGFLOAT_MAX)</span><span class="s4">;</span>
+
+    <span class="s1">[[NSNotificationCenter defaultCenter] addObserver:self</span>
+                                             <span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(handleBridgeWillLoadJavaScriptNotification:)</span>
+                                                 <span class="s1">name:RCTJavaScriptWillStartLoadingNotification</span>
+                                               <span class="s1">object:_bridge]</span><span class="s4">;</span>
+
+    <span class="s1">[[NSNotificationCenter defaultCenter] addObserver:self</span>
+                                             <span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(handleBridgeDidLoadJavaScriptNotification:)</span>
+                                                 <span class="s1">name:RCTJavaScriptDidLoadNotification</span>
+                                               <span class="s1">object:_bridge]</span><span class="s4">;</span>
+
+    <span class="s1">_stage = RCTSurfaceStageSurfaceDidInitialize</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!bridge.loading) {</span>
+      <span class="s1">_stage = _stage | RCTSurfaceStageBridgeDidLoad</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">[_bridge.uiManager.observerCoordinator addObserver:self]</span><span class="s4">;</span>
+
+    <span class="s1">[self _registerRootView]</span><span class="s4">;</span>
+    <span class="s1">[self _run]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dealloc</span>
+<span class="s1">{</span>
+  <span class="s1">[self _stop]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Immutable Properties (no need to enforce synchronization)</span>
+
+<span class="s1">- (RCTBridge *)bridge</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_bridge</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSString *)moduleName</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_moduleName</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSNumber *)rootViewTag</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_rootViewTag</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Convenience Internal Thread-Safe Properties</span>
+
+<span class="s1">- (RCTBridge *)_batchedBridge</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_batchedBridge</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTUIManager *)_uiManager</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">self._batchedBridge.uiManager</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Main-Threaded Routines</span>
+
+<span class="s1">- (RCTSurfaceView *)view</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_view) {</span>
+    <span class="s1">_view = [[RCTSurfaceView alloc] initWithSurface:self]</span><span class="s4">;</span>
+
+    <span class="s1">_touchHandler = [[RCTTouchHandler alloc] initWithBridge:self.bridge]</span><span class="s4">;</span>
+    <span class="s1">[_touchHandler attachToView:_view]</span><span class="s4">;</span>
+
+    <span class="s1">[self _mountRootViewIfNeeded]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">_view</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_mountRootViewIfNeeded</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+
+  <span class="s1">RCTSurfaceView *view = self-&gt;_view</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!view) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTSurfaceRootView *rootView = (RCTSurfaceRootView *)[self._uiManager viewForReactTag:self-&gt;_rootViewTag]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!rootView) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTAssert(</span>
+      <span class="s1">[rootView isKindOfClass:[RCTSurfaceRootView </span><span class="s4">class</span><span class="s1">]]</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;Received root view is not an instance of `RCTSurfaceRootView`.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(rootView.superview != view) {</span>
+    <span class="s1">view.rootView = rootView</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Bridge Events</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleBridgeWillLoadJavaScriptNotification:(__unused NSNotification *)notification</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+
+  <span class="s0">// Reset states because the bridge is reloading. This is similar to initialization phase.</span>
+  <span class="s1">_stage = RCTSurfaceStageSurfaceDidInitialize</span><span class="s4">;</span>
+  <span class="s1">_view = nil</span><span class="s4">;</span>
+  <span class="s1">_touchHandler = nil</span><span class="s4">;</span>
+  <span class="s1">[self _setStage:RCTSurfaceStageBridgeDidLoad]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleBridgeDidLoadJavaScriptNotification:(NSNotification *)notification</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+
+  <span class="s1">[self _setStage:RCTSurfaceStageModuleDidLoad]</span><span class="s4">;</span>
+
+  <span class="s1">RCTBridge *bridge = notification.userInfo[</span><span class="s4">@</span><span class="s3">&quot;bridge&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">BOOL isRerunNeeded = NO</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(bridge != _batchedBridge) {</span>
+      <span class="s1">_batchedBridge = bridge</span><span class="s4">;</span>
+      <span class="s1">isRerunNeeded = YES</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(isRerunNeeded) {</span>
+    <span class="s1">[self _registerRootView]</span><span class="s4">;</span>
+    <span class="s1">[self _run]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Stage management</span>
+
+<span class="s1">- (RCTSurfaceStage)stage</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_stage</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_setStage:(RCTSurfaceStage)stage</span>
+<span class="s1">{</span>
+  <span class="s1">RCTSurfaceStage updatedStage</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(_stage &amp; stage) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">updatedStage = (RCTSurfaceStage)(_stage | stage)</span><span class="s4">;</span>
+    <span class="s1">_stage = updatedStage</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _propagateStageChange:updatedStage]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_propagateStageChange:(RCTSurfaceStage)stage</span>
+<span class="s1">{</span>
+  <span class="s0">// Updating the `view`</span>
+  <span class="s1">RCTExecuteOnMainQueue(^{</span>
+    <span class="s1">self-&gt;_view.stage = stage</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s0">// Notifying the `delegate`</span>
+  <span class="s1">id&lt;RCTSurfaceDelegate&gt; delegate = self.delegate</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([delegate respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(surface:didChangeStage:)]) {</span>
+    <span class="s1">[delegate surface:self didChangeStage:stage]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Properties Management</span>
+
+<span class="s1">- (NSDictionary *)properties</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_properties</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setProperties:(NSDictionary *)properties</span>
+<span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">([properties isEqualToDictionary:_properties]) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_properties = [properties copy]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _run]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Running</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_run</span>
+<span class="s1">{</span>
+  <span class="s1">RCTBridge *batchedBridge</span><span class="s4">;</span>
+  <span class="s1">NSDictionary *properties</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+
+    <span class="s1">batchedBridge = _batchedBridge</span><span class="s4">;</span>
+    <span class="s1">properties = _properties</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!batchedBridge.valid) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSDictionary *applicationParameters = </span><span class="s4">@</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;rootTag&quot; </span><span class="s1">: _rootViewTag</span><span class="s4">,</span>
+    <span class="s4">@</span><span class="s3">&quot;initialProps&quot; </span><span class="s1">: properties</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">RCTLogInfo(</span><span class="s4">@</span><span class="s3">&quot;Running surface %@ (%@)&quot;</span><span class="s4">, </span><span class="s1">_moduleName</span><span class="s4">, </span><span class="s1">applicationParameters)</span><span class="s4">;</span>
+
+  <span class="s1">[self mountReactComponentWithBridge:batchedBridge moduleName:_moduleName params:applicationParameters]</span><span class="s4">;</span>
+
+  <span class="s1">[self _setStage:RCTSurfaceStageSurfaceDidRun]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_stop</span>
+<span class="s1">{</span>
+  <span class="s1">[self unmountReactComponentWithBridge:self._batchedBridge rootViewTag:self-&gt;_rootViewTag]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_registerRootView</span>
+<span class="s1">{</span>
+  <span class="s1">RCTBridge *batchedBridge</span><span class="s4">;</span>
+  <span class="s1">CGSize minimumSize</span><span class="s4">;</span>
+  <span class="s1">CGSize maximumSize</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+    <span class="s1">batchedBridge = _batchedBridge</span><span class="s4">;</span>
+    <span class="s1">minimumSize = _minimumSize</span><span class="s4">;</span>
+    <span class="s1">maximumSize = _maximumSize</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTUIManager *uiManager = batchedBridge.uiManager</span><span class="s4">;</span>
+
+  <span class="s0">// If we are on the main queue now, we have to proceed synchronously.</span>
+  <span class="s0">// Otherwise, we cannot perform synchronous waiting for some stages later.</span>
+  <span class="s1">(RCTIsMainQueue() ? RCTUnsafeExecuteOnUIManagerQueueSync : RCTExecuteOnUIManagerQueue)(^{</span>
+    <span class="s1">[uiManager registerRootViewTag:self-&gt;_rootViewTag]</span><span class="s4">;</span>
+
+    <span class="s1">RCTSurfaceRootShadowView *rootShadowView =</span>
+        <span class="s1">(RCTSurfaceRootShadowView *)[uiManager shadowViewForReactTag:self-&gt;_rootViewTag]</span><span class="s4">;</span>
+    <span class="s1">RCTAssert(</span>
+        <span class="s1">[rootShadowView isKindOfClass:[RCTSurfaceRootShadowView </span><span class="s4">class</span><span class="s1">]]</span><span class="s4">,</span>
+        <span class="s4">@</span><span class="s3">&quot;Received shadow view is not an instance of `RCTSurfaceRootShadowView`.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">[rootShadowView setMinimumSize:minimumSize maximumSize:maximumSize]</span><span class="s4">;</span>
+    <span class="s1">rootShadowView.delegate = self</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Layout</span>
+
+<span class="s1">- (CGSize)sizeThatFitsMinimumSize:(CGSize)minimumSize maximumSize:(CGSize)maximumSize</span>
+<span class="s1">{</span>
+  <span class="s1">RCTUIManager *uiManager = self._uiManager</span><span class="s4">;</span>
+  <span class="s1">__block CGSize fittingSize</span><span class="s4">;</span>
+
+  <span class="s1">RCTUnsafeExecuteOnUIManagerQueueSync(^{</span>
+    <span class="s1">RCTSurfaceRootShadowView *rootShadowView =</span>
+        <span class="s1">(RCTSurfaceRootShadowView *)[uiManager shadowViewForReactTag:self-&gt;_rootViewTag]</span><span class="s4">;</span>
+
+    <span class="s1">RCTAssert(</span>
+        <span class="s1">[rootShadowView isKindOfClass:[RCTSurfaceRootShadowView </span><span class="s4">class</span><span class="s1">]]</span><span class="s4">,</span>
+        <span class="s4">@</span><span class="s3">&quot;Received shadow view is not an instance of `RCTSurfaceRootShadowView`.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">fittingSize = [rootShadowView sizeThatFitsMinimumSize:minimumSize maximumSize:maximumSize]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">fittingSize</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Size Constraints</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setSize:(CGSize)size</span>
+<span class="s1">{</span>
+  <span class="s0">// `viewportOffset` is intentionally zero because `RCTSurface` ignores it.</span>
+  <span class="s0">// However, it is needed in `RCTFabricSurface`.</span>
+  <span class="s1">[self setMinimumSize:size maximumSize:size viewportOffset:CGPointZero]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setMinimumSize:(CGSize)minimumSize maximumSize:(CGSize)maximumSize viewportOffset:(CGPoint)viewportOffset</span>
+<span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(CGSizeEqualToSize(minimumSize</span><span class="s4">, </span><span class="s1">_minimumSize) &amp;&amp; CGSizeEqualToSize(maximumSize</span><span class="s4">, </span><span class="s1">_maximumSize)) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_maximumSize = maximumSize</span><span class="s4">;</span>
+    <span class="s1">_minimumSize = minimumSize</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTUIManager *uiManager = self._uiManager</span><span class="s4">;</span>
+
+  <span class="s1">RCTUnsafeExecuteOnUIManagerQueueSync(^{</span>
+    <span class="s1">RCTSurfaceRootShadowView *rootShadowView =</span>
+        <span class="s1">(RCTSurfaceRootShadowView *)[uiManager shadowViewForReactTag:self-&gt;_rootViewTag]</span><span class="s4">;</span>
+    <span class="s1">RCTAssert(</span>
+        <span class="s1">[rootShadowView isKindOfClass:[RCTSurfaceRootShadowView </span><span class="s4">class</span><span class="s1">]]</span><span class="s4">,</span>
+        <span class="s4">@</span><span class="s3">&quot;Received shadow view is not an instance of `RCTSurfaceRootShadowView`.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">[rootShadowView setMinimumSize:minimumSize maximumSize:maximumSize]</span><span class="s4">;</span>
+    <span class="s1">[uiManager setNeedsLayout]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setMinimumSize:(CGSize)minimumSize maximumSize:(CGSize)maximumSize</span>
+<span class="s1">{</span>
+  <span class="s1">[self setMinimumSize:minimumSize maximumSize:maximumSize viewportOffset:CGPointZero]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (CGSize)minimumSize</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_minimumSize</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (CGSize)maximumSize</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_maximumSize</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - intrinsicSize</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setIntrinsicSize:(CGSize)intrinsicSize</span>
+<span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(CGSizeEqualToSize(intrinsicSize</span><span class="s4">, </span><span class="s1">_intrinsicSize)) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_intrinsicSize = intrinsicSize</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Notifying `delegate`</span>
+  <span class="s1">id&lt;RCTSurfaceDelegate&gt; delegate = self.delegate</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([delegate respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(surface:didChangeIntrinsicSize:)]) {</span>
+    <span class="s1">[delegate surface:self didChangeIntrinsicSize:intrinsicSize]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (CGSize)intrinsicSize</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_intrinsicSize</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Synchronous Waiting</span>
+
+<span class="s1">- (BOOL)synchronouslyWaitForStage:(RCTSurfaceStage)stage timeout:(NSTimeInterval)timeout</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(RCTIsUIManagerQueue()) {</span>
+    <span class="s1">RCTLogInfo(</span><span class="s4">@</span><span class="s3">&quot;Synchronous waiting is not supported on UIManager queue.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(RCTIsMainQueue() &amp;&amp; (stage &amp; RCTSurfaceStageSurfaceDidInitialMounting)) {</span>
+    <span class="s0">// All main-threaded execution (especially mounting process) has to be</span>
+    <span class="s0">// intercepted, captured and performed synchronously at the end of this method</span>
+    <span class="s0">// right after the semaphore signals.</span>
+
+    <span class="s0">// Atomic variant of `_waitingForMountingStageOnMainQueue = YES;`</span>
+    <span class="s1">atomic_fetch_or(&amp;_waitingForMountingStageOnMainQueue</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">dispatch_semaphore_t semaphore</span><span class="s4">;</span>
+  <span class="s4">switch </span><span class="s1">(stage) {</span>
+    <span class="s4">case </span><span class="s1">RCTSurfaceStageSurfaceDidInitialLayout:</span>
+      <span class="s1">semaphore = _rootShadowViewDidStartLayingOutSemaphore</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">RCTSurfaceStageSurfaceDidInitialRendering:</span>
+      <span class="s1">semaphore = _rootShadowViewDidStartRenderingSemaphore</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">RCTSurfaceStageSurfaceDidInitialMounting:</span>
+      <span class="s1">semaphore = _uiManagerDidPerformMountingSemaphore</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">default</span><span class="s1">:</span>
+      <span class="s1">RCTAssert(</span>
+          <span class="s1">NO</span><span class="s4">,</span>
+          <span class="s4">@</span><span class="s3">&quot;Only waiting for `RCTSurfaceStageSurfaceDidInitialRendering`, `RCTSurfaceStageSurfaceDidInitialLayout` and `RCTSurfaceStageSurfaceDidInitialMounting` stages are supported.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">timeoutOccurred = dispatch_semaphore_wait(semaphore</span><span class="s4">, </span><span class="s1">dispatch_time(DISPATCH_TIME_NOW</span><span class="s4">, </span><span class="s1">timeout * NSEC_PER_SEC))</span><span class="s4">;</span>
+
+  <span class="s0">// Atomic equivalent of `_waitingForMountingStageOnMainQueue = NO;`.</span>
+  <span class="s1">atomic_fetch_and(&amp;_waitingForMountingStageOnMainQueue</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!timeoutOccurred) {</span>
+    <span class="s0">// Balancing the semaphore.</span>
+    <span class="s0">// Note: `dispatch_semaphore_wait` reverts the decrement in case when timeout occurred.</span>
+    <span class="s1">dispatch_semaphore_signal(semaphore)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(RCTIsMainQueue() &amp;&amp; (stage &amp; RCTSurfaceStageSurfaceDidInitialMounting)) {</span>
+    <span class="s0">// Time to apply captured mounting block.</span>
+    <span class="s1">RCTUIManagerMountingBlock mountingBlock</span><span class="s4">;</span>
+    <span class="s1">{</span>
+      <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+      <span class="s1">mountingBlock = _mountingBlock</span><span class="s4">;</span>
+      <span class="s1">_mountingBlock = nil</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(mountingBlock) {</span>
+      <span class="s1">mountingBlock()</span><span class="s4">;</span>
+      <span class="s1">[self _mountRootViewIfNeeded]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">!timeoutOccurred</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTSurfaceRootShadowViewDelegate</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)rootShadowView:(__unused RCTRootShadowView *)rootShadowView didChangeIntrinsicSize:(CGSize)intrinsicSize</span>
+<span class="s1">{</span>
+  <span class="s1">self.intrinsicSize = intrinsicSize</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)rootShadowViewDidStartRendering:(__unused RCTSurfaceRootShadowView *)rootShadowView</span>
+<span class="s1">{</span>
+  <span class="s1">[self _setStage:RCTSurfaceStageSurfaceDidInitialRendering]</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_semaphore_signal(_rootShadowViewDidStartRenderingSemaphore)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)rootShadowViewDidStartLayingOut:(__unused RCTSurfaceRootShadowView *)rootShadowView</span>
+<span class="s1">{</span>
+  <span class="s1">[self _setStage:RCTSurfaceStageSurfaceDidInitialLayout]</span><span class="s4">;</span>
+
+  <span class="s1">dispatch_semaphore_signal(_rootShadowViewDidStartLayingOutSemaphore)</span><span class="s4">;</span>
+
+  <span class="s1">RCTExecuteOnMainQueue(^{</span>
+    <span class="s0">// Rendering is happening, let's mount `rootView` into `view` if we already didn't do this.</span>
+    <span class="s1">[self _mountRootViewIfNeeded]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTUIManagerObserver</span>
+
+<span class="s1">- (BOOL)uiManager:(__unused RCTUIManager *)manager performMountingWithBlock:(RCTUIManagerMountingBlock)block</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(atomic_load(&amp;_waitingForMountingStageOnMainQueue) &amp;&amp; (self.stage &amp; RCTSurfaceStageSurfaceDidInitialLayout)) {</span>
+    <span class="s0">// Atomic equivalent of `_waitingForMountingStageOnMainQueue = NO;`.</span>
+    <span class="s1">atomic_fetch_and(&amp;_waitingForMountingStageOnMainQueue</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">{</span>
+      <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_mutex)</span><span class="s4">;</span>
+      <span class="s1">_mountingBlock = block</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)uiManagerDidPerformMounting:(__unused RCTUIManager *)manager</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self.stage &amp; RCTSurfaceStageSurfaceDidInitialLayout) {</span>
+    <span class="s1">[self _setStage:RCTSurfaceStageSurfaceDidInitialMounting]</span><span class="s4">;</span>
+    <span class="s1">dispatch_semaphore_signal(_uiManagerDidPerformMountingSemaphore)</span><span class="s4">;</span>
+
+    <span class="s0">// No need to listen to UIManager anymore.</span>
+    <span class="s1">dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">[self-&gt;_bridge.uiManager.observerCoordinator removeObserver:self]</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)start</span>
+<span class="s1">{</span>
+  <span class="s0">// Does nothing.</span>
+  <span class="s0">// The Start&amp;Stop feature is not implemented for regular Surface yet.</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)stop</span>
+<span class="s1">{</span>
+  <span class="s0">// Does nothing.</span>
+  <span class="s0">// The Start&amp;Stop feature is not implemented for regular Surface yet.</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Mounting/Unmounting of React components</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)mountReactComponentWithBridge:(RCTBridge *)bridge</span>
+                           <span class="s1">moduleName:(NSString *)moduleName</span>
+                               <span class="s1">params:(NSDictionary *)params</span>
+<span class="s1">{</span>
+  <span class="s1">[bridge enqueueJSCall:</span><span class="s4">@</span><span class="s3">&quot;AppRegistry&quot; </span><span class="s1">method:</span><span class="s4">@</span><span class="s3">&quot;runApplication&quot; </span><span class="s1">args:</span><span class="s4">@</span><span class="s1">[ moduleName</span><span class="s4">, </span><span class="s1">params ] completion:NULL]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)unmountReactComponentWithBridge:(RCTBridge *)bridge rootViewTag:(NSNumber *)rootViewTag</span>
+<span class="s1">{</span>
+  <span class="s1">[bridge enqueueJSCall:</span><span class="s4">@</span><span class="s3">&quot;AppRegistry&quot;</span>
+                 <span class="s1">method:</span><span class="s4">@</span><span class="s3">&quot;unmountApplicationComponentAtRootTag&quot;</span>
+                   <span class="s1">args:</span><span class="s4">@</span><span class="s1">[ rootViewTag ]</span>
+             <span class="s1">completion:NULL]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSInteger)rootTag</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_rootViewTag.integerValue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

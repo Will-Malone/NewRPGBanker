@@ -1,0 +1,147 @@
+<html>
+<head>
+<title>normalizePseudoGlobals.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+normalizePseudoGlobals.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {NodePath, Scope} from '@babel/traverse';</span>
+<span class="s0">import type {Program} from '@babel/types';</span>
+
+<span class="s0">const traverse = require('@babel/traverse').default;</span>
+<span class="s0">const nullthrows = require('nullthrows');</span>
+
+<span class="s0">export type Options = {</span>
+  <span class="s0">reservedNames: $ReadOnlyArray&lt;string&gt;,</span>
+<span class="s0">};</span>
+
+<span class="s0">function normalizePseudoglobals(</span>
+  <span class="s0">ast: BabelNode,</span>
+  <span class="s0">options?: Options,</span>
+<span class="s0">): $ReadOnlyArray&lt;string&gt; {</span>
+  <span class="s0">const reservedNames = new Set&lt;</span>
+    <span class="s0">| void</span>
+    <span class="s0">| string</span>
+    <span class="s0">| BabelNodeIdentifier</span>
+    <span class="s0">| BabelNodeJSXIdentifier</span>
+    <span class="s0">| BabelNodeJSXMemberExpression</span>
+    <span class="s0">| BabelNodeJSXNamespacedName,</span>
+  <span class="s0">&gt;(options?.reservedNames ?? []);</span>
+  <span class="s0">const renamedParamNames = [];</span>
+  <span class="s0">traverse(ast, {</span>
+    <span class="s0">Program(path: NodePath&lt;Program&gt;): void {</span>
+      <span class="s0">const params = path.get('body.0.expression.arguments.0.params');</span>
+      <span class="s0">const body = path.get('body.0.expression.arguments.0.body');</span>
+
+      <span class="s0">if (!body || Array.isArray(body) || !Array.isArray(params)) {</span>
+        <span class="s0">path.stop();</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">const pseudoglobals: Array&lt;string&gt; = params</span>
+        <span class="s0">.map(path =&gt; path.node.name)</span>
+        <span class="s0">// $FlowFixMe[incompatible-call] Flow error uncovered by typing Babel more strictly</span>
+        <span class="s0">.filter(name =&gt; !reservedNames.has(name));</span>
+
+      <span class="s0">const usedShortNames = new Set&lt;string&gt;();</span>
+      <span class="s0">const namePairs: Array&lt;[string, string]&gt; = pseudoglobals.map(fullName =&gt; [</span>
+        <span class="s0">fullName,</span>
+        <span class="s0">getShortName(fullName, usedShortNames),</span>
+      <span class="s0">]);</span>
+
+      <span class="s0">for (const [fullName, shortName] of namePairs) {</span>
+        <span class="s0">if (reservedNames.has(shortName)) {</span>
+          <span class="s0">throw new ReferenceError(</span>
+            <span class="s0">'Could not reserve the identifier ' +</span>
+              <span class="s0">shortName +</span>
+              <span class="s0">' because it is the short name for ' +</span>
+              <span class="s0">fullName,</span>
+          <span class="s0">);</span>
+        <span class="s0">}</span>
+        <span class="s0">renamedParamNames.push(rename(fullName, shortName, body.scope));</span>
+      <span class="s0">}</span>
+
+      <span class="s0">path.stop();</span>
+    <span class="s0">},</span>
+  <span class="s0">});</span>
+
+  <span class="s0">return renamedParamNames;</span>
+<span class="s0">}</span>
+
+<span class="s0">function getShortName(fullName: string, usedNames: Set&lt;string&gt;): string {</span>
+  <span class="s0">// Try finding letters that are semantically relatable to the name</span>
+  <span class="s0">// of the variable given. For instance, in XMLHttpRequest, it will</span>
+  <span class="s0">// first match &quot;X&quot;, then &quot;H&quot;, then &quot;R&quot;.</span>
+  <span class="s0">const regexp = /^[^A-Za-z]*([A-Za-z])|([A-Z])[a-z]|([A-Z])[A-Z]+$/g;</span>
+  <span class="s0">let match;</span>
+
+  <span class="s0">while ((match = regexp.exec(fullName))) {</span>
+    <span class="s0">const name = (match[1] || match[2] || match[3] || '').toLowerCase();</span>
+
+    <span class="s0">if (!name) {</span>
+      <span class="s0">throw new ReferenceError(</span>
+        <span class="s0">'Could not identify any valid name for ' + fullName,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (!usedNames.has(name)) {</span>
+      <span class="s0">usedNames.add(name);</span>
+      <span class="s0">return name;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">throw new ReferenceError(</span>
+    <span class="s0">`Unable to determine short name for ${fullName}. The variables are not unique: ${Array.from(</span>
+      <span class="s0">usedNames,</span>
+    <span class="s0">).join(', ')}`,</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function rename(fullName: string, shortName: string, scope: Scope): string {</span>
+  <span class="s0">let unusedName = shortName;</span>
+
+  <span class="s0">// `generateUid` generates a name of the form name_ even if there was no conflict which we don't want.</span>
+  <span class="s0">// Check if the desired name was never used and in that case proceed and only use `generateUid` if there's a</span>
+  <span class="s0">// name clash.</span>
+  <span class="s0">if (</span>
+    <span class="s0">scope.hasLabel(shortName) ||</span>
+    <span class="s0">scope.hasBinding(shortName) ||</span>
+    <span class="s0">scope.hasGlobal(shortName) ||</span>
+    <span class="s0">scope.hasReference(shortName)</span>
+  <span class="s0">) {</span>
+    <span class="s0">unusedName = scope.generateUid(shortName);</span>
+
+    <span class="s0">const programScope = scope.getProgramParent();</span>
+    <span class="s0">nullthrows(programScope.references)[shortName] = true;</span>
+    <span class="s0">nullthrows(programScope.uids)[shortName] = true;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">scope.rename(fullName, unusedName);</span>
+
+  <span class="s0">return unusedName;</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = normalizePseudoglobals;</span>
+</pre>
+</body>
+</html>

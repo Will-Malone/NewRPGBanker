@@ -1,0 +1,522 @@
+<html>
+<head>
+<title>prefer-const.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+prefer-const.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview A rule to suggest using of const declaration for variables that are never reassigned after declared. 
+ * @author Toru Nagashima 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const FixTracker = require(</span><span class="s2">&quot;./utils/fix-tracker&quot;</span><span class="s1">);</span>
+<span class="s1">const astUtils = require(</span><span class="s2">&quot;./utils/ast-utils&quot;</span><span class="s1">);</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const PATTERN_TYPE = /^(?:.+?Pattern|RestElement|SpreadProperty|ExperimentalRestProperty|Property)$/u;</span>
+<span class="s1">const DECLARATION_HOST_TYPE = /^(?:Program|BlockStatement|StaticBlock|SwitchCase)$/u;</span>
+<span class="s1">const DESTRUCTURING_HOST_TYPE = /^(?:VariableDeclarator|AssignmentExpression)$/u;</span>
+
+<span class="s0">/** 
+ * Checks whether a given node is located at `ForStatement.init` or not. 
+ * @param {ASTNode} node A node to check. 
+ * @returns {boolean} `true` if the node is located at `ForStatement.init`. 
+ */</span>
+<span class="s3">function </span><span class="s1">isInitOfForStatement(node) {</span>
+    <span class="s3">return </span><span class="s1">node.parent.type === </span><span class="s2">&quot;ForStatement&quot; </span><span class="s1">&amp;&amp; node.parent.init === node;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks whether a given Identifier node becomes a VariableDeclaration or not. 
+ * @param {ASTNode} identifier An Identifier node to check. 
+ * @returns {boolean} `true` if the node can become a VariableDeclaration. 
+ */</span>
+<span class="s3">function </span><span class="s1">canBecomeVariableDeclaration(identifier) {</span>
+    <span class="s1">let node = identifier.parent;</span>
+
+    <span class="s3">while </span><span class="s1">(PATTERN_TYPE.test(node.type)) {</span>
+        <span class="s1">node = node.parent;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">(</span>
+        <span class="s1">node.type === </span><span class="s2">&quot;VariableDeclarator&quot; </span><span class="s1">||</span>
+        <span class="s1">(</span>
+            <span class="s1">node.type === </span><span class="s2">&quot;AssignmentExpression&quot; </span><span class="s1">&amp;&amp;</span>
+            <span class="s1">node.parent.type === </span><span class="s2">&quot;ExpressionStatement&quot; </span><span class="s1">&amp;&amp;</span>
+            <span class="s1">DECLARATION_HOST_TYPE.test(node.parent.parent.type)</span>
+        <span class="s1">)</span>
+    <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks if an property or element is from outer scope or function parameters 
+ * in destructing pattern. 
+ * @param {string} name A variable name to be checked. 
+ * @param {eslint-scope.Scope} initScope A scope to start find. 
+ * @returns {boolean} Indicates if the variable is from outer scope or function parameters. 
+ */</span>
+<span class="s3">function </span><span class="s1">isOuterVariableInDestructing(name, initScope) {</span>
+
+    <span class="s3">if </span><span class="s1">(initScope.through.some(ref =&gt; ref.resolved &amp;&amp; ref.resolved.name === name)) {</span>
+        <span class="s3">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const variable = astUtils.getVariableByName(initScope, name);</span>
+
+    <span class="s3">if </span><span class="s1">(variable !== </span><span class="s3">null</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">variable.defs.some(def =&gt; def.type === </span><span class="s2">&quot;Parameter&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Gets the VariableDeclarator/AssignmentExpression node that a given reference 
+ * belongs to. 
+ * This is used to detect a mix of reassigned and never reassigned in a 
+ * destructuring. 
+ * @param {eslint-scope.Reference} reference A reference to get. 
+ * @returns {ASTNode|null} A VariableDeclarator/AssignmentExpression node or 
+ *      null. 
+ */</span>
+<span class="s3">function </span><span class="s1">getDestructuringHost(reference) {</span>
+    <span class="s3">if </span><span class="s1">(!reference.isWrite()) {</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">let node = reference.identifier.parent;</span>
+
+    <span class="s3">while </span><span class="s1">(PATTERN_TYPE.test(node.type)) {</span>
+        <span class="s1">node = node.parent;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(!DESTRUCTURING_HOST_TYPE.test(node.type)) {</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">node;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Determines if a destructuring assignment node contains 
+ * any MemberExpression nodes. This is used to determine if a 
+ * variable that is only written once using destructuring can be 
+ * safely converted into a const declaration. 
+ * @param {ASTNode} node The ObjectPattern or ArrayPattern node to check. 
+ * @returns {boolean} True if the destructuring pattern contains 
+ *      a MemberExpression, false if not. 
+ */</span>
+<span class="s3">function </span><span class="s1">hasMemberExpressionAssignment(node) {</span>
+    <span class="s3">switch </span><span class="s1">(node.type) {</span>
+        <span class="s3">case </span><span class="s2">&quot;ObjectPattern&quot;</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">node.properties.some(prop =&gt; {</span>
+                <span class="s3">if </span><span class="s1">(prop) {</span>
+
+                    <span class="s0">/* 
+                     * Spread elements have an argument property while 
+                     * others have a value property. Because different 
+                     * parsers use different node types for spread elements, 
+                     * we just check if there is an argument property. 
+                     */</span>
+                    <span class="s3">return </span><span class="s1">hasMemberExpressionAssignment(prop.argument || prop.value);</span>
+                <span class="s1">}</span>
+
+                <span class="s3">return false</span><span class="s1">;</span>
+            <span class="s1">});</span>
+
+        <span class="s3">case </span><span class="s2">&quot;ArrayPattern&quot;</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">node.elements.some(element =&gt; {</span>
+                <span class="s3">if </span><span class="s1">(element) {</span>
+                    <span class="s3">return </span><span class="s1">hasMemberExpressionAssignment(element);</span>
+                <span class="s1">}</span>
+
+                <span class="s3">return false</span><span class="s1">;</span>
+            <span class="s1">});</span>
+
+        <span class="s3">case </span><span class="s2">&quot;AssignmentPattern&quot;</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">hasMemberExpressionAssignment(node.left);</span>
+
+        <span class="s3">case </span><span class="s2">&quot;MemberExpression&quot;</span><span class="s1">:</span>
+            <span class="s3">return true</span><span class="s1">;</span>
+
+        <span class="s0">// no default</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Gets an identifier node of a given variable. 
+ * 
+ * If the initialization exists or one or more reading references exist before 
+ * the first assignment, the identifier node is the node of the declaration. 
+ * Otherwise, the identifier node is the node of the first assignment. 
+ * 
+ * If the variable should not change to const, this function returns null. 
+ * - If the variable is reassigned. 
+ * - If the variable is never initialized nor assigned. 
+ * - If the variable is initialized in a different scope from the declaration. 
+ * - If the unique assignment of the variable cannot change to a declaration. 
+ *   e.g. `if (a) b = 1` / `return (b = 1)` 
+ * - If the variable is declared in the global scope and `eslintUsed` is `true`. 
+ *   `/*exported foo` directive comment makes such variables. This rule does not 
+ *   warn such variables because this rule cannot distinguish whether the 
+ *   exported variables are reassigned or not. 
+ * @param {eslint-scope.Variable} variable A variable to get. 
+ * @param {boolean} ignoreReadBeforeAssign 
+ *      The value of `ignoreReadBeforeAssign` option. 
+ * @returns {ASTNode|null} 
+ *      An Identifier node if the variable should change to const. 
+ *      Otherwise, null. 
+ */</span>
+<span class="s3">function </span><span class="s1">getIdentifierIfShouldBeConst(variable, ignoreReadBeforeAssign) {</span>
+    <span class="s3">if </span><span class="s1">(variable.eslintUsed &amp;&amp; variable.scope.type === </span><span class="s2">&quot;global&quot;</span><span class="s1">) {</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Finds the unique WriteReference.</span>
+    <span class="s1">let writer = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">let isReadBeforeInit = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s1">const references = variable.references;</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; references.length; ++i) {</span>
+        <span class="s1">const reference = references[i];</span>
+
+        <span class="s3">if </span><span class="s1">(reference.isWrite()) {</span>
+            <span class="s1">const isReassigned = (</span>
+                <span class="s1">writer !== </span><span class="s3">null </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">writer.identifier !== reference.identifier</span>
+            <span class="s1">);</span>
+
+            <span class="s3">if </span><span class="s1">(isReassigned) {</span>
+                <span class="s3">return null</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s1">const destructuringHost = getDestructuringHost(reference);</span>
+
+            <span class="s3">if </span><span class="s1">(destructuringHost !== </span><span class="s3">null </span><span class="s1">&amp;&amp; destructuringHost.left !== </span><span class="s3">void </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s1">const leftNode = destructuringHost.left;</span>
+                <span class="s1">let hasOuterVariables = </span><span class="s3">false</span><span class="s1">,</span>
+                    <span class="s1">hasNonIdentifiers = </span><span class="s3">false</span><span class="s1">;</span>
+
+                <span class="s3">if </span><span class="s1">(leftNode.type === </span><span class="s2">&quot;ObjectPattern&quot;</span><span class="s1">) {</span>
+                    <span class="s1">const properties = leftNode.properties;</span>
+
+                    <span class="s1">hasOuterVariables = properties</span>
+                        <span class="s1">.filter(prop =&gt; prop.value)</span>
+                        <span class="s1">.map(prop =&gt; prop.value.name)</span>
+                        <span class="s1">.some(name =&gt; isOuterVariableInDestructing(name, variable.scope));</span>
+
+                    <span class="s1">hasNonIdentifiers = hasMemberExpressionAssignment(leftNode);</span>
+
+                <span class="s1">} </span><span class="s3">else if </span><span class="s1">(leftNode.type === </span><span class="s2">&quot;ArrayPattern&quot;</span><span class="s1">) {</span>
+                    <span class="s1">const elements = leftNode.elements;</span>
+
+                    <span class="s1">hasOuterVariables = elements</span>
+                        <span class="s1">.map(element =&gt; element &amp;&amp; element.name)</span>
+                        <span class="s1">.some(name =&gt; isOuterVariableInDestructing(name, variable.scope));</span>
+
+                    <span class="s1">hasNonIdentifiers = hasMemberExpressionAssignment(leftNode);</span>
+                <span class="s1">}</span>
+
+                <span class="s3">if </span><span class="s1">(hasOuterVariables || hasNonIdentifiers) {</span>
+                    <span class="s3">return null</span><span class="s1">;</span>
+                <span class="s1">}</span>
+
+            <span class="s1">}</span>
+
+            <span class="s1">writer = reference;</span>
+
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(reference.isRead() &amp;&amp; writer === </span><span class="s3">null</span><span class="s1">) {</span>
+            <span class="s3">if </span><span class="s1">(ignoreReadBeforeAssign) {</span>
+                <span class="s3">return null</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s1">isReadBeforeInit = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* 
+     * If the assignment is from a different scope, ignore it. 
+     * If the assignment cannot change to a declaration, ignore it. 
+     */</span>
+    <span class="s1">const shouldBeConst = (</span>
+        <span class="s1">writer !== </span><span class="s3">null </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">writer.from === variable.scope &amp;&amp;</span>
+        <span class="s1">canBecomeVariableDeclaration(writer.identifier)</span>
+    <span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(!shouldBeConst) {</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(isReadBeforeInit) {</span>
+        <span class="s3">return </span><span class="s1">variable.defs[</span><span class="s4">0</span><span class="s1">].name;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">writer.identifier;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Groups by the VariableDeclarator/AssignmentExpression node that each 
+ * reference of given variables belongs to. 
+ * This is used to detect a mix of reassigned and never reassigned in a 
+ * destructuring. 
+ * @param {eslint-scope.Variable[]} variables Variables to group by destructuring. 
+ * @param {boolean} ignoreReadBeforeAssign 
+ *      The value of `ignoreReadBeforeAssign` option. 
+ * @returns {Map&lt;ASTNode, ASTNode[]&gt;} Grouped identifier nodes. 
+ */</span>
+<span class="s3">function </span><span class="s1">groupByDestructuring(variables, ignoreReadBeforeAssign) {</span>
+    <span class="s1">const identifierMap = </span><span class="s3">new </span><span class="s1">Map();</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">0</span><span class="s1">; i &lt; variables.length; ++i) {</span>
+        <span class="s1">const variable = variables[i];</span>
+        <span class="s1">const references = variable.references;</span>
+        <span class="s1">const identifier = getIdentifierIfShouldBeConst(variable, ignoreReadBeforeAssign);</span>
+        <span class="s1">let prevId = </span><span class="s3">null</span><span class="s1">;</span>
+
+        <span class="s3">for </span><span class="s1">(let j = </span><span class="s4">0</span><span class="s1">; j &lt; references.length; ++j) {</span>
+            <span class="s1">const reference = references[j];</span>
+            <span class="s1">const id = reference.identifier;</span>
+
+            <span class="s0">/* 
+             * Avoid counting a reference twice or more for default values of 
+             * destructuring. 
+             */</span>
+            <span class="s3">if </span><span class="s1">(id === prevId) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s1">prevId = id;</span>
+
+            <span class="s0">// Add the identifier node into the destructuring group.</span>
+            <span class="s1">const group = getDestructuringHost(reference);</span>
+
+            <span class="s3">if </span><span class="s1">(group) {</span>
+                <span class="s3">if </span><span class="s1">(identifierMap.has(group)) {</span>
+                    <span class="s1">identifierMap.get(group).push(identifier);</span>
+                <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                    <span class="s1">identifierMap.set(group, [identifier]);</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s3">return </span><span class="s1">identifierMap;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Finds the nearest parent of node with a given type. 
+ * @param {ASTNode} node The node to search from. 
+ * @param {string} type The type field of the parent node. 
+ * @param {Function} shouldStop A predicate that returns true if the traversal should stop, and false otherwise. 
+ * @returns {ASTNode} The closest ancestor with the specified type; null if no such ancestor exists. 
+ */</span>
+<span class="s3">function </span><span class="s1">findUp(node, type, shouldStop) {</span>
+    <span class="s3">if </span><span class="s1">(!node || shouldStop(node)) {</span>
+        <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(node.type === type) {</span>
+        <span class="s3">return </span><span class="s1">node;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">findUp(node.parent, type, shouldStop);</span>
+<span class="s1">}</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Rule Definition</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** @type {import('../shared/types').Rule} */</span>
+<span class="s1">module.exports = {</span>
+    <span class="s1">meta: {</span>
+        <span class="s1">type: </span><span class="s2">&quot;suggestion&quot;</span><span class="s1">,</span>
+
+        <span class="s1">docs: {</span>
+            <span class="s1">description: </span><span class="s2">&quot;Require `const` declarations for variables that are never reassigned after declared&quot;</span><span class="s1">,</span>
+            <span class="s1">recommended: </span><span class="s3">false</span><span class="s1">,</span>
+            <span class="s1">url: </span><span class="s2">&quot;https://eslint.org/docs/latest/rules/prefer-const&quot;</span>
+        <span class="s1">},</span>
+
+        <span class="s1">fixable: </span><span class="s2">&quot;code&quot;</span><span class="s1">,</span>
+
+        <span class="s1">schema: [</span>
+            <span class="s1">{</span>
+                <span class="s1">type: </span><span class="s2">&quot;object&quot;</span><span class="s1">,</span>
+                <span class="s1">properties: {</span>
+                    <span class="s1">destructuring: { enum: [</span><span class="s2">&quot;any&quot;</span><span class="s1">, </span><span class="s2">&quot;all&quot;</span><span class="s1">], </span><span class="s3">default</span><span class="s1">: </span><span class="s2">&quot;any&quot; </span><span class="s1">},</span>
+                    <span class="s1">ignoreReadBeforeAssign: { type: </span><span class="s2">&quot;boolean&quot;</span><span class="s1">, </span><span class="s3">default</span><span class="s1">: </span><span class="s3">false </span><span class="s1">}</span>
+                <span class="s1">},</span>
+                <span class="s1">additionalProperties: </span><span class="s3">false</span>
+            <span class="s1">}</span>
+        <span class="s1">],</span>
+        <span class="s1">messages: {</span>
+            <span class="s1">useConst: </span><span class="s2">&quot;'{{name}}' is never reassigned. Use 'const' instead.&quot;</span>
+        <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">create(context) {</span>
+        <span class="s1">const options = context.options[</span><span class="s4">0</span><span class="s1">] || {};</span>
+        <span class="s1">const sourceCode = context.sourceCode;</span>
+        <span class="s1">const shouldMatchAnyDestructuredVariable = options.destructuring !== </span><span class="s2">&quot;all&quot;</span><span class="s1">;</span>
+        <span class="s1">const ignoreReadBeforeAssign = options.ignoreReadBeforeAssign === </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s1">const variables = [];</span>
+        <span class="s1">let reportCount = </span><span class="s4">0</span><span class="s1">;</span>
+        <span class="s1">let checkedId = </span><span class="s3">null</span><span class="s1">;</span>
+        <span class="s1">let checkedName = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+
+
+        <span class="s0">/** 
+         * Reports given identifier nodes if all of the nodes should be declared 
+         * as const. 
+         * 
+         * The argument 'nodes' is an array of Identifier nodes. 
+         * This node is the result of 'getIdentifierIfShouldBeConst()', so it's 
+         * nullable. In simple declaration or assignment cases, the length of 
+         * the array is 1. In destructuring cases, the length of the array can 
+         * be 2 or more. 
+         * @param {(eslint-scope.Reference|null)[]} nodes 
+         *      References which are grouped by destructuring to report. 
+         * @returns {void} 
+         */</span>
+        <span class="s3">function </span><span class="s1">checkGroup(nodes) {</span>
+            <span class="s1">const nodesToReport = nodes.filter(Boolean);</span>
+
+            <span class="s3">if </span><span class="s1">(nodes.length &amp;&amp; (shouldMatchAnyDestructuredVariable || nodesToReport.length === nodes.length)) {</span>
+                <span class="s1">const varDeclParent = findUp(nodes[</span><span class="s4">0</span><span class="s1">], </span><span class="s2">&quot;VariableDeclaration&quot;</span><span class="s1">, parentNode =&gt; parentNode.type.endsWith(</span><span class="s2">&quot;Statement&quot;</span><span class="s1">));</span>
+                <span class="s1">const isVarDecParentNull = varDeclParent === </span><span class="s3">null</span><span class="s1">;</span>
+
+                <span class="s3">if </span><span class="s1">(!isVarDecParentNull &amp;&amp; varDeclParent.declarations.length &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+                    <span class="s1">const firstDeclaration = varDeclParent.declarations[</span><span class="s4">0</span><span class="s1">];</span>
+
+                    <span class="s3">if </span><span class="s1">(firstDeclaration.init) {</span>
+                        <span class="s1">const firstDecParent = firstDeclaration.init.parent;</span>
+
+                        <span class="s0">/* 
+                         * First we check the declaration type and then depending on 
+                         * if the type is a &quot;VariableDeclarator&quot; or its an &quot;ObjectPattern&quot; 
+                         * we compare the name and id from the first identifier, if the names are different 
+                         * we assign the new name, id and reset the count of reportCount and nodeCount in 
+                         * order to check each block for the number of reported errors and base our fix 
+                         * based on comparing nodes.length and nodesToReport.length. 
+                         */</span>
+
+                        <span class="s3">if </span><span class="s1">(firstDecParent.type === </span><span class="s2">&quot;VariableDeclarator&quot;</span><span class="s1">) {</span>
+
+                            <span class="s3">if </span><span class="s1">(firstDecParent.id.name !== checkedName) {</span>
+                                <span class="s1">checkedName = firstDecParent.id.name;</span>
+                                <span class="s1">reportCount = </span><span class="s4">0</span><span class="s1">;</span>
+                            <span class="s1">}</span>
+
+                            <span class="s3">if </span><span class="s1">(firstDecParent.id.type === </span><span class="s2">&quot;ObjectPattern&quot;</span><span class="s1">) {</span>
+                                <span class="s3">if </span><span class="s1">(firstDecParent.init.name !== checkedName) {</span>
+                                    <span class="s1">checkedName = firstDecParent.init.name;</span>
+                                    <span class="s1">reportCount = </span><span class="s4">0</span><span class="s1">;</span>
+                                <span class="s1">}</span>
+                            <span class="s1">}</span>
+
+                            <span class="s3">if </span><span class="s1">(firstDecParent.id !== checkedId) {</span>
+                                <span class="s1">checkedId = firstDecParent.id;</span>
+                                <span class="s1">reportCount = </span><span class="s4">0</span><span class="s1">;</span>
+                            <span class="s1">}</span>
+                        <span class="s1">}</span>
+                    <span class="s1">}</span>
+                <span class="s1">}</span>
+
+                <span class="s1">let shouldFix = varDeclParent &amp;&amp;</span>
+
+                    <span class="s0">// Don't do a fix unless all variables in the declarations are initialized (or it's in a for-in or for-of loop)</span>
+                    <span class="s1">(varDeclParent.parent.type === </span><span class="s2">&quot;ForInStatement&quot; </span><span class="s1">|| varDeclParent.parent.type === </span><span class="s2">&quot;ForOfStatement&quot; </span><span class="s1">||</span>
+                        <span class="s1">varDeclParent.declarations.every(declaration =&gt; declaration.init)) &amp;&amp;</span>
+
+                    <span class="s0">/* 
+                     * If options.destructuring is &quot;all&quot;, then this warning will not occur unless 
+                     * every assignment in the destructuring should be const. In that case, it's safe 
+                     * to apply the fix. 
+                     */</span>
+                    <span class="s1">nodesToReport.length === nodes.length;</span>
+
+                <span class="s3">if </span><span class="s1">(!isVarDecParentNull &amp;&amp; varDeclParent.declarations &amp;&amp; varDeclParent.declarations.length !== </span><span class="s4">1</span><span class="s1">) {</span>
+
+                    <span class="s3">if </span><span class="s1">(varDeclParent &amp;&amp; varDeclParent.declarations &amp;&amp; varDeclParent.declarations.length &gt;= </span><span class="s4">1</span><span class="s1">) {</span>
+
+                        <span class="s0">/* 
+                         * Add nodesToReport.length to a count, then comparing the count to the length 
+                         * of the declarations in the current block. 
+                         */</span>
+
+                        <span class="s1">reportCount += nodesToReport.length;</span>
+
+                        <span class="s1">let totalDeclarationsCount = </span><span class="s4">0</span><span class="s1">;</span>
+
+                        <span class="s1">varDeclParent.declarations.forEach(declaration =&gt; {</span>
+                            <span class="s3">if </span><span class="s1">(declaration.id.type === </span><span class="s2">&quot;ObjectPattern&quot;</span><span class="s1">) {</span>
+                                <span class="s1">totalDeclarationsCount += declaration.id.properties.length;</span>
+                            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(declaration.id.type === </span><span class="s2">&quot;ArrayPattern&quot;</span><span class="s1">) {</span>
+                                <span class="s1">totalDeclarationsCount += declaration.id.elements.length;</span>
+                            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                                <span class="s1">totalDeclarationsCount += </span><span class="s4">1</span><span class="s1">;</span>
+                            <span class="s1">}</span>
+                        <span class="s1">});</span>
+
+                        <span class="s1">shouldFix = shouldFix &amp;&amp; (reportCount === totalDeclarationsCount);</span>
+                    <span class="s1">}</span>
+                <span class="s1">}</span>
+
+                <span class="s1">nodesToReport.forEach(node =&gt; {</span>
+                    <span class="s1">context.report({</span>
+                        <span class="s1">node,</span>
+                        <span class="s1">messageId: </span><span class="s2">&quot;useConst&quot;</span><span class="s1">,</span>
+                        <span class="s1">data: node,</span>
+                        <span class="s1">fix: shouldFix</span>
+                            <span class="s1">? fixer =&gt; {</span>
+                                <span class="s1">const letKeywordToken = sourceCode.getFirstToken(varDeclParent, t =&gt; t.value === varDeclParent.kind);</span>
+
+                                <span class="s0">/** 
+                                 * Extend the replacement range to the whole declaration, 
+                                 * in order to prevent other fixes in the same pass 
+                                 * https://github.com/eslint/eslint/issues/13899 
+                                 */</span>
+                                <span class="s3">return new </span><span class="s1">FixTracker(fixer, sourceCode)</span>
+                                    <span class="s1">.retainRange(varDeclParent.range)</span>
+                                    <span class="s1">.replaceTextRange(letKeywordToken.range, </span><span class="s2">&quot;const&quot;</span><span class="s1">);</span>
+                            <span class="s1">}</span>
+                            <span class="s1">: </span><span class="s3">null</span>
+                    <span class="s1">});</span>
+                <span class="s1">});</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">{</span>
+            <span class="s2">&quot;Program:exit&quot;</span><span class="s1">() {</span>
+                <span class="s1">groupByDestructuring(variables, ignoreReadBeforeAssign).forEach(checkGroup);</span>
+            <span class="s1">},</span>
+
+            <span class="s1">VariableDeclaration(node) {</span>
+                <span class="s3">if </span><span class="s1">(node.kind === </span><span class="s2">&quot;let&quot; </span><span class="s1">&amp;&amp; !isInitOfForStatement(node)) {</span>
+                    <span class="s1">variables.push(...sourceCode.getDeclaredVariables(node));</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">};</span>
+    <span class="s1">}</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

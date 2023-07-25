@@ -1,0 +1,131 @@
+<html>
+<head>
+<title>LayoutAnimationDriver.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+LayoutAnimationDriver.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;LayoutAnimationDriver.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/animations/utils.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;algorithm&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s4">void </span><span class="s1">LayoutAnimationDriver::animationMutationsForFrame(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutation::List &amp;mutationsList</span><span class="s4">,</span>
+    <span class="s1">uint64_t now) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;animation : inflightAnimations_) {</span>
+    <span class="s4">if </span><span class="s1">(animation.surfaceId != surfaceId) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(animation.completed) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">int </span><span class="s1">incompleteAnimations = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">&amp;keyframe : animation.keyFrames) {</span>
+      <span class="s4">if </span><span class="s1">(keyframe.invalidated) {</span>
+        <span class="s4">continue;</span>
+      <span class="s1">}</span>
+
+      <span class="s4">auto const </span><span class="s1">&amp;baselineShadowView = keyframe.viewStart</span><span class="s4">;</span>
+      <span class="s4">auto const </span><span class="s1">&amp;finalShadowView = keyframe.viewEnd</span><span class="s4">;</span>
+
+      <span class="s0">// The contract with the &quot;keyframes generation&quot; phase is that any animated</span>
+      <span class="s0">// node will have a valid configuration.</span>
+      <span class="s4">auto const </span><span class="s1">layoutAnimationConfig = animation.layoutAnimationConfig</span><span class="s4">;</span>
+      <span class="s4">auto const </span><span class="s1">&amp;mutationConfig =</span>
+          <span class="s1">(keyframe.type == AnimationConfigurationType::Delete</span>
+               <span class="s1">? layoutAnimationConfig.deleteConfig</span>
+               <span class="s1">: (keyframe.type == AnimationConfigurationType::Create</span>
+                      <span class="s1">? layoutAnimationConfig.createConfig</span>
+                      <span class="s1">: layoutAnimationConfig.updateConfig))</span><span class="s4">;</span>
+
+      <span class="s0">// Interpolate</span>
+      <span class="s4">auto </span><span class="s1">progress =</span>
+          <span class="s1">calculateAnimationProgress(now</span><span class="s4">, </span><span class="s1">animation</span><span class="s4">, </span><span class="s1">mutationConfig)</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">animationTimeProgressLinear = progress.first</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">animationInterpolationFactor = progress.second</span><span class="s4">;</span>
+
+      <span class="s4">auto </span><span class="s1">mutatedShadowView = createInterpolatedShadowView(</span>
+          <span class="s1">animationInterpolationFactor</span><span class="s4">, </span><span class="s1">baselineShadowView</span><span class="s4">, </span><span class="s1">finalShadowView)</span><span class="s4">;</span>
+
+      <span class="s0">// Create the mutation instruction</span>
+      <span class="s1">mutationsList.emplace_back(ShadowViewMutation::UpdateMutation(</span>
+          <span class="s1">keyframe.viewPrev</span><span class="s4">, </span><span class="s1">mutatedShadowView</span><span class="s4">, </span><span class="s1">keyframe.parentView))</span><span class="s4">;</span>
+
+      <span class="s1">PrintMutationInstruction(</span><span class="s3">&quot;Animation Progress:&quot;</span><span class="s4">, </span><span class="s1">mutationsList.back())</span><span class="s4">;</span>
+
+      <span class="s1">keyframe.viewPrev = std::move(mutatedShadowView)</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(animationTimeProgressLinear &lt; </span><span class="s5">1</span><span class="s1">) {</span>
+        <span class="s1">incompleteAnimations++</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Are there no ongoing mutations left in this animation?</span>
+    <span class="s4">if </span><span class="s1">(incompleteAnimations == </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">animation.completed = </span><span class="s4">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Clear out finished animations</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">it = inflightAnimations_.begin()</span><span class="s4">;</span>
+       <span class="s1">it != inflightAnimations_.end()</span><span class="s4">;</span><span class="s1">) {</span>
+    <span class="s4">const auto </span><span class="s1">&amp;animation = *it</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(animation.completed) {</span>
+      <span class="s1">callCallback(animation.successCallback)</span><span class="s4">;</span>
+
+      <span class="s0">// Queue up &quot;final&quot; mutations for all keyframes in the completed animation</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;keyframe : animation.keyFrames) {</span>
+        <span class="s4">if </span><span class="s1">(keyframe.invalidated) {</span>
+          <span class="s4">continue;</span>
+        <span class="s1">}</span>
+        <span class="s1">queueFinalMutationsForCompletedKeyFrame(</span>
+            <span class="s1">keyframe</span><span class="s4">,</span>
+            <span class="s1">mutationsList</span><span class="s4">,</span>
+            <span class="s4">false,</span>
+            <span class="s3">&quot;LayoutAnimationDriver: Animation Completed&quot;</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">it = inflightAnimations_.erase(it)</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">it++</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Final step: make sure that all operations execute in the proper order.</span>
+  <span class="s0">// REMOVE operations with highest indices must operate first.</span>
+  <span class="s1">std::stable_sort(</span>
+      <span class="s1">mutationsList.begin()</span><span class="s4">,</span>
+      <span class="s1">mutationsList.end()</span><span class="s4">,</span>
+      <span class="s1">&amp;shouldFirstComeBeforeSecondMutation)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

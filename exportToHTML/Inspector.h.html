@@ -1,0 +1,406 @@
+<html>
+<head>
+<title>Inspector.h</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Inspector.h</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s0">// using include guards instead of #pragma once due to compile issues</span>
+<span class="s0">// with MSVC and BUCK</span>
+<span class="s2">#ifndef </span><span class="s1">HERMES_INSPECTOR_INSPECTOR_H</span>
+<span class="s2">#define </span><span class="s1">HERMES_INSPECTOR_INSPECTOR_H</span>
+
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;queue&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;unordered_map&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;folly/Executor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/Unit.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/futures/Future.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/DebuggerAPI.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/hermes.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/AsyncPauseState.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/Exceptions.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/RuntimeAdapter.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;optional&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">hermes {</span>
+<span class="s4">namespace </span><span class="s1">inspector {</span>
+
+<span class="s4">class </span><span class="s1">Inspector</span><span class="s4">;</span>
+<span class="s4">class </span><span class="s1">InspectorState</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * ScriptInfo contains info about loaded scripts. 
+ */</span>
+<span class="s4">struct </span><span class="s1">ScriptInfo {</span>
+  <span class="s1">uint32_t fileId{}</span><span class="s4">;</span>
+  <span class="s1">std::string fileName</span><span class="s4">;</span>
+  <span class="s1">std::string sourceMappingUrl</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">struct </span><span class="s1">ConsoleMessageInfo {</span>
+  <span class="s1">std::string source</span><span class="s4">;</span>
+  <span class="s1">std::string level</span><span class="s4">;</span>
+  <span class="s1">std::string url</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">line</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">column</span><span class="s4">;</span>
+
+  <span class="s1">jsi::Array args</span><span class="s4">;</span>
+
+  <span class="s1">ConsoleMessageInfo(std::string level</span><span class="s4">, </span><span class="s1">jsi::Array args)</span>
+      <span class="s1">: source(</span><span class="s3">&quot;console-api&quot;</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">level(level)</span><span class="s4">,</span>
+        <span class="s1">url(</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">line(-</span><span class="s5">1</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">column(-</span><span class="s5">1</span><span class="s1">)</span><span class="s4">,</span>
+        <span class="s1">args(std::move(args)) {}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">enum </span><span class="s1">PauseOnLoadMode { None</span><span class="s4">, </span><span class="s1">Smart</span><span class="s4">, </span><span class="s1">All }</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * InspectorObserver notifies the observer of events that occur in the VM. 
+ */</span>
+<span class="s4">class </span><span class="s1">InspectorObserver {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">virtual </span><span class="s1">~InspectorObserver() = </span><span class="s4">default;</span>
+
+  <span class="s0">/// onContextCreated fires when the VM is created.</span>
+  <span class="s4">virtual void </span><span class="s1">onContextCreated(Inspector &amp;inspector) = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s0">/// onBreakpointResolve fires when a lazy breakpoint is resolved.</span>
+  <span class="s4">virtual void </span><span class="s1">onBreakpointResolved(</span>
+      <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">facebook::hermes::debugger::BreakpointInfo &amp;info) = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s0">/// onPause fires when VM transitions from running to paused state. This is</span>
+  <span class="s0">/// called directly on the JS thread while the VM is paused, so the receiver</span>
+  <span class="s0">/// can call debugger::ProgramState methods safely.</span>
+  <span class="s4">virtual void </span><span class="s1">onPause(</span>
+      <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">facebook::hermes::debugger::ProgramState &amp;state) = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s0">/// onResume fires when VM transitions from paused to running state.</span>
+  <span class="s4">virtual void </span><span class="s1">onResume(Inspector &amp;inspector) = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s0">/// onScriptParsed fires when after the VM parses a script.</span>
+  <span class="s4">virtual void </span><span class="s1">onScriptParsed(Inspector &amp;inspector</span><span class="s4">, const </span><span class="s1">ScriptInfo &amp;info) = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s0">// onMessageAdded fires when new console message is added.</span>
+  <span class="s4">virtual void </span><span class="s1">onMessageAdded(</span>
+      <span class="s1">Inspector &amp;inspector</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">ConsoleMessageInfo &amp;info) = </span><span class="s5">0</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/** 
+ * Inspector implements a future-based interface over the low-level Hermes 
+ * debugging API. 
+ */</span>
+<span class="s4">class </span><span class="s1">Inspector : </span><span class="s4">public </span><span class="s1">facebook::hermes::debugger::EventObserver</span><span class="s4">,</span>
+                  <span class="s4">public </span><span class="s1">std::enable_shared_from_this&lt;Inspector&gt; {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s0">/** 
+   * Inspector's constructor should be used to install the inspector on the 
+   * provided runtime before any JS executes in the runtime. 
+   */</span>
+  <span class="s1">Inspector(</span>
+      <span class="s1">std::shared_ptr&lt;RuntimeAdapter&gt; adapter</span><span class="s4">,</span>
+      <span class="s1">InspectorObserver &amp;observer</span><span class="s4">,</span>
+      <span class="s4">bool </span><span class="s1">pauseOnFirstStatement)</span><span class="s4">;</span>
+  <span class="s1">~Inspector() override</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * disable turns off the inspector. All of the subsequent methods will not do 
+   * anything unless the inspector is enabled. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; disable()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * enable turns on the inspector. All of the subsequent methods will not do 
+   * anything unless the inspector is enabled. The returned future succeeds when 
+   * the debugger is enabled, or fails with AlreadyEnabledException if the 
+   * debugger was already enabled. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; enable()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * installs console log handler. Ideally this should be done inside 
+   * constructor, but because it uses shared_from_this we can't do this 
+   * in constructor. 
+   */</span>
+  <span class="s4">void </span><span class="s1">installLogHandler()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * executeIfEnabled executes the provided callback *on the JS thread with the 
+   * inspector lock held*. Execution can be implicitly requested while running. 
+   * The inspector lock: 
+   * 
+   *  1) Protects VM state transitions. This means that the VM is guaranteed to 
+   *     stay in the paused or running state for the duration of the callback. 
+   *  2) Protects InspectorObserver callbacks. This means that if some shared 
+   *     data is accessed only in InspectorObserver and executeIfEnabled 
+   *     callbacks, it does not need to be locked, since it's already protected 
+   *     by the inspector lock. 
+   * 
+   * The returned future resolves to true in the VM can be paused, or 
+   * fails with IllegalStateException otherwise. The description is only used 
+   * to populate the IllegalStateException with more useful info on failure. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; executeIfEnabled(</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;description</span><span class="s4">,</span>
+      <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::ProgramState &amp;)&gt;</span>
+          <span class="s1">func)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * setBreakpoint can be called at any time after the debugger is enabled to 
+   * set a breakpoint in the VM. The future is fulfilled with the resolved 
+   * breakpoint info. 
+   * 
+   * Resolving a breakpoint takes an indeterminate amount of time since Hermes 
+   * only resolves breakpoints when the debugger is able to actively pause JS 
+   * execution. 
+   */</span>
+  <span class="s1">folly::Future&lt;facebook::hermes::debugger::BreakpointInfo&gt; setBreakpoint(</span>
+      <span class="s1">facebook::hermes::debugger::SourceLocation loc</span><span class="s4">,</span>
+      <span class="s1">std::optional&lt;std::string&gt; condition = std::nullopt)</span><span class="s4">;</span>
+
+  <span class="s1">folly::Future&lt;folly::Unit&gt; removeBreakpoint(</span>
+      <span class="s1">facebook::hermes::debugger::BreakpointID loc)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * logs console message. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; logMessage(ConsoleMessageInfo info)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * resume and step methods are only valid when the VM is currently paused. The 
+   * returned future succeeds when the VM resumes execution, or fails with an 
+   * InvalidStateException otherwise. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; resume()</span><span class="s4">;</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; stepIn()</span><span class="s4">;</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; stepOver()</span><span class="s4">;</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; stepOut()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * pause can be issued at any time while the inspector is enabled. It requests 
+   * the VM to asynchronously break execution. The returned future succeeds if 
+   * the VM can be paused in this state and fails with InvalidStateException if 
+   * otherwise. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; pause()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * evaluate runs JavaScript code within the context of a call frame. The 
+   * returned promise is fulfilled with an eval result if it's possible to 
+   * evaluate code in the current state or fails with InvalidStateException 
+   * otherwise. 
+   */</span>
+  <span class="s1">folly::Future&lt;facebook::hermes::debugger::EvalResult&gt; evaluate(</span>
+      <span class="s1">uint32_t frameIndex</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;src</span><span class="s4">,</span>
+      <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+          <span class="s1">resultTransformer)</span><span class="s4">;</span>
+
+  <span class="s1">folly::Future&lt;folly::Unit&gt; setPauseOnExceptions(</span>
+      <span class="s4">const </span><span class="s1">facebook::hermes::debugger::PauseOnThrowMode &amp;mode)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Set whether to pause on loads. This does not require runtime modifications, 
+   * but returns a future for consistency. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; setPauseOnLoads(</span><span class="s4">const </span><span class="s1">PauseOnLoadMode mode)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Set whether breakpoints are active (pause when hit). This does not require 
+   * runtime modifications, but returns a future for consistency. 
+   */</span>
+  <span class="s1">folly::Future&lt;folly::Unit&gt; setBreakpointsActive(</span><span class="s4">bool </span><span class="s1">active)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * If called during a script load event, return true if we should pause. 
+   * Assumed to be called from a script load event where we already hold 
+   * `mutex_`. 
+   */</span>
+  <span class="s4">bool </span><span class="s1">shouldPauseOnThisScriptLoad()</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * didPause implements the pause callback from Hermes. This callback arrives 
+   * on the JS thread. 
+   */</span>
+  <span class="s1">facebook::hermes::debugger::Command didPause(</span>
+      <span class="s1">facebook::hermes::debugger::Debugger &amp;debugger) override</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * breakpointResolved implements the breakpointResolved callback from Hermes. 
+   */</span>
+  <span class="s4">void </span><span class="s1">breakpointResolved(</span>
+      <span class="s1">facebook::hermes::debugger::Debugger &amp;debugger</span><span class="s4">,</span>
+      <span class="s1">facebook::hermes::debugger::BreakpointID breakpointId) override</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Get whether we started with pauseOnFirstStatement, and have not yet had a 
+   * debugger attach and ask to resume from that point. This matches the 
+   * semantics of when CDP Debugger.runIfWaitingForDebugger should resume. 
+   * 
+   * It's not named &quot;isPausedOnStart&quot; because the VM and inspector is not 
+   * necessarily paused; we could be in a RunningWaitPause state. 
+   */</span>
+  <span class="s4">bool </span><span class="s1">isAwaitingDebuggerOnStart()</span><span class="s4">;</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s4">friend class </span><span class="s1">InspectorState</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">triggerAsyncPause(</span><span class="s4">bool </span><span class="s1">andTickle)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">notifyContextCreated()</span><span class="s4">;</span>
+
+  <span class="s1">ScriptInfo getScriptInfoFromTopCallFrame()</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">addCurrentScriptToLoadedScripts()</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">removeAllBreakpoints()</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">resetScriptsLoaded()</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">notifyScriptsLoaded()</span><span class="s4">;</span>
+
+  <span class="s1">folly::Future&lt;folly::Unit&gt; setPendingCommand(debugger::Command command)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">transition(std::unique_ptr&lt;InspectorState&gt; nextState)</span><span class="s4">;</span>
+
+  <span class="s0">// All methods that end with OnExecutor run on executor_.</span>
+  <span class="s4">void </span><span class="s1">disableOnExecutor(std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">enableOnExecutor(std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">executeIfEnabledOnExecutor(</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;description</span><span class="s4">,</span>
+      <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::ProgramState &amp;)&gt;</span>
+          <span class="s1">func</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">setBreakpointOnExecutor(</span>
+      <span class="s1">debugger::SourceLocation loc</span><span class="s4">,</span>
+      <span class="s1">std::optional&lt;std::string&gt; condition</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;</span>
+          <span class="s1">folly::Promise&lt;facebook::hermes::debugger::BreakpointInfo&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">removeBreakpointOnExecutor(</span>
+      <span class="s1">debugger::BreakpointID breakpointId</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">logOnExecutor(</span>
+      <span class="s1">ConsoleMessageInfo info</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">setPendingCommandOnExecutor(</span>
+      <span class="s1">facebook::hermes::debugger::Command command</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">pauseOnExecutor(std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">evaluateOnExecutor(</span>
+      <span class="s1">uint32_t frameIndex</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;src</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;facebook::hermes::debugger::EvalResult&gt;&gt;</span>
+          <span class="s1">promise</span><span class="s4">,</span>
+      <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::hermes::debugger::EvalResult &amp;)&gt;</span>
+          <span class="s1">resultTransformer)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">setPauseOnExceptionsOnExecutor(</span>
+      <span class="s4">const </span><span class="s1">facebook::hermes::debugger::PauseOnThrowMode &amp;mode</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;folly::Promise&lt;folly::Unit&gt;&gt; promise)</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">installConsoleFunction(</span>
+      <span class="s1">jsi::Object &amp;console</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;jsi::Object&gt; &amp;originalConsole</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;name</span><span class="s4">,</span>
+      <span class="s4">const </span><span class="s1">std::string &amp;chromeType)</span><span class="s4">;</span>
+
+  <span class="s1">std::shared_ptr&lt;RuntimeAdapter&gt; adapter_</span><span class="s4">;</span>
+  <span class="s1">facebook::hermes::debugger::Debugger &amp;debugger_</span><span class="s4">;</span>
+  <span class="s1">InspectorObserver &amp;observer_</span><span class="s4">;</span>
+
+  <span class="s0">// All of the following member variables are guarded by mutex_.</span>
+  <span class="s1">std::mutex mutex_</span><span class="s4">;</span>
+  <span class="s1">std::unique_ptr&lt;InspectorState&gt; state_</span><span class="s4">;</span>
+
+  <span class="s0">// See the InspectorState::Running implementation for an explanation for why</span>
+  <span class="s0">// this state is here rather than in the Running class.</span>
+  <span class="s1">AsyncPauseState pendingPauseState_ = AsyncPauseState::None</span><span class="s4">;</span>
+
+  <span class="s0">// Whether we should enter a paused state when a script loads.</span>
+  <span class="s1">PauseOnLoadMode pauseOnLoadMode_ = PauseOnLoadMode::None</span><span class="s4">;</span>
+
+  <span class="s0">// Whether or not we should pause on breakpoints.</span>
+  <span class="s4">bool </span><span class="s1">breakpointsActive_ = </span><span class="s4">true;</span>
+
+  <span class="s0">// All scripts loaded in to the VM, along with whether we've notified the</span>
+  <span class="s0">// client about the script yet.</span>
+  <span class="s4">struct </span><span class="s1">LoadedScriptInfo {</span>
+    <span class="s1">ScriptInfo info</span><span class="s4">;</span>
+    <span class="s4">bool </span><span class="s1">notifiedClient</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">std::unordered_map&lt;</span><span class="s4">int, </span><span class="s1">LoadedScriptInfo&gt; loadedScripts_</span><span class="s4">;</span>
+  <span class="s1">std::unordered_map&lt;std::string</span><span class="s4">, int</span><span class="s1">&gt; loadedScriptIdByName_</span><span class="s4">;</span>
+
+  <span class="s0">// Returns true if we are executing a file instance that has since been</span>
+  <span class="s0">// reloaded. I.e. we are running an old version of the file.</span>
+  <span class="s4">bool </span><span class="s1">isExecutingSupersededFile()</span><span class="s4">;</span>
+
+  <span class="s0">// Allow the user to suppress warnings about superseded files.</span>
+  <span class="s4">bool </span><span class="s1">shouldSuppressAlertAboutSupersededFiles()</span><span class="s4">;</span>
+
+  <span class="s0">// Trigger a fake console.log if we're currently in a superseded file.</span>
+  <span class="s4">void </span><span class="s1">alertIfPausedInSupersededFile()</span><span class="s4">;</span>
+
+  <span class="s0">// Are we currently waiting for a debugger to attach, because we</span>
+  <span class="s0">// requested 'pauseOnFirstStatement'?</span>
+  <span class="s4">bool </span><span class="s1">awaitingDebuggerOnStart_</span><span class="s4">;</span>
+
+  <span class="s0">// All client methods (e.g. enable, setBreakpoint, resume, etc.) are executed</span>
+  <span class="s0">// on executor_ to prevent deadlocking on mutex_. See the implementation for</span>
+  <span class="s0">// more comments on the threading invariants used in this class.</span>
+  <span class="s0">// NOTE: This needs to be declared LAST because it should be destroyed FIRST.</span>
+  <span class="s1">std::unique_ptr&lt;folly::Executor&gt; executor_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">/// Helper function that guards user code execution in a try-catch block.</span>
+<span class="s4">template </span><span class="s1">&lt;</span><span class="s4">typename </span><span class="s1">C</span><span class="s4">, typename</span><span class="s1">... A&gt;</span>
+<span class="s1">std::optional&lt;UserCallbackException&gt; runUserCallback(C &amp;cb</span><span class="s4">, </span><span class="s1">A &amp;&amp;...arg) {</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s1">cb(std::forward&lt;A&gt;(arg)...)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::exception &amp;e) {</span>
+    <span class="s4">return </span><span class="s1">UserCallbackException(e)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">{}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace inspector</span>
+<span class="s1">} </span><span class="s0">// namespace hermes</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+
+<span class="s2">#endif </span><span class="s0">// HERMES_INSPECTOR_INSPECTOR_H</span>
+</pre>
+</body>
+</html>

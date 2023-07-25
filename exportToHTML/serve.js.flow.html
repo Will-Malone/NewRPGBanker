@@ -1,0 +1,140 @@
+<html>
+<head>
+<title>serve.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+serve.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import typeof Yargs from 'yargs';</span>
+<span class="s0">import type {ModuleObject} from 'yargs';</span>
+
+<span class="s0">const {makeAsyncCommand, watchFile} = require('../cli-utils');</span>
+<span class="s0">const {loadConfig, resolveConfig} = require('metro-config');</span>
+<span class="s0">const {promisify} = require('util');</span>
+
+<span class="s0">type Args = $ReadOnly&lt;{</span>
+  <span class="s0">projectRoots?: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">host: string,</span>
+  <span class="s0">port: number,</span>
+  <span class="s0">maxWorkers?: number,</span>
+  <span class="s0">secure?: boolean,</span>
+  <span class="s0">secureKey?: string,</span>
+  <span class="s0">secureCert?: string,</span>
+  <span class="s0">secureServerOptions?: string,</span>
+  <span class="s0">hmrEnabled?: boolean,</span>
+  <span class="s0">config?: string,</span>
+  <span class="s0">resetCache?: boolean,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">module.exports = (): {</span>
+  <span class="s0">...ModuleObject,</span>
+  <span class="s0">handler: Function,</span>
+<span class="s0">} =&gt; ({</span>
+  <span class="s0">command: 'serve',</span>
+  <span class="s0">aliases: ['start'],</span>
+  <span class="s0">desc: 'Starts Metro on the given port, building bundles on the fly',</span>
+
+  <span class="s0">builder: (yargs: Yargs): void =&gt; {</span>
+    <span class="s0">yargs.option('project-roots', {</span>
+      <span class="s0">alias: 'P',</span>
+      <span class="s0">type: 'string',</span>
+      <span class="s0">array: true,</span>
+    <span class="s0">});</span>
+
+    <span class="s0">yargs.option('host', {alias: 'h', type: 'string', default: 'localhost'});</span>
+    <span class="s0">yargs.option('port', {alias: 'p', type: 'number', default: 8080});</span>
+
+    <span class="s0">yargs.option('max-workers', {alias: 'j', type: 'number'});</span>
+
+    <span class="s0">yargs.option('secure', {type: 'boolean', describe: '(deprecated)'});</span>
+    <span class="s0">yargs.option('secure-key', {type: 'string', describe: '(deprecated)'});</span>
+    <span class="s0">yargs.option('secure-cert', {type: 'string', describe: '(deprecated)'});</span>
+    <span class="s0">yargs.option('secure-server-options', {</span>
+      <span class="s0">alias: 's',</span>
+      <span class="s0">type: 'string',</span>
+      <span class="s0">describe: 'Use dot notation for object path',</span>
+    <span class="s0">});</span>
+
+    <span class="s0">yargs.option('hmr-enabled', {alias: 'hmr', type: 'boolean'});</span>
+
+    <span class="s0">yargs.option('config', {alias: 'c', type: 'string'});</span>
+
+    <span class="s0">// Deprecated</span>
+    <span class="s0">yargs.option('reset-cache', {type: 'boolean'});</span>
+
+    <span class="s0">// Examples</span>
+    <span class="s0">yargs.example(</span>
+      <span class="s0">'secure-server-options',</span>
+      <span class="s0">'-s.cert=&quot;$(cat path/to/cert)&quot; -s.key=&quot;$(cat path/to/key&quot;)',</span>
+    <span class="s0">);</span>
+  <span class="s0">},</span>
+
+  <span class="s0">handler: makeAsyncCommand(async (argv: Args) =&gt; {</span>
+    <span class="s0">let server = null;</span>
+    <span class="s0">let restarting = false;</span>
+
+    <span class="s0">async function restart(): Promise&lt;void&gt; {</span>
+      <span class="s0">if (restarting) {</span>
+        <span class="s0">return;</span>
+      <span class="s0">} else {</span>
+        <span class="s0">restarting = true;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">if (server) {</span>
+        <span class="s0">// eslint-disable-next-line no-console</span>
+        <span class="s0">console.log('Configuration changed. Restarting the server...');</span>
+        <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+        <span class="s0">await promisify(server.close).call(server);</span>
+      <span class="s0">}</span>
+
+      <span class="s0">const config = await loadConfig(argv);</span>
+
+      <span class="s0">// Inline require() to avoid circular dependency with ../index</span>
+      <span class="s0">const MetroApi = require('../index');</span>
+
+      <span class="s0">const {</span>
+        <span class="s0">config: _config,</span>
+        <span class="s0">hmrEnabled: _hmrEnabled,</span>
+        <span class="s0">maxWorkers: _maxWorkers,</span>
+        <span class="s0">port: _port,</span>
+        <span class="s0">projectRoots: _projectRoots,</span>
+        <span class="s0">resetCache: _resetCache,</span>
+        <span class="s0">...runServerOptions</span>
+      <span class="s0">} = argv;</span>
+      <span class="s0">server = await MetroApi.runServer(config, runServerOptions);</span>
+
+      <span class="s0">restarting = false;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const foundConfig = await resolveConfig(argv.config);</span>
+
+    <span class="s0">if (foundConfig) {</span>
+      <span class="s0">await watchFile(foundConfig.filepath, restart);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">await restart();</span>
+    <span class="s0">}</span>
+  <span class="s0">}),</span>
+<span class="s0">});</span>
+</pre>
+</body>
+</html>

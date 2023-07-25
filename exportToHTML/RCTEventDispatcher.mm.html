@@ -1,0 +1,261 @@
+<html>
+<head>
+<title>RCTEventDispatcher.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTEventDispatcher.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTEventDispatcher.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTAssert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBridge+Private.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBridge.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTComponentEvent.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTProfile.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;ReactCommon/RCTTurboModule.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;CoreModulesPlugins.h&quot;</span>
+
+<span class="s4">static </span><span class="s1">NSNumber *RCTGetEventID(NSNumber *viewTag</span><span class="s4">, </span><span class="s1">NSString *eventName</span><span class="s4">, </span><span class="s1">uint16_t coalescingKey)</span>
+<span class="s1">{</span>
+  <span class="s4">return @</span><span class="s1">(viewTag.intValue | (((uint64_t)eventName.hash &amp; </span><span class="s5">0xFFFF</span><span class="s1">) &lt;&lt; </span><span class="s5">32</span><span class="s1">) | (((uint64_t)coalescingKey) &lt;&lt; </span><span class="s5">48</span><span class="s1">))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">uint16_t RCTUniqueCoalescingKeyGenerator = </span><span class="s5">0</span><span class="s4">;</span>
+
+<span class="s4">@interface </span><span class="s1">RCTEventDispatcher () &lt;RCTTurboModule&gt;</span>
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTEventDispatcher {</span>
+  <span class="s0">// We need this lock to protect access to _events, _eventQueue and _eventsDispatchScheduled. It's filled in on main</span>
+  <span class="s0">// thread and consumed on js thread.</span>
+  <span class="s1">NSLock *_eventQueueLock</span><span class="s4">;</span>
+  <span class="s0">// We have this id -&gt; event mapping so we coalesce effectively.</span>
+  <span class="s1">NSMutableDictionary&lt;NSNumber *</span><span class="s4">, </span><span class="s1">id&lt;RCTEvent&gt;&gt; *_events</span><span class="s4">;</span>
+  <span class="s0">// This array contains ids of events in order they come in, so we can emit them to JS in the exact same order.</span>
+  <span class="s1">NSMutableArray&lt;NSNumber *&gt; *_eventQueue</span><span class="s4">;</span>
+  <span class="s1">BOOL _eventsDispatchScheduled</span><span class="s4">;</span>
+  <span class="s1">NSHashTable&lt;id&lt;RCTEventDispatcherObserver&gt;&gt; *_observers</span><span class="s4">;</span>
+  <span class="s1">NSRecursiveLock *_observersLock</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@synthesize </span><span class="s1">bridge = _bridge</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">dispatchToJSThread = _dispatchToJSThread</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">callableJSModules = _callableJSModules</span><span class="s4">;</span>
+
+<span class="s1">RCT_EXPORT_MODULE()</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)initialize</span>
+<span class="s1">{</span>
+  <span class="s1">_events = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_eventQueue = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_eventQueueLock = [NSLock </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_eventsDispatchScheduled = NO</span><span class="s4">;</span>
+  <span class="s1">_observers = [NSHashTable weakObjectsHashTable]</span><span class="s4">;</span>
+  <span class="s1">_observersLock = [NSRecursiveLock </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendViewEventWithName:(NSString *)name reactTag:(NSNumber *)reactTag</span>
+<span class="s1">{</span>
+  <span class="s1">[_callableJSModules invokeModule:</span><span class="s4">@</span><span class="s3">&quot;RCTViewEventEmitter&quot; </span><span class="s1">method:</span><span class="s4">@</span><span class="s3">&quot;emit&quot; </span><span class="s1">withArgs:</span><span class="s4">@</span><span class="s1">[ name</span><span class="s4">, </span><span class="s1">RCTNullIfNil(reactTag) ]]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendAppEventWithName:(NSString *)name body:(id)body</span>
+<span class="s1">{</span>
+  <span class="s1">[_callableJSModules invokeModule:</span><span class="s4">@</span><span class="s3">&quot;RCTNativeAppEventEmitter&quot;</span>
+                            <span class="s1">method:</span><span class="s4">@</span><span class="s3">&quot;emit&quot;</span>
+                          <span class="s1">withArgs:body ? </span><span class="s4">@</span><span class="s1">[ name</span><span class="s4">, </span><span class="s1">body ] : </span><span class="s4">@</span><span class="s1">[ name ]]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendDeviceEventWithName:(NSString *)name body:(id)body</span>
+<span class="s1">{</span>
+  <span class="s1">[_callableJSModules invokeModule:</span><span class="s4">@</span><span class="s3">&quot;RCTDeviceEventEmitter&quot; </span><span class="s1">method:</span><span class="s4">@</span><span class="s3">&quot;emit&quot; </span><span class="s1">withArgs:body ? </span><span class="s4">@</span><span class="s1">[ name</span><span class="s4">, </span><span class="s1">body ] : </span><span class="s4">@</span><span class="s1">[ name ]]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendTextEventWithType:(RCTTextEventType)type</span>
+                     <span class="s1">reactTag:(NSNumber *)reactTag</span>
+                         <span class="s1">text:(NSString *)text</span>
+                          <span class="s1">key:(NSString *)key</span>
+                   <span class="s1">eventCount:(NSInteger)eventCount</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSString *events[] = {</span><span class="s4">@</span><span class="s3">&quot;focus&quot;</span><span class="s4">, @</span><span class="s3">&quot;blur&quot;</span><span class="s4">, @</span><span class="s3">&quot;change&quot;</span><span class="s4">, @</span><span class="s3">&quot;submitEditing&quot;</span><span class="s4">, @</span><span class="s3">&quot;endEditing&quot;</span><span class="s4">, @</span><span class="s3">&quot;keyPress&quot;</span><span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">NSMutableDictionary *body = [[NSMutableDictionary alloc] initWithDictionary:</span><span class="s4">@</span><span class="s1">{</span>
+    <span class="s4">@</span><span class="s3">&quot;eventCount&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(eventCount)</span><span class="s4">,</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(text) {</span>
+    <span class="s0">// We copy the string here because if it's a mutable string it may get released before we dispatch the event on a</span>
+    <span class="s0">// different thread, causing a crash.</span>
+    <span class="s1">body[</span><span class="s4">@</span><span class="s3">&quot;text&quot;</span><span class="s1">] = [text copy]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(key) {</span>
+    <span class="s4">if </span><span class="s1">(key.length == </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">key = </span><span class="s4">@</span><span class="s3">&quot;Backspace&quot;</span><span class="s4">; </span><span class="s0">// backspace</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">switch </span><span class="s1">([key characterAtIndex:</span><span class="s5">0</span><span class="s1">]) {</span>
+        <span class="s4">case </span><span class="s3">'</span><span class="s4">\t</span><span class="s3">'</span><span class="s1">:</span>
+          <span class="s1">key = </span><span class="s4">@</span><span class="s3">&quot;Tab&quot;</span><span class="s4">;</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s3">'</span><span class="s4">\n</span><span class="s3">'</span><span class="s1">:</span>
+          <span class="s1">key = </span><span class="s4">@</span><span class="s3">&quot;Enter&quot;</span><span class="s4">;</span>
+        <span class="s4">default</span><span class="s1">:</span>
+          <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s0">// We copy the string here because if it's a mutable string it may get released before we dispatch the event on a</span>
+    <span class="s0">// different thread, causing a crash.</span>
+    <span class="s1">body[</span><span class="s4">@</span><span class="s3">&quot;key&quot;</span><span class="s1">] = [key copy]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTComponentEvent *event = [[RCTComponentEvent alloc] initWithName:events[type] viewTag:reactTag body:body]</span><span class="s4">;</span>
+  <span class="s1">[self sendEvent:event]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)notifyObserversOfEvent:(id&lt;RCTEvent&gt;)event</span>
+<span class="s1">{</span>
+  <span class="s1">[_observersLock lock]</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(id&lt;RCTEventDispatcherObserver&gt; observer in _observers) {</span>
+    <span class="s1">[observer eventDispatcherWillDispatchEvent:event]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[_observersLock unlock]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)sendEvent:(id&lt;RCTEvent&gt;)event</span>
+<span class="s1">{</span>
+  <span class="s1">[self notifyObserversOfEvent:event]</span><span class="s4">;</span>
+
+  <span class="s1">[_eventQueueLock lock]</span><span class="s4">;</span>
+
+  <span class="s1">NSNumber *eventID</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(event.canCoalesce) {</span>
+    <span class="s1">eventID = RCTGetEventID(event.viewTag</span><span class="s4">, </span><span class="s1">event.eventName</span><span class="s4">, </span><span class="s1">event.coalescingKey)</span><span class="s4">;</span>
+    <span class="s1">id&lt;RCTEvent&gt; previousEvent = _events[eventID]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(previousEvent) {</span>
+      <span class="s1">event = [previousEvent coalesceWithEvent:event]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">[_eventQueue addObject:eventID]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">id&lt;RCTEvent&gt; previousEvent = _events[eventID]</span><span class="s4">;</span>
+    <span class="s1">eventID = RCTGetEventID(event.viewTag</span><span class="s4">, </span><span class="s1">event.eventName</span><span class="s4">, </span><span class="s1">RCTUniqueCoalescingKeyGenerator++)</span><span class="s4">;</span>
+    <span class="s1">RCTAssert(</span>
+        <span class="s1">previousEvent == nil</span><span class="s4">,</span>
+        <span class="s4">@</span><span class="s3">&quot;Got event %@ which cannot be coalesced, but has the same eventID %@ as the previous event %@&quot;</span><span class="s4">,</span>
+        <span class="s1">event</span><span class="s4">,</span>
+        <span class="s1">eventID</span><span class="s4">,</span>
+        <span class="s1">previousEvent)</span><span class="s4">;</span>
+    <span class="s1">[_eventQueue addObject:eventID]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_events[eventID] = event</span><span class="s4">;</span>
+
+  <span class="s1">BOOL scheduleEventsDispatch = NO</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!_eventsDispatchScheduled) {</span>
+    <span class="s1">_eventsDispatchScheduled = YES</span><span class="s4">;</span>
+    <span class="s1">scheduleEventsDispatch = YES</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// We have to release the lock before dispatching block with events,</span>
+  <span class="s0">// since dispatchBlock: can be executed synchronously on the same queue.</span>
+  <span class="s0">// (This is happening when chrome debugging is turned on.)</span>
+  <span class="s1">[_eventQueueLock unlock]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(scheduleEventsDispatch) {</span>
+    <span class="s4">if </span><span class="s1">(_bridge) {</span>
+      <span class="s1">[_bridge</span>
+          <span class="s1">dispatchBlock:^{</span>
+            <span class="s1">[self flushEventsQueue]</span><span class="s4">;</span>
+          <span class="s1">}</span>
+                  <span class="s1">queue:RCTJSThread]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(_dispatchToJSThread) {</span>
+      <span class="s1">_dispatchToJSThread(^{</span>
+        <span class="s1">[self flushEventsQueue]</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)addDispatchObserver:(id&lt;RCTEventDispatcherObserver&gt;)observer</span>
+<span class="s1">{</span>
+  <span class="s1">[_observersLock lock]</span><span class="s4">;</span>
+  <span class="s1">[_observers addObject:observer]</span><span class="s4">;</span>
+  <span class="s1">[_observersLock unlock]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)removeDispatchObserver:(id&lt;RCTEventDispatcherObserver&gt;)observer</span>
+<span class="s1">{</span>
+  <span class="s1">[_observersLock lock]</span><span class="s4">;</span>
+  <span class="s1">[_observers removeObject:observer]</span><span class="s4">;</span>
+  <span class="s1">[_observersLock unlock]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dispatchEvent:(id&lt;RCTEvent&gt;)event</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *moduleDotMethod = [[event </span><span class="s4">class</span><span class="s1">] moduleDotMethod]</span><span class="s4">;</span>
+  <span class="s1">NSArray&lt;NSString *&gt; *</span><span class="s4">const </span><span class="s1">components = [moduleDotMethod componentsSeparatedByString:</span><span class="s4">@</span><span class="s3">&quot;.&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSString *</span><span class="s4">const </span><span class="s1">moduleName = components[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSString *</span><span class="s4">const </span><span class="s1">methodName = components[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">[_callableJSModules invokeModule:moduleName method:methodName withArgs:[event arguments]]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (dispatch_queue_t)methodQueue</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTJSThread</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// js thread only (which surprisingly can be the main thread, depends on used JS executor)</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)flushEventsQueue</span>
+<span class="s1">{</span>
+  <span class="s1">[_eventQueueLock lock]</span><span class="s4">;</span>
+  <span class="s1">NSDictionary *events = _events</span><span class="s4">;</span>
+  <span class="s1">_events = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray *eventQueue = _eventQueue</span><span class="s4">;</span>
+  <span class="s1">_eventQueue = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_eventsDispatchScheduled = NO</span><span class="s4">;</span>
+  <span class="s1">[_eventQueueLock unlock]</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(NSNumber *eventId in eventQueue) {</span>
+    <span class="s1">[self dispatchEvent:events[eventId]]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (std::shared_ptr&lt;facebook::react::TurboModule&gt;)getTurboModule:</span>
+    <span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::react::ObjCTurboModule::InitParams &amp;)params</span>
+<span class="s1">{</span>
+  <span class="s4">return nullptr;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s1">Class RCTEventDispatcherCls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTEventDispatcher.</span><span class="s4">class;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

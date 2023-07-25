@@ -1,0 +1,250 @@
+<html>
+<head>
+<title>WebSocketInterceptor.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+WebSocketInterceptor.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @format 
+ */</span>
+
+<span class="s1">import NativeEventEmitter from </span><span class="s2">'../EventEmitter/NativeEventEmitter'</span><span class="s1">;</span>
+<span class="s1">import Platform from </span><span class="s2">'../Utilities/Platform'</span><span class="s1">;</span>
+<span class="s1">import NativeWebSocketModule from </span><span class="s2">'./NativeWebSocketModule'</span><span class="s1">;</span>
+<span class="s1">import base64 from </span><span class="s2">'base64-js'</span><span class="s1">;</span>
+
+<span class="s1">const originalRCTWebSocketConnect = NativeWebSocketModule.connect;</span>
+<span class="s1">const originalRCTWebSocketSend = NativeWebSocketModule.send;</span>
+<span class="s1">const originalRCTWebSocketSendBinary = NativeWebSocketModule.sendBinary;</span>
+<span class="s1">const originalRCTWebSocketClose = NativeWebSocketModule.close;</span>
+
+<span class="s1">let eventEmitter;</span>
+<span class="s1">let subscriptions;</span>
+
+<span class="s1">let closeCallback;</span>
+<span class="s1">let sendCallback;</span>
+<span class="s1">let connectCallback;</span>
+<span class="s1">let onOpenCallback;</span>
+<span class="s1">let onMessageCallback;</span>
+<span class="s1">let onErrorCallback;</span>
+<span class="s1">let onCloseCallback;</span>
+
+<span class="s1">let isInterceptorEnabled = </span><span class="s3">false</span><span class="s1">;</span>
+
+<span class="s0">/** 
+ * A network interceptor which monkey-patches RCTWebSocketModule methods 
+ * to gather all websocket network requests/responses, in order to show 
+ * their information in the React Native inspector development tool. 
+ */</span>
+
+<span class="s1">const WebSocketInterceptor = {</span>
+  <span class="s0">/** 
+   * Invoked when RCTWebSocketModule.close(...) is called. 
+   */</span>
+  <span class="s1">setCloseCallback(callback) {</span>
+    <span class="s1">closeCallback = callback;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when RCTWebSocketModule.send(...) or sendBinary(...) is called. 
+   */</span>
+  <span class="s1">setSendCallback(callback) {</span>
+    <span class="s1">sendCallback = callback;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when RCTWebSocketModule.connect(...) is called. 
+   */</span>
+  <span class="s1">setConnectCallback(callback) {</span>
+    <span class="s1">connectCallback = callback;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when event &quot;websocketOpen&quot; happens. 
+   */</span>
+  <span class="s1">setOnOpenCallback(callback) {</span>
+    <span class="s1">onOpenCallback = callback;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when event &quot;websocketMessage&quot; happens. 
+   */</span>
+  <span class="s1">setOnMessageCallback(callback) {</span>
+    <span class="s1">onMessageCallback = callback;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when event &quot;websocketFailed&quot; happens. 
+   */</span>
+  <span class="s1">setOnErrorCallback(callback) {</span>
+    <span class="s1">onErrorCallback = callback;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Invoked when event &quot;websocketClosed&quot; happens. 
+   */</span>
+  <span class="s1">setOnCloseCallback(callback) {</span>
+    <span class="s1">onCloseCallback = callback;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">isInterceptorEnabled() {</span>
+    <span class="s3">return </span><span class="s1">isInterceptorEnabled;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">_unregisterEvents() {</span>
+    <span class="s1">subscriptions.forEach(e =&gt; e.remove());</span>
+    <span class="s1">subscriptions = [];</span>
+  <span class="s1">},</span>
+
+  <span class="s0">/** 
+   * Add listeners to the RCTWebSocketModule events to intercept them. 
+   */</span>
+  <span class="s1">_registerEvents() {</span>
+    <span class="s1">subscriptions = [</span>
+      <span class="s1">eventEmitter.addListener(</span><span class="s2">'websocketMessage'</span><span class="s1">, ev =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(onMessageCallback) {</span>
+          <span class="s1">onMessageCallback(</span>
+            <span class="s1">ev.id,</span>
+            <span class="s1">ev.type === </span><span class="s2">'binary'</span>
+              <span class="s1">? WebSocketInterceptor._arrayBufferToString(ev.data)</span>
+              <span class="s1">: ev.data,</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}),</span>
+      <span class="s1">eventEmitter.addListener(</span><span class="s2">'websocketOpen'</span><span class="s1">, ev =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(onOpenCallback) {</span>
+          <span class="s1">onOpenCallback(ev.id);</span>
+        <span class="s1">}</span>
+      <span class="s1">}),</span>
+      <span class="s1">eventEmitter.addListener(</span><span class="s2">'websocketClosed'</span><span class="s1">, ev =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(onCloseCallback) {</span>
+          <span class="s1">onCloseCallback(ev.id, {code: ev.code, reason: ev.reason});</span>
+        <span class="s1">}</span>
+      <span class="s1">}),</span>
+      <span class="s1">eventEmitter.addListener(</span><span class="s2">'websocketFailed'</span><span class="s1">, ev =&gt; {</span>
+        <span class="s3">if </span><span class="s1">(onErrorCallback) {</span>
+          <span class="s1">onErrorCallback(ev.id, {message: ev.message});</span>
+        <span class="s1">}</span>
+      <span class="s1">}),</span>
+    <span class="s1">];</span>
+  <span class="s1">},</span>
+
+  <span class="s1">enableInterception() {</span>
+    <span class="s3">if </span><span class="s1">(isInterceptorEnabled) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">eventEmitter = </span><span class="s3">new </span><span class="s1">NativeEventEmitter(</span>
+      <span class="s0">// T88715063: NativeEventEmitter only used this parameter on iOS. Now it uses it on all platforms, so this code was modified automatically to preserve its behavior</span>
+      <span class="s0">// If you want to use the native module on other platforms, please remove this condition and test its behavior</span>
+      <span class="s1">Platform.OS !== </span><span class="s2">'ios' </span><span class="s1">? </span><span class="s3">null </span><span class="s1">: NativeWebSocketModule,</span>
+    <span class="s1">);</span>
+    <span class="s1">WebSocketInterceptor._registerEvents();</span>
+
+    <span class="s0">// Override `connect` method for all RCTWebSocketModule requests</span>
+    <span class="s0">// to intercept the request url, protocols, options and socketId,</span>
+    <span class="s0">// then pass them through the `connectCallback`.</span>
+    <span class="s1">NativeWebSocketModule.connect = </span><span class="s3">function </span><span class="s1">(</span>
+      <span class="s1">url,</span>
+      <span class="s1">protocols,</span>
+      <span class="s1">options,</span>
+      <span class="s1">socketId,</span>
+    <span class="s1">) {</span>
+      <span class="s3">if </span><span class="s1">(connectCallback) {</span>
+        <span class="s1">connectCallback(url, protocols, options, socketId);</span>
+      <span class="s1">}</span>
+      <span class="s1">originalRCTWebSocketConnect.apply(</span><span class="s3">this</span><span class="s1">, arguments);</span>
+    <span class="s1">};</span>
+
+    <span class="s0">// Override `send` method for all RCTWebSocketModule requests to intercept</span>
+    <span class="s0">// the data sent, then pass them through the `sendCallback`.</span>
+    <span class="s1">NativeWebSocketModule.send = </span><span class="s3">function </span><span class="s1">(data, socketId) {</span>
+      <span class="s3">if </span><span class="s1">(sendCallback) {</span>
+        <span class="s1">sendCallback(data, socketId);</span>
+      <span class="s1">}</span>
+      <span class="s1">originalRCTWebSocketSend.apply(</span><span class="s3">this</span><span class="s1">, arguments);</span>
+    <span class="s1">};</span>
+
+    <span class="s0">// Override `sendBinary` method for all RCTWebSocketModule requests to</span>
+    <span class="s0">// intercept the data sent, then pass them through the `sendCallback`.</span>
+    <span class="s1">NativeWebSocketModule.sendBinary = </span><span class="s3">function </span><span class="s1">(data, socketId) {</span>
+      <span class="s3">if </span><span class="s1">(sendCallback) {</span>
+        <span class="s1">sendCallback(WebSocketInterceptor._arrayBufferToString(data), socketId);</span>
+      <span class="s1">}</span>
+      <span class="s1">originalRCTWebSocketSendBinary.apply(</span><span class="s3">this</span><span class="s1">, arguments);</span>
+    <span class="s1">};</span>
+
+    <span class="s0">// Override `close` method for all RCTWebSocketModule requests to intercept</span>
+    <span class="s0">// the close information, then pass them through the `closeCallback`.</span>
+    <span class="s1">NativeWebSocketModule.close = </span><span class="s3">function </span><span class="s1">() {</span>
+      <span class="s3">if </span><span class="s1">(closeCallback) {</span>
+        <span class="s3">if </span><span class="s1">(arguments.length === </span><span class="s4">3</span><span class="s1">) {</span>
+          <span class="s1">closeCallback(arguments[</span><span class="s4">0</span><span class="s1">], arguments[</span><span class="s4">1</span><span class="s1">], arguments[</span><span class="s4">2</span><span class="s1">]);</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s1">closeCallback(</span><span class="s3">null</span><span class="s1">, </span><span class="s3">null</span><span class="s1">, arguments[</span><span class="s4">0</span><span class="s1">]);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">originalRCTWebSocketClose.apply(</span><span class="s3">this</span><span class="s1">, arguments);</span>
+    <span class="s1">};</span>
+
+    <span class="s1">isInterceptorEnabled = </span><span class="s3">true</span><span class="s1">;</span>
+  <span class="s1">},</span>
+
+  <span class="s1">_arrayBufferToString(data) {</span>
+    <span class="s1">const value = base64.toByteArray(data).buffer;</span>
+    <span class="s3">if </span><span class="s1">(value === undefined || value === </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">return </span><span class="s2">'(no value)'</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s3">typeof </span><span class="s1">ArrayBuffer !== </span><span class="s2">'undefined' </span><span class="s1">&amp;&amp;</span>
+      <span class="s3">typeof </span><span class="s1">Uint8Array !== </span><span class="s2">'undefined' </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">value </span><span class="s3">instanceof </span><span class="s1">ArrayBuffer</span>
+    <span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">`ArrayBuffer {${String(Array.from(</span><span class="s3">new </span><span class="s1">Uint8Array(value)))}}`;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">value;</span>
+  <span class="s1">},</span>
+
+  <span class="s0">// Unpatch RCTWebSocketModule methods and remove the callbacks.</span>
+  <span class="s1">disableInterception() {</span>
+    <span class="s3">if </span><span class="s1">(!isInterceptorEnabled) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">isInterceptorEnabled = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s1">NativeWebSocketModule.send = originalRCTWebSocketSend;</span>
+    <span class="s1">NativeWebSocketModule.sendBinary = originalRCTWebSocketSendBinary;</span>
+    <span class="s1">NativeWebSocketModule.close = originalRCTWebSocketClose;</span>
+    <span class="s1">NativeWebSocketModule.connect = originalRCTWebSocketConnect;</span>
+
+    <span class="s1">connectCallback = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">closeCallback = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">sendCallback = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">onOpenCallback = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">onMessageCallback = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">onCloseCallback = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s1">onErrorCallback = </span><span class="s3">null</span><span class="s1">;</span>
+
+    <span class="s1">WebSocketInterceptor._unregisterEvents();</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+
+<span class="s1">module.exports = WebSocketInterceptor;</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,209 @@
+<html>
+<head>
+<title>FileIoHandler.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+FileIoHandler.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.packagerconnection</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.os.Handler</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.os.Looper</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.util.Base64</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.io.FileInputStream</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.io.FileNotFoundException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.io.IOException</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.HashMap</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Iterator</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Map</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">org.json.JSONObject</span><span class="s2">;</span>
+
+<span class="s2">public class </span><span class="s1">FileIoHandler </span><span class="s2">implements </span><span class="s1">Runnable {</span>
+  <span class="s2">private static final </span><span class="s1">String TAG = JSPackagerClient.</span><span class="s2">class</span><span class="s1">.getSimpleName()</span><span class="s2">;</span>
+  <span class="s2">private static final long </span><span class="s1">FILE_TTL = </span><span class="s3">30 </span><span class="s1">* </span><span class="s3">1000</span><span class="s2">;</span>
+
+  <span class="s2">private static class </span><span class="s1">TtlFileInputStream {</span>
+    <span class="s2">private final </span><span class="s1">FileInputStream mStream</span><span class="s2">;</span>
+    <span class="s2">private long </span><span class="s1">mTtl</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">TtlFileInputStream(String path) </span><span class="s2">throws </span><span class="s1">FileNotFoundException {</span>
+      <span class="s1">mStream = </span><span class="s2">new </span><span class="s1">FileInputStream(path)</span><span class="s2">;</span>
+      <span class="s1">mTtl = System.currentTimeMillis() + FILE_TTL</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">private void </span><span class="s1">extendTtl() {</span>
+      <span class="s1">mTtl = System.currentTimeMillis() + FILE_TTL</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public boolean </span><span class="s1">expiredTtl() {</span>
+      <span class="s2">return </span><span class="s1">System.currentTimeMillis() &gt;= mTtl</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public </span><span class="s1">String read(</span><span class="s2">int </span><span class="s1">size) </span><span class="s2">throws </span><span class="s1">IOException {</span>
+      <span class="s1">extendTtl()</span><span class="s2">;</span>
+      <span class="s2">byte</span><span class="s1">[] buffer = </span><span class="s2">new byte</span><span class="s1">[size]</span><span class="s2">;</span>
+      <span class="s2">int </span><span class="s1">bytesRead = mStream.read(buffer)</span><span class="s2">;</span>
+      <span class="s2">return </span><span class="s1">Base64.encodeToString(buffer</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">bytesRead</span><span class="s2">, </span><span class="s1">Base64.DEFAULT)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public void </span><span class="s1">close() </span><span class="s2">throws </span><span class="s1">IOException {</span>
+      <span class="s1">mStream.close()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s2">;</span>
+
+  <span class="s2">private int </span><span class="s1">mNextHandle</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Handler mHandler</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Map&lt;Integer</span><span class="s2">, </span><span class="s1">TtlFileInputStream&gt; mOpenFiles</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Map&lt;String</span><span class="s2">, </span><span class="s1">RequestHandler&gt; mRequestHandlers</span><span class="s2">;</span>
+
+  <span class="s2">public </span><span class="s1">FileIoHandler() {</span>
+    <span class="s1">mNextHandle = </span><span class="s3">1</span><span class="s2">;</span>
+    <span class="s1">mHandler = </span><span class="s2">new </span><span class="s1">Handler(Looper.getMainLooper())</span><span class="s2">;</span>
+    <span class="s1">mOpenFiles = </span><span class="s2">new </span><span class="s1">HashMap&lt;&gt;()</span><span class="s2">;</span>
+    <span class="s1">mRequestHandlers = </span><span class="s2">new </span><span class="s1">HashMap&lt;&gt;()</span><span class="s2">;</span>
+    <span class="s1">mRequestHandlers.put(</span>
+        <span class="s4">&quot;fopen&quot;</span><span class="s2">,</span>
+        <span class="s2">new </span><span class="s1">RequestOnlyHandler() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">onRequest(@Nullable Object params</span><span class="s2">, </span><span class="s1">Responder responder) {</span>
+            <span class="s2">synchronized </span><span class="s1">(mOpenFiles) {</span>
+              <span class="s2">try </span><span class="s1">{</span>
+                <span class="s1">JSONObject paramsObj = (JSONObject) params</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(paramsObj == </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span>
+                      <span class="s4">&quot;params must be an object { mode: string, filename: string }&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s1">String mode = paramsObj.optString(</span><span class="s4">&quot;mode&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(mode == </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;missing params.mode&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s1">String filename = paramsObj.optString(</span><span class="s4">&quot;filename&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(filename == </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;missing params.filename&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s2">if </span><span class="s1">(!mode.equals(</span><span class="s4">&quot;r&quot;</span><span class="s1">)) {</span>
+                  <span class="s2">throw new </span><span class="s1">IllegalArgumentException(</span><span class="s4">&quot;unsupported mode: &quot; </span><span class="s1">+ mode)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+
+                <span class="s1">responder.respond(addOpenFile(filename))</span><span class="s2">;</span>
+              <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+                <span class="s1">responder.error(e.toString())</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+    <span class="s1">mRequestHandlers.put(</span>
+        <span class="s4">&quot;fclose&quot;</span><span class="s2">,</span>
+        <span class="s2">new </span><span class="s1">RequestOnlyHandler() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">onRequest(@Nullable Object params</span><span class="s2">, </span><span class="s1">Responder responder) {</span>
+            <span class="s2">synchronized </span><span class="s1">(mOpenFiles) {</span>
+              <span class="s2">try </span><span class="s1">{</span>
+                <span class="s2">if </span><span class="s1">(!(params </span><span class="s2">instanceof </span><span class="s1">Number)) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;params must be a file handle&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s1">TtlFileInputStream stream = mOpenFiles.get((</span><span class="s2">int</span><span class="s1">) params)</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(stream == </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;invalid file handle, it might have timed out&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+
+                <span class="s1">mOpenFiles.remove((</span><span class="s2">int</span><span class="s1">) params)</span><span class="s2">;</span>
+                <span class="s1">stream.close()</span><span class="s2">;</span>
+                <span class="s1">responder.respond(</span><span class="s4">&quot;&quot;</span><span class="s1">)</span><span class="s2">;</span>
+              <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+                <span class="s1">responder.error(e.toString())</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+    <span class="s1">mRequestHandlers.put(</span>
+        <span class="s4">&quot;fread&quot;</span><span class="s2">,</span>
+        <span class="s2">new </span><span class="s1">RequestOnlyHandler() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">onRequest(@Nullable Object params</span><span class="s2">, </span><span class="s1">Responder responder) {</span>
+            <span class="s2">synchronized </span><span class="s1">(mOpenFiles) {</span>
+              <span class="s2">try </span><span class="s1">{</span>
+                <span class="s1">JSONObject paramsObj = (JSONObject) params</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(paramsObj == </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;params must be an object { file: handle, size: number }&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s2">int </span><span class="s1">file = paramsObj.optInt(</span><span class="s4">&quot;file&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(file == </span><span class="s3">0</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;invalid or missing file handle&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s2">int </span><span class="s1">size = paramsObj.optInt(</span><span class="s4">&quot;size&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(size == </span><span class="s3">0</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;invalid or missing read size&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+                <span class="s1">TtlFileInputStream stream = mOpenFiles.get(file)</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(stream == </span><span class="s2">null</span><span class="s1">) {</span>
+                  <span class="s2">throw new </span><span class="s1">Exception(</span><span class="s4">&quot;invalid file handle, it might have timed out&quot;</span><span class="s1">)</span><span class="s2">;</span>
+                <span class="s1">}</span>
+
+                <span class="s1">responder.respond(stream.read(size))</span><span class="s2">;</span>
+              <span class="s1">} </span><span class="s2">catch </span><span class="s1">(Exception e) {</span>
+                <span class="s1">responder.error(e.toString())</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">Map&lt;String</span><span class="s2">, </span><span class="s1">RequestHandler&gt; handlers() {</span>
+    <span class="s2">return </span><span class="s1">mRequestHandlers</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private int </span><span class="s1">addOpenFile(String filename) </span><span class="s2">throws </span><span class="s1">FileNotFoundException {</span>
+    <span class="s2">int </span><span class="s1">handle = mNextHandle++</span><span class="s2">;</span>
+    <span class="s1">mOpenFiles.put(handle</span><span class="s2">, new </span><span class="s1">TtlFileInputStream(filename))</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mOpenFiles.size() == </span><span class="s3">1</span><span class="s1">) {</span>
+      <span class="s1">mHandler.postDelayed(FileIoHandler.</span><span class="s2">this, </span><span class="s1">FILE_TTL)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">handle</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">run() {</span>
+    <span class="s0">// clean up files that are past their expiry date</span>
+    <span class="s2">synchronized </span><span class="s1">(mOpenFiles) {</span>
+      <span class="s1">Iterator&lt;TtlFileInputStream&gt; i = mOpenFiles.values().iterator()</span><span class="s2">;</span>
+      <span class="s2">while </span><span class="s1">(i.hasNext()) {</span>
+        <span class="s1">TtlFileInputStream stream = i.next()</span><span class="s2">;</span>
+        <span class="s2">if </span><span class="s1">(stream.expiredTtl()) {</span>
+          <span class="s1">i.remove()</span><span class="s2">;</span>
+          <span class="s2">try </span><span class="s1">{</span>
+            <span class="s1">stream.close()</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">catch </span><span class="s1">(IOException e) {</span>
+            <span class="s1">FLog.e(TAG</span><span class="s2">, </span><span class="s4">&quot;closing expired file failed: &quot; </span><span class="s1">+ e.toString())</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(!mOpenFiles.isEmpty()) {</span>
+        <span class="s1">mHandler.postDelayed(</span><span class="s2">this, </span><span class="s1">FILE_TTL)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

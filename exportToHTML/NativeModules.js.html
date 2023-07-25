@@ -1,0 +1,231 @@
+<html>
+<head>
+<title>NativeModules.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+NativeModules.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @format 
+ * @flow strict 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">import type {ExtendedError} from </span><span class="s2">'../Core/ExtendedError'</span><span class="s1">;</span>
+
+<span class="s1">const BatchedBridge = require(</span><span class="s2">'./BatchedBridge'</span><span class="s1">);</span>
+<span class="s1">const invariant = require(</span><span class="s2">'invariant'</span><span class="s1">);</span>
+
+<span class="s1">export type ModuleConfig = [</span>
+  <span class="s1">string </span><span class="s0">/* name */</span><span class="s1">,</span>
+  <span class="s1">?{...} </span><span class="s0">/* constants */</span><span class="s1">,</span>
+  <span class="s1">?$ReadOnlyArray&lt;string&gt; </span><span class="s0">/* functions */</span><span class="s1">,</span>
+  <span class="s1">?$ReadOnlyArray&lt;number&gt; </span><span class="s0">/* promise method IDs */</span><span class="s1">,</span>
+  <span class="s1">?$ReadOnlyArray&lt;number&gt; </span><span class="s0">/* sync method IDs */</span><span class="s1">,</span>
+<span class="s1">];</span>
+
+<span class="s1">export type MethodType = </span><span class="s2">'async' </span><span class="s1">| </span><span class="s2">'promise' </span><span class="s1">| </span><span class="s2">'sync'</span><span class="s1">;</span>
+
+<span class="s3">function </span><span class="s1">genModule(</span>
+  <span class="s1">config: ?ModuleConfig,</span>
+  <span class="s1">moduleID: number,</span>
+<span class="s1">): ?{</span>
+  <span class="s1">name: string,</span>
+  <span class="s1">module?: {...},</span>
+  <span class="s1">...</span>
+<span class="s1">} {</span>
+  <span class="s3">if </span><span class="s1">(!config) {</span>
+    <span class="s3">return null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const [moduleName, constants, methods, promiseMethods, syncMethods] = config;</span>
+  <span class="s1">invariant(</span>
+    <span class="s1">!moduleName.startsWith(</span><span class="s2">'RCT'</span><span class="s1">) &amp;&amp; !moduleName.startsWith(</span><span class="s2">'RK'</span><span class="s1">),</span>
+    <span class="s2">&quot;Module name prefixes should've been stripped by the native side &quot; </span><span class="s1">+</span>
+      <span class="s2">&quot;but wasn't for &quot; </span><span class="s1">+</span>
+      <span class="s1">moduleName,</span>
+  <span class="s1">);</span>
+
+  <span class="s3">if </span><span class="s1">(!constants &amp;&amp; !methods) {</span>
+    <span class="s0">// Module contents will be filled in lazily later</span>
+    <span class="s3">return </span><span class="s1">{name: moduleName};</span>
+  <span class="s1">}</span>
+
+  <span class="s1">const module: {[string]: mixed} = {};</span>
+  <span class="s1">methods &amp;&amp;</span>
+    <span class="s1">methods.forEach((methodName, methodID) =&gt; {</span>
+      <span class="s1">const isPromise =</span>
+        <span class="s1">(promiseMethods &amp;&amp; arrayContains(promiseMethods, methodID)) || </span><span class="s3">false</span><span class="s1">;</span>
+      <span class="s1">const isSync =</span>
+        <span class="s1">(syncMethods &amp;&amp; arrayContains(syncMethods, methodID)) || </span><span class="s3">false</span><span class="s1">;</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">!isPromise || !isSync,</span>
+        <span class="s2">'Cannot have a method that is both async and a sync hook'</span><span class="s1">,</span>
+      <span class="s1">);</span>
+      <span class="s1">const methodType = isPromise ? </span><span class="s2">'promise' </span><span class="s1">: isSync ? </span><span class="s2">'sync' </span><span class="s1">: </span><span class="s2">'async'</span><span class="s1">;</span>
+      <span class="s1">module[methodName] = genMethod(moduleID, methodID, methodType);</span>
+    <span class="s1">});</span>
+
+  <span class="s1">Object.assign(module, constants);</span>
+
+  <span class="s3">if </span><span class="s1">(module.getConstants == </span><span class="s3">null</span><span class="s1">) {</span>
+    <span class="s1">module.getConstants = () =&gt; constants || Object.freeze({});</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s1">console.warn(</span>
+      <span class="s1">`Unable to define method </span><span class="s2">'getConstants()' </span><span class="s1">on NativeModule </span><span class="s2">'${moduleName}'</span><span class="s1">. NativeModule </span><span class="s2">'${moduleName}' </span><span class="s1">already has a constant or method called </span><span class="s2">'getConstants'</span><span class="s1">. Please remove it.`,</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">if </span><span class="s1">(__DEV__) {</span>
+    <span class="s1">BatchedBridge.createDebugLookup(moduleID, moduleName, methods);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">{name: moduleName, module};</span>
+<span class="s1">}</span>
+
+<span class="s0">// export this method as a global so we can call it from native</span>
+<span class="s1">global.__fbGenNativeModule = genModule;</span>
+
+<span class="s3">function </span><span class="s1">loadModule(name: string, moduleID: number): ?{...} {</span>
+  <span class="s1">invariant(</span>
+    <span class="s1">global.nativeRequireModuleConfig,</span>
+    <span class="s2">&quot;Can't lazily create module without nativeRequireModuleConfig&quot;</span><span class="s1">,</span>
+  <span class="s1">);</span>
+  <span class="s1">const config = global.nativeRequireModuleConfig(name);</span>
+  <span class="s1">const info = genModule(config, moduleID);</span>
+  <span class="s3">return </span><span class="s1">info &amp;&amp; info.module;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">genMethod(moduleID: number, methodID: number, type: MethodType) {</span>
+  <span class="s1">let fn = </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s3">if </span><span class="s1">(type === </span><span class="s2">'promise'</span><span class="s1">) {</span>
+    <span class="s1">fn = </span><span class="s3">function </span><span class="s1">promiseMethodWrapper(...args: Array&lt;mixed&gt;) {</span>
+      <span class="s0">// In case we reject, capture a useful stack trace here.</span>
+      <span class="s0">/* $FlowFixMe[class-object-subtyping] added when improving typing for 
+       * this parameters */</span>
+      <span class="s1">const enqueueingFrameError: ExtendedError = </span><span class="s3">new </span><span class="s1">Error();</span>
+      <span class="s3">return new </span><span class="s1">Promise((resolve, reject) =&gt; {</span>
+        <span class="s1">BatchedBridge.enqueueNativeCall(</span>
+          <span class="s1">moduleID,</span>
+          <span class="s1">methodID,</span>
+          <span class="s1">args,</span>
+          <span class="s1">data =&gt; resolve(data),</span>
+          <span class="s1">errorData =&gt;</span>
+            <span class="s1">reject(</span>
+              <span class="s1">updateErrorWithErrorData(</span>
+                <span class="s1">(errorData: $FlowFixMe),</span>
+                <span class="s1">enqueueingFrameError,</span>
+              <span class="s1">),</span>
+            <span class="s1">),</span>
+        <span class="s1">);</span>
+      <span class="s1">});</span>
+    <span class="s1">};</span>
+  <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+    <span class="s1">fn = </span><span class="s3">function </span><span class="s1">nonPromiseMethodWrapper(...args: Array&lt;mixed&gt;) {</span>
+      <span class="s1">const lastArg = args.length &gt; </span><span class="s4">0 </span><span class="s1">? args[args.length - </span><span class="s4">1</span><span class="s1">] : </span><span class="s3">null</span><span class="s1">;</span>
+      <span class="s1">const secondLastArg = args.length &gt; </span><span class="s4">1 </span><span class="s1">? args[args.length - </span><span class="s4">2</span><span class="s1">] : </span><span class="s3">null</span><span class="s1">;</span>
+      <span class="s1">const hasSuccessCallback = </span><span class="s3">typeof </span><span class="s1">lastArg === </span><span class="s2">'function'</span><span class="s1">;</span>
+      <span class="s1">const hasErrorCallback = </span><span class="s3">typeof </span><span class="s1">secondLastArg === </span><span class="s2">'function'</span><span class="s1">;</span>
+      <span class="s1">hasErrorCallback &amp;&amp;</span>
+        <span class="s1">invariant(</span>
+          <span class="s1">hasSuccessCallback,</span>
+          <span class="s2">'Cannot have a non-function arg after a function arg.'</span><span class="s1">,</span>
+        <span class="s1">);</span>
+      <span class="s0">// $FlowFixMe[incompatible-type]</span>
+      <span class="s1">const onSuccess: ?(mixed) =&gt; </span><span class="s3">void </span><span class="s1">= hasSuccessCallback ? lastArg : </span><span class="s3">null</span><span class="s1">;</span>
+      <span class="s0">// $FlowFixMe[incompatible-type]</span>
+      <span class="s1">const onFail: ?(mixed) =&gt; </span><span class="s3">void </span><span class="s1">= hasErrorCallback ? secondLastArg : </span><span class="s3">null</span><span class="s1">;</span>
+      <span class="s0">// $FlowFixMe[unsafe-addition]</span>
+      <span class="s1">const callbackCount = hasSuccessCallback + hasErrorCallback;</span>
+      <span class="s1">const newArgs = args.slice(</span><span class="s4">0</span><span class="s1">, args.length - callbackCount);</span>
+      <span class="s3">if </span><span class="s1">(type === </span><span class="s2">'sync'</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">BatchedBridge.callNativeSyncHook(</span>
+          <span class="s1">moduleID,</span>
+          <span class="s1">methodID,</span>
+          <span class="s1">newArgs,</span>
+          <span class="s1">onFail,</span>
+          <span class="s1">onSuccess,</span>
+        <span class="s1">);</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">BatchedBridge.enqueueNativeCall(</span>
+          <span class="s1">moduleID,</span>
+          <span class="s1">methodID,</span>
+          <span class="s1">newArgs,</span>
+          <span class="s1">onFail,</span>
+          <span class="s1">onSuccess,</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+  <span class="s0">// $FlowFixMe[prop-missing]</span>
+  <span class="s1">fn.type = type;</span>
+  <span class="s3">return </span><span class="s1">fn;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">arrayContains&lt;T&gt;(array: $ReadOnlyArray&lt;T&gt;, value: T): boolean {</span>
+  <span class="s3">return </span><span class="s1">array.indexOf(value) !== -</span><span class="s4">1</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">updateErrorWithErrorData(</span>
+  <span class="s1">errorData: {message: string, ...},</span>
+  <span class="s1">error: ExtendedError,</span>
+<span class="s1">): ExtendedError {</span>
+  <span class="s0">/* $FlowFixMe[class-object-subtyping] added when improving typing for this 
+   * parameters */</span>
+  <span class="s3">return </span><span class="s1">Object.assign(error, errorData || {});</span>
+<span class="s1">}</span>
+
+<span class="s1">let NativeModules: {[moduleName: string]: $FlowFixMe, ...} = {};</span>
+<span class="s3">if </span><span class="s1">(global.nativeModuleProxy) {</span>
+  <span class="s1">NativeModules = global.nativeModuleProxy;</span>
+<span class="s1">} </span><span class="s3">else if </span><span class="s1">(!global.nativeExtensions) {</span>
+  <span class="s1">const bridgeConfig = global.__fbBatchedBridgeConfig;</span>
+  <span class="s1">invariant(</span>
+    <span class="s1">bridgeConfig,</span>
+    <span class="s2">'__fbBatchedBridgeConfig is not set, cannot invoke native modules'</span><span class="s1">,</span>
+  <span class="s1">);</span>
+
+  <span class="s1">const defineLazyObjectProperty = require(</span><span class="s2">'../Utilities/defineLazyObjectProperty'</span><span class="s1">);</span>
+  <span class="s1">(bridgeConfig.remoteModuleConfig || []).forEach(</span>
+    <span class="s1">(config: ModuleConfig, moduleID: number) =&gt; {</span>
+      <span class="s0">// Initially this config will only contain the module name when running in JSC. The actual</span>
+      <span class="s0">// configuration of the module will be lazily loaded.</span>
+      <span class="s1">const info = genModule(config, moduleID);</span>
+      <span class="s3">if </span><span class="s1">(!info) {</span>
+        <span class="s3">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s3">if </span><span class="s1">(info.module) {</span>
+        <span class="s1">NativeModules[info.name] = info.module;</span>
+      <span class="s1">}</span>
+      <span class="s0">// If there's no module config, define a lazy getter</span>
+      <span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">defineLazyObjectProperty(NativeModules, info.name, {</span>
+          <span class="s1">get: () =&gt; loadModule(info.name, moduleID),</span>
+        <span class="s1">});</span>
+      <span class="s1">}</span>
+    <span class="s1">},</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = NativeModules;</span>
+</pre>
+</body>
+</html>

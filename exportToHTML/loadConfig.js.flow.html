@@ -1,0 +1,359 @@
+<html>
+<head>
+<title>loadConfig.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+loadConfig.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {ConfigT, InputConfigT, YargArguments} from './configTypes.flow';</span>
+
+<span class="s0">const getDefaultConfig = require('./defaults');</span>
+<span class="s0">const validConfig = require('./defaults/validConfig');</span>
+<span class="s0">const cosmiconfig = require('cosmiconfig');</span>
+<span class="s0">const fs = require('fs');</span>
+<span class="s0">const {validate} = require('jest-validate');</span>
+<span class="s0">const MetroCache = require('metro-cache');</span>
+<span class="s0">const path = require('path');</span>
+<span class="s0">const {dirname, join} = require('path');</span>
+
+<span class="s0">type CosmiConfigResult = {</span>
+  <span class="s0">filepath: string,</span>
+  <span class="s0">isEmpty: boolean,</span>
+  <span class="s0">config: (ConfigT =&gt; Promise&lt;ConfigT&gt;) | (ConfigT =&gt; ConfigT) | InputConfigT,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Takes the last argument if multiple of the same argument are given</span>
+ <span class="s0">*/</span>
+<span class="s0">function overrideArgument&lt;T&gt;(arg: Array&lt;T&gt; | T): T {</span>
+  <span class="s0">if (arg == null) {</span>
+    <span class="s0">return arg;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (Array.isArray(arg)) {</span>
+    <span class="s0">// $FlowFixMe[incompatible-return]</span>
+    <span class="s0">return arg[arg.length - 1];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return arg;</span>
+<span class="s0">}</span>
+
+<span class="s0">const explorer = cosmiconfig('metro', {</span>
+  <span class="s0">searchPlaces: ['metro.config.js', 'metro.config.json', 'package.json'],</span>
+
+  <span class="s0">loaders: {</span>
+    <span class="s0">'.json': cosmiconfig.loadJson,</span>
+    <span class="s0">'.yaml': cosmiconfig.loadYaml,</span>
+    <span class="s0">'.yml': cosmiconfig.loadYaml,</span>
+    <span class="s0">'.js': cosmiconfig.loadJs,</span>
+    <span class="s0">'.es6': cosmiconfig.loadJs,</span>
+    <span class="s0">noExt: cosmiconfig.loadYaml,</span>
+  <span class="s0">},</span>
+<span class="s0">});</span>
+
+<span class="s0">const isFile = (filePath: string) =&gt;</span>
+  <span class="s0">fs.existsSync(filePath) &amp;&amp; !fs.lstatSync(filePath).isDirectory();</span>
+
+<span class="s0">const resolve = (filePath: string) =&gt; {</span>
+  <span class="s0">// Attempt to resolve the path with the node resolution algorithm but fall back to resolving</span>
+  <span class="s0">// the file relative to the current working directory if the input is not an absolute path.</span>
+  <span class="s0">try {</span>
+    <span class="s0">return require.resolve(filePath);</span>
+  <span class="s0">} catch (error) {</span>
+    <span class="s0">if (path.isAbsolute(filePath) || error.code !== 'MODULE_NOT_FOUND') {</span>
+      <span class="s0">throw error;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const possiblePath = path.resolve(process.cwd(), filePath);</span>
+  <span class="s0">return isFile(possiblePath) ? possiblePath : filePath;</span>
+<span class="s0">};</span>
+
+<span class="s0">async function resolveConfig(</span>
+  <span class="s0">filePath?: string,</span>
+  <span class="s0">cwd?: string,</span>
+<span class="s0">): Promise&lt;CosmiConfigResult&gt; {</span>
+  <span class="s0">if (filePath) {</span>
+    <span class="s0">return explorer.load(resolve(filePath));</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const result = await explorer.search(cwd);</span>
+  <span class="s0">if (result == null) {</span>
+    <span class="s0">// No config file found, return a default</span>
+    <span class="s0">return {</span>
+      <span class="s0">isEmpty: true,</span>
+      <span class="s0">filepath: join(cwd || process.cwd(), 'metro.config.stub.js'),</span>
+      <span class="s0">config: {},</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return result;</span>
+<span class="s0">}</span>
+
+<span class="s0">function mergeConfig&lt;T: $ReadOnly&lt;InputConfigT&gt;&gt;(</span>
+  <span class="s0">defaultConfig: T,</span>
+  <span class="s0">...configs: Array&lt;InputConfigT&gt;</span>
+<span class="s0">): T {</span>
+  <span class="s0">// If the file is a plain object we merge the file with the default config,</span>
+  <span class="s0">// for the function we don't do this since that's the responsibility of the user</span>
+  <span class="s0">return configs.reduce(</span>
+    <span class="s0">(totalConfig, nextConfig) =&gt; ({</span>
+      <span class="s0">...totalConfig,</span>
+      <span class="s0">...nextConfig,</span>
+
+      <span class="s0">cacheStores:</span>
+        <span class="s0">nextConfig.cacheStores != null</span>
+          <span class="s0">? typeof nextConfig.cacheStores === 'function'</span>
+            <span class="s0">? nextConfig.cacheStores(MetroCache)</span>
+            <span class="s0">: nextConfig.cacheStores</span>
+          <span class="s0">: totalConfig.cacheStores,</span>
+
+      <span class="s0">resolver: {</span>
+        <span class="s0">...totalConfig.resolver,</span>
+        <span class="s0">// $FlowFixMe[exponential-spread]</span>
+        <span class="s0">...(nextConfig.resolver || {}),</span>
+        <span class="s0">dependencyExtractor:</span>
+          <span class="s0">nextConfig.resolver &amp;&amp; nextConfig.resolver.dependencyExtractor != null</span>
+            <span class="s0">? resolve(nextConfig.resolver.dependencyExtractor)</span>
+            <span class="s0">: // $FlowFixMe[incompatible-use]</span>
+              <span class="s0">totalConfig.resolver.dependencyExtractor,</span>
+        <span class="s0">hasteImplModulePath:</span>
+          <span class="s0">nextConfig.resolver &amp;&amp; nextConfig.resolver.hasteImplModulePath != null</span>
+            <span class="s0">? resolve(nextConfig.resolver.hasteImplModulePath)</span>
+            <span class="s0">: // $FlowFixMe[incompatible-use]</span>
+              <span class="s0">totalConfig.resolver.hasteImplModulePath,</span>
+      <span class="s0">},</span>
+      <span class="s0">serializer: {</span>
+        <span class="s0">...totalConfig.serializer,</span>
+        <span class="s0">// $FlowFixMe[exponential-spread]</span>
+        <span class="s0">...(nextConfig.serializer || {}),</span>
+      <span class="s0">},</span>
+      <span class="s0">transformer: {</span>
+        <span class="s0">...totalConfig.transformer,</span>
+        <span class="s0">// $FlowFixMe[exponential-spread]</span>
+        <span class="s0">...(nextConfig.transformer || {}),</span>
+        <span class="s0">babelTransformerPath:</span>
+          <span class="s0">nextConfig.transformer &amp;&amp;</span>
+          <span class="s0">nextConfig.transformer.babelTransformerPath != null</span>
+            <span class="s0">? resolve(nextConfig.transformer.babelTransformerPath)</span>
+            <span class="s0">: // $FlowFixMe[incompatible-use]</span>
+              <span class="s0">totalConfig.transformer.babelTransformerPath,</span>
+      <span class="s0">},</span>
+      <span class="s0">server: {</span>
+        <span class="s0">...totalConfig.server,</span>
+        <span class="s0">// $FlowFixMe[exponential-spread]</span>
+        <span class="s0">...(nextConfig.server || {}),</span>
+      <span class="s0">},</span>
+      <span class="s0">symbolicator: {</span>
+        <span class="s0">...totalConfig.symbolicator,</span>
+        <span class="s0">// $FlowFixMe[exponential-spread]</span>
+        <span class="s0">...(nextConfig.symbolicator || {}),</span>
+      <span class="s0">},</span>
+      <span class="s0">watcher: {</span>
+        <span class="s0">...totalConfig.watcher,</span>
+        <span class="s0">// $FlowFixMe[exponential-spread]</span>
+        <span class="s0">...nextConfig.watcher,</span>
+        <span class="s0">watchman: {</span>
+          <span class="s0">// $FlowFixMe[exponential-spread]</span>
+          <span class="s0">...totalConfig.watcher?.watchman,</span>
+          <span class="s0">...nextConfig.watcher?.watchman,</span>
+        <span class="s0">},</span>
+        <span class="s0">healthCheck: {</span>
+          <span class="s0">// $FlowFixMe[exponential-spread]</span>
+          <span class="s0">...totalConfig.watcher?.healthCheck,</span>
+          <span class="s0">// $FlowFixMe: Spreading shapes creates an explosion of union types</span>
+          <span class="s0">...nextConfig.watcher?.healthCheck,</span>
+        <span class="s0">},</span>
+      <span class="s0">},</span>
+    <span class="s0">}),</span>
+    <span class="s0">defaultConfig,</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">async function loadMetroConfigFromDisk(</span>
+  <span class="s0">path?: string,</span>
+  <span class="s0">cwd?: string,</span>
+  <span class="s0">defaultConfigOverrides: InputConfigT,</span>
+<span class="s0">): Promise&lt;ConfigT&gt; {</span>
+  <span class="s0">const resolvedConfigResults: CosmiConfigResult = await resolveConfig(</span>
+    <span class="s0">path,</span>
+    <span class="s0">cwd,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const {config: configModule, filepath} = resolvedConfigResults;</span>
+  <span class="s0">const rootPath = dirname(filepath);</span>
+
+  <span class="s0">const defaults = await getDefaultConfig(rootPath);</span>
+  <span class="s0">// $FlowFixMe[incompatible-variance]</span>
+  <span class="s0">// $FlowFixMe[incompatible-call]</span>
+  <span class="s0">const defaultConfig: ConfigT = mergeConfig(defaults, defaultConfigOverrides);</span>
+
+  <span class="s0">if (typeof configModule === 'function') {</span>
+    <span class="s0">// Get a default configuration based on what we know, which we in turn can pass</span>
+    <span class="s0">// to the function.</span>
+
+    <span class="s0">const resultedConfig = await configModule(defaultConfig);</span>
+    <span class="s0">// $FlowFixMe[incompatible-call]</span>
+    <span class="s0">// $FlowFixMe[incompatible-variance]</span>
+    <span class="s0">return mergeConfig(defaultConfig, resultedConfig);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// $FlowFixMe[incompatible-variance]</span>
+  <span class="s0">// $FlowFixMe[incompatible-call]</span>
+  <span class="s0">return mergeConfig(defaultConfig, configModule);</span>
+<span class="s0">}</span>
+
+<span class="s0">function overrideConfigWithArguments(</span>
+  <span class="s0">config: ConfigT,</span>
+  <span class="s0">argv: YargArguments,</span>
+<span class="s0">): ConfigT {</span>
+  <span class="s0">// We override some config arguments here with the argv</span>
+
+  <span class="s0">const output: InputConfigT = {</span>
+    <span class="s0">resolver: {},</span>
+    <span class="s0">serializer: {},</span>
+    <span class="s0">server: {},</span>
+    <span class="s0">transformer: {},</span>
+  <span class="s0">};</span>
+
+  <span class="s0">if (argv.port != null) {</span>
+    <span class="s0">// $FlowFixMe[incompatible-use]</span>
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s0">output.server.port = Number(argv.port);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.runInspectorProxy != null) {</span>
+    <span class="s0">// $FlowFixMe[incompatible-use]</span>
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s0">output.server.runInspectorProxy = Boolean(argv.runInspectorProxy);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.projectRoot != null) {</span>
+    <span class="s0">output.projectRoot = argv.projectRoot;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.watchFolders != null) {</span>
+    <span class="s0">output.watchFolders = argv.watchFolders;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.assetExts != null) {</span>
+    <span class="s0">// $FlowFixMe[incompatible-use]</span>
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s0">output.resolver.assetExts = argv.assetExts;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.sourceExts != null) {</span>
+    <span class="s0">// $FlowFixMe[incompatible-use]</span>
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s0">output.resolver.sourceExts = argv.sourceExts;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.platforms != null) {</span>
+    <span class="s0">// $FlowFixMe[incompatible-use]</span>
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s0">output.resolver.platforms = argv.platforms;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv['max-workers'] != null || argv.maxWorkers != null) {</span>
+    <span class="s0">output.maxWorkers = Number(argv['max-workers'] || argv.maxWorkers);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.transformer != null) {</span>
+    <span class="s0">// $FlowFixMe[incompatible-use]</span>
+    <span class="s0">// $FlowFixMe[cannot-write]</span>
+    <span class="s0">output.transformer.babelTransformerPath = argv.transformer;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv['reset-cache'] != null) {</span>
+    <span class="s0">output.resetCache = argv['reset-cache'];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.resetCache != null) {</span>
+    <span class="s0">output.resetCache = argv.resetCache;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (argv.verbose === false) {</span>
+    <span class="s0">output.reporter = {update: () =&gt; {}};</span>
+    <span class="s0">// TODO: Ask if this is the way to go</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// $FlowFixMe[incompatible-variance]</span>
+  <span class="s0">// $FlowFixMe[incompatible-call]</span>
+  <span class="s0">return mergeConfig(config, output);</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Load the metro configuration from disk</span>
+ <span class="s0">* @param  {object} argv                    Arguments coming from the CLI, can be empty</span>
+ <span class="s0">* @param  {object} defaultConfigOverrides  A configuration that can override the default config</span>
+ <span class="s0">* @return {object}                         Configuration returned</span>
+ <span class="s0">*/</span>
+<span class="s0">async function loadConfig(</span>
+  <span class="s0">argvInput?: YargArguments = {},</span>
+  <span class="s0">defaultConfigOverrides?: InputConfigT = {},</span>
+<span class="s0">): Promise&lt;ConfigT&gt; {</span>
+  <span class="s0">const argv = {...argvInput, config: overrideArgument(argvInput.config)};</span>
+
+  <span class="s0">const configuration = await loadMetroConfigFromDisk(</span>
+    <span class="s0">argv.config,</span>
+    <span class="s0">argv.cwd,</span>
+    <span class="s0">defaultConfigOverrides,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">validate(configuration, {</span>
+    <span class="s0">exampleConfig: await validConfig(),</span>
+    <span class="s0">recursiveDenylist: ['reporter', 'resolver', 'transformer'],</span>
+    <span class="s0">deprecatedConfig: {</span>
+      <span class="s0">blacklistRE: () =&gt;</span>
+        <span class="s0">`Warning: Metro config option \`blacklistRE\` is deprecated.</span>
+         <span class="s0">Please use \`blockList\` instead.`,</span>
+    <span class="s0">},</span>
+  <span class="s0">});</span>
+
+  <span class="s0">// Override the configuration with cli parameters</span>
+  <span class="s0">const configWithArgs = overrideConfigWithArguments(configuration, argv);</span>
+
+  <span class="s0">const overriddenConfig: {[string]: mixed} = {};</span>
+
+  <span class="s0">overriddenConfig.watchFolders = [</span>
+    <span class="s0">configWithArgs.projectRoot,</span>
+    <span class="s0">...configWithArgs.watchFolders,</span>
+  <span class="s0">];</span>
+
+  <span class="s0">// Set the watchfolders to include the projectRoot, as Metro assumes that is</span>
+  <span class="s0">// the case</span>
+  <span class="s0">// $FlowFixMe[incompatible-variance]</span>
+  <span class="s0">// $FlowFixMe[incompatible-indexer]</span>
+  <span class="s0">// $FlowFixMe[incompatible-call]</span>
+  <span class="s0">return mergeConfig(configWithArgs, overriddenConfig);</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">loadConfig,</span>
+  <span class="s0">resolveConfig,</span>
+  <span class="s0">mergeConfig,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

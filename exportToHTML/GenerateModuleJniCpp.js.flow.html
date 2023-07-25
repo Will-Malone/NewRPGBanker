@@ -1,0 +1,540 @@
+<html>
+<head>
+<title>GenerateModuleJniCpp.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+GenerateModuleJniCpp.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">Nullable,</span>
+  <span class="s0">NamedShape,</span>
+  <span class="s0">SchemaType,</span>
+  <span class="s0">NativeModulePropertyShape,</span>
+  <span class="s0">NativeModuleReturnTypeAnnotation,</span>
+  <span class="s0">NativeModuleParamTypeAnnotation,</span>
+  <span class="s0">NativeModuleFunctionTypeAnnotation,</span>
+<span class="s0">} from '../../CodegenSchema';</span>
+
+<span class="s0">import type {AliasResolver} from './Utils';</span>
+<span class="s0">const {createAliasResolver, getModules} = require('./Utils');</span>
+<span class="s0">const {unwrapNullable} = require('../../parsers/parsers-commons');</span>
+
+<span class="s0">type FilesOutput = Map&lt;string, string&gt;;</span>
+
+<span class="s0">type JSReturnType =</span>
+  <span class="s0">| 'VoidKind'</span>
+  <span class="s0">| 'StringKind'</span>
+  <span class="s0">| 'BooleanKind'</span>
+  <span class="s0">| 'NumberKind'</span>
+  <span class="s0">| 'PromiseKind'</span>
+  <span class="s0">| 'ObjectKind'</span>
+  <span class="s0">| 'ArrayKind';</span>
+
+<span class="s0">const HostFunctionTemplate = ({</span>
+  <span class="s0">hasteModuleName,</span>
+  <span class="s0">propertyName,</span>
+  <span class="s0">jniSignature,</span>
+  <span class="s0">jsReturnType,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">propertyName: string,</span>
+  <span class="s0">jniSignature: string,</span>
+  <span class="s0">jsReturnType: JSReturnType,</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `static facebook::jsi::Value __hostFunction_${hasteModuleName}SpecJSI_${propertyName}(facebook::jsi::Runtime&amp; rt, TurboModule &amp;turboModule, const facebook::jsi::Value* args, size_t count) {</span>
+  <span class="s0">static jmethodID cachedMethodId = nullptr;</span>
+  <span class="s0">return static_cast&lt;JavaTurboModule &amp;&gt;(turboModule).invokeJavaMethod(rt, ${jsReturnType}, &quot;${propertyName}&quot;, &quot;${jniSignature}&quot;, args, count, cachedMethodId);</span>
+<span class="s0">}`;</span>
+<span class="s0">};</span>
+
+<span class="s0">const ModuleClassConstructorTemplate = ({</span>
+  <span class="s0">hasteModuleName,</span>
+  <span class="s0">methods,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">methods: $ReadOnlyArray&lt;{</span>
+    <span class="s0">propertyName: string,</span>
+    <span class="s0">argCount: number,</span>
+  <span class="s0">}&gt;,</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `</span>
+<span class="s0">${hasteModuleName}SpecJSI::${hasteModuleName}SpecJSI(const JavaTurboModule::InitParams &amp;params)</span>
+  <span class="s0">: JavaTurboModule(params) {</span>
+<span class="s0">${methods</span>
+  <span class="s0">.map(({propertyName, argCount}) =&gt; {</span>
+    <span class="s0">return `  methodMap_[&quot;${propertyName}&quot;] = MethodMetadata {${argCount}, __hostFunction_${hasteModuleName}SpecJSI_${propertyName}};`;</span>
+  <span class="s0">})</span>
+  <span class="s0">.join('\n')}</span>
+<span class="s0">}`.trim();</span>
+<span class="s0">};</span>
+
+<span class="s0">const ModuleLookupTemplate = ({</span>
+  <span class="s0">moduleName,</span>
+  <span class="s0">hasteModuleName,</span>
+<span class="s0">}: $ReadOnly&lt;{moduleName: string, hasteModuleName: string}&gt;) =&gt; {</span>
+  <span class="s0">return `  if (moduleName == &quot;${moduleName}&quot;) {</span>
+    <span class="s0">return std::make_shared&lt;${hasteModuleName}SpecJSI&gt;(params);</span>
+  <span class="s0">}`;</span>
+<span class="s0">};</span>
+
+<span class="s0">const FileTemplate = ({</span>
+  <span class="s0">libraryName,</span>
+  <span class="s0">include,</span>
+  <span class="s0">modules,</span>
+  <span class="s0">moduleLookups,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">libraryName: string,</span>
+  <span class="s0">include: string,</span>
+  <span class="s0">modules: string,</span>
+  <span class="s0">moduleLookups: $ReadOnlyArray&lt;{</span>
+    <span class="s0">hasteModuleName: string,</span>
+    <span class="s0">moduleName: string,</span>
+  <span class="s0">}&gt;,</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `</span>
+<span class="s0">/**</span>
+ <span class="s0">* This code was generated by [react-native-codegen](https://www.npmjs.com/package/react-native-codegen).</span>
+ <span class="s0">*</span>
+ <span class="s0">* Do not edit this file as changes may cause incorrect behavior and will be lost</span>
+ <span class="s0">* once the code is regenerated.</span>
+ <span class="s0">*</span>
+ <span class="s0">* ${'@'}generated by codegen project: GenerateModuleJniCpp.js</span>
+ <span class="s0">*/</span>
+
+<span class="s0">#include ${include}</span>
+
+<span class="s0">namespace facebook {</span>
+<span class="s0">namespace react {</span>
+
+<span class="s0">${modules}</span>
+
+<span class="s0">std::shared_ptr&lt;TurboModule&gt; ${libraryName}_ModuleProvider(const std::string &amp;moduleName, const JavaTurboModule::InitParams &amp;params) {</span>
+<span class="s0">${moduleLookups.map(ModuleLookupTemplate).join('\n')}</span>
+  <span class="s0">return nullptr;</span>
+<span class="s0">}</span>
+
+<span class="s0">} // namespace react</span>
+<span class="s0">} // namespace facebook</span>
+<span class="s0">`;</span>
+<span class="s0">};</span>
+
+<span class="s0">function translateReturnTypeToKind(</span>
+  <span class="s0">nullableTypeAnnotation: Nullable&lt;NativeModuleReturnTypeAnnotation&gt;,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+<span class="s0">): JSReturnType {</span>
+  <span class="s0">const [typeAnnotation] = unwrapNullable&lt;NativeModuleReturnTypeAnnotation&gt;(</span>
+    <span class="s0">nullableTypeAnnotation,</span>
+  <span class="s0">);</span>
+  <span class="s0">let realTypeAnnotation = typeAnnotation;</span>
+  <span class="s0">if (realTypeAnnotation.type === 'TypeAliasTypeAnnotation') {</span>
+    <span class="s0">realTypeAnnotation = resolveAlias(realTypeAnnotation.name);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">switch (realTypeAnnotation.type) {</span>
+    <span class="s0">case 'ReservedTypeAnnotation':</span>
+      <span class="s0">switch (realTypeAnnotation.name) {</span>
+        <span class="s0">case 'RootTag':</span>
+          <span class="s0">return 'NumberKind';</span>
+        <span class="s0">default:</span>
+          <span class="s0">(realTypeAnnotation.name: empty);</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Invalid ReservedFunctionValueTypeName name, got ${realTypeAnnotation.name}`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'VoidTypeAnnotation':</span>
+      <span class="s0">return 'VoidKind';</span>
+    <span class="s0">case 'StringTypeAnnotation':</span>
+      <span class="s0">return 'StringKind';</span>
+    <span class="s0">case 'BooleanTypeAnnotation':</span>
+      <span class="s0">return 'BooleanKind';</span>
+    <span class="s0">case 'EnumDeclaration':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return 'NumberKind';</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return 'StringKind';</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unknown enum prop type for returning value, found: ${realTypeAnnotation.type}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'UnionTypeAnnotation':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return 'NumberKind';</span>
+        <span class="s0">case 'ObjectTypeAnnotation':</span>
+          <span class="s0">return 'ObjectKind';</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return 'StringKind';</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unsupported union member returning value, found: ${realTypeAnnotation.memberType}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'NumberTypeAnnotation':</span>
+      <span class="s0">return 'NumberKind';</span>
+    <span class="s0">case 'DoubleTypeAnnotation':</span>
+      <span class="s0">return 'NumberKind';</span>
+    <span class="s0">case 'FloatTypeAnnotation':</span>
+      <span class="s0">return 'NumberKind';</span>
+    <span class="s0">case 'Int32TypeAnnotation':</span>
+      <span class="s0">return 'NumberKind';</span>
+    <span class="s0">case 'PromiseTypeAnnotation':</span>
+      <span class="s0">return 'PromiseKind';</span>
+    <span class="s0">case 'GenericObjectTypeAnnotation':</span>
+      <span class="s0">return 'ObjectKind';</span>
+    <span class="s0">case 'ObjectTypeAnnotation':</span>
+      <span class="s0">return 'ObjectKind';</span>
+    <span class="s0">case 'ArrayTypeAnnotation':</span>
+      <span class="s0">return 'ArrayKind';</span>
+    <span class="s0">default:</span>
+      <span class="s0">(realTypeAnnotation.type: 'MixedTypeAnnotation');</span>
+      <span class="s0">throw new Error(</span>
+        <span class="s0">`Unknown prop type for returning value, found: ${realTypeAnnotation.type}&quot;`,</span>
+      <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">type Param = NamedShape&lt;Nullable&lt;NativeModuleParamTypeAnnotation&gt;&gt;;</span>
+
+<span class="s0">function translateParamTypeToJniType(</span>
+  <span class="s0">param: Param,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const {optional, typeAnnotation: nullableTypeAnnotation} = param;</span>
+  <span class="s0">const [typeAnnotation, nullable] =</span>
+    <span class="s0">unwrapNullable&lt;NativeModuleParamTypeAnnotation&gt;(nullableTypeAnnotation);</span>
+  <span class="s0">const isRequired = !optional &amp;&amp; !nullable;</span>
+
+  <span class="s0">let realTypeAnnotation = typeAnnotation;</span>
+  <span class="s0">if (realTypeAnnotation.type === 'TypeAliasTypeAnnotation') {</span>
+    <span class="s0">realTypeAnnotation = resolveAlias(realTypeAnnotation.name);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">switch (realTypeAnnotation.type) {</span>
+    <span class="s0">case 'ReservedTypeAnnotation':</span>
+      <span class="s0">switch (realTypeAnnotation.name) {</span>
+        <span class="s0">case 'RootTag':</span>
+          <span class="s0">return !isRequired ? 'Ljava/lang/Double;' : 'D';</span>
+        <span class="s0">default:</span>
+          <span class="s0">(realTypeAnnotation.name: empty);</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Invalid ReservedFunctionValueTypeName name, got ${realTypeAnnotation.name}`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'StringTypeAnnotation':</span>
+      <span class="s0">return 'Ljava/lang/String;';</span>
+    <span class="s0">case 'BooleanTypeAnnotation':</span>
+      <span class="s0">return !isRequired ? 'Ljava/lang/Boolean;' : 'Z';</span>
+    <span class="s0">case 'EnumDeclaration':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return !isRequired ? 'Ljava/lang/Double;' : 'D';</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return 'Ljava/lang/String;';</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unknown enum prop type for method arg, found: ${realTypeAnnotation.type}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'UnionTypeAnnotation':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return !isRequired ? 'Ljava/lang/Double;' : 'D';</span>
+        <span class="s0">case 'ObjectTypeAnnotation':</span>
+          <span class="s0">return 'Lcom/facebook/react/bridge/ReadableMap;';</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return 'Ljava/lang/String;';</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unsupported union prop value, found: ${realTypeAnnotation.memberType}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'NumberTypeAnnotation':</span>
+      <span class="s0">return !isRequired ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'DoubleTypeAnnotation':</span>
+      <span class="s0">return !isRequired ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'FloatTypeAnnotation':</span>
+      <span class="s0">return !isRequired ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'Int32TypeAnnotation':</span>
+      <span class="s0">return !isRequired ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'GenericObjectTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/ReadableMap;';</span>
+    <span class="s0">case 'ObjectTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/ReadableMap;';</span>
+    <span class="s0">case 'ArrayTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/ReadableArray;';</span>
+    <span class="s0">case 'FunctionTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/Callback;';</span>
+    <span class="s0">default:</span>
+      <span class="s0">(realTypeAnnotation.type: 'MixedTypeAnnotation');</span>
+      <span class="s0">throw new Error(</span>
+        <span class="s0">`Unknown prop type for method arg, found: ${realTypeAnnotation.type}&quot;`,</span>
+      <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function translateReturnTypeToJniType(</span>
+  <span class="s0">nullableTypeAnnotation: Nullable&lt;NativeModuleReturnTypeAnnotation&gt;,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const [typeAnnotation, nullable] = unwrapNullable(nullableTypeAnnotation);</span>
+
+  <span class="s0">let realTypeAnnotation = typeAnnotation;</span>
+  <span class="s0">if (realTypeAnnotation.type === 'TypeAliasTypeAnnotation') {</span>
+    <span class="s0">realTypeAnnotation = resolveAlias(realTypeAnnotation.name);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">switch (realTypeAnnotation.type) {</span>
+    <span class="s0">case 'ReservedTypeAnnotation':</span>
+      <span class="s0">switch (realTypeAnnotation.name) {</span>
+        <span class="s0">case 'RootTag':</span>
+          <span class="s0">return nullable ? 'Ljava/lang/Double;' : 'D';</span>
+        <span class="s0">default:</span>
+          <span class="s0">(realTypeAnnotation.name: empty);</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Invalid ReservedFunctionValueTypeName name, got ${realTypeAnnotation.name}`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'VoidTypeAnnotation':</span>
+      <span class="s0">return 'V';</span>
+    <span class="s0">case 'StringTypeAnnotation':</span>
+      <span class="s0">return 'Ljava/lang/String;';</span>
+    <span class="s0">case 'BooleanTypeAnnotation':</span>
+      <span class="s0">return nullable ? 'Ljava/lang/Boolean;' : 'Z';</span>
+    <span class="s0">case 'EnumDeclaration':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return nullable ? 'Ljava/lang/Double;' : 'D';</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return 'Ljava/lang/String;';</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unknown enum prop type for method return type, found: ${realTypeAnnotation.type}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'UnionTypeAnnotation':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return nullable ? 'Ljava/lang/Double;' : 'D';</span>
+        <span class="s0">case 'ObjectTypeAnnotation':</span>
+          <span class="s0">return 'Lcom/facebook/react/bridge/WritableMap;';</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return 'Ljava/lang/String;';</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unsupported union member type, found: ${realTypeAnnotation.memberType}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'NumberTypeAnnotation':</span>
+      <span class="s0">return nullable ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'DoubleTypeAnnotation':</span>
+      <span class="s0">return nullable ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'FloatTypeAnnotation':</span>
+      <span class="s0">return nullable ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'Int32TypeAnnotation':</span>
+      <span class="s0">return nullable ? 'Ljava/lang/Double;' : 'D';</span>
+    <span class="s0">case 'PromiseTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/Promise;';</span>
+    <span class="s0">case 'GenericObjectTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/WritableMap;';</span>
+    <span class="s0">case 'ObjectTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/WritableMap;';</span>
+    <span class="s0">case 'ArrayTypeAnnotation':</span>
+      <span class="s0">return 'Lcom/facebook/react/bridge/WritableArray;';</span>
+    <span class="s0">default:</span>
+      <span class="s0">(realTypeAnnotation.type: 'MixedTypeAnnotation');</span>
+      <span class="s0">throw new Error(</span>
+        <span class="s0">`Unknown prop type for method return type, found: ${realTypeAnnotation.type}&quot;`,</span>
+      <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function translateMethodTypeToJniSignature(</span>
+  <span class="s0">property: NativeModulePropertyShape,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const {name, typeAnnotation} = property;</span>
+  <span class="s0">let [{returnTypeAnnotation, params}] =</span>
+    <span class="s0">unwrapNullable&lt;NativeModuleFunctionTypeAnnotation&gt;(typeAnnotation);</span>
+
+  <span class="s0">params = [...params];</span>
+  <span class="s0">let processedReturnTypeAnnotation = returnTypeAnnotation;</span>
+  <span class="s0">const isPromiseReturn = returnTypeAnnotation.type === 'PromiseTypeAnnotation';</span>
+  <span class="s0">if (isPromiseReturn) {</span>
+    <span class="s0">processedReturnTypeAnnotation = {</span>
+      <span class="s0">type: 'VoidTypeAnnotation',</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const argsSignatureParts = params.map(t =&gt; {</span>
+    <span class="s0">return translateParamTypeToJniType(t, resolveAlias);</span>
+  <span class="s0">});</span>
+  <span class="s0">if (isPromiseReturn) {</span>
+    <span class="s0">// Additional promise arg for this case.</span>
+    <span class="s0">argsSignatureParts.push(</span>
+      <span class="s0">translateReturnTypeToJniType(returnTypeAnnotation, resolveAlias),</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+  <span class="s0">const argsSignature = argsSignatureParts.join('');</span>
+  <span class="s0">const returnSignature =</span>
+    <span class="s0">name === 'getConstants'</span>
+      <span class="s0">? 'Ljava/util/Map;'</span>
+      <span class="s0">: translateReturnTypeToJniType(</span>
+          <span class="s0">processedReturnTypeAnnotation,</span>
+          <span class="s0">resolveAlias,</span>
+        <span class="s0">);</span>
+
+  <span class="s0">return `(${argsSignature})${returnSignature}`;</span>
+<span class="s0">}</span>
+
+<span class="s0">function translateMethodForImplementation(</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">property: NativeModulePropertyShape,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const [propertyTypeAnnotation] =</span>
+    <span class="s0">unwrapNullable&lt;NativeModuleFunctionTypeAnnotation&gt;(property.typeAnnotation);</span>
+  <span class="s0">const {returnTypeAnnotation} = propertyTypeAnnotation;</span>
+
+  <span class="s0">if (</span>
+    <span class="s0">property.name === 'getConstants' &amp;&amp;</span>
+    <span class="s0">returnTypeAnnotation.type === 'ObjectTypeAnnotation' &amp;&amp;</span>
+    <span class="s0">returnTypeAnnotation.properties.length === 0</span>
+  <span class="s0">) {</span>
+    <span class="s0">return '';</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return HostFunctionTemplate({</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">propertyName: property.name,</span>
+    <span class="s0">jniSignature: translateMethodTypeToJniSignature(property, resolveAlias),</span>
+    <span class="s0">jsReturnType: translateReturnTypeToKind(returnTypeAnnotation, resolveAlias),</span>
+  <span class="s0">});</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">generate(</span>
+    <span class="s0">libraryName: string,</span>
+    <span class="s0">schema: SchemaType,</span>
+    <span class="s0">packageName?: string,</span>
+    <span class="s0">assumeNonnull: boolean = false,</span>
+  <span class="s0">): FilesOutput {</span>
+    <span class="s0">const nativeModules = getModules(schema);</span>
+
+    <span class="s0">const modules = Object.keys(nativeModules)</span>
+      <span class="s0">.filter(hasteModuleName =&gt; {</span>
+        <span class="s0">const module = nativeModules[hasteModuleName];</span>
+        <span class="s0">return !(</span>
+          <span class="s0">module.excludedPlatforms != null &amp;&amp;</span>
+          <span class="s0">module.excludedPlatforms.includes('android')</span>
+        <span class="s0">);</span>
+      <span class="s0">})</span>
+      <span class="s0">.sort()</span>
+      <span class="s0">.map(hasteModuleName =&gt; {</span>
+        <span class="s0">const {</span>
+          <span class="s0">aliasMap,</span>
+          <span class="s0">spec: {properties},</span>
+        <span class="s0">} = nativeModules[hasteModuleName];</span>
+        <span class="s0">const resolveAlias = createAliasResolver(aliasMap);</span>
+
+        <span class="s0">const translatedMethods = properties</span>
+          <span class="s0">.map(property =&gt;</span>
+            <span class="s0">translateMethodForImplementation(</span>
+              <span class="s0">hasteModuleName,</span>
+              <span class="s0">property,</span>
+              <span class="s0">resolveAlias,</span>
+            <span class="s0">),</span>
+          <span class="s0">)</span>
+          <span class="s0">.join('\n\n');</span>
+
+        <span class="s0">return (</span>
+          <span class="s0">translatedMethods +</span>
+          <span class="s0">'\n\n' +</span>
+          <span class="s0">ModuleClassConstructorTemplate({</span>
+            <span class="s0">hasteModuleName,</span>
+            <span class="s0">methods: properties</span>
+              <span class="s0">.map(({name: propertyName, typeAnnotation}) =&gt; {</span>
+                <span class="s0">const [{returnTypeAnnotation, params}] =</span>
+                  <span class="s0">unwrapNullable&lt;NativeModuleFunctionTypeAnnotation&gt;(</span>
+                    <span class="s0">typeAnnotation,</span>
+                  <span class="s0">);</span>
+
+                <span class="s0">if (</span>
+                  <span class="s0">propertyName === 'getConstants' &amp;&amp;</span>
+                  <span class="s0">returnTypeAnnotation.type === 'ObjectTypeAnnotation' &amp;&amp;</span>
+                  <span class="s0">returnTypeAnnotation.properties &amp;&amp;</span>
+                  <span class="s0">returnTypeAnnotation.properties.length === 0</span>
+                <span class="s0">) {</span>
+                  <span class="s0">return null;</span>
+                <span class="s0">}</span>
+
+                <span class="s0">return {</span>
+                  <span class="s0">propertyName,</span>
+                  <span class="s0">argCount: params.length,</span>
+                <span class="s0">};</span>
+              <span class="s0">})</span>
+              <span class="s0">.filter(Boolean),</span>
+          <span class="s0">})</span>
+        <span class="s0">);</span>
+      <span class="s0">})</span>
+      <span class="s0">.join('\n');</span>
+
+    <span class="s0">const moduleLookups: $ReadOnlyArray&lt;{</span>
+      <span class="s0">hasteModuleName: string,</span>
+      <span class="s0">moduleName: string,</span>
+    <span class="s0">}&gt; = Object.keys(nativeModules)</span>
+      <span class="s0">.filter(hasteModuleName =&gt; {</span>
+        <span class="s0">const module = nativeModules[hasteModuleName];</span>
+        <span class="s0">return !(</span>
+          <span class="s0">module.excludedPlatforms != null &amp;&amp;</span>
+          <span class="s0">module.excludedPlatforms.includes('android')</span>
+        <span class="s0">);</span>
+      <span class="s0">})</span>
+      <span class="s0">.sort((a, b) =&gt; {</span>
+        <span class="s0">const nameA = nativeModules[a].moduleName;</span>
+        <span class="s0">const nameB = nativeModules[b].moduleName;</span>
+        <span class="s0">if (nameA &lt; nameB) {</span>
+          <span class="s0">return -1;</span>
+        <span class="s0">} else if (nameA &gt; nameB) {</span>
+          <span class="s0">return 1;</span>
+        <span class="s0">}</span>
+        <span class="s0">return 0;</span>
+      <span class="s0">})</span>
+      <span class="s0">.map((hasteModuleName: string) =&gt; ({</span>
+        <span class="s0">moduleName: nativeModules[hasteModuleName].moduleName,</span>
+        <span class="s0">hasteModuleName,</span>
+      <span class="s0">}));</span>
+
+    <span class="s0">const fileName = `${libraryName}-generated.cpp`;</span>
+    <span class="s0">const replacedTemplate = FileTemplate({</span>
+      <span class="s0">modules: modules,</span>
+      <span class="s0">libraryName: libraryName.replace(/-/g, '_'),</span>
+      <span class="s0">moduleLookups,</span>
+      <span class="s0">include: `&quot;${libraryName}.h&quot;`,</span>
+    <span class="s0">});</span>
+    <span class="s0">return new Map([[`jni/${fileName}`, replacedTemplate]]);</span>
+  <span class="s0">},</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

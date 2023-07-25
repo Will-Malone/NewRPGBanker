@@ -1,0 +1,259 @@
+<html>
+<head>
+<title>ignore-pattern.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ignore-pattern.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview `IgnorePattern` class. 
+ * 
+ * `IgnorePattern` class has the set of glob patterns and the base path. 
+ * 
+ * It provides two static methods. 
+ * 
+ * - `IgnorePattern.createDefaultIgnore(cwd)` 
+ *      Create the default predicate function. 
+ * - `IgnorePattern.createIgnore(ignorePatterns)` 
+ *      Create the predicate function from multiple `IgnorePattern` objects. 
+ * 
+ * It provides two properties and a method. 
+ * 
+ * - `patterns` 
+ *      The glob patterns that ignore to lint. 
+ * - `basePath` 
+ *      The base path of the glob patterns. If absolute paths existed in the 
+ *      glob patterns, those are handled as relative paths to the base path. 
+ * - `getPatternsRelativeTo(basePath)` 
+ *      Get `patterns` as modified for a given base path. It modifies the 
+ *      absolute paths in the patterns as prepending the difference of two base 
+ *      paths. 
+ * 
+ * `ConfigArrayFactory` creates `IgnorePattern` objects when it processes 
+ * `ignorePatterns` properties. 
+ * 
+ * @author Toru Nagashima &lt;https://github.com/mysticatea&gt; 
+ */</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">import assert from </span><span class="s2">&quot;assert&quot;</span><span class="s1">;</span>
+<span class="s1">import path from </span><span class="s2">&quot;path&quot;</span><span class="s1">;</span>
+<span class="s1">import ignore from </span><span class="s2">&quot;ignore&quot;</span><span class="s1">;</span>
+<span class="s1">import debugOrig from </span><span class="s2">&quot;debug&quot;</span><span class="s1">;</span>
+
+<span class="s1">const debug = debugOrig(</span><span class="s2">&quot;eslintrc:ignore-pattern&quot;</span><span class="s1">);</span>
+
+<span class="s0">/** @typedef {ReturnType&lt;import(&quot;ignore&quot;).default&gt;} Ignore */</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Get the path to the common ancestor directory of given paths. 
+ * @param {string[]} sourcePaths The paths to calculate the common ancestor. 
+ * @returns {string} The path to the common ancestor directory. 
+ */</span>
+<span class="s3">function </span><span class="s1">getCommonAncestorPath(sourcePaths) {</span>
+    <span class="s1">let result = sourcePaths[</span><span class="s4">0</span><span class="s1">];</span>
+
+    <span class="s3">for </span><span class="s1">(let i = </span><span class="s4">1</span><span class="s1">; i &lt; sourcePaths.length; ++i) {</span>
+        <span class="s1">const a = result;</span>
+        <span class="s1">const b = sourcePaths[i];</span>
+
+        <span class="s0">// Set the shorter one (it's the common ancestor if one includes the other).</span>
+        <span class="s1">result = a.length &lt; b.length ? a : b;</span>
+
+        <span class="s0">// Set the common ancestor.</span>
+        <span class="s3">for </span><span class="s1">(let j = </span><span class="s4">0</span><span class="s1">, lastSepPos = </span><span class="s4">0</span><span class="s1">; j &lt; a.length &amp;&amp; j &lt; b.length; ++j) {</span>
+            <span class="s3">if </span><span class="s1">(a[j] !== b[j]) {</span>
+                <span class="s1">result = a.slice(</span><span class="s4">0</span><span class="s1">, lastSepPos);</span>
+                <span class="s3">break</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s3">if </span><span class="s1">(a[j] === path.sep) {</span>
+                <span class="s1">lastSepPos = j;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">let resolvedResult = result || path.sep;</span>
+
+    <span class="s0">// if Windows common ancestor is root of drive must have trailing slash to be absolute.</span>
+    <span class="s3">if </span><span class="s1">(resolvedResult &amp;&amp; resolvedResult.endsWith(</span><span class="s2">&quot;:&quot;</span><span class="s1">) &amp;&amp; process.platform === </span><span class="s2">&quot;win32&quot;</span><span class="s1">) {</span>
+        <span class="s1">resolvedResult += path.sep;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">resolvedResult;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Make relative path. 
+ * @param {string} from The source path to get relative path. 
+ * @param {string} to The destination path to get relative path. 
+ * @returns {string} The relative path. 
+ */</span>
+<span class="s3">function </span><span class="s1">relative(from, to) {</span>
+    <span class="s1">const relPath = path.relative(from, to);</span>
+
+    <span class="s3">if </span><span class="s1">(path.sep === </span><span class="s2">&quot;/&quot;</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">relPath;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">relPath.split(path.sep).join(</span><span class="s2">&quot;/&quot;</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Get the trailing slash if existed. 
+ * @param {string} filePath The path to check. 
+ * @returns {string} The trailing slash if existed. 
+ */</span>
+<span class="s3">function </span><span class="s1">dirSuffix(filePath) {</span>
+    <span class="s1">const isDir = (</span>
+        <span class="s1">filePath.endsWith(path.sep) ||</span>
+        <span class="s1">(process.platform === </span><span class="s2">&quot;win32&quot; </span><span class="s1">&amp;&amp; filePath.endsWith(</span><span class="s2">&quot;/&quot;</span><span class="s1">))</span>
+    <span class="s1">);</span>
+
+    <span class="s3">return </span><span class="s1">isDir ? </span><span class="s2">&quot;/&quot; </span><span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s1">const DefaultPatterns = Object.freeze([</span><span class="s2">&quot;/**/node_modules/*&quot;</span><span class="s1">]);</span>
+<span class="s1">const DotPatterns = Object.freeze([</span><span class="s2">&quot;.*&quot;</span><span class="s1">, </span><span class="s2">&quot;!.eslintrc.*&quot;</span><span class="s1">, </span><span class="s2">&quot;!../&quot;</span><span class="s1">]);</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Public</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">class IgnorePattern {</span>
+
+    <span class="s0">/** 
+     * The default patterns. 
+     * @type {string[]} 
+     */</span>
+    <span class="s1">static get DefaultPatterns() {</span>
+        <span class="s3">return </span><span class="s1">DefaultPatterns;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Create the default predicate function. 
+     * @param {string} cwd The current working directory. 
+     * @returns {((filePath:string, dot:boolean) =&gt; boolean) &amp; {basePath:string; patterns:string[]}} 
+     * The preficate function. 
+     * The first argument is an absolute path that is checked. 
+     * The second argument is the flag to not ignore dotfiles. 
+     * If the predicate function returned `true`, it means the path should be ignored. 
+     */</span>
+    <span class="s1">static createDefaultIgnore(cwd) {</span>
+        <span class="s3">return this</span><span class="s1">.createIgnore([</span><span class="s3">new </span><span class="s1">IgnorePattern(DefaultPatterns, cwd)]);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Create the predicate function from multiple `IgnorePattern` objects. 
+     * @param {IgnorePattern[]} ignorePatterns The list of ignore patterns. 
+     * @returns {((filePath:string, dot?:boolean) =&gt; boolean) &amp; {basePath:string; patterns:string[]}} 
+     * The preficate function. 
+     * The first argument is an absolute path that is checked. 
+     * The second argument is the flag to not ignore dotfiles. 
+     * If the predicate function returned `true`, it means the path should be ignored. 
+     */</span>
+    <span class="s1">static createIgnore(ignorePatterns) {</span>
+        <span class="s1">debug(</span><span class="s2">&quot;Create with: %o&quot;</span><span class="s1">, ignorePatterns);</span>
+
+        <span class="s1">const basePath = getCommonAncestorPath(ignorePatterns.map(p =&gt; p.basePath));</span>
+        <span class="s1">const patterns = [].concat(</span>
+            <span class="s1">...ignorePatterns.map(p =&gt; p.getPatternsRelativeTo(basePath))</span>
+        <span class="s1">);</span>
+        <span class="s1">const ig = ignore({ allowRelativePaths: </span><span class="s3">true </span><span class="s1">}).add([...DotPatterns, ...patterns]);</span>
+        <span class="s1">const dotIg = ignore({ allowRelativePaths: </span><span class="s3">true </span><span class="s1">}).add(patterns);</span>
+
+        <span class="s1">debug(</span><span class="s2">&quot;  processed: %o&quot;</span><span class="s1">, { basePath, patterns });</span>
+
+        <span class="s3">return </span><span class="s1">Object.assign(</span>
+            <span class="s1">(filePath, dot = </span><span class="s3">false</span><span class="s1">) =&gt; {</span>
+                <span class="s1">assert(path.isAbsolute(filePath), </span><span class="s2">&quot;'filePath' should be an absolute path.&quot;</span><span class="s1">);</span>
+                <span class="s1">const relPathRaw = relative(basePath, filePath);</span>
+                <span class="s1">const relPath = relPathRaw &amp;&amp; (relPathRaw + dirSuffix(filePath));</span>
+                <span class="s1">const adoptedIg = dot ? dotIg : ig;</span>
+                <span class="s1">const result = relPath !== </span><span class="s2">&quot;&quot; </span><span class="s1">&amp;&amp; adoptedIg.ignores(relPath);</span>
+
+                <span class="s1">debug(</span><span class="s2">&quot;Check&quot;</span><span class="s1">, { filePath, dot, relativePath: relPath, result });</span>
+                <span class="s3">return </span><span class="s1">result;</span>
+            <span class="s1">},</span>
+            <span class="s1">{ basePath, patterns }</span>
+        <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Initialize a new `IgnorePattern` instance. 
+     * @param {string[]} patterns The glob patterns that ignore to lint. 
+     * @param {string} basePath The base path of `patterns`. 
+     */</span>
+    <span class="s1">constructor(patterns, basePath) {</span>
+        <span class="s1">assert(path.isAbsolute(basePath), </span><span class="s2">&quot;'basePath' should be an absolute path.&quot;</span><span class="s1">);</span>
+
+        <span class="s0">/** 
+         * The glob patterns that ignore to lint. 
+         * @type {string[]} 
+         */</span>
+        <span class="s3">this</span><span class="s1">.patterns = patterns;</span>
+
+        <span class="s0">/** 
+         * The base path of `patterns`. 
+         * @type {string} 
+         */</span>
+        <span class="s3">this</span><span class="s1">.basePath = basePath;</span>
+
+        <span class="s0">/** 
+         * If `true` then patterns which don't start with `/` will match the paths to the outside of `basePath`. Defaults to `false`. 
+         * 
+         * It's set `true` for `.eslintignore`, `package.json`, and `--ignore-path` for backward compatibility. 
+         * It's `false` as-is for `ignorePatterns` property in config files. 
+         * @type {boolean} 
+         */</span>
+        <span class="s3">this</span><span class="s1">.loose = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Get `patterns` as modified for a given base path. It modifies the 
+     * absolute paths in the patterns as prepending the difference of two base 
+     * paths. 
+     * @param {string} newBasePath The base path. 
+     * @returns {string[]} Modifired patterns. 
+     */</span>
+    <span class="s1">getPatternsRelativeTo(newBasePath) {</span>
+        <span class="s1">assert(path.isAbsolute(newBasePath), </span><span class="s2">&quot;'newBasePath' should be an absolute path.&quot;</span><span class="s1">);</span>
+        <span class="s1">const { basePath, loose, patterns } = </span><span class="s3">this</span><span class="s1">;</span>
+
+        <span class="s3">if </span><span class="s1">(newBasePath === basePath) {</span>
+            <span class="s3">return </span><span class="s1">patterns;</span>
+        <span class="s1">}</span>
+        <span class="s1">const prefix = `/${relative(newBasePath, basePath)}`;</span>
+
+        <span class="s3">return </span><span class="s1">patterns.map(pattern =&gt; {</span>
+            <span class="s1">const negative = pattern.startsWith(</span><span class="s2">&quot;!&quot;</span><span class="s1">);</span>
+            <span class="s1">const head = negative ? </span><span class="s2">&quot;!&quot; </span><span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+            <span class="s1">const body = negative ? pattern.slice(</span><span class="s4">1</span><span class="s1">) : pattern;</span>
+
+            <span class="s3">if </span><span class="s1">(body.startsWith(</span><span class="s2">&quot;/&quot;</span><span class="s1">) || body.startsWith(</span><span class="s2">&quot;../&quot;</span><span class="s1">)) {</span>
+                <span class="s3">return </span><span class="s1">`${head}${prefix}${body}`;</span>
+            <span class="s1">}</span>
+            <span class="s3">return </span><span class="s1">loose ? pattern : `${head}${prefix}</span><span class="s0">/**/</span><span class="s1">${body}`;</span>
+        <span class="s1">});</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export { IgnorePattern };</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,588 @@
+<html>
+<head>
+<title>UIManager.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+UIManager.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;UIManager.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/DynamicPropsUtilities.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/PropsParserContext.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/ShadowNodeFragment.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/TraitCast.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/uimanager/SurfaceRegistryBinding.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/uimanager/UIManagerBinding.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/uimanager/UIManagerCommitHook.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;utility&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s0">// Explicitly define destructors here, as they to exist in order to act as a</span>
+<span class="s0">// &quot;key function&quot; for the ShadowNodeWrapper class -- this allow for RTTI to work</span>
+<span class="s0">// properly across dynamic library boundaries (i.e. dynamic_cast that is used by</span>
+<span class="s0">// isHostObject method)</span>
+<span class="s1">ShadowNodeWrapper::~ShadowNodeWrapper() = </span><span class="s4">default;</span>
+<span class="s1">ShadowNodeListWrapper::~ShadowNodeListWrapper() = </span><span class="s4">default;</span>
+
+<span class="s4">static </span><span class="s1">std::unique_ptr&lt;LeakChecker&gt; constructLeakCheckerIfNeeded(</span>
+    <span class="s1">RuntimeExecutor </span><span class="s4">const </span><span class="s1">&amp;runtimeExecutor) {</span>
+<span class="s2">#ifdef </span><span class="s1">REACT_NATIVE_DEBUG</span>
+  <span class="s4">return </span><span class="s1">std::make_unique&lt;LeakChecker&gt;(runtimeExecutor)</span><span class="s4">;</span>
+<span class="s2">#else</span>
+  <span class="s4">return </span><span class="s1">{}</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+<span class="s1">}</span>
+
+<span class="s1">UIManager::UIManager(</span>
+    <span class="s1">RuntimeExecutor </span><span class="s4">const </span><span class="s1">&amp;runtimeExecutor</span><span class="s4">,</span>
+    <span class="s1">BackgroundExecutor backgroundExecutor</span><span class="s4">,</span>
+    <span class="s1">ContextContainer::Shared contextContainer)</span>
+    <span class="s1">: runtimeExecutor_(runtimeExecutor)</span><span class="s4">,</span>
+      <span class="s1">backgroundExecutor_(std::move(backgroundExecutor))</span><span class="s4">,</span>
+      <span class="s1">contextContainer_(std::move(contextContainer))</span><span class="s4">,</span>
+      <span class="s1">leakChecker_(constructLeakCheckerIfNeeded(runtimeExecutor)) {}</span>
+
+<span class="s1">UIManager::~UIManager() {</span>
+  <span class="s1">LOG(WARNING) &lt;&lt; </span><span class="s3">&quot;UIManager::~UIManager() was called (address: &quot; </span><span class="s1">&lt;&lt; </span><span class="s4">this</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot;).&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Shared UIManager::createNode(</span>
+    <span class="s1">Tag tag</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;name</span><span class="s4">,</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">RawProps &amp;rawProps</span><span class="s4">,</span>
+    <span class="s1">SharedEventTarget eventTarget) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::createNode&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">&amp;componentDescriptor = componentDescriptorRegistry_-&gt;at(name)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">fallbackDescriptor =</span>
+      <span class="s1">componentDescriptorRegistry_-&gt;getFallbackComponentDescriptor()</span><span class="s4">;</span>
+
+  <span class="s1">PropsParserContext propsParserContext{surfaceId</span><span class="s4">, </span><span class="s1">*contextContainer_.get()}</span><span class="s4">;</span>
+
+  <span class="s4">auto const </span><span class="s1">fragment = ShadowNodeFamilyFragment{tag</span><span class="s4">, </span><span class="s1">surfaceId</span><span class="s4">, nullptr</span><span class="s1">}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">family =</span>
+      <span class="s1">componentDescriptor.createFamily(fragment</span><span class="s4">, </span><span class="s1">std::move(eventTarget))</span><span class="s4">;</span>
+  <span class="s4">auto const </span><span class="s1">props =</span>
+      <span class="s1">componentDescriptor.cloneProps(propsParserContext</span><span class="s4">, nullptr, </span><span class="s1">rawProps)</span><span class="s4">;</span>
+  <span class="s4">auto const </span><span class="s1">state =</span>
+      <span class="s1">componentDescriptor.createInitialState(ShadowNodeFragment{props}</span><span class="s4">, </span><span class="s1">family)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">shadowNode = componentDescriptor.createShadowNode(</span>
+      <span class="s1">ShadowNodeFragment{</span>
+          <span class="s0">/* .props = */</span>
+          <span class="s1">fallbackDescriptor != </span><span class="s4">nullptr </span><span class="s1">&amp;&amp;</span>
+                  <span class="s1">fallbackDescriptor-&gt;getComponentHandle() ==</span>
+                      <span class="s1">componentDescriptor.getComponentHandle()</span>
+              <span class="s1">? componentDescriptor.cloneProps(</span>
+                    <span class="s1">propsParserContext</span><span class="s4">,</span>
+                    <span class="s1">props</span><span class="s4">,</span>
+                    <span class="s1">RawProps(folly::dynamic::object(</span><span class="s3">&quot;name&quot;</span><span class="s4">, </span><span class="s1">name)))</span>
+              <span class="s1">: props</span><span class="s4">,</span>
+          <span class="s0">/* .children = */ </span><span class="s1">ShadowNodeFragment::childrenPlaceholder()</span><span class="s4">,</span>
+          <span class="s0">/* .state = */ </span><span class="s1">state</span><span class="s4">,</span>
+      <span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">family)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">delegate_-&gt;uiManagerDidCreateShadowNode(*shadowNode)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(leakChecker_) {</span>
+    <span class="s1">leakChecker_-&gt;uiManagerDidCreateShadowNodeFamily(family)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">shadowNode</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Shared UIManager::cloneNode(</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">ShadowNode::SharedListOfShared </span><span class="s4">const </span><span class="s1">&amp;children</span><span class="s4">,</span>
+    <span class="s1">RawProps </span><span class="s4">const </span><span class="s1">*rawProps) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::cloneNode&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">PropsParserContext propsParserContext{</span>
+      <span class="s1">shadowNode.getFamily().getSurfaceId()</span><span class="s4">, </span><span class="s1">*contextContainer_.get()}</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">&amp;componentDescriptor = shadowNode.getComponentDescriptor()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;family = shadowNode.getFamily()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">props = ShadowNodeFragment::propsPlaceholder()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(rawProps != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">if </span><span class="s1">(family.nativeProps_DEPRECATED != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s0">// Values in `rawProps` patch (take precedence over)</span>
+      <span class="s0">// `nativeProps_DEPRECATED`. For example, if both `nativeProps_DEPRECATED`</span>
+      <span class="s0">// and `rawProps` contain key 'A'. Value from `rawProps` overrides what</span>
+      <span class="s0">// was previously in `nativeProps_DEPRECATED`.</span>
+      <span class="s1">family.nativeProps_DEPRECATED =</span>
+          <span class="s1">std::make_unique&lt;folly::dynamic&gt;(mergeDynamicProps(</span>
+              <span class="s1">*family.nativeProps_DEPRECATED</span><span class="s4">, </span><span class="s1">(folly::dynamic)*rawProps))</span><span class="s4">;</span>
+
+      <span class="s1">props = componentDescriptor.cloneProps(</span>
+          <span class="s1">propsParserContext</span><span class="s4">,</span>
+          <span class="s1">shadowNode.getProps()</span><span class="s4">,</span>
+          <span class="s1">RawProps(*family.nativeProps_DEPRECATED))</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">props = componentDescriptor.cloneProps(</span>
+          <span class="s1">propsParserContext</span><span class="s4">, </span><span class="s1">shadowNode.getProps()</span><span class="s4">, </span><span class="s1">*rawProps)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">clonedShadowNode = componentDescriptor.cloneShadowNode(</span>
+      <span class="s1">shadowNode</span><span class="s4">,</span>
+      <span class="s1">{</span>
+          <span class="s0">/* .props = */ </span><span class="s1">props</span><span class="s4">,</span>
+          <span class="s0">/* .children = */ </span><span class="s1">children</span><span class="s4">,</span>
+      <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">clonedShadowNode</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::appendChild(</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::Shared &amp;parentShadowNode</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::Shared &amp;childShadowNode) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::appendChild&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">&amp;componentDescriptor = parentShadowNode-&gt;getComponentDescriptor()</span><span class="s4">;</span>
+  <span class="s1">componentDescriptor.appendChild(parentShadowNode</span><span class="s4">, </span><span class="s1">childShadowNode)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::completeSurface(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">ShadowNode::UnsharedListOfShared </span><span class="s4">const </span><span class="s1">&amp;rootChildren</span><span class="s4">,</span>
+    <span class="s1">ShadowTree::CommitOptions commitOptions) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::completeSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">shadowTreeRegistry_.visit(surfaceId</span><span class="s4">, </span><span class="s1">[&amp;](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree) {</span>
+    <span class="s1">shadowTree.commit(</span>
+        <span class="s1">[&amp;](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode) {</span>
+          <span class="s4">return </span><span class="s1">std::make_shared&lt;RootShadowNode&gt;(</span>
+              <span class="s1">oldRootShadowNode</span><span class="s4">,</span>
+              <span class="s1">ShadowNodeFragment{</span>
+                  <span class="s0">/* .props = */ </span><span class="s1">ShadowNodeFragment::propsPlaceholder()</span><span class="s4">,</span>
+                  <span class="s0">/* .children = */ </span><span class="s1">rootChildren</span><span class="s4">,</span>
+              <span class="s1">})</span><span class="s4">;</span>
+        <span class="s1">}</span><span class="s4">,</span>
+        <span class="s1">commitOptions)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::setIsJSResponder(</span>
+    <span class="s1">ShadowNode::Shared </span><span class="s4">const </span><span class="s1">&amp;shadowNode</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">isJSResponder</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">blockNativeResponder) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">delegate_-&gt;uiManagerDidSetIsJSResponder(</span>
+        <span class="s1">shadowNode</span><span class="s4">, </span><span class="s1">isJSResponder</span><span class="s4">, </span><span class="s1">blockNativeResponder)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::startSurface(</span>
+    <span class="s1">ShadowTree::Unique &amp;&amp;shadowTree</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;moduleName</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;props</span><span class="s4">,</span>
+    <span class="s1">DisplayMode displayMode) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::startSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">surfaceId = shadowTree-&gt;getSurfaceId()</span><span class="s4">;</span>
+  <span class="s1">shadowTreeRegistry_.add(std::move(shadowTree))</span><span class="s4">;</span>
+
+  <span class="s1">runtimeExecutor_([=](jsi::Runtime &amp;runtime) {</span>
+    <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::startSurface::onRuntime&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">SurfaceRegistryBinding::startSurface(</span>
+        <span class="s1">runtime</span><span class="s4">, </span><span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">moduleName</span><span class="s4">, </span><span class="s1">props</span><span class="s4">, </span><span class="s1">displayMode)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::setSurfaceProps(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;moduleName</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;props</span><span class="s4">,</span>
+    <span class="s1">DisplayMode displayMode) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::setSurfaceProps&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">runtimeExecutor_([=](jsi::Runtime &amp;runtime) {</span>
+    <span class="s1">SurfaceRegistryBinding::setSurfaceProps(</span>
+        <span class="s1">runtime</span><span class="s4">, </span><span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">moduleName</span><span class="s4">, </span><span class="s1">props</span><span class="s4">, </span><span class="s1">displayMode)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowTree::Unique UIManager::stopSurface(SurfaceId surfaceId) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::stopSurface&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// Stop any ongoing animations.</span>
+  <span class="s1">stopSurfaceForAnimationDelegate(surfaceId)</span><span class="s4">;</span>
+
+  <span class="s0">// Waiting for all concurrent commits to be finished and unregistering the</span>
+  <span class="s0">// `ShadowTree`.</span>
+  <span class="s4">auto </span><span class="s1">shadowTree = getShadowTreeRegistry().remove(surfaceId)</span><span class="s4">;</span>
+
+  <span class="s0">// We execute JavaScript/React part of the process at the very end to minimize</span>
+  <span class="s0">// any visible side-effects of stopping the Surface. Any possible commits from</span>
+  <span class="s0">// the JavaScript side will not be able to reference a `ShadowTree` and will</span>
+  <span class="s0">// fail silently.</span>
+  <span class="s1">runtimeExecutor_([=](jsi::Runtime &amp;runtime) {</span>
+    <span class="s1">SurfaceRegistryBinding::stopSurface(runtime</span><span class="s4">, </span><span class="s1">surfaceId)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(leakChecker_) {</span>
+    <span class="s1">leakChecker_-&gt;stopSurface(surfaceId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">shadowTree</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Shared UIManager::getNewestCloneOfShadowNode(</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;shadowNode) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">ancestorShadowNode = ShadowNode::Shared{}</span><span class="s4">;</span>
+  <span class="s1">shadowTreeRegistry_.visit(</span>
+      <span class="s1">shadowNode.getSurfaceId()</span><span class="s4">, </span><span class="s1">[&amp;](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree) {</span>
+        <span class="s1">ancestorShadowNode = shadowTree.getCurrentRevision().rootShadowNode</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!ancestorShadowNode) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">ancestors = shadowNode.getFamily().getAncestors(*ancestorShadowNode)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(ancestors.empty()) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">pair = ancestors.rbegin()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">pair-&gt;first.get().getChildren().at(pair-&gt;second)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Shared UIManager::findNodeAtPoint(</span>
+    <span class="s1">ShadowNode::Shared </span><span class="s4">const </span><span class="s1">&amp;node</span><span class="s4">,</span>
+    <span class="s1">Point point) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">LayoutableShadowNode::findNodeAtPoint(</span>
+      <span class="s1">getNewestCloneOfShadowNode(*node)</span><span class="s4">, </span><span class="s1">point)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">LayoutMetrics UIManager::getRelativeLayoutMetrics(</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">*ancestorShadowNode</span><span class="s4">,</span>
+    <span class="s1">LayoutableShadowNode::LayoutInspectingPolicy policy) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::getRelativeLayoutMetrics&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// We might store here an owning pointer to `ancestorShadowNode` to ensure</span>
+  <span class="s0">// that the node is not deallocated during method execution lifetime.</span>
+  <span class="s4">auto </span><span class="s1">owningAncestorShadowNode = ShadowNode::Shared{}</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(ancestorShadowNode == </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">shadowTreeRegistry_.visit(</span>
+        <span class="s1">shadowNode.getSurfaceId()</span><span class="s4">, </span><span class="s1">[&amp;](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree) {</span>
+          <span class="s1">owningAncestorShadowNode =</span>
+              <span class="s1">shadowTree.getCurrentRevision().rootShadowNode</span><span class="s4">;</span>
+          <span class="s1">ancestorShadowNode = owningAncestorShadowNode.get()</span><span class="s4">;</span>
+        <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s0">// It is possible for JavaScript (or other callers) to have a reference</span>
+    <span class="s0">// to a previous version of ShadowNodes, but we enforce that</span>
+    <span class="s0">// metrics are only calculated on most recently committed versions.</span>
+    <span class="s1">owningAncestorShadowNode = getNewestCloneOfShadowNode(*ancestorShadowNode)</span><span class="s4">;</span>
+    <span class="s1">ancestorShadowNode = owningAncestorShadowNode.get()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">layoutableAncestorShadowNode =</span>
+      <span class="s1">traitCast&lt;LayoutableShadowNode </span><span class="s4">const </span><span class="s1">*&gt;(ancestorShadowNode)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(layoutableAncestorShadowNode == </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">EmptyLayoutMetrics</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">LayoutableShadowNode::computeRelativeLayoutMetrics(</span>
+      <span class="s1">shadowNode.getFamily()</span><span class="s4">, </span><span class="s1">*layoutableAncestorShadowNode</span><span class="s4">, </span><span class="s1">policy)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::updateState(StateUpdate </span><span class="s4">const </span><span class="s1">&amp;stateUpdate) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">&amp;callback = stateUpdate.callback</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;family = stateUpdate.family</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;componentDescriptor = family-&gt;getComponentDescriptor()</span><span class="s4">;</span>
+
+  <span class="s1">shadowTreeRegistry_.visit(</span>
+      <span class="s1">family-&gt;getSurfaceId()</span><span class="s4">, </span><span class="s1">[&amp;](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree) {</span>
+        <span class="s1">shadowTree.commit(</span>
+            <span class="s1">[&amp;](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode) {</span>
+              <span class="s4">auto </span><span class="s1">isValid = </span><span class="s4">true;</span>
+
+              <span class="s4">auto </span><span class="s1">rootNode = oldRootShadowNode.cloneTree(</span>
+                  <span class="s1">*family</span><span class="s4">, </span><span class="s1">[&amp;](ShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldShadowNode) {</span>
+                    <span class="s4">auto </span><span class="s1">newData =</span>
+                        <span class="s1">callback(oldShadowNode.getState()-&gt;getDataPointer())</span><span class="s4">;</span>
+
+                    <span class="s4">if </span><span class="s1">(!newData) {</span>
+                      <span class="s1">isValid = </span><span class="s4">false;</span>
+                      <span class="s0">// Just return something, we will discard it anyway.</span>
+                      <span class="s4">return </span><span class="s1">oldShadowNode.clone({})</span><span class="s4">;</span>
+                    <span class="s1">}</span>
+
+                    <span class="s4">auto </span><span class="s1">newState =</span>
+                        <span class="s1">componentDescriptor.createState(*family</span><span class="s4">, </span><span class="s1">newData)</span><span class="s4">;</span>
+
+                    <span class="s4">return </span><span class="s1">oldShadowNode.clone({</span>
+                        <span class="s0">/* .props = */ </span><span class="s1">ShadowNodeFragment::propsPlaceholder()</span><span class="s4">,</span>
+                        <span class="s0">/* .children = */</span>
+                        <span class="s1">ShadowNodeFragment::childrenPlaceholder()</span><span class="s4">,</span>
+                        <span class="s0">/* .state = */ </span><span class="s1">newState</span><span class="s4">,</span>
+                    <span class="s1">})</span><span class="s4">;</span>
+                  <span class="s1">})</span><span class="s4">;</span>
+
+              <span class="s4">return </span><span class="s1">isValid</span>
+                  <span class="s1">? std::static_pointer_cast&lt;RootShadowNode&gt;(rootNode)</span>
+                  <span class="s1">: </span><span class="s4">nullptr;</span>
+            <span class="s1">}</span><span class="s4">,</span>
+            <span class="s1">{</span><span class="s0">/* default commit options */</span><span class="s1">})</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::dispatchCommand(</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::Shared &amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;commandName</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;args) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">delegate_-&gt;uiManagerDidDispatchCommand(shadowNode</span><span class="s4">, </span><span class="s1">commandName</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::setNativeProps_DEPRECATED(</span>
+    <span class="s1">ShadowNode::Shared </span><span class="s4">const </span><span class="s1">&amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">RawProps </span><span class="s4">const </span><span class="s1">&amp;rawProps) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">&amp;family = shadowNode-&gt;getFamily()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(family.nativeProps_DEPRECATED) {</span>
+    <span class="s0">// Values in `rawProps` patch (take precedence over)</span>
+    <span class="s0">// `nativeProps_DEPRECATED`. For example, if both `nativeProps_DEPRECATED`</span>
+    <span class="s0">// and `rawProps` contain key 'A'. Value from `rawProps` overrides what was</span>
+    <span class="s0">// previously in `nativeProps_DEPRECATED`.</span>
+    <span class="s1">family.nativeProps_DEPRECATED =</span>
+        <span class="s1">std::make_unique&lt;folly::dynamic&gt;(mergeDynamicProps(</span>
+            <span class="s1">*family.nativeProps_DEPRECATED</span><span class="s4">, </span><span class="s1">(folly::dynamic)rawProps))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">family.nativeProps_DEPRECATED =</span>
+        <span class="s1">std::make_unique&lt;folly::dynamic&gt;((folly::dynamic)rawProps)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">shadowTreeRegistry_.visit(</span>
+      <span class="s1">family.getSurfaceId()</span><span class="s4">, </span><span class="s1">[&amp;](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree) {</span>
+        <span class="s1">shadowTree.commit(</span>
+            <span class="s1">[&amp;](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode) {</span>
+              <span class="s4">auto </span><span class="s1">rootNode = oldRootShadowNode.cloneTree(</span>
+                  <span class="s1">family</span><span class="s4">, </span><span class="s1">[&amp;](ShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldShadowNode) {</span>
+                    <span class="s4">auto </span><span class="s1">&amp;componentDescriptor =</span>
+                        <span class="s1">componentDescriptorRegistry_-&gt;at(</span>
+                            <span class="s1">shadowNode-&gt;getComponentHandle())</span><span class="s4">;</span>
+                    <span class="s1">PropsParserContext propsParserContext{</span>
+                        <span class="s1">family.getSurfaceId()</span><span class="s4">, </span><span class="s1">*contextContainer_.get()}</span><span class="s4">;</span>
+                    <span class="s4">auto </span><span class="s1">props = componentDescriptor.cloneProps(</span>
+                        <span class="s1">propsParserContext</span><span class="s4">,</span>
+                        <span class="s1">getNewestCloneOfShadowNode(*shadowNode)-&gt;getProps()</span><span class="s4">,</span>
+                        <span class="s1">rawProps)</span><span class="s4">;</span>
+
+                    <span class="s4">return </span><span class="s1">oldShadowNode.clone({</span><span class="s0">/* .props = */ </span><span class="s1">props})</span><span class="s4">;</span>
+                  <span class="s1">})</span><span class="s4">;</span>
+
+              <span class="s4">return </span><span class="s1">std::static_pointer_cast&lt;RootShadowNode&gt;(rootNode)</span><span class="s4">;</span>
+            <span class="s1">}</span><span class="s4">,</span>
+            <span class="s1">{</span><span class="s0">/* default commit options */</span><span class="s1">})</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::sendAccessibilityEvent(</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::Shared &amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;eventType) {</span>
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">delegate_-&gt;uiManagerDidSendAccessibilityEvent(shadowNode</span><span class="s4">, </span><span class="s1">eventType)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::configureNextLayoutAnimation(</span>
+    <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+    <span class="s1">RawValue </span><span class="s4">const </span><span class="s1">&amp;config</span><span class="s4">,</span>
+    <span class="s1">jsi::Value </span><span class="s4">const </span><span class="s1">&amp;successCallback</span><span class="s4">,</span>
+    <span class="s1">jsi::Value </span><span class="s4">const </span><span class="s1">&amp;failureCallback) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(animationDelegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">animationDelegate_-&gt;uiManagerDidConfigureNextLayoutAnimation(</span>
+        <span class="s1">runtime</span><span class="s4">,</span>
+        <span class="s1">config</span><span class="s4">,</span>
+        <span class="s1">std::move(successCallback)</span><span class="s4">,</span>
+        <span class="s1">std::move(failureCallback))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">ShadowNode::Shared findShadowNodeByTagRecursively(</span>
+    <span class="s1">ShadowNode::Shared parentShadowNode</span><span class="s4">,</span>
+    <span class="s1">Tag tag) {</span>
+  <span class="s4">if </span><span class="s1">(parentShadowNode-&gt;getTag() == tag) {</span>
+    <span class="s4">return </span><span class="s1">parentShadowNode</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(ShadowNode::Shared </span><span class="s4">const </span><span class="s1">&amp;shadowNode : parentShadowNode-&gt;getChildren()) {</span>
+    <span class="s4">auto </span><span class="s1">result = findShadowNodeByTagRecursively(shadowNode</span><span class="s4">, </span><span class="s1">tag)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(result) {</span>
+      <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return nullptr;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowNode::Shared UIManager::findShadowNodeByTag_DEPRECATED(Tag tag) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">shadowNode = ShadowNode::Shared{}</span><span class="s4">;</span>
+
+  <span class="s1">shadowTreeRegistry_.enumerate([&amp;](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree</span><span class="s4">, bool </span><span class="s1">&amp;stop) {</span>
+    <span class="s1">RootShadowNode </span><span class="s4">const </span><span class="s1">*rootShadowNode</span><span class="s4">;</span>
+    <span class="s0">// The public interface of `ShadowTree` discourages accessing a stored</span>
+    <span class="s0">// pointer to a root node because of the possible data race.</span>
+    <span class="s0">// To work around this, we ask for a commit and immediately cancel it</span>
+    <span class="s0">// returning `nullptr` instead of a new shadow tree.</span>
+    <span class="s0">// We don't want to add a way to access a stored pointer to a root node</span>
+    <span class="s0">// because this `findShadowNodeByTag` is deprecated. It is only added</span>
+    <span class="s0">// to make migration to the new architecture easier.</span>
+    <span class="s1">shadowTree.tryCommit(</span>
+        <span class="s1">[&amp;](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode) {</span>
+          <span class="s1">rootShadowNode = &amp;oldRootShadowNode</span><span class="s4">;</span>
+          <span class="s4">return nullptr;</span>
+        <span class="s1">}</span><span class="s4">,</span>
+        <span class="s1">{</span><span class="s0">/* default commit options */</span><span class="s1">})</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(rootShadowNode != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s4">auto const </span><span class="s1">&amp;children = rootShadowNode-&gt;getChildren()</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(!children.empty()) {</span>
+        <span class="s4">auto const </span><span class="s1">&amp;child = children.front()</span><span class="s4">;</span>
+        <span class="s1">shadowNode = findShadowNodeByTagRecursively(child</span><span class="s4">, </span><span class="s1">tag)</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(shadowNode) {</span>
+          <span class="s1">stop = </span><span class="s4">true;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">shadowNode</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::setComponentDescriptorRegistry(</span>
+    <span class="s4">const </span><span class="s1">SharedComponentDescriptorRegistry &amp;componentDescriptorRegistry) {</span>
+  <span class="s1">componentDescriptorRegistry_ = componentDescriptorRegistry</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::setDelegate(UIManagerDelegate *delegate) {</span>
+  <span class="s1">delegate_ = delegate</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">UIManagerDelegate *UIManager::getDelegate() {</span>
+  <span class="s4">return </span><span class="s1">delegate_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::visitBinding(</span>
+    <span class="s1">std::function&lt;</span><span class="s4">void</span><span class="s1">(UIManagerBinding </span><span class="s4">const </span><span class="s1">&amp;uiManagerBinding)&gt; </span><span class="s4">const</span>
+        <span class="s1">&amp;callback</span><span class="s4">,</span>
+    <span class="s1">jsi::Runtime &amp;runtime) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">uiManagerBinding = UIManagerBinding::getBinding(runtime)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(uiManagerBinding) {</span>
+    <span class="s1">callback(*uiManagerBinding)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowTreeRegistry </span><span class="s4">const </span><span class="s1">&amp;UIManager::getShadowTreeRegistry() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">shadowTreeRegistry_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::registerCommitHook(</span>
+    <span class="s1">UIManagerCommitHook </span><span class="s4">const </span><span class="s1">&amp;commitHook) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::unique_lock lock(commitHookMutex_)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">std::find(commitHooks_.begin()</span><span class="s4">, </span><span class="s1">commitHooks_.end()</span><span class="s4">, </span><span class="s1">&amp;commitHook) ==</span>
+      <span class="s1">commitHooks_.end())</span><span class="s4">;</span>
+  <span class="s1">commitHook.commitHookWasRegistered(*</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">commitHooks_.push_back(&amp;commitHook)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::unregisterCommitHook(</span>
+    <span class="s1">UIManagerCommitHook </span><span class="s4">const </span><span class="s1">&amp;commitHook) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::unique_lock lock(commitHookMutex_)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">iterator =</span>
+      <span class="s1">std::find(commitHooks_.begin()</span><span class="s4">, </span><span class="s1">commitHooks_.end()</span><span class="s4">, </span><span class="s1">&amp;commitHook)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(iterator != commitHooks_.end())</span><span class="s4">;</span>
+  <span class="s1">commitHooks_.erase(iterator)</span><span class="s4">;</span>
+  <span class="s1">commitHook.commitHookWasUnregistered(*</span><span class="s4">this</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - ShadowTreeDelegate</span>
+
+<span class="s1">RootShadowNode::Unshared UIManager::shadowTreeWillCommit(</span>
+    <span class="s1">ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree</span><span class="s4">,</span>
+    <span class="s1">RootShadowNode::Shared </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode</span><span class="s4">,</span>
+    <span class="s1">RootShadowNode::Unshared </span><span class="s4">const </span><span class="s1">&amp;newRootShadowNode) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(commitHookMutex_)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">resultRootShadowNode = newRootShadowNode</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">*commitHook : commitHooks_) {</span>
+    <span class="s1">resultRootShadowNode = commitHook-&gt;shadowTreeWillCommit(</span>
+        <span class="s1">shadowTree</span><span class="s4">, </span><span class="s1">oldRootShadowNode</span><span class="s4">, </span><span class="s1">resultRootShadowNode)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">resultRootShadowNode</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::shadowTreeDidFinishTransaction(</span>
+    <span class="s1">MountingCoordinator::Shared mountingCoordinator</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">mountSynchronously) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;UIManager::shadowTreeDidFinishTransaction&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(delegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">delegate_-&gt;uiManagerDidFinishTransaction(</span>
+        <span class="s1">std::move(mountingCoordinator)</span><span class="s4">, </span><span class="s1">mountSynchronously)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - UIManagerAnimationDelegate</span>
+
+<span class="s4">void </span><span class="s1">UIManager::setAnimationDelegate(UIManagerAnimationDelegate *delegate) {</span>
+  <span class="s1">animationDelegate_ = delegate</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::stopSurfaceForAnimationDelegate(SurfaceId surfaceId) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(animationDelegate_ != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">animationDelegate_-&gt;stopSurface(surfaceId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">UIManager::animationTick() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(animationDelegate_ != </span><span class="s4">nullptr </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">animationDelegate_-&gt;shouldAnimateFrame()) {</span>
+    <span class="s1">shadowTreeRegistry_.enumerate([](ShadowTree </span><span class="s4">const </span><span class="s1">&amp;shadowTree</span><span class="s4">, bool </span><span class="s1">&amp;) {</span>
+      <span class="s1">shadowTree.notifyDelegatesOfUpdates()</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

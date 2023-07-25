@@ -1,0 +1,327 @@
+<html>
+<head>
+<title>parser.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+parser.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">UnionTypeAnnotationMemberType,</span>
+  <span class="s0">SchemaType,</span>
+  <span class="s0">NamedShape,</span>
+  <span class="s0">Nullable,</span>
+  <span class="s0">NativeModuleParamTypeAnnotation,</span>
+  <span class="s0">NativeModuleEnumMembers,</span>
+  <span class="s0">NativeModuleEnumMemberType,</span>
+  <span class="s0">NativeModuleAliasMap,</span>
+  <span class="s0">NativeModuleEnumMap,</span>
+<span class="s0">} from '../../CodegenSchema';</span>
+<span class="s0">import type {ParserType} from '../errors';</span>
+<span class="s0">import type {Parser} from '../parser';</span>
+<span class="s0">import type {ParserErrorCapturer, TypeDeclarationMap} from '../utils';</span>
+
+<span class="s0">const {typeScriptTranslateTypeAnnotation} = require('./modules');</span>
+
+<span class="s0">// $FlowFixMe[untyped-import] Use flow-types for @babel/parser</span>
+<span class="s0">const babelParser = require('@babel/parser');</span>
+
+<span class="s0">const {buildSchema} = require('../parsers-commons');</span>
+<span class="s0">const {Visitor} = require('../parsers-primitives');</span>
+<span class="s0">const {buildComponentSchema} = require('./components');</span>
+<span class="s0">const {wrapComponentSchema} = require('../schema.js');</span>
+<span class="s0">const {buildModuleSchema} = require('../parsers-commons.js');</span>
+<span class="s0">const {resolveTypeAnnotation} = require('./utils');</span>
+
+<span class="s0">const fs = require('fs');</span>
+
+<span class="s0">const {</span>
+  <span class="s0">UnsupportedObjectPropertyTypeAnnotationParserError,</span>
+<span class="s0">} = require('../errors');</span>
+
+<span class="s0">class TypeScriptParser implements Parser {</span>
+  <span class="s0">typeParameterInstantiation: string = 'TSTypeParameterInstantiation';</span>
+
+  <span class="s0">isProperty(property: $FlowFixMe): boolean {</span>
+    <span class="s0">return property.type === 'TSPropertySignature';</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getKeyName(property: $FlowFixMe, hasteModuleName: string): string {</span>
+    <span class="s0">if (!this.isProperty(property)) {</span>
+      <span class="s0">throw new UnsupportedObjectPropertyTypeAnnotationParserError(</span>
+        <span class="s0">hasteModuleName,</span>
+        <span class="s0">property,</span>
+        <span class="s0">property.type,</span>
+        <span class="s0">this.language(),</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s0">return property.key.name;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">language(): ParserType {</span>
+    <span class="s0">return 'TypeScript';</span>
+  <span class="s0">}</span>
+
+  <span class="s0">nameForGenericTypeAnnotation(typeAnnotation: $FlowFixMe): string {</span>
+    <span class="s0">return typeAnnotation.typeName.name;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">checkIfInvalidModule(typeArguments: $FlowFixMe): boolean {</span>
+    <span class="s0">return (</span>
+      <span class="s0">typeArguments.type !== 'TSTypeParameterInstantiation' ||</span>
+      <span class="s0">typeArguments.params.length !== 1 ||</span>
+      <span class="s0">typeArguments.params[0].type !== 'TSTypeReference' ||</span>
+      <span class="s0">typeArguments.params[0].typeName.name !== 'Spec'</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">remapUnionTypeAnnotationMemberNames(</span>
+    <span class="s0">membersTypes: $FlowFixMe[],</span>
+  <span class="s0">): UnionTypeAnnotationMemberType[] {</span>
+    <span class="s0">const remapLiteral = (item: $FlowFixMe) =&gt; {</span>
+      <span class="s0">return item.literal</span>
+        <span class="s0">? item.literal.type</span>
+            <span class="s0">.replace('NumericLiteral', 'NumberTypeAnnotation')</span>
+            <span class="s0">.replace('StringLiteral', 'StringTypeAnnotation')</span>
+        <span class="s0">: 'ObjectTypeAnnotation';</span>
+    <span class="s0">};</span>
+
+    <span class="s0">return [...new Set(membersTypes.map(remapLiteral))];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">parseFile(filename: string): SchemaType {</span>
+    <span class="s0">const contents = fs.readFileSync(filename, 'utf8');</span>
+
+    <span class="s0">return this.parseString(contents, filename);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">parseString(contents: string, filename: ?string): SchemaType {</span>
+    <span class="s0">return buildSchema(</span>
+      <span class="s0">contents,</span>
+      <span class="s0">filename,</span>
+      <span class="s0">wrapComponentSchema,</span>
+      <span class="s0">buildComponentSchema,</span>
+      <span class="s0">buildModuleSchema,</span>
+      <span class="s0">Visitor,</span>
+      <span class="s0">this,</span>
+      <span class="s0">resolveTypeAnnotation,</span>
+      <span class="s0">typeScriptTranslateTypeAnnotation,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">parseModuleFixture(filename: string): SchemaType {</span>
+    <span class="s0">const contents = fs.readFileSync(filename, 'utf8');</span>
+
+    <span class="s0">return this.parseString(contents, 'path/NativeSampleTurboModule.ts');</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getAst(contents: string): $FlowFixMe {</span>
+    <span class="s0">return babelParser.parse(contents, {</span>
+      <span class="s0">sourceType: 'module',</span>
+      <span class="s0">plugins: ['typescript'],</span>
+    <span class="s0">}).program;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getFunctionTypeAnnotationParameters(</span>
+    <span class="s0">functionTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">): $ReadOnlyArray&lt;$FlowFixMe&gt; {</span>
+    <span class="s0">return functionTypeAnnotation.parameters;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getFunctionNameFromParameter(</span>
+    <span class="s0">parameter: NamedShape&lt;Nullable&lt;NativeModuleParamTypeAnnotation&gt;&gt;,</span>
+  <span class="s0">): $FlowFixMe {</span>
+    <span class="s0">return parameter.typeAnnotation;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getParameterName(parameter: $FlowFixMe): string {</span>
+    <span class="s0">return parameter.name;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getParameterTypeAnnotation(parameter: $FlowFixMe): $FlowFixMe {</span>
+    <span class="s0">return parameter.typeAnnotation.typeAnnotation;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getFunctionTypeAnnotationReturnType(</span>
+    <span class="s0">functionTypeAnnotation: $FlowFixMe,</span>
+  <span class="s0">): $FlowFixMe {</span>
+    <span class="s0">return functionTypeAnnotation.typeAnnotation.typeAnnotation;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">parseEnumMembersType(typeAnnotation: $FlowFixMe): NativeModuleEnumMemberType {</span>
+    <span class="s0">const enumInitializer = typeAnnotation.members[0]?.initializer;</span>
+    <span class="s0">const enumMembersType: ?NativeModuleEnumMemberType =</span>
+      <span class="s0">!enumInitializer || enumInitializer.type === 'StringLiteral'</span>
+        <span class="s0">? 'StringTypeAnnotation'</span>
+        <span class="s0">: enumInitializer.type === 'NumericLiteral'</span>
+        <span class="s0">? 'NumberTypeAnnotation'</span>
+        <span class="s0">: null;</span>
+    <span class="s0">if (!enumMembersType) {</span>
+      <span class="s0">throw new Error(</span>
+        <span class="s0">'Enum values must be either blank, number, or string values.',</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s0">return enumMembersType;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">validateEnumMembersSupported(</span>
+    <span class="s0">typeAnnotation: $FlowFixMe,</span>
+    <span class="s0">enumMembersType: NativeModuleEnumMemberType,</span>
+  <span class="s0">): void {</span>
+    <span class="s0">if (!typeAnnotation.members || typeAnnotation.members.length === 0) {</span>
+      <span class="s0">throw new Error('Enums should have at least one member.');</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const enumInitializerType =</span>
+      <span class="s0">enumMembersType === 'StringTypeAnnotation'</span>
+        <span class="s0">? 'StringLiteral'</span>
+        <span class="s0">: enumMembersType === 'NumberTypeAnnotation'</span>
+        <span class="s0">? 'NumericLiteral'</span>
+        <span class="s0">: null;</span>
+
+    <span class="s0">typeAnnotation.members.forEach(member =&gt; {</span>
+      <span class="s0">if (</span>
+        <span class="s0">(member.initializer?.type ?? 'StringLiteral') !== enumInitializerType</span>
+      <span class="s0">) {</span>
+        <span class="s0">throw new Error(</span>
+          <span class="s0">'Enum values can not be mixed. They all must be either blank, number, or string values.',</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">parseEnumMembers(typeAnnotation: $FlowFixMe): NativeModuleEnumMembers {</span>
+    <span class="s0">return typeAnnotation.members.map(member =&gt; ({</span>
+      <span class="s0">name: member.id.name,</span>
+      <span class="s0">value: member.initializer?.value ?? member.id.name,</span>
+    <span class="s0">}));</span>
+  <span class="s0">}</span>
+
+  <span class="s0">isModuleInterface(node: $FlowFixMe): boolean {</span>
+    <span class="s0">return (</span>
+      <span class="s0">node.type === 'TSInterfaceDeclaration' &amp;&amp;</span>
+      <span class="s0">node.extends?.length === 1 &amp;&amp;</span>
+      <span class="s0">node.extends[0].type === 'TSExpressionWithTypeArguments' &amp;&amp;</span>
+      <span class="s0">node.extends[0].expression.name === 'TurboModule'</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">extractAnnotatedElement(</span>
+    <span class="s0">typeAnnotation: $FlowFixMe,</span>
+    <span class="s0">types: TypeDeclarationMap,</span>
+  <span class="s0">): $FlowFixMe {</span>
+    <span class="s0">return types[typeAnnotation.typeParameters.params[0].typeName.name];</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* TODO(T108222691): Use flow-types for @babel/parser</span>
+   <span class="s0">*/</span>
+  <span class="s0">getTypes(ast: $FlowFixMe): TypeDeclarationMap {</span>
+    <span class="s0">return ast.body.reduce((types, node) =&gt; {</span>
+      <span class="s0">switch (node.type) {</span>
+        <span class="s0">case 'ExportNamedDeclaration': {</span>
+          <span class="s0">if (node.declaration) {</span>
+            <span class="s0">switch (node.declaration.type) {</span>
+              <span class="s0">case 'TSTypeAliasDeclaration':</span>
+              <span class="s0">case 'TSInterfaceDeclaration':</span>
+              <span class="s0">case 'TSEnumDeclaration': {</span>
+                <span class="s0">types[node.declaration.id.name] = node.declaration;</span>
+                <span class="s0">break;</span>
+              <span class="s0">}</span>
+            <span class="s0">}</span>
+          <span class="s0">}</span>
+          <span class="s0">break;</span>
+        <span class="s0">}</span>
+        <span class="s0">case 'TSTypeAliasDeclaration':</span>
+        <span class="s0">case 'TSInterfaceDeclaration':</span>
+        <span class="s0">case 'TSEnumDeclaration': {</span>
+          <span class="s0">types[node.id.name] = node;</span>
+          <span class="s0">break;</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+      <span class="s0">return types;</span>
+    <span class="s0">}, {});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">callExpressionTypeParameters(callExpression: $FlowFixMe): $FlowFixMe | null {</span>
+    <span class="s0">return callExpression.typeParameters || null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">computePartialProperties(</span>
+    <span class="s0">properties: Array&lt;$FlowFixMe&gt;,</span>
+    <span class="s0">hasteModuleName: string,</span>
+    <span class="s0">types: TypeDeclarationMap,</span>
+    <span class="s0">aliasMap: {...NativeModuleAliasMap},</span>
+    <span class="s0">enumMap: {...NativeModuleEnumMap},</span>
+    <span class="s0">tryParse: ParserErrorCapturer,</span>
+    <span class="s0">cxxOnly: boolean,</span>
+  <span class="s0">): Array&lt;$FlowFixMe&gt; {</span>
+    <span class="s0">return properties.map(prop =&gt; {</span>
+      <span class="s0">return {</span>
+        <span class="s0">name: prop.key.name,</span>
+        <span class="s0">optional: true,</span>
+        <span class="s0">typeAnnotation: typeScriptTranslateTypeAnnotation(</span>
+          <span class="s0">hasteModuleName,</span>
+          <span class="s0">prop.typeAnnotation.typeAnnotation,</span>
+          <span class="s0">types,</span>
+          <span class="s0">aliasMap,</span>
+          <span class="s0">enumMap,</span>
+          <span class="s0">tryParse,</span>
+          <span class="s0">cxxOnly,</span>
+          <span class="s0">this,</span>
+        <span class="s0">),</span>
+      <span class="s0">};</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">functionTypeAnnotation(propertyValueType: string): boolean {</span>
+    <span class="s0">return (</span>
+      <span class="s0">propertyValueType === 'TSFunctionType' ||</span>
+      <span class="s0">propertyValueType === 'TSMethodSignature'</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getTypeArgumentParamsFromDeclaration(declaration: $FlowFixMe): $FlowFixMe {</span>
+    <span class="s0">return declaration.typeParameters.params;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// This FlowFixMe is supposed to refer to typeArgumentParams and funcArgumentParams of generated AST.</span>
+  <span class="s0">getNativeComponentType(</span>
+    <span class="s0">typeArgumentParams: $FlowFixMe,</span>
+    <span class="s0">funcArgumentParams: $FlowFixMe,</span>
+  <span class="s0">): {[string]: string} {</span>
+    <span class="s0">return {</span>
+      <span class="s0">propsTypeName: typeArgumentParams[0].typeName.name,</span>
+      <span class="s0">componentName: funcArgumentParams[0].value,</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getAnnotatedElementProperties(annotatedElement: $FlowFixMe): $FlowFixMe {</span>
+    <span class="s0">return annotatedElement.typeAnnotation.members;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">TypeScriptParser,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

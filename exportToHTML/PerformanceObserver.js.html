@@ -1,0 +1,339 @@
+<html>
+<head>
+<title>PerformanceObserver.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+PerformanceObserver.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @format 
+ * @flow strict 
+ */</span>
+
+<span class="s1">import type {HighResTimeStamp, PerformanceEntryType} from </span><span class="s2">'./PerformanceEntry'</span><span class="s1">;</span>
+
+<span class="s1">import warnOnce from </span><span class="s2">'../Utilities/warnOnce'</span><span class="s1">;</span>
+<span class="s1">import NativePerformanceObserver from </span><span class="s2">'./NativePerformanceObserver'</span><span class="s1">;</span>
+<span class="s1">import {PerformanceEntry} from </span><span class="s2">'./PerformanceEntry'</span><span class="s1">;</span>
+<span class="s1">import {</span>
+  <span class="s1">performanceEntryTypeToRaw,</span>
+  <span class="s1">rawToPerformanceEntry,</span>
+<span class="s1">} from </span><span class="s2">'./RawPerformanceEntry'</span><span class="s1">;</span>
+
+<span class="s1">export type PerformanceEntryList = $ReadOnlyArray&lt;PerformanceEntry&gt;;</span>
+
+<span class="s1">export class PerformanceObserverEntryList {</span>
+  <span class="s1">_entries: PerformanceEntryList;</span>
+
+  <span class="s1">constructor(entries: PerformanceEntryList) {</span>
+    <span class="s3">this</span><span class="s1">._entries = entries;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getEntries(): PerformanceEntryList {</span>
+    <span class="s3">return this</span><span class="s1">._entries;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getEntriesByType(type: PerformanceEntryType): PerformanceEntryList {</span>
+    <span class="s3">return this</span><span class="s1">._entries.filter(entry =&gt; entry.entryType === type);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">getEntriesByName(</span>
+    <span class="s1">name: string,</span>
+    <span class="s1">type?: PerformanceEntryType,</span>
+  <span class="s1">): PerformanceEntryList {</span>
+    <span class="s3">if </span><span class="s1">(type === undefined) {</span>
+      <span class="s3">return this</span><span class="s1">._entries.filter(entry =&gt; entry.name === name);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s3">return this</span><span class="s1">._entries.filter(</span>
+        <span class="s1">entry =&gt; entry.name === name &amp;&amp; entry.entryType === type,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">export type PerformanceObserverCallback = (</span>
+  <span class="s1">list: PerformanceObserverEntryList,</span>
+  <span class="s1">observer: PerformanceObserver,</span>
+  <span class="s0">// The number of buffered entries which got dropped from the buffer due to the buffer being full:</span>
+  <span class="s1">droppedEntryCount?: number,</span>
+<span class="s1">) =&gt; </span><span class="s3">void</span><span class="s1">;</span>
+
+<span class="s1">export type PerformanceObserverInit =</span>
+  <span class="s1">| {</span>
+      <span class="s1">entryTypes: Array&lt;PerformanceEntryType&gt;,</span>
+    <span class="s1">}</span>
+  <span class="s1">| {</span>
+      <span class="s1">type: PerformanceEntryType,</span>
+      <span class="s1">durationThreshold?: HighResTimeStamp,</span>
+    <span class="s1">};</span>
+
+<span class="s1">type PerformanceObserverConfig = {|</span>
+  <span class="s1">callback: PerformanceObserverCallback,</span>
+  <span class="s0">// Map of {entryType: durationThreshold}</span>
+  <span class="s1">entryTypes: $ReadOnlyMap&lt;PerformanceEntryType, ?number&gt;,</span>
+<span class="s1">|};</span>
+
+<span class="s1">const observerCountPerEntryType: Map&lt;PerformanceEntryType, number&gt; = </span><span class="s3">new </span><span class="s1">Map();</span>
+<span class="s1">const registeredObservers: Map&lt;PerformanceObserver, PerformanceObserverConfig&gt; =</span>
+  <span class="s3">new </span><span class="s1">Map();</span>
+<span class="s1">let isOnPerformanceEntryCallbackSet: boolean = </span><span class="s3">false</span><span class="s1">;</span>
+
+<span class="s0">// This is a callback that gets scheduled and periodically called from the native side</span>
+<span class="s1">const onPerformanceEntry = () =&gt; {</span>
+  <span class="s3">if </span><span class="s1">(!NativePerformanceObserver) {</span>
+    <span class="s3">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">const entryResult = NativePerformanceObserver.popPendingEntries();</span>
+  <span class="s1">const rawEntries = entryResult?.entries ?? [];</span>
+  <span class="s1">const droppedEntriesCount = entryResult?.droppedEntriesCount;</span>
+  <span class="s3">if </span><span class="s1">(rawEntries.length === </span><span class="s4">0</span><span class="s1">) {</span>
+    <span class="s3">return</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">const entries = rawEntries.map(rawToPerformanceEntry);</span>
+  <span class="s3">for </span><span class="s1">(const [observer, observerConfig] of registeredObservers.entries()) {</span>
+    <span class="s1">const entriesForObserver: PerformanceEntryList = entries.filter(entry =&gt; {</span>
+      <span class="s3">if </span><span class="s1">(!observerConfig.entryTypes.has(entry.entryType)) {</span>
+        <span class="s3">return false</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">const durationThreshold = observerConfig.entryTypes.get(entry.entryType);</span>
+      <span class="s3">return </span><span class="s1">entry.duration &gt;= (durationThreshold ?? </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">});</span>
+    <span class="s1">observerConfig.callback(</span>
+      <span class="s3">new </span><span class="s1">PerformanceObserverEntryList(entriesForObserver),</span>
+      <span class="s1">observer,</span>
+      <span class="s1">droppedEntriesCount,</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">};</span>
+
+<span class="s1">export </span><span class="s3">function </span><span class="s1">warnNoNativePerformanceObserver() {</span>
+  <span class="s1">warnOnce(</span>
+    <span class="s2">'missing-native-performance-observer'</span><span class="s1">,</span>
+    <span class="s2">'Missing native implementation of PerformanceObserver'</span><span class="s1">,</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">applyDurationThresholds() {</span>
+  <span class="s1">const durationThresholds: Map&lt;PerformanceEntryType, ?number&gt; = Array.from(</span>
+    <span class="s1">registeredObservers.values(),</span>
+  <span class="s1">)</span>
+    <span class="s1">.map(config =&gt; config.entryTypes)</span>
+    <span class="s1">.reduce(</span>
+      <span class="s1">(accumulator, currentValue) =&gt; union(accumulator, currentValue),</span>
+      <span class="s3">new </span><span class="s1">Map(),</span>
+    <span class="s1">);</span>
+
+  <span class="s3">for </span><span class="s1">(const [entryType, durationThreshold] of durationThresholds) {</span>
+    <span class="s1">NativePerformanceObserver?.setDurationThreshold(</span>
+      <span class="s1">performanceEntryTypeToRaw(entryType),</span>
+      <span class="s1">durationThreshold ?? </span><span class="s4">0</span><span class="s1">,</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Implementation of the PerformanceObserver interface for RN, 
+ * corresponding to the standard in https://www.w3.org/TR/performance-timeline/ 
+ * 
+ * @example 
+ * const observer = new PerformanceObserver((list, _observer) =&gt; { 
+ *   const entries = list.getEntries(); 
+ *   entries.forEach(entry =&gt; { 
+ *     reportEvent({ 
+ *       eventName: entry.name, 
+ *       startTime: entry.startTime, 
+ *       endTime: entry.startTime + entry.duration, 
+ *       processingStart: entry.processingStart, 
+ *       processingEnd: entry.processingEnd, 
+ *       interactionId: entry.interactionId, 
+ *     }); 
+ *   }); 
+ * }); 
+ * observer.observe({ type: &quot;event&quot; }); 
+ */</span>
+<span class="s1">export </span><span class="s3">default </span><span class="s1">class PerformanceObserver {</span>
+  <span class="s1">_callback: PerformanceObserverCallback;</span>
+  <span class="s1">_type: </span><span class="s2">'single' </span><span class="s1">| </span><span class="s2">'multiple' </span><span class="s1">| </span><span class="s3">void</span><span class="s1">;</span>
+
+  <span class="s1">constructor(callback: PerformanceObserverCallback) {</span>
+    <span class="s3">this</span><span class="s1">._callback = callback;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">observe(options: PerformanceObserverInit): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">if </span><span class="s1">(!NativePerformanceObserver) {</span>
+      <span class="s1">warnNoNativePerformanceObserver();</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s3">this</span><span class="s1">._validateObserveOptions(options);</span>
+
+    <span class="s1">let requestedEntryTypes;</span>
+
+    <span class="s3">if </span><span class="s1">(options.entryTypes) {</span>
+      <span class="s3">this</span><span class="s1">._type = </span><span class="s2">'multiple'</span><span class="s1">;</span>
+      <span class="s1">requestedEntryTypes = </span><span class="s3">new </span><span class="s1">Map(</span>
+        <span class="s1">options.entryTypes.map(t =&gt; [t, undefined]),</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s3">this</span><span class="s1">._type = </span><span class="s2">'single'</span><span class="s1">;</span>
+      <span class="s1">requestedEntryTypes = </span><span class="s3">new </span><span class="s1">Map([</span>
+        <span class="s1">[options.type, options.durationThreshold],</span>
+      <span class="s1">]);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// The same observer may receive multiple calls to &quot;observe&quot;, so we need</span>
+    <span class="s0">// to check what is new on this call vs. previous ones.</span>
+    <span class="s1">const currentEntryTypes = registeredObservers.get(</span><span class="s3">this</span><span class="s1">)?.entryTypes;</span>
+    <span class="s1">const nextEntryTypes = currentEntryTypes</span>
+      <span class="s1">? union(requestedEntryTypes, currentEntryTypes)</span>
+      <span class="s1">: requestedEntryTypes;</span>
+
+    <span class="s0">// This `observe` call is a no-op because there are no new things to observe.</span>
+    <span class="s3">if </span><span class="s1">(currentEntryTypes &amp;&amp; currentEntryTypes.size === nextEntryTypes.size) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">registeredObservers.set(</span><span class="s3">this</span><span class="s1">, {</span>
+      <span class="s1">callback: </span><span class="s3">this</span><span class="s1">._callback,</span>
+      <span class="s1">entryTypes: nextEntryTypes,</span>
+    <span class="s1">});</span>
+
+    <span class="s3">if </span><span class="s1">(!isOnPerformanceEntryCallbackSet) {</span>
+      <span class="s1">NativePerformanceObserver.setOnPerformanceEntryCallback(</span>
+        <span class="s1">onPerformanceEntry,</span>
+      <span class="s1">);</span>
+      <span class="s1">isOnPerformanceEntryCallbackSet = </span><span class="s3">true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// We only need to start listenening to new entry types being observed in</span>
+    <span class="s0">// this observer.</span>
+    <span class="s1">const newEntryTypes = currentEntryTypes</span>
+      <span class="s1">? difference(</span>
+          <span class="s3">new </span><span class="s1">Set(requestedEntryTypes.keys()),</span>
+          <span class="s3">new </span><span class="s1">Set(currentEntryTypes.keys()),</span>
+        <span class="s1">)</span>
+      <span class="s1">: </span><span class="s3">new </span><span class="s1">Set(requestedEntryTypes.keys());</span>
+    <span class="s3">for </span><span class="s1">(const type of newEntryTypes) {</span>
+      <span class="s3">if </span><span class="s1">(!observerCountPerEntryType.has(type)) {</span>
+        <span class="s1">const rawType = performanceEntryTypeToRaw(type);</span>
+        <span class="s1">NativePerformanceObserver.startReporting(rawType);</span>
+      <span class="s1">}</span>
+      <span class="s1">observerCountPerEntryType.set(</span>
+        <span class="s1">type,</span>
+        <span class="s1">(observerCountPerEntryType.get(type) ?? </span><span class="s4">0</span><span class="s1">) + </span><span class="s4">1</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">applyDurationThresholds();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">disconnect(): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">if </span><span class="s1">(!NativePerformanceObserver) {</span>
+      <span class="s1">warnNoNativePerformanceObserver();</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const observerConfig = registeredObservers.get(</span><span class="s3">this</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(!observerConfig) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Disconnect this observer</span>
+    <span class="s3">for </span><span class="s1">(const type of observerConfig.entryTypes.keys()) {</span>
+      <span class="s1">const numberOfObserversForThisType =</span>
+        <span class="s1">observerCountPerEntryType.get(type) ?? </span><span class="s4">0</span><span class="s1">;</span>
+      <span class="s3">if </span><span class="s1">(numberOfObserversForThisType === </span><span class="s4">1</span><span class="s1">) {</span>
+        <span class="s1">observerCountPerEntryType.</span><span class="s3">delete</span><span class="s1">(type);</span>
+        <span class="s1">NativePerformanceObserver.stopReporting(</span>
+          <span class="s1">performanceEntryTypeToRaw(type),</span>
+        <span class="s1">);</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(numberOfObserversForThisType !== </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s1">observerCountPerEntryType.set(type, numberOfObserversForThisType - </span><span class="s4">1</span><span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Disconnect all observers if this was the last one</span>
+    <span class="s1">registeredObservers.</span><span class="s3">delete</span><span class="s1">(</span><span class="s3">this</span><span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(registeredObservers.size === </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s1">NativePerformanceObserver.setOnPerformanceEntryCallback(undefined);</span>
+      <span class="s1">isOnPerformanceEntryCallbackSet = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">applyDurationThresholds();</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_validateObserveOptions(options: PerformanceObserverInit): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">const {type, entryTypes, durationThreshold} = options;</span>
+
+    <span class="s3">if </span><span class="s1">(!type &amp;&amp; !entryTypes) {</span>
+      <span class="s3">throw new </span><span class="s1">TypeError(</span>
+        <span class="s2">&quot;Failed to execute 'observe' on 'PerformanceObserver': An observe() call must not include both entryTypes and type arguments.&quot;</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(entryTypes &amp;&amp; type) {</span>
+      <span class="s3">throw new </span><span class="s1">TypeError(</span>
+        <span class="s2">&quot;Failed to execute 'observe' on 'PerformanceObserver': An observe() call must include either entryTypes or type arguments.&quot;</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._type === </span><span class="s2">'multiple' </span><span class="s1">&amp;&amp; type) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span>
+        <span class="s2">&quot;Failed to execute 'observe' on 'PerformanceObserver': This observer has performed observe({entryTypes:...}, therefore it cannot perform observe({type:...})&quot;</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._type === </span><span class="s2">'single' </span><span class="s1">&amp;&amp; entryTypes) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span>
+        <span class="s2">&quot;Failed to execute 'observe' on 'PerformanceObserver': This PerformanceObserver has performed observe({type:...}, therefore it cannot perform observe({entryTypes:...})&quot;</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(entryTypes &amp;&amp; durationThreshold !== undefined) {</span>
+      <span class="s3">throw new </span><span class="s1">TypeError(</span>
+        <span class="s2">&quot;Failed to execute 'observe' on 'PerformanceObserver': An observe() call must not include both entryTypes and durationThreshold arguments.&quot;</span><span class="s1">,</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">static supportedEntryTypes: $ReadOnlyArray&lt;PerformanceEntryType&gt; =</span>
+    <span class="s1">Object.freeze([</span><span class="s2">'mark'</span><span class="s1">, </span><span class="s2">'measure'</span><span class="s1">, </span><span class="s2">'event'</span><span class="s1">]);</span>
+<span class="s1">}</span>
+
+<span class="s0">// As a Set union, except if value exists in both, we take minimum</span>
+<span class="s3">function </span><span class="s1">union&lt;T&gt;(</span>
+  <span class="s1">a: $ReadOnlyMap&lt;T, ?number&gt;,</span>
+  <span class="s1">b: $ReadOnlyMap&lt;T, ?number&gt;,</span>
+<span class="s1">): Map&lt;T, ?number&gt; {</span>
+  <span class="s1">const res = </span><span class="s3">new </span><span class="s1">Map&lt;T, ?number&gt;();</span>
+  <span class="s3">for </span><span class="s1">(const [k, v] of a) {</span>
+    <span class="s3">if </span><span class="s1">(!b.has(k)) {</span>
+      <span class="s1">res.set(k, v);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">res.set(k, Math.min(v ?? </span><span class="s4">0</span><span class="s1">, b.get(k) ?? </span><span class="s4">0</span><span class="s1">));</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">res;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">difference&lt;T&gt;(a: $ReadOnlySet&lt;T&gt;, b: $ReadOnlySet&lt;T&gt;): Set&lt;T&gt; {</span>
+  <span class="s3">return new </span><span class="s1">Set([...a].filter(x =&gt; !b.has(x)));</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

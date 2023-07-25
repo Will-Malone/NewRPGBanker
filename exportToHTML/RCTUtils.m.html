@@ -1,0 +1,1096 @@
+<html>
+<head>
+<title>RCTUtils.m</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTUtils.m</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTUtils.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;dlfcn.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;mach/mach_time.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;objc/message.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;objc/runtime.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;zlib.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;UIKit/UIKit.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;CommonCrypto/CommonCrypto.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtilsUIOverride.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTAssert.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTLog.h&quot;</span>
+
+<span class="s1">NSString *</span><span class="s4">const </span><span class="s1">RCTErrorUnspecified = </span><span class="s4">@</span><span class="s3">&quot;EUNSPECIFIED&quot;</span><span class="s4">;</span>
+
+<span class="s0">// Returns the Path of Home directory</span>
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTHomePath(</span><span class="s4">void</span><span class="s1">)</span><span class="s4">;</span>
+
+<span class="s0">// Returns the relative path within the Home for an absolute URL</span>
+<span class="s0">// (or nil, if the URL does not specify a path within the Home directory)</span>
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTHomePathForURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">URL)</span><span class="s4">;</span>
+
+<span class="s0">// Determines if a given image URL refers to a image in Home directory (~)</span>
+<span class="s1">BOOL RCTIsHomeAssetURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">imageURL)</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">_RCTJSONStringifyNoRetry(id </span><span class="s4">__nullable </span><span class="s1">jsonObject</span><span class="s4">, </span><span class="s1">NSError **error)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!jsonObject) {</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">static </span><span class="s1">SEL JSONKitSelector = NULL</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">NSSet&lt;Class&gt; *collectionTypes</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">SEL </span><span class="s4">selector </span><span class="s1">= NSSelectorFromString(</span><span class="s4">@</span><span class="s3">&quot;JSONStringWithOptions:error:&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">([NSDictionary instancesRespondToSelector:</span><span class="s4">selector</span><span class="s1">]) {</span>
+      <span class="s1">JSONKitSelector = </span><span class="s4">selector;</span>
+      <span class="s1">collectionTypes = [NSSet setWithObjects:[NSArray </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+                                              <span class="s1">[NSMutableArray </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+                                              <span class="s1">[NSDictionary </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+                                              <span class="s1">[NSMutableDictionary </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+                                              <span class="s1">nil]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">@try </span><span class="s1">{</span>
+    <span class="s0">// Use JSONKit if available and object is not a fragment</span>
+    <span class="s4">if </span><span class="s1">(JSONKitSelector &amp;&amp; [collectionTypes containsObject:[jsonObject classForCoder]]) {</span>
+      <span class="s4">return </span><span class="s1">((NSString * (*)(id</span><span class="s4">, </span><span class="s1">SEL</span><span class="s4">, int, </span><span class="s1">NSError **)) objc_msgSend)(jsonObject</span><span class="s4">, </span><span class="s1">JSONKitSelector</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Use Foundation JSON method</span>
+    <span class="s1">NSData *jsonData = [NSJSONSerialization dataWithJSONObject:jsonObject</span>
+                                                       <span class="s1">options:(NSJSONWritingOptions)NSJSONReadingAllowFragments</span>
+                                                         <span class="s1">error:error]</span><span class="s4">;</span>
+
+    <span class="s4">return </span><span class="s1">jsonData ? [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] : nil</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">@catch </span><span class="s1">(NSException *exception) {</span>
+    <span class="s0">// Convert exception to error</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">*error = [NSError errorWithDomain:RCTErrorDomain</span>
+                                   <span class="s1">code:</span><span class="s5">0</span>
+                               <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{NSLocalizedDescriptionKey : exception.description ?: </span><span class="s4">@</span><span class="s3">&quot;&quot;</span><span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTJSONStringify(id </span><span class="s4">__nullable </span><span class="s1">jsonObject</span><span class="s4">, </span><span class="s1">NSError **error)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(error) {</span>
+    <span class="s4">return </span><span class="s1">_RCTJSONStringifyNoRetry(jsonObject</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">NSError *localError</span><span class="s4">;</span>
+    <span class="s1">NSString *json = _RCTJSONStringifyNoRetry(jsonObject</span><span class="s4">, </span><span class="s1">&amp;localError)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(localError) {</span>
+      <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;RCTJSONStringify() encountered the following error: %@&quot;</span><span class="s4">, </span><span class="s1">localError.localizedDescription)</span><span class="s4">;</span>
+      <span class="s0">// Sanitize the data, then retry. This is slow, but it prevents uncaught</span>
+      <span class="s0">// data issues from crashing in production</span>
+      <span class="s4">return </span><span class="s1">_RCTJSONStringifyNoRetry(RCTJSONClean(jsonObject)</span><span class="s4">, </span><span class="s1">NULL)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">json</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">id </span><span class="s4">__nullable </span><span class="s1">_RCTJSONParse(NSString *</span><span class="s4">__nullable </span><span class="s1">jsonString</span><span class="s4">, </span><span class="s1">BOOL mutable</span><span class="s4">, </span><span class="s1">NSError **error)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">SEL JSONKitSelector = NULL</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">SEL JSONKitMutableSelector = NULL</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">SEL </span><span class="s4">selector </span><span class="s1">= NSSelectorFromString(</span><span class="s4">@</span><span class="s3">&quot;objectFromJSONStringWithParseOptions:error:&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">([NSString instancesRespondToSelector:</span><span class="s4">selector</span><span class="s1">]) {</span>
+      <span class="s1">JSONKitSelector = </span><span class="s4">selector;</span>
+      <span class="s1">JSONKitMutableSelector = NSSelectorFromString(</span><span class="s4">@</span><span class="s3">&quot;mutableObjectFromJSONStringWithParseOptions:error:&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(jsonString) {</span>
+    <span class="s0">// Use JSONKit if available and string is not a fragment</span>
+    <span class="s4">if </span><span class="s1">(JSONKitSelector) {</span>
+      <span class="s1">NSInteger length = jsonString.length</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(NSInteger i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; length</span><span class="s4">; </span><span class="s1">i++) {</span>
+        <span class="s1">unichar c = [jsonString characterAtIndex:i]</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(strchr(</span><span class="s3">&quot;{[&quot;</span><span class="s4">, </span><span class="s1">c)) {</span>
+          <span class="s4">static const int </span><span class="s1">options = (</span><span class="s5">1 </span><span class="s1">&lt;&lt; </span><span class="s5">2</span><span class="s1">)</span><span class="s4">; </span><span class="s0">// loose unicode</span>
+          <span class="s1">SEL </span><span class="s4">selector </span><span class="s1">= mutable ? JSONKitMutableSelector : JSONKitSelector</span><span class="s4">;</span>
+          <span class="s4">return </span><span class="s1">((id(*)(id</span><span class="s4">, </span><span class="s1">SEL</span><span class="s4">, int, </span><span class="s1">NSError **))objc_msgSend)(jsonString</span><span class="s4">, selector, </span><span class="s1">options</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(!strchr(</span><span class="s3">&quot; </span><span class="s4">\r\n\t</span><span class="s3">&quot;</span><span class="s4">, </span><span class="s1">c)) {</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Use Foundation JSON method</span>
+    <span class="s1">NSData *jsonData = [jsonString dataUsingEncoding:NSUTF8StringEncoding]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!jsonData) {</span>
+      <span class="s1">jsonData = [jsonString dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:YES]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(jsonData) {</span>
+        <span class="s1">RCTLogWarn(</span>
+            <span class="s4">@</span><span class="s3">&quot;RCTJSONParse received the following string, which could &quot;</span>
+             <span class="s3">&quot;not be losslessly converted to UTF8 data: '%@'&quot;</span><span class="s4">,</span>
+            <span class="s1">jsonString)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">NSString *errorMessage = </span><span class="s4">@</span><span class="s3">&quot;RCTJSONParse received invalid UTF8 data&quot;</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(error) {</span>
+          <span class="s1">*error = RCTErrorWithMessage(errorMessage)</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;%@&quot;</span><span class="s4">, </span><span class="s1">errorMessage)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">NSJSONReadingOptions options = NSJSONReadingAllowFragments</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(mutable) {</span>
+      <span class="s1">options |= NSJSONReadingMutableContainers</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">[NSJSONSerialization JSONObjectWithData:jsonData options:options error:error]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">id </span><span class="s4">__nullable </span><span class="s1">RCTJSONParse(NSString *</span><span class="s4">__nullable </span><span class="s1">jsonString</span><span class="s4">, </span><span class="s1">NSError **error)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_RCTJSONParse(jsonString</span><span class="s4">, </span><span class="s1">NO</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">id </span><span class="s4">__nullable </span><span class="s1">RCTJSONParseMutable(NSString *</span><span class="s4">__nullable </span><span class="s1">jsonString</span><span class="s4">, </span><span class="s1">NSError **error)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_RCTJSONParse(jsonString</span><span class="s4">, </span><span class="s1">YES</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">id RCTJSONClean(id object)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">NSSet&lt;Class&gt; *validLeafTypes</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">validLeafTypes = [[NSSet alloc] initWithArray:</span><span class="s4">@</span><span class="s1">[</span>
+      <span class="s1">[NSString </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+      <span class="s1">[NSMutableString </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+      <span class="s1">[NSNumber </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+      <span class="s1">[NSNull </span><span class="s4">class</span><span class="s1">]</span><span class="s4">,</span>
+    <span class="s1">]]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">([validLeafTypes containsObject:[object classForCoder]]) {</span>
+    <span class="s4">if </span><span class="s1">([object isKindOfClass:[NSNumber </span><span class="s4">class</span><span class="s1">]]) {</span>
+      <span class="s4">return @</span><span class="s1">(RCTZeroIfNaN([object doubleValue]))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">([object isKindOfClass:[NSString </span><span class="s4">class</span><span class="s1">]]) {</span>
+      <span class="s4">if </span><span class="s1">([object UTF8String] == NULL) {</span>
+        <span class="s4">return </span><span class="s1">(id)kCFNull</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">object</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">([object isKindOfClass:[NSDictionary </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s1">__block BOOL copy = NO</span><span class="s4">;</span>
+    <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *values = [[NSMutableDictionary alloc] initWithCapacity:[object count]]</span><span class="s4">;</span>
+    <span class="s1">[object enumerateKeysAndObjectsUsingBlock:^(NSString *key</span><span class="s4">, </span><span class="s1">id item</span><span class="s4">, </span><span class="s1">__unused BOOL *stop) {</span>
+      <span class="s1">id value = RCTJSONClean(item)</span><span class="s4">;</span>
+      <span class="s1">values[key] = value</span><span class="s4">;</span>
+      <span class="s1">copy |= value != item</span><span class="s4">;</span>
+    <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">copy ? values : object</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">([object isKindOfClass:[NSArray </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s1">__block BOOL copy = NO</span><span class="s4">;</span>
+    <span class="s1">__block NSArray *values = object</span><span class="s4">;</span>
+    <span class="s1">[object enumerateObjectsUsingBlock:^(id item</span><span class="s4">, </span><span class="s1">NSUInteger idx</span><span class="s4">, </span><span class="s1">__unused BOOL *stop) {</span>
+      <span class="s1">id value = RCTJSONClean(item)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(copy) {</span>
+        <span class="s1">[(NSMutableArray *)values addObject:value]</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else if </span><span class="s1">(value != item) {</span>
+        <span class="s0">// Converted value is different, so we'll need to copy the array</span>
+        <span class="s1">values = [[NSMutableArray alloc] initWithCapacity:values.count]</span><span class="s4">;</span>
+        <span class="s4">for </span><span class="s1">(NSUInteger i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; idx</span><span class="s4">; </span><span class="s1">i++) {</span>
+          <span class="s1">[(NSMutableArray *)values addObject:object[i]]</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s1">[(NSMutableArray *)values addObject:value]</span><span class="s4">;</span>
+        <span class="s1">copy = YES</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">values</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">(id)kCFNull</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *RCTMD5Hash(NSString *string)</span>
+<span class="s1">{</span>
+  <span class="s4">const char </span><span class="s1">*str = string.UTF8String</span><span class="s4">;</span>
+  <span class="s4">unsigned char </span><span class="s1">result[CC_MD5_DIGEST_LENGTH]</span><span class="s4">;</span>
+  <span class="s1">CC_MD5(str</span><span class="s4">, </span><span class="s1">(CC_LONG)strlen(str)</span><span class="s4">, </span><span class="s1">result)</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x&quot;</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">2</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">3</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">4</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">5</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">6</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">7</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">8</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">9</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">10</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">11</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">12</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">13</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">14</span><span class="s1">]</span><span class="s4">,</span>
+                                    <span class="s1">result[</span><span class="s5">15</span><span class="s1">]]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsMainQueue()</span>
+<span class="s1">{</span>
+  <span class="s4">static void </span><span class="s1">*mainQueueKey = &amp;mainQueueKey</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">dispatch_queue_set_specific(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">mainQueueKey</span><span class="s4">, </span><span class="s1">mainQueueKey</span><span class="s4">, </span><span class="s1">NULL)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">dispatch_get_specific(mainQueueKey) == mainQueueKey</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTExecuteOnMainQueue(dispatch_block_t block)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(RCTIsMainQueue()) {</span>
+    <span class="s1">block()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">dispatch_async(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">block()</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// Please do not use this method</span>
+<span class="s0">// unless you know what you are doing.</span>
+<span class="s4">void </span><span class="s1">RCTUnsafeExecuteOnMainQueueSync(dispatch_block_t block)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(RCTIsMainQueue()) {</span>
+    <span class="s1">block()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">dispatch_sync(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">block()</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static void </span><span class="s1">RCTUnsafeExecuteOnMainQueueOnceSync(dispatch_once_t *onceToken</span><span class="s4">, </span><span class="s1">dispatch_block_t block)</span>
+<span class="s1">{</span>
+  <span class="s0">// The solution was borrowed from a post by Ben Alpert:</span>
+  <span class="s0">// https://benalpert.com/2014/04/02/dispatch-once-initialization-on-the-main-thread.html</span>
+  <span class="s0">// See also: https://www.mikeash.com/pyblog/friday-qa-2014-06-06-secrets-of-dispatch_once.html</span>
+  <span class="s4">if </span><span class="s1">(RCTIsMainQueue()) {</span>
+    <span class="s1">dispatch_once(onceToken</span><span class="s4">, </span><span class="s1">block)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">if </span><span class="s1">(DISPATCH_EXPECT(*onceToken == </span><span class="s5">0L</span><span class="s4">, </span><span class="s1">NO)) {</span>
+      <span class="s1">dispatch_sync(dispatch_get_main_queue()</span><span class="s4">, </span><span class="s1">^{</span>
+        <span class="s1">dispatch_once(onceToken</span><span class="s4">, </span><span class="s1">block)</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">dispatch_once_t onceTokenScreenScale</span><span class="s4">;</span>
+<span class="s4">static </span><span class="s1">CGFloat screenScale</span><span class="s4">;</span>
+
+<span class="s4">void </span><span class="s1">RCTComputeScreenScale()</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_once(&amp;onceTokenScreenScale</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">screenScale = [UIScreen mainScreen].scale</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGFloat RCTScreenScale()</span>
+<span class="s1">{</span>
+  <span class="s1">RCTUnsafeExecuteOnMainQueueOnceSync(&amp;onceTokenScreenScale</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">screenScale = [UIScreen mainScreen].scale</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">screenScale</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGFloat RCTFontSizeMultiplier()</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">NSNumber *&gt; *mapping</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">mapping = </span><span class="s4">@</span><span class="s1">{</span>
+      <span class="s1">UIContentSizeCategoryExtraSmall : </span><span class="s4">@</span><span class="s5">0.823</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategorySmall : </span><span class="s4">@</span><span class="s5">0.882</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryMedium : </span><span class="s4">@</span><span class="s5">0.941</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryLarge : </span><span class="s4">@</span><span class="s5">1.0</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryExtraLarge : </span><span class="s4">@</span><span class="s5">1.118</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryExtraExtraLarge : </span><span class="s4">@</span><span class="s5">1.235</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryExtraExtraExtraLarge : </span><span class="s4">@</span><span class="s5">1.353</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryAccessibilityMedium : </span><span class="s4">@</span><span class="s5">1.786</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryAccessibilityLarge : </span><span class="s4">@</span><span class="s5">2.143</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryAccessibilityExtraLarge : </span><span class="s4">@</span><span class="s5">2.643</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryAccessibilityExtraExtraLarge : </span><span class="s4">@</span><span class="s5">3.143</span><span class="s4">,</span>
+      <span class="s1">UIContentSizeCategoryAccessibilityExtraExtraExtraLarge : </span><span class="s4">@</span><span class="s5">3.571</span>
+    <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">mapping[RCTSharedApplication().preferredContentSizeCategory].floatValue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGSize RCTScreenSize()</span>
+<span class="s1">{</span>
+  <span class="s0">// FIXME: this caches whatever the bounds were when it was first called, and then</span>
+  <span class="s0">// doesn't update when the device is rotated. We need to find another thread-</span>
+  <span class="s0">// safe way to get the screen size.</span>
+
+  <span class="s4">static </span><span class="s1">CGSize size</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">RCTUnsafeExecuteOnMainQueueSync(^{</span>
+      <span class="s1">size = [UIScreen mainScreen].bounds.size</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">size</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGSize RCTViewportSize()</span>
+<span class="s1">{</span>
+  <span class="s1">UIWindow *window = RCTKeyWindow()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">window ? window.bounds.size : RCTScreenSize()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGFloat RCTRoundPixelValue(CGFloat value)</span>
+<span class="s1">{</span>
+  <span class="s1">CGFloat scale = RCTScreenScale()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">round(value * scale) / scale</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGFloat RCTCeilPixelValue(CGFloat value)</span>
+<span class="s1">{</span>
+  <span class="s1">CGFloat scale = RCTScreenScale()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">ceil(value * scale) / scale</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGFloat RCTFloorPixelValue(CGFloat value)</span>
+<span class="s1">{</span>
+  <span class="s1">CGFloat scale = RCTScreenScale()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">floor(value * scale) / scale</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CGSize RCTSizeInPixels(CGSize pointSize</span><span class="s4">, </span><span class="s1">CGFloat scale)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">(CGSize){</span>
+      <span class="s1">ceil(pointSize.width * scale)</span><span class="s4">,</span>
+      <span class="s1">ceil(pointSize.height * scale)</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTSwapClassMethods(Class cls</span><span class="s4">, </span><span class="s1">SEL original</span><span class="s4">, </span><span class="s1">SEL replacement)</span>
+<span class="s1">{</span>
+  <span class="s1">Method originalMethod = class_getClassMethod(cls</span><span class="s4">, </span><span class="s1">original)</span><span class="s4">;</span>
+  <span class="s1">IMP originalImplementation = method_getImplementation(originalMethod)</span><span class="s4">;</span>
+  <span class="s4">const char </span><span class="s1">*originalArgTypes = method_getTypeEncoding(originalMethod)</span><span class="s4">;</span>
+
+  <span class="s1">Method replacementMethod = class_getClassMethod(cls</span><span class="s4">, </span><span class="s1">replacement)</span><span class="s4">;</span>
+  <span class="s1">IMP replacementImplementation = method_getImplementation(replacementMethod)</span><span class="s4">;</span>
+  <span class="s4">const char </span><span class="s1">*replacementArgTypes = method_getTypeEncoding(replacementMethod)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(class_addMethod(cls</span><span class="s4">, </span><span class="s1">original</span><span class="s4">, </span><span class="s1">replacementImplementation</span><span class="s4">, </span><span class="s1">replacementArgTypes)) {</span>
+    <span class="s1">class_replaceMethod(cls</span><span class="s4">, </span><span class="s1">replacement</span><span class="s4">, </span><span class="s1">originalImplementation</span><span class="s4">, </span><span class="s1">originalArgTypes)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">method_exchangeImplementations(originalMethod</span><span class="s4">, </span><span class="s1">replacementMethod)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTSwapInstanceMethods(Class cls</span><span class="s4">, </span><span class="s1">SEL original</span><span class="s4">, </span><span class="s1">SEL replacement)</span>
+<span class="s1">{</span>
+  <span class="s1">Method originalMethod = class_getInstanceMethod(cls</span><span class="s4">, </span><span class="s1">original)</span><span class="s4">;</span>
+  <span class="s1">IMP originalImplementation = method_getImplementation(originalMethod)</span><span class="s4">;</span>
+  <span class="s4">const char </span><span class="s1">*originalArgTypes = method_getTypeEncoding(originalMethod)</span><span class="s4">;</span>
+
+  <span class="s1">Method replacementMethod = class_getInstanceMethod(cls</span><span class="s4">, </span><span class="s1">replacement)</span><span class="s4">;</span>
+  <span class="s1">IMP replacementImplementation = method_getImplementation(replacementMethod)</span><span class="s4">;</span>
+  <span class="s4">const char </span><span class="s1">*replacementArgTypes = method_getTypeEncoding(replacementMethod)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(class_addMethod(cls</span><span class="s4">, </span><span class="s1">original</span><span class="s4">, </span><span class="s1">replacementImplementation</span><span class="s4">, </span><span class="s1">replacementArgTypes)) {</span>
+    <span class="s1">class_replaceMethod(cls</span><span class="s4">, </span><span class="s1">replacement</span><span class="s4">, </span><span class="s1">originalImplementation</span><span class="s4">, </span><span class="s1">originalArgTypes)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">method_exchangeImplementations(originalMethod</span><span class="s4">, </span><span class="s1">replacementMethod)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTSwapInstanceMethodWithBlock(Class cls</span><span class="s4">, </span><span class="s1">SEL original</span><span class="s4">, </span><span class="s1">id replacementBlock</span><span class="s4">, </span><span class="s1">SEL replacementSelector)</span>
+<span class="s1">{</span>
+  <span class="s1">Method originalMethod = class_getInstanceMethod(cls</span><span class="s4">, </span><span class="s1">original)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!originalMethod) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">IMP </span><span class="s4">implementation </span><span class="s1">= imp_implementationWithBlock(replacementBlock)</span><span class="s4">;</span>
+  <span class="s1">class_addMethod(cls</span><span class="s4">, </span><span class="s1">replacementSelector</span><span class="s4">, implementation, </span><span class="s1">method_getTypeEncoding(originalMethod))</span><span class="s4">;</span>
+  <span class="s1">Method newMethod = class_getInstanceMethod(cls</span><span class="s4">, </span><span class="s1">replacementSelector)</span><span class="s4">;</span>
+  <span class="s1">method_exchangeImplementations(originalMethod</span><span class="s4">, </span><span class="s1">newMethod)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTClassOverridesClassMethod(Class cls</span><span class="s4">, </span><span class="s1">SEL </span><span class="s4">selector</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTClassOverridesInstanceMethod(object_getClass(cls)</span><span class="s4">, selector</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTClassOverridesInstanceMethod(Class cls</span><span class="s4">, </span><span class="s1">SEL </span><span class="s4">selector</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">unsigned int </span><span class="s1">numberOfMethods</span><span class="s4">;</span>
+  <span class="s1">Method *methods = class_copyMethodList(cls</span><span class="s4">, </span><span class="s1">&amp;numberOfMethods)</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">unsigned int </span><span class="s1">i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; numberOfMethods</span><span class="s4">; </span><span class="s1">i++) {</span>
+    <span class="s4">if </span><span class="s1">(method_getName(methods[i]) == </span><span class="s4">selector</span><span class="s1">) {</span>
+      <span class="s1">free(methods)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">free(methods)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt;</span>
+    <span class="s1">*RCTMakeError(NSString *message</span><span class="s4">, </span><span class="s1">id </span><span class="s4">__nullable </span><span class="s1">toStringify</span><span class="s4">, </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *</span><span class="s4">__nullable </span><span class="s1">extraData)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(toStringify) {</span>
+    <span class="s1">message = [message stringByAppendingString:[toStringify description]]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *error = [extraData mutableCopy] ?: [NSMutableDictionary new]</span><span class="s4">;</span>
+  <span class="s1">error[</span><span class="s4">@</span><span class="s3">&quot;message&quot;</span><span class="s1">] = message</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">error</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *</span>
+<span class="s1">RCTMakeAndLogError(NSString *message</span><span class="s4">, </span><span class="s1">id </span><span class="s4">__nullable </span><span class="s1">toStringify</span><span class="s4">, </span><span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *</span><span class="s4">__nullable </span><span class="s1">extraData)</span>
+<span class="s1">{</span>
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *error = RCTMakeError(message</span><span class="s4">, </span><span class="s1">toStringify</span><span class="s4">, </span><span class="s1">extraData)</span><span class="s4">;</span>
+  <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;</span><span class="s4">\n</span><span class="s3">Error: %@&quot;</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">error</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *RCTJSErrorFromNSError(NSError *error)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *codeWithDomain =</span>
+      <span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;E%@%lld&quot;</span><span class="s4">, </span><span class="s1">error.domain.uppercaseString</span><span class="s4">, </span><span class="s1">(</span><span class="s4">long long</span><span class="s1">)error.code]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">RCTJSErrorFromCodeMessageAndNSError(codeWithDomain</span><span class="s4">, </span><span class="s1">error.localizedDescription</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// TODO: Can we just replace RCTMakeError with this function instead?</span>
+<span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt;</span>
+    <span class="s1">*RCTJSErrorFromCodeMessageAndNSError(NSString *code</span><span class="s4">, </span><span class="s1">NSString *message</span><span class="s4">, </span><span class="s1">NSError *</span><span class="s4">__nullable </span><span class="s1">error)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *errorMessage</span><span class="s4">;</span>
+  <span class="s1">NSArray&lt;NSString *&gt; *stackTrace = [NSThread callStackSymbols]</span><span class="s4">;</span>
+  <span class="s1">NSMutableDictionary *userInfo</span><span class="s4">;</span>
+  <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *errorInfo = [NSMutableDictionary dictionaryWithObject:stackTrace</span>
+                                                                                      <span class="s1">forKey:</span><span class="s4">@</span><span class="s3">&quot;nativeStackIOS&quot;</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(error) {</span>
+    <span class="s1">errorMessage = error.localizedDescription ?: </span><span class="s4">@</span><span class="s3">&quot;Unknown error from a native module&quot;</span><span class="s4">;</span>
+    <span class="s1">errorInfo[</span><span class="s4">@</span><span class="s3">&quot;domain&quot;</span><span class="s1">] = error.domain ?: RCTErrorDomain</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(error.userInfo) {</span>
+      <span class="s1">userInfo = [error.userInfo mutableCopy]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(userInfo != nil &amp;&amp; userInfo[NSUnderlyingErrorKey] != nil) {</span>
+        <span class="s1">NSError *underlyingError = error.userInfo[NSUnderlyingErrorKey]</span><span class="s4">;</span>
+        <span class="s1">NSString *underlyingCode = [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;%d&quot;</span><span class="s4">, </span><span class="s1">(</span><span class="s4">int</span><span class="s1">)underlyingError.code]</span><span class="s4">;</span>
+        <span class="s1">userInfo[NSUnderlyingErrorKey] =</span>
+            <span class="s1">RCTJSErrorFromCodeMessageAndNSError(underlyingCode</span><span class="s4">, @</span><span class="s3">&quot;underlying error&quot;</span><span class="s4">, </span><span class="s1">underlyingError)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">errorMessage = </span><span class="s4">@</span><span class="s3">&quot;Unknown error from a native module&quot;</span><span class="s4">;</span>
+    <span class="s1">errorInfo[</span><span class="s4">@</span><span class="s3">&quot;domain&quot;</span><span class="s1">] = RCTErrorDomain</span><span class="s4">;</span>
+    <span class="s1">userInfo = nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">errorInfo[</span><span class="s4">@</span><span class="s3">&quot;code&quot;</span><span class="s1">] = code ?: RCTErrorUnspecified</span><span class="s4">;</span>
+  <span class="s1">errorInfo[</span><span class="s4">@</span><span class="s3">&quot;userInfo&quot;</span><span class="s1">] = RCTNullIfNil(userInfo)</span><span class="s4">;</span>
+
+  <span class="s0">// Allow for explicit overriding of the error message</span>
+  <span class="s1">errorMessage = message ?: errorMessage</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">RCTMakeError(errorMessage</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">errorInfo)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTRunningInTestEnvironment(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">BOOL isTestEnvironment = NO</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">NSDictionary *environment = [[NSProcessInfo processInfo] environment]</span><span class="s4">;</span>
+    <span class="s1">isTestEnvironment = objc_lookUpClass(</span><span class="s3">&quot;SenTestCase&quot;</span><span class="s1">) || objc_lookUpClass(</span><span class="s3">&quot;XCTest&quot;</span><span class="s1">) ||</span>
+        <span class="s1">objc_lookUpClass(</span><span class="s3">&quot;SnapshotTestAppDelegate&quot;</span><span class="s1">) || [environment[</span><span class="s4">@</span><span class="s3">&quot;IS_TESTING&quot;</span><span class="s1">] boolValue]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">isTestEnvironment</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTRunningInAppExtension(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[[[[NSBundle mainBundle] bundlePath] pathExtension] isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;appex&quot;</span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">UIApplication *</span><span class="s4">__nullable </span><span class="s1">RCTSharedApplication(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(RCTRunningInAppExtension()) {</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">[[UIApplication </span><span class="s4">class</span><span class="s1">] performSelector:</span><span class="s4">@selector</span><span class="s1">(sharedApplication)]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">UIWindow *</span><span class="s4">__nullable </span><span class="s1">RCTKeyWindow(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(RCTRunningInAppExtension()) {</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// TODO: replace with a more robust solution</span>
+  <span class="s4">for </span><span class="s1">(UIWindow *window in RCTSharedApplication().windows) {</span>
+    <span class="s4">if </span><span class="s1">(window.keyWindow) {</span>
+      <span class="s4">return </span><span class="s1">window</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">UIViewController *</span><span class="s4">__nullable </span><span class="s1">RCTPresentedViewController(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">([RCTUtilsUIOverride hasPresentedViewController]) {</span>
+    <span class="s4">return </span><span class="s1">[RCTUtilsUIOverride presentedViewController]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">UIViewController *controller = RCTKeyWindow().rootViewController</span><span class="s4">;</span>
+  <span class="s1">UIViewController *presentedController = controller.presentedViewController</span><span class="s4">;</span>
+  <span class="s4">while </span><span class="s1">(presentedController &amp;&amp; ![presentedController isBeingDismissed]) {</span>
+    <span class="s1">controller = presentedController</span><span class="s4">;</span>
+    <span class="s1">presentedController = controller.presentedViewController</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">controller</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTForceTouchAvailable(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">BOOL forceSupported</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">forceSupported =</span>
+        <span class="s1">[UITraitCollection </span><span class="s4">class</span><span class="s1">] &amp;&amp; [UITraitCollection instancesRespondToSelector:</span><span class="s4">@selector</span><span class="s1">(forceTouchCapability)]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">forceSupported &amp;&amp;</span>
+      <span class="s1">(RCTKeyWindow() ?: [UIView new]).traitCollection.forceTouchCapability == UIForceTouchCapabilityAvailable</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSError *RCTErrorWithMessage(NSString *message)</span>
+<span class="s1">{</span>
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *errorInfo = </span><span class="s4">@</span><span class="s1">{NSLocalizedDescriptionKey : message}</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[[NSError alloc] initWithDomain:RCTErrorDomain code:</span><span class="s5">0 </span><span class="s1">userInfo:errorInfo]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSError *RCTErrorWithNSException(NSException *exception)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *message = [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;NSException: %@; trace: %@.&quot;</span><span class="s4">,</span>
+                                                 <span class="s1">exception</span><span class="s4">,</span>
+                                                 <span class="s1">[[exception callStackSymbols] componentsJoinedByString:</span><span class="s4">@</span><span class="s3">&quot;;&quot;</span><span class="s1">]]</span><span class="s4">;</span>
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *errorInfo =</span>
+      <span class="s4">@</span><span class="s1">{NSLocalizedDescriptionKey : message</span><span class="s4">, </span><span class="s1">RCTObjCStackTraceKey : [exception callStackSymbols]}</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[[NSError alloc] initWithDomain:RCTErrorDomain code:</span><span class="s5">0 </span><span class="s1">userInfo:errorInfo]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">double </span><span class="s1">RCTZeroIfNaN(</span><span class="s4">double </span><span class="s1">value)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">isnan(value) || isinf(value) ? </span><span class="s5">0 </span><span class="s1">: value</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">double </span><span class="s1">RCTSanitizeNaNValue(</span><span class="s4">double </span><span class="s1">value</span><span class="s4">, </span><span class="s1">NSString *</span><span class="s4">property</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!isnan(value) &amp;&amp; !isinf(value)) {</span>
+    <span class="s4">return </span><span class="s1">value</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;The value `%@` equals NaN or INF and will be replaced by `0`.&quot;</span><span class="s4">, property</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s5">0</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSURL *RCTDataURL(NSString *mimeType</span><span class="s4">, </span><span class="s1">NSData *data)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[NSURL</span>
+      <span class="s1">URLWithString:[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;data:%@;base64,%@&quot;</span><span class="s4">,</span>
+                                               <span class="s1">mimeType</span><span class="s4">,</span>
+                                               <span class="s1">[data base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)</span><span class="s5">0</span><span class="s1">]]]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsGzippedData(NSData *</span><span class="s4">__nullable</span><span class="s1">)</span><span class="s4">; </span><span class="s0">// exposed for unit testing purposes</span>
+<span class="s1">BOOL RCTIsGzippedData(NSData *</span><span class="s4">__nullable </span><span class="s1">data)</span>
+<span class="s1">{</span>
+  <span class="s1">UInt8 *bytes = (UInt8 *)data.bytes</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">(data.length &gt;= </span><span class="s5">2 </span><span class="s1">&amp;&amp; bytes[</span><span class="s5">0</span><span class="s1">] == </span><span class="s5">0x1f </span><span class="s1">&amp;&amp; bytes[</span><span class="s5">1</span><span class="s1">] == </span><span class="s5">0x8b</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSData *</span><span class="s4">__nullable </span><span class="s1">RCTGzipData(NSData *</span><span class="s4">__nullable </span><span class="s1">input</span><span class="s4">, float </span><span class="s1">level)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(input.length == </span><span class="s5">0 </span><span class="s1">|| RCTIsGzippedData(input)) {</span>
+    <span class="s4">return </span><span class="s1">input</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">*libz = dlopen(</span><span class="s3">&quot;/usr/lib/libz.dylib&quot;</span><span class="s4">, </span><span class="s1">RTLD_LAZY)</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">(*deflateInit2_)(z_streamp</span><span class="s4">, int, int, int, int, int, const char </span><span class="s1">*</span><span class="s4">, int</span><span class="s1">) = dlsym(libz</span><span class="s4">, </span><span class="s3">&quot;deflateInit2_&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">(*deflate)(z_streamp</span><span class="s4">, int</span><span class="s1">) = dlsym(libz</span><span class="s4">, </span><span class="s3">&quot;deflate&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">(*deflateEnd)(z_streamp) = dlsym(libz</span><span class="s4">, </span><span class="s3">&quot;deflateEnd&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">z_stream stream</span><span class="s4">;</span>
+  <span class="s1">stream.zalloc = Z_NULL</span><span class="s4">;</span>
+  <span class="s1">stream.zfree = Z_NULL</span><span class="s4">;</span>
+  <span class="s1">stream.opaque = Z_NULL</span><span class="s4">;</span>
+  <span class="s1">stream.avail_in = (uint)input.length</span><span class="s4">;</span>
+  <span class="s1">stream.next_in = (Bytef *)input.bytes</span><span class="s4">;</span>
+  <span class="s1">stream.total_out = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">stream.avail_out = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s4">static const </span><span class="s1">NSUInteger RCTGZipChunkSize = </span><span class="s5">16384</span><span class="s4">;</span>
+
+  <span class="s1">NSMutableData *output = nil</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">compression = (level &lt; </span><span class="s5">0.0f</span><span class="s1">) ? Z_DEFAULT_COMPRESSION : (</span><span class="s4">int</span><span class="s1">)(roundf(level * </span><span class="s5">9</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(deflateInit2(&amp;stream</span><span class="s4">, </span><span class="s1">compression</span><span class="s4">, </span><span class="s1">Z_DEFLATED</span><span class="s4">, </span><span class="s5">31</span><span class="s4">, </span><span class="s5">8</span><span class="s4">, </span><span class="s1">Z_DEFAULT_STRATEGY) == Z_OK) {</span>
+    <span class="s1">output = [NSMutableData dataWithLength:RCTGZipChunkSize]</span><span class="s4">;</span>
+    <span class="s4">while </span><span class="s1">(stream.avail_out == </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s4">if </span><span class="s1">(stream.total_out &gt;= output.length) {</span>
+        <span class="s1">output.length += RCTGZipChunkSize</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">stream.next_out = (uint8_t *)output.mutableBytes + stream.total_out</span><span class="s4">;</span>
+      <span class="s1">stream.avail_out = (uInt)(output.length - stream.total_out)</span><span class="s4">;</span>
+      <span class="s1">deflate(&amp;stream</span><span class="s4">, </span><span class="s1">Z_FINISH)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">deflateEnd(&amp;stream)</span><span class="s4">;</span>
+    <span class="s1">output.length = stream.total_out</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">dlclose(libz)</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">output</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSString *RCTRelativePathForURL(NSString *basePath</span><span class="s4">, </span><span class="s1">NSURL *</span><span class="s4">__nullable </span><span class="s1">URL)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!URL.fileURL) {</span>
+    <span class="s0">// Not a file path</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">NSString *path = [NSString stringWithUTF8String:[URL fileSystemRepresentation]]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(![path hasPrefix:basePath]) {</span>
+    <span class="s0">// Not a bundle-relative file</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">path = [path substringFromIndex:basePath.length]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([path hasPrefix:</span><span class="s4">@</span><span class="s3">&quot;/&quot;</span><span class="s1">]) {</span>
+    <span class="s1">path = [path substringFromIndex:</span><span class="s5">1</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">path</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTLibraryPath(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSString *libraryPath = nil</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">libraryPath = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory</span><span class="s4">, </span><span class="s1">NSUserDomainMask</span><span class="s4">, </span><span class="s1">YES) lastObject]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">libraryPath</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTHomePath(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSString *homePath = nil</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">homePath = NSHomeDirectory()</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">homePath</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTBundlePathForURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">URL)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTRelativePathForURL([[NSBundle mainBundle] resourcePath]</span><span class="s4">, </span><span class="s1">URL)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTLibraryPathForURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">URL)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTRelativePathForURL(RCTLibraryPath()</span><span class="s4">, </span><span class="s1">URL)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTHomePathForURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">URL)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTRelativePathForURL(RCTHomePath()</span><span class="s4">, </span><span class="s1">URL)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">BOOL RCTIsImageAssetsPath(NSString *path)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *extension = [path pathExtension]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[extension isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;png&quot;</span><span class="s1">] || [extension isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;jpg&quot;</span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsBundleAssetURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">imageURL)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTIsImageAssetsPath(RCTBundlePathForURL(imageURL))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsLibraryAssetURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">imageURL)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTIsImageAssetsPath(RCTLibraryPathForURL(imageURL))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsHomeAssetURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">imageURL)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTIsImageAssetsPath(RCTHomePathForURL(imageURL))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsLocalAssetURL(NSURL *</span><span class="s4">__nullable </span><span class="s1">imageURL)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTIsBundleAssetURL(imageURL) || RCTIsHomeAssetURL(imageURL)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSString *bundleName(NSBundle *bundle)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *name = bundle.infoDictionary[</span><span class="s4">@</span><span class="s3">&quot;CFBundleName&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!name) {</span>
+    <span class="s1">name = [[bundle.bundlePath lastPathComponent] stringByDeletingPathExtension]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">name</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSBundle *bundleForPath(NSString *key)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSMutableDictionary *bundleCache</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!bundleCache) {</span>
+    <span class="s1">bundleCache = [NSMutableDictionary new]</span><span class="s4">;</span>
+    <span class="s1">bundleCache[</span><span class="s4">@</span><span class="s3">&quot;main&quot;</span><span class="s1">] = [NSBundle mainBundle]</span><span class="s4">;</span>
+
+    <span class="s0">// Initialize every bundle in the array</span>
+    <span class="s4">for </span><span class="s1">(NSString *path in [[NSBundle mainBundle] pathsForResourcesOfType:</span><span class="s4">@</span><span class="s3">&quot;bundle&quot; </span><span class="s1">inDirectory:nil]) {</span>
+      <span class="s1">[NSBundle bundleWithPath:path]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// The bundles initialized above will now also be in `allBundles`</span>
+    <span class="s4">for </span><span class="s1">(NSBundle *bundle in [NSBundle allBundles]) {</span>
+      <span class="s1">bundleCache[bundleName(bundle)] = bundle</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">bundleCache[key]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">UIImage *</span><span class="s4">__nullable </span><span class="s1">RCTImageFromLocalBundleAssetURL(NSURL *imageURL)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(![imageURL.scheme isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;file&quot;</span><span class="s1">]) {</span>
+    <span class="s0">// We only want to check for local file assets</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s0">// Get the bundle URL, and add the image URL</span>
+  <span class="s0">// Note that we have to add both host and path, since host is the first &quot;assets&quot; part</span>
+  <span class="s0">// while path is the rest of the URL</span>
+  <span class="s1">NSURL *bundleImageUrl = [[[NSBundle mainBundle] bundleURL]</span>
+      <span class="s1">URLByAppendingPathComponent:[imageURL.host stringByAppendingString:imageURL.path]]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">RCTImageFromLocalAssetURL(bundleImageUrl)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">UIImage *</span><span class="s4">__nullable </span><span class="s1">RCTImageFromLocalAssetURL(NSURL *imageURL)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *imageName = RCTBundlePathForURL(imageURL)</span><span class="s4">;</span>
+
+  <span class="s1">NSBundle *bundle = nil</span><span class="s4">;</span>
+  <span class="s1">NSArray *imagePathComponents = [imageName pathComponents]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([imagePathComponents count] &gt; </span><span class="s5">1 </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">[[[imagePathComponents firstObject] pathExtension] isEqualToString:</span><span class="s4">@</span><span class="s3">&quot;bundle&quot;</span><span class="s1">]) {</span>
+    <span class="s1">NSString *bundlePath = [imagePathComponents firstObject]</span><span class="s4">;</span>
+    <span class="s1">bundle = bundleForPath([bundlePath stringByDeletingPathExtension])</span><span class="s4">;</span>
+    <span class="s1">imageName = [imageName substringFromIndex:(bundlePath.length + </span><span class="s5">1</span><span class="s1">)]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">UIImage *image = nil</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(imageName) {</span>
+    <span class="s4">if </span><span class="s1">(bundle) {</span>
+      <span class="s1">image = [UIImage imageNamed:imageName inBundle:bundle compatibleWithTraitCollection:nil]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">image = [UIImage imageNamed:imageName]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!image) {</span>
+    <span class="s0">// Attempt to load from the file system</span>
+    <span class="s4">const char </span><span class="s1">*fileSystemCString = [imageURL fileSystemRepresentation]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(fileSystemCString != NULL) {</span>
+      <span class="s1">NSString *filePath = [NSString stringWithUTF8String:fileSystemCString]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(filePath.pathExtension.length == </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s1">filePath = [filePath stringByAppendingPathExtension:</span><span class="s4">@</span><span class="s3">&quot;png&quot;</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">image = [UIImage imageWithContentsOfFile:filePath]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!image &amp;&amp; !bundle) {</span>
+    <span class="s0">// We did not find the image in the mainBundle, check in other shipped frameworks.</span>
+    <span class="s1">NSArray&lt;NSURL *&gt; *possibleFrameworks =</span>
+        <span class="s1">[[NSFileManager defaultManager] contentsOfDirectoryAtURL:[[NSBundle mainBundle] privateFrameworksURL]</span>
+                                      <span class="s1">includingPropertiesForKeys:</span><span class="s4">@</span><span class="s1">[]</span>
+                                                         <span class="s1">options:</span><span class="s5">0</span>
+                                                           <span class="s1">error:nil]</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(NSURL *frameworkURL in possibleFrameworks) {</span>
+      <span class="s1">bundle = [NSBundle bundleWithURL:frameworkURL]</span><span class="s4">;</span>
+      <span class="s1">image = [UIImage imageNamed:imageName inBundle:bundle compatibleWithTraitCollection:nil]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(image) {</span>
+        <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Image %@ not found in mainBundle, but found in %@&quot;</span><span class="s4">, </span><span class="s1">imageName</span><span class="s4">, </span><span class="s1">bundle)</span><span class="s4">;</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">image</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXTERN NSString *</span><span class="s4">__nullable </span><span class="s1">RCTTempFilePath(NSString *extension</span><span class="s4">, </span><span class="s1">NSError **error)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">NSError *setupError = nil</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">NSString *directory</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">directory = [NSTemporaryDirectory() stringByAppendingPathComponent:</span><span class="s4">@</span><span class="s3">&quot;ReactNative&quot;</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s0">// If the temporary directory already exists, we'll delete it to ensure</span>
+    <span class="s0">// that temp files from the previous run have all been deleted. This is not</span>
+    <span class="s0">// a security measure, it simply prevents the temp directory from using too</span>
+    <span class="s0">// much space, as the circumstances under which iOS clears it automatically</span>
+    <span class="s0">// are not well-defined.</span>
+    <span class="s1">NSFileManager *fileManager = [NSFileManager new]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">([fileManager fileExistsAtPath:directory]) {</span>
+      <span class="s1">[fileManager removeItemAtPath:directory error:NULL]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(![fileManager fileExistsAtPath:directory]) {</span>
+      <span class="s1">NSError *localError = nil</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(![fileManager createDirectoryAtPath:directory</span>
+                  <span class="s1">withIntermediateDirectories:YES</span>
+                                   <span class="s1">attributes:nil</span>
+                                        <span class="s1">error:&amp;localError]) {</span>
+        <span class="s0">// This is bad</span>
+        <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;Failed to create temporary directory: %@&quot;</span><span class="s4">, </span><span class="s1">localError)</span><span class="s4">;</span>
+        <span class="s1">setupError = localError</span><span class="s4">;</span>
+        <span class="s1">directory = nil</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!directory || setupError) {</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">*error = setupError</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Append a unique filename</span>
+  <span class="s1">NSString *filename = [NSUUID new].UUIDString</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(extension) {</span>
+    <span class="s1">filename = [filename stringByAppendingPathExtension:extension]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">[directory stringByAppendingPathComponent:filename]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXTERN </span><span class="s4">void </span><span class="s1">RCTGetRGBAColorComponents(CGColorRef color</span><span class="s4">, </span><span class="s1">CGFloat rgba[</span><span class="s5">4</span><span class="s1">])</span>
+<span class="s1">{</span>
+  <span class="s1">CGColorSpaceModel model = CGColorSpaceGetModel(CGColorGetColorSpace(color))</span><span class="s4">;</span>
+  <span class="s4">const </span><span class="s1">CGFloat *components = CGColorGetComponents(color)</span><span class="s4">;</span>
+  <span class="s4">switch </span><span class="s1">(model) {</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelMonochrome: {</span>
+      <span class="s1">rgba[</span><span class="s5">0</span><span class="s1">] = components[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">1</span><span class="s1">] = components[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">2</span><span class="s1">] = components[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">3</span><span class="s1">] = components[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelRGB: {</span>
+      <span class="s1">rgba[</span><span class="s5">0</span><span class="s1">] = components[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">1</span><span class="s1">] = components[</span><span class="s5">1</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">2</span><span class="s1">] = components[</span><span class="s5">2</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">3</span><span class="s1">] = components[</span><span class="s5">3</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelCMYK:</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelDeviceN:</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelIndexed:</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelLab:</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelPattern:</span>
+    <span class="s4">case </span><span class="s1">kCGColorSpaceModelUnknown:</span>
+    <span class="s0">// TODO: kCGColorSpaceModelXYZ should be added sometime after Xcode 10 release.</span>
+    <span class="s4">default</span><span class="s1">: {</span>
+<span class="s2">#if </span><span class="s1">RCT_DEBUG</span>
+      <span class="s0">// unsupported format</span>
+      <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;Unsupported color model: %i&quot;</span><span class="s4">, </span><span class="s1">model)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+      <span class="s1">rgba[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">0.0</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">1</span><span class="s1">] = </span><span class="s5">0.0</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">2</span><span class="s1">] = </span><span class="s5">0.0</span><span class="s4">;</span>
+      <span class="s1">rgba[</span><span class="s5">3</span><span class="s1">] = </span><span class="s5">1.0</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *RCTColorToHexString(CGColorRef color)</span>
+<span class="s1">{</span>
+  <span class="s1">CGFloat rgba[</span><span class="s5">4</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">RCTGetRGBAColorComponents(color</span><span class="s4">, </span><span class="s1">rgba)</span><span class="s4">;</span>
+  <span class="s1">uint8_t r = rgba[</span><span class="s5">0</span><span class="s1">] * </span><span class="s5">255</span><span class="s4">;</span>
+  <span class="s1">uint8_t g = rgba[</span><span class="s5">1</span><span class="s1">] * </span><span class="s5">255</span><span class="s4">;</span>
+  <span class="s1">uint8_t b = rgba[</span><span class="s5">2</span><span class="s1">] * </span><span class="s5">255</span><span class="s4">;</span>
+  <span class="s1">uint8_t a = rgba[</span><span class="s5">3</span><span class="s1">] * </span><span class="s5">255</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(a &lt; </span><span class="s5">255</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;#%02x%02x%02x%02x&quot;</span><span class="s4">, </span><span class="s1">r</span><span class="s4">, </span><span class="s1">g</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">a]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;#%02x%02x%02x&quot;</span><span class="s4">, </span><span class="s1">r</span><span class="s4">, </span><span class="s1">g</span><span class="s4">, </span><span class="s1">b]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// (https://github.com/0xced/XCDFormInputAccessoryView/blob/master/XCDFormInputAccessoryView/XCDFormInputAccessoryView.m#L10-L14)</span>
+<span class="s1">NSString *RCTUIKitLocalizedString(NSString *string)</span>
+<span class="s1">{</span>
+  <span class="s1">NSBundle *UIKitBundle = [NSBundle bundleForClass:[UIApplication </span><span class="s4">class</span><span class="s1">]]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">UIKitBundle ? [UIKitBundle localizedStringForKey:string value:string table:nil] : string</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *RCTHumanReadableType(NSObject *obj)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">([obj isKindOfClass:[NSString </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s4">return @</span><span class="s3">&quot;string&quot;</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">([obj isKindOfClass:[NSNumber </span><span class="s4">class</span><span class="s1">]]) {</span>
+    <span class="s4">int </span><span class="s1">intVal = [(NSNumber *)obj intValue]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(intVal == </span><span class="s5">0 </span><span class="s1">|| intVal == </span><span class="s5">1</span><span class="s1">) {</span>
+      <span class="s4">return @</span><span class="s3">&quot;boolean or number&quot;</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return @</span><span class="s3">&quot;number&quot;</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">NSStringFromClass([obj </span><span class="s4">class</span><span class="s1">])</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">RCTGetURLQueryParam(NSURL *</span><span class="s4">__nullable </span><span class="s1">URL</span><span class="s4">, </span><span class="s1">NSString *param)</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertParam(param)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!URL) {</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSURLComponents *components = [NSURLComponents componentsWithURL:URL resolvingAgainstBaseURL:YES]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(NSURLQueryItem *queryItem in [components.queryItems reverseObjectEnumerator]) {</span>
+    <span class="s4">if </span><span class="s1">([queryItem.name isEqualToString:param]) {</span>
+      <span class="s4">return </span><span class="s1">queryItem.value</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">NSURL *</span><span class="s4">__nullable </span><span class="s1">RCTURLByReplacingQueryParam(NSURL *</span><span class="s4">__nullable </span><span class="s1">URL</span><span class="s4">, </span><span class="s1">NSString *param</span><span class="s4">, </span><span class="s1">NSString *</span><span class="s4">__nullable </span><span class="s1">value)</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertParam(param)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!URL) {</span>
+    <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSURLComponents *components = [NSURLComponents componentsWithURL:URL resolvingAgainstBaseURL:YES]</span><span class="s4">;</span>
+
+  <span class="s1">__block NSInteger paramIndex = NSNotFound</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray&lt;NSURLQueryItem *&gt; *queryItems = [components.queryItems mutableCopy]</span><span class="s4">;</span>
+  <span class="s1">[queryItems enumerateObjectsWithOptions:NSEnumerationReverse</span>
+                               <span class="s1">usingBlock:^(NSURLQueryItem *item</span><span class="s4">, </span><span class="s1">NSUInteger i</span><span class="s4">, </span><span class="s1">BOOL *stop) {</span>
+                                 <span class="s4">if </span><span class="s1">([item.name isEqualToString:param]) {</span>
+                                   <span class="s1">paramIndex = i</span><span class="s4">;</span>
+                                   <span class="s1">*stop = YES</span><span class="s4">;</span>
+                                 <span class="s1">}</span>
+                               <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!value) {</span>
+    <span class="s4">if </span><span class="s1">(paramIndex != NSNotFound) {</span>
+      <span class="s1">[queryItems removeObjectAtIndex:paramIndex]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">NSURLQueryItem *newItem = [NSURLQueryItem queryItemWithName:param value:value]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(paramIndex == NSNotFound) {</span>
+      <span class="s1">[queryItems addObject:newItem]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">[queryItems replaceObjectAtIndex:paramIndex withObject:newItem]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">components.queryItems = queryItems</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">components.URL</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXTERN NSString *RCTDropReactPrefixes(NSString *s)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">([s hasPrefix:</span><span class="s4">@</span><span class="s3">&quot;RK&quot;</span><span class="s1">]) {</span>
+    <span class="s4">return </span><span class="s1">[s substringFromIndex:</span><span class="s5">2</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">([s hasPrefix:</span><span class="s4">@</span><span class="s3">&quot;RCT&quot;</span><span class="s1">]) {</span>
+    <span class="s4">return </span><span class="s1">[s substringFromIndex:</span><span class="s5">3</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">s</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXTERN BOOL RCTUIManagerTypeForTagIsFabric(NSNumber *reactTag)</span>
+<span class="s1">{</span>
+  <span class="s0">// See https://github.com/facebook/react/pull/12587</span>
+  <span class="s4">return </span><span class="s1">[reactTag integerValue] % </span><span class="s5">2 </span><span class="s1">== </span><span class="s5">0</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXTERN BOOL RCTValidateTypeOfViewCommandArgument(</span>
+    <span class="s1">NSObject *obj</span><span class="s4">,</span>
+    <span class="s1">id expectedClass</span><span class="s4">,</span>
+    <span class="s1">NSString </span><span class="s4">const </span><span class="s1">*expectedType</span><span class="s4">,</span>
+    <span class="s1">NSString </span><span class="s4">const </span><span class="s1">*componentName</span><span class="s4">,</span>
+    <span class="s1">NSString </span><span class="s4">const </span><span class="s1">*commandName</span><span class="s4">,</span>
+    <span class="s1">NSString </span><span class="s4">const </span><span class="s1">*argPos)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(![obj isKindOfClass:expectedClass]) {</span>
+    <span class="s1">NSString *kindOfClass = RCTHumanReadableType(obj)</span><span class="s4">;</span>
+
+    <span class="s1">RCTLogError(</span>
+        <span class="s4">@</span><span class="s3">&quot;%@ command %@ received %@ argument of type %@, expected %@.&quot;</span><span class="s4">,</span>
+        <span class="s1">componentName</span><span class="s4">,</span>
+        <span class="s1">commandName</span><span class="s4">,</span>
+        <span class="s1">argPos</span><span class="s4">,</span>
+        <span class="s1">kindOfClass</span><span class="s4">,</span>
+        <span class="s1">expectedType)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">false</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">true</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsAppActive(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[RCTSharedApplication() applicationState] == UIApplicationStateActive</span><span class="s4">;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

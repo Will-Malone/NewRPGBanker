@@ -1,0 +1,437 @@
+<html>
+<head>
+<title>JavaTimerManager.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #629755; font-weight: bold; font-style: italic;}
+.s5 { color: #77b767; font-style: italic;}
+.s6 { color: #6897bb;}
+.s7 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JavaTimerManager.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.modules.core</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.util.SparseArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.proguard.annotations.DoNotStrip</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.Arguments</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactApplicationContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.UiThreadUtil</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.WritableArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.SystemClock</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.devsupport.interfaces.DevSupportManager</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.jstasks.HeadlessJsTaskContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Comparator</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.PriorityQueue</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.atomic.AtomicBoolean</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* This class is the native implementation for JS timer execution on Android. It schedules JS timers</span>
+ <span class="s3">* to be invoked on frame boundaries using {</span><span class="s4">@link </span><span class="s3">ReactChoreographer}.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">This is used by the NativeModule {</span><span class="s4">@link </span><span class="s3">TimingModule}.</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">JavaTimerManager {</span>
+
+  <span class="s0">// These timing constants should be kept in sync with the ones in `JSTimers.js`.</span>
+  <span class="s0">// The minimum time in milliseconds left in the frame to call idle callbacks.</span>
+  <span class="s2">private static final float </span><span class="s1">IDLE_CALLBACK_FRAME_DEADLINE_MS = </span><span class="s6">1.f</span><span class="s2">;</span>
+  <span class="s0">// The total duration of a frame in milliseconds, this assumes that devices run at 60 fps.</span>
+  <span class="s0">// TODO: Lower frame duration on devices that are too slow to run consistently</span>
+  <span class="s0">// at 60 fps.</span>
+  <span class="s2">private static final float </span><span class="s1">FRAME_DURATION_MS = </span><span class="s6">1000.f </span><span class="s1">/ </span><span class="s6">60.f</span><span class="s2">;</span>
+
+  <span class="s2">private static class </span><span class="s1">Timer {</span>
+    <span class="s2">private final int </span><span class="s1">mCallbackID</span><span class="s2">;</span>
+    <span class="s2">private final boolean </span><span class="s1">mRepeat</span><span class="s2">;</span>
+    <span class="s2">private final int </span><span class="s1">mInterval</span><span class="s2">;</span>
+    <span class="s2">private long </span><span class="s1">mTargetTime</span><span class="s2">;</span>
+
+    <span class="s2">private </span><span class="s1">Timer(</span><span class="s2">int </span><span class="s1">callbackID</span><span class="s2">, long </span><span class="s1">initialTargetTime</span><span class="s2">, int </span><span class="s1">duration</span><span class="s2">, boolean </span><span class="s1">repeat) {</span>
+      <span class="s1">mCallbackID = callbackID</span><span class="s2">;</span>
+      <span class="s1">mTargetTime = initialTargetTime</span><span class="s2">;</span>
+      <span class="s1">mInterval = duration</span><span class="s2">;</span>
+      <span class="s1">mRepeat = repeat</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">TimerFrameCallback </span><span class="s2">extends </span><span class="s1">ChoreographerCompat.FrameCallback {</span>
+
+    <span class="s0">// Temporary map for constructing the individual arrays of timers to call</span>
+    <span class="s2">private </span><span class="s1">@Nullable WritableArray mTimersToCall = </span><span class="s2">null;</span>
+
+    <span class="s3">/** Calls all timers that have expired since the last time this frame callback was called. */</span>
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">doFrame(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+      <span class="s2">if </span><span class="s1">(isPaused.get() &amp;&amp; !isRunningTasks.get()) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">long </span><span class="s1">frameTimeMillis = frameTimeNanos / </span><span class="s6">1000000</span><span class="s2">;</span>
+      <span class="s2">synchronized </span><span class="s1">(mTimerGuard) {</span>
+        <span class="s2">while </span><span class="s1">(!mTimers.isEmpty() &amp;&amp; mTimers.peek().mTargetTime &lt; frameTimeMillis) {</span>
+          <span class="s1">Timer timer = mTimers.poll()</span><span class="s2">;</span>
+          <span class="s2">if </span><span class="s1">(mTimersToCall == </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s1">mTimersToCall = Arguments.createArray()</span><span class="s2">;</span>
+          <span class="s1">}</span>
+          <span class="s1">mTimersToCall.pushInt(timer.mCallbackID)</span><span class="s2">;</span>
+          <span class="s2">if </span><span class="s1">(timer.mRepeat) {</span>
+            <span class="s1">timer.mTargetTime = frameTimeMillis + timer.mInterval</span><span class="s2">;</span>
+            <span class="s1">mTimers.add(timer)</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s1">mTimerIdsToTimers.remove(timer.mCallbackID)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s2">if </span><span class="s1">(mTimersToCall != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">mJavaScriptTimerExecutor.callTimers(mTimersToCall)</span><span class="s2">;</span>
+        <span class="s1">mTimersToCall = </span><span class="s2">null;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">mReactChoreographer.postFrameCallback(ReactChoreographer.CallbackType.TIMERS_EVENTS</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">IdleFrameCallback </span><span class="s2">extends </span><span class="s1">ChoreographerCompat.FrameCallback {</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">doFrame(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+      <span class="s2">if </span><span class="s1">(isPaused.get() &amp;&amp; !isRunningTasks.get()) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// If the JS thread is busy for multiple frames we cancel any other pending runnable.</span>
+      <span class="s2">if </span><span class="s1">(mCurrentIdleCallbackRunnable != </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s1">mCurrentIdleCallbackRunnable.cancel()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">mCurrentIdleCallbackRunnable = </span><span class="s2">new </span><span class="s1">IdleCallbackRunnable(frameTimeNanos)</span><span class="s2">;</span>
+      <span class="s1">mReactApplicationContext.runOnJSQueueThread(mCurrentIdleCallbackRunnable)</span><span class="s2">;</span>
+
+      <span class="s1">mReactChoreographer.postFrameCallback(ReactChoreographer.CallbackType.IDLE_EVENT</span><span class="s2">, this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">IdleCallbackRunnable </span><span class="s2">implements </span><span class="s1">Runnable {</span>
+    <span class="s2">private volatile boolean </span><span class="s1">mCancelled = </span><span class="s2">false;</span>
+    <span class="s2">private final long </span><span class="s1">mFrameStartTime</span><span class="s2">;</span>
+
+    <span class="s2">public </span><span class="s1">IdleCallbackRunnable(</span><span class="s2">long </span><span class="s1">frameStartTime) {</span>
+      <span class="s1">mFrameStartTime = frameStartTime</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">run() {</span>
+      <span class="s2">if </span><span class="s1">(mCancelled) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">long </span><span class="s1">frameTimeMillis = mFrameStartTime / </span><span class="s6">1000000</span><span class="s2">;</span>
+      <span class="s2">long </span><span class="s1">timeSinceBoot = SystemClock.uptimeMillis()</span><span class="s2">;</span>
+      <span class="s2">long </span><span class="s1">frameTimeElapsed = timeSinceBoot - frameTimeMillis</span><span class="s2">;</span>
+      <span class="s2">long </span><span class="s1">time = SystemClock.currentTimeMillis()</span><span class="s2">;</span>
+      <span class="s2">long </span><span class="s1">absoluteFrameStartTime = time - frameTimeElapsed</span><span class="s2">;</span>
+
+      <span class="s2">if </span><span class="s1">(FRAME_DURATION_MS - (</span><span class="s2">float</span><span class="s1">) frameTimeElapsed &lt; IDLE_CALLBACK_FRAME_DEADLINE_MS) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">boolean </span><span class="s1">sendIdleEvents</span><span class="s2">;</span>
+      <span class="s2">synchronized </span><span class="s1">(mIdleCallbackGuard) {</span>
+        <span class="s1">sendIdleEvents = mSendIdleEvents</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">if </span><span class="s1">(sendIdleEvents) {</span>
+        <span class="s1">mJavaScriptTimerExecutor.callIdleCallbacks(absoluteFrameStartTime)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">mCurrentIdleCallbackRunnable = </span><span class="s2">null;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public void </span><span class="s1">cancel() {</span>
+      <span class="s1">mCancelled = </span><span class="s2">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private final </span><span class="s1">ReactApplicationContext mReactApplicationContext</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">JavaScriptTimerExecutor mJavaScriptTimerExecutor</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ReactChoreographer mReactChoreographer</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">DevSupportManager mDevSupportManager</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Object mTimerGuard = </span><span class="s2">new </span><span class="s1">Object()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Object mIdleCallbackGuard = </span><span class="s2">new </span><span class="s1">Object()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">PriorityQueue&lt;Timer&gt; mTimers</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">SparseArray&lt;Timer&gt; mTimerIdsToTimers</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">AtomicBoolean isPaused = </span><span class="s2">new </span><span class="s1">AtomicBoolean(</span><span class="s2">true</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">AtomicBoolean isRunningTasks = </span><span class="s2">new </span><span class="s1">AtomicBoolean(</span><span class="s2">false</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">TimerFrameCallback mTimerFrameCallback = </span><span class="s2">new </span><span class="s1">TimerFrameCallback()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">IdleFrameCallback mIdleFrameCallback = </span><span class="s2">new </span><span class="s1">IdleFrameCallback()</span><span class="s2">;</span>
+  <span class="s2">private </span><span class="s1">@Nullable IdleCallbackRunnable mCurrentIdleCallbackRunnable</span><span class="s2">;</span>
+  <span class="s2">private boolean </span><span class="s1">mFrameCallbackPosted = </span><span class="s2">false;</span>
+  <span class="s2">private boolean </span><span class="s1">mFrameIdleCallbackPosted = </span><span class="s2">false;</span>
+  <span class="s2">private boolean </span><span class="s1">mSendIdleEvents = </span><span class="s2">false;</span>
+
+  <span class="s2">public </span><span class="s1">JavaTimerManager(</span>
+      <span class="s1">ReactApplicationContext reactContext</span><span class="s2">,</span>
+      <span class="s1">JavaScriptTimerExecutor javaScriptTimerManager</span><span class="s2">,</span>
+      <span class="s1">ReactChoreographer reactChoreographer</span><span class="s2">,</span>
+      <span class="s1">DevSupportManager devSupportManager) {</span>
+    <span class="s1">mReactApplicationContext = reactContext</span><span class="s2">;</span>
+    <span class="s1">mJavaScriptTimerExecutor = javaScriptTimerManager</span><span class="s2">;</span>
+    <span class="s1">mReactChoreographer = reactChoreographer</span><span class="s2">;</span>
+    <span class="s1">mDevSupportManager = devSupportManager</span><span class="s2">;</span>
+
+    <span class="s0">// We store timers sorted by finish time.</span>
+    <span class="s1">mTimers =</span>
+        <span class="s2">new </span><span class="s1">PriorityQueue&lt;Timer&gt;(</span>
+            <span class="s6">11</span><span class="s2">, </span><span class="s0">// Default capacity: for some reason they don't expose a (Comparator) constructor</span>
+            <span class="s2">new </span><span class="s1">Comparator&lt;Timer&gt;() {</span>
+              <span class="s1">@Override</span>
+              <span class="s2">public int </span><span class="s1">compare(Timer lhs</span><span class="s2">, </span><span class="s1">Timer rhs) {</span>
+                <span class="s2">long </span><span class="s1">diff = lhs.mTargetTime - rhs.mTargetTime</span><span class="s2">;</span>
+                <span class="s2">if </span><span class="s1">(diff == </span><span class="s6">0</span><span class="s1">) {</span>
+                  <span class="s2">return </span><span class="s6">0</span><span class="s2">;</span>
+                <span class="s1">} </span><span class="s2">else if </span><span class="s1">(diff &lt; </span><span class="s6">0</span><span class="s1">) {</span>
+                  <span class="s2">return </span><span class="s1">-</span><span class="s6">1</span><span class="s2">;</span>
+                <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                  <span class="s2">return </span><span class="s6">1</span><span class="s2">;</span>
+                <span class="s1">}</span>
+              <span class="s1">}</span>
+            <span class="s1">})</span><span class="s2">;</span>
+    <span class="s1">mTimerIdsToTimers = </span><span class="s2">new </span><span class="s1">SparseArray&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onHostPause() {</span>
+    <span class="s1">isPaused.set(</span><span class="s2">true</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">clearFrameCallback()</span><span class="s2">;</span>
+    <span class="s1">maybeIdleCallback()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onHostDestroy() {</span>
+    <span class="s1">clearFrameCallback()</span><span class="s2">;</span>
+    <span class="s1">maybeIdleCallback()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onHostResume() {</span>
+    <span class="s1">isPaused.set(</span><span class="s2">false</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s0">// TODO(5195192) Investigate possible problems related to restarting all tasks at the same</span>
+    <span class="s0">// moment</span>
+    <span class="s1">setChoreographerCallback()</span><span class="s2">;</span>
+    <span class="s1">maybeSetChoreographerIdleCallback()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onHeadlessJsTaskStart(</span><span class="s2">int </span><span class="s1">taskId) {</span>
+    <span class="s2">if </span><span class="s1">(!isRunningTasks.getAndSet(</span><span class="s2">true</span><span class="s1">)) {</span>
+      <span class="s1">setChoreographerCallback()</span><span class="s2">;</span>
+      <span class="s1">maybeSetChoreographerIdleCallback()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onHeadlessJsTaskFinish(</span><span class="s2">int </span><span class="s1">taskId) {</span>
+    <span class="s1">HeadlessJsTaskContext headlessJsTaskContext =</span>
+        <span class="s1">HeadlessJsTaskContext.getInstance(mReactApplicationContext)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(!headlessJsTaskContext.hasActiveTasks()) {</span>
+      <span class="s1">isRunningTasks.set(</span><span class="s2">false</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">clearFrameCallback()</span><span class="s2">;</span>
+      <span class="s1">maybeIdleCallback()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onInstanceDestroy() {</span>
+    <span class="s1">clearFrameCallback()</span><span class="s2">;</span>
+    <span class="s1">clearChoreographerIdleCallback()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">maybeSetChoreographerIdleCallback() {</span>
+    <span class="s2">synchronized </span><span class="s1">(mIdleCallbackGuard) {</span>
+      <span class="s2">if </span><span class="s1">(mSendIdleEvents) {</span>
+        <span class="s1">setChoreographerIdleCallback()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">maybeIdleCallback() {</span>
+    <span class="s2">if </span><span class="s1">(isPaused.get() &amp;&amp; !isRunningTasks.get()) {</span>
+      <span class="s1">clearFrameCallback()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">setChoreographerCallback() {</span>
+    <span class="s2">if </span><span class="s1">(!mFrameCallbackPosted) {</span>
+      <span class="s1">mReactChoreographer.postFrameCallback(</span>
+          <span class="s1">ReactChoreographer.CallbackType.TIMERS_EVENTS</span><span class="s2">, </span><span class="s1">mTimerFrameCallback)</span><span class="s2">;</span>
+      <span class="s1">mFrameCallbackPosted = </span><span class="s2">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">clearFrameCallback() {</span>
+    <span class="s1">HeadlessJsTaskContext headlessJsTaskContext =</span>
+        <span class="s1">HeadlessJsTaskContext.getInstance(mReactApplicationContext)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mFrameCallbackPosted &amp;&amp; isPaused.get() &amp;&amp; !headlessJsTaskContext.hasActiveTasks()) {</span>
+      <span class="s1">mReactChoreographer.removeFrameCallback(</span>
+          <span class="s1">ReactChoreographer.CallbackType.TIMERS_EVENTS</span><span class="s2">, </span><span class="s1">mTimerFrameCallback)</span><span class="s2">;</span>
+      <span class="s1">mFrameCallbackPosted = </span><span class="s2">false;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">setChoreographerIdleCallback() {</span>
+    <span class="s2">if </span><span class="s1">(!mFrameIdleCallbackPosted) {</span>
+      <span class="s1">mReactChoreographer.postFrameCallback(</span>
+          <span class="s1">ReactChoreographer.CallbackType.IDLE_EVENT</span><span class="s2">, </span><span class="s1">mIdleFrameCallback)</span><span class="s2">;</span>
+      <span class="s1">mFrameIdleCallbackPosted = </span><span class="s2">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">clearChoreographerIdleCallback() {</span>
+    <span class="s2">if </span><span class="s1">(mFrameIdleCallbackPosted) {</span>
+      <span class="s1">mReactChoreographer.removeFrameCallback(</span>
+          <span class="s1">ReactChoreographer.CallbackType.IDLE_EVENT</span><span class="s2">, </span><span class="s1">mIdleFrameCallback)</span><span class="s2">;</span>
+      <span class="s1">mFrameIdleCallbackPosted = </span><span class="s2">false;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* A method to be used for synchronously creating a timer. The timer will not be invoked until the</span>
+   <span class="s3">* next frame, regardless of whether it has already expired (i.e. the delay is 0).</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">callbackID An identifier for the callback that can be passed to JS or C++ to invoke it.</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">delay The time in ms before the callback should be invoked.</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">repeat Whether the timer should be repeated (used for setInterval).</span>
+   <span class="s3">*/</span>
+  <span class="s1">@DoNotStrip</span>
+  <span class="s2">public void </span><span class="s1">createTimer(</span><span class="s2">final int </span><span class="s1">callbackID</span><span class="s2">, final long </span><span class="s1">delay</span><span class="s2">, final boolean </span><span class="s1">repeat) {</span>
+    <span class="s2">long </span><span class="s1">initialTargetTime = SystemClock.nanoTime() / </span><span class="s6">1000000 </span><span class="s1">+ delay</span><span class="s2">;</span>
+    <span class="s1">Timer timer = </span><span class="s2">new </span><span class="s1">Timer(callbackID</span><span class="s2">, </span><span class="s1">initialTargetTime</span><span class="s2">, </span><span class="s1">(</span><span class="s2">int</span><span class="s1">) delay</span><span class="s2">, </span><span class="s1">repeat)</span><span class="s2">;</span>
+    <span class="s2">synchronized </span><span class="s1">(mTimerGuard) {</span>
+      <span class="s1">mTimers.add(timer)</span><span class="s2">;</span>
+      <span class="s1">mTimerIdsToTimers.put(callbackID</span><span class="s2">, </span><span class="s1">timer)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* A method to be used for asynchronously creating a timer. If the timer has already expired,</span>
+   <span class="s3">* (based on the provided jsSchedulingTime) then it will be immediately invoked.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">callbackID An identifier that can be passed back to JS to invoke the callback.</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">duration The time in ms before the callback should be invoked.</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">jsSchedulingTime The time (ms since epoch) when this timer was created in JS.</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">repeat Whether the timer should be repeated (used for setInterval)</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">createAndMaybeCallTimer(</span>
+      <span class="s2">final int </span><span class="s1">callbackID</span><span class="s2">,</span>
+      <span class="s2">final int </span><span class="s1">duration</span><span class="s2">,</span>
+      <span class="s2">final double </span><span class="s1">jsSchedulingTime</span><span class="s2">,</span>
+      <span class="s2">final boolean </span><span class="s1">repeat) {</span>
+    <span class="s2">long </span><span class="s1">deviceTime = SystemClock.currentTimeMillis()</span><span class="s2">;</span>
+    <span class="s2">long </span><span class="s1">remoteTime = (</span><span class="s2">long</span><span class="s1">) jsSchedulingTime</span><span class="s2">;</span>
+
+    <span class="s0">// If the times on the server and device have drifted throw an exception to warn the developer</span>
+    <span class="s0">// that things might not work or results may not be accurate. This is required only for</span>
+    <span class="s0">// developer builds.</span>
+    <span class="s2">if </span><span class="s1">(mDevSupportManager.getDevSupportEnabled()) {</span>
+      <span class="s2">long </span><span class="s1">driftTime = Math.abs(remoteTime - deviceTime)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(driftTime &gt; </span><span class="s6">60000</span><span class="s1">) {</span>
+        <span class="s1">mJavaScriptTimerExecutor.emitTimeDriftWarning(</span>
+            <span class="s7">&quot;Debugger and device times have drifted by more than 60s. Please correct this by &quot;</span>
+                <span class="s1">+ </span><span class="s7">&quot;running adb shell </span><span class="s2">\&quot;</span><span class="s7">date `date +%m%d%H%M%Y.%S`</span><span class="s2">\&quot; </span><span class="s7">on your debugger machine.&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Adjust for the amount of time it took for native to receive the timer registration call</span>
+    <span class="s2">long </span><span class="s1">adjustedDuration = Math.max(</span><span class="s6">0</span><span class="s2">, </span><span class="s1">remoteTime - deviceTime + duration)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(duration == </span><span class="s6">0 </span><span class="s1">&amp;&amp; !repeat) {</span>
+      <span class="s1">WritableArray timerToCall = Arguments.createArray()</span><span class="s2">;</span>
+      <span class="s1">timerToCall.pushInt(callbackID)</span><span class="s2">;</span>
+      <span class="s1">mJavaScriptTimerExecutor.callTimers(timerToCall)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">createTimer(callbackID</span><span class="s2">, </span><span class="s1">adjustedDuration</span><span class="s2">, </span><span class="s1">repeat)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@DoNotStrip</span>
+  <span class="s2">public void </span><span class="s1">deleteTimer(</span><span class="s2">int </span><span class="s1">timerId) {</span>
+    <span class="s2">synchronized </span><span class="s1">(mTimerGuard) {</span>
+      <span class="s1">Timer timer = mTimerIdsToTimers.get(timerId)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(timer == </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+      <span class="s1">mTimerIdsToTimers.remove(timerId)</span><span class="s2">;</span>
+      <span class="s1">mTimers.remove(timer)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@DoNotStrip</span>
+  <span class="s2">public void </span><span class="s1">setSendIdleEvents(</span><span class="s2">final boolean </span><span class="s1">sendIdleEvents) {</span>
+    <span class="s2">synchronized </span><span class="s1">(mIdleCallbackGuard) {</span>
+      <span class="s1">mSendIdleEvents = sendIdleEvents</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">UiThreadUtil.runOnUiThread(</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s2">synchronized </span><span class="s1">(mIdleCallbackGuard) {</span>
+              <span class="s2">if </span><span class="s1">(sendIdleEvents) {</span>
+                <span class="s1">setChoreographerIdleCallback()</span><span class="s2">;</span>
+              <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                <span class="s1">clearChoreographerIdleCallback()</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Returns a bool representing whether there are any active timers that will be fired within a</span>
+   <span class="s3">* certain period of time. Disregards repeating timers (setInterval). Used for testing to</span>
+   <span class="s3">* determine if RN is idle.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s4">@param </span><span class="s3">rangeMs The time range, in ms, to check</span>
+   <span class="s3">* </span><span class="s4">@return </span><span class="s3">True if there are pending timers within the given range; false otherwise</span>
+   <span class="s3">*/</span>
+  <span class="s0">/* package */ </span><span class="s2">boolean </span><span class="s1">hasActiveTimersInRange(</span><span class="s2">long </span><span class="s1">rangeMs) {</span>
+    <span class="s2">synchronized </span><span class="s1">(mTimerGuard) {</span>
+      <span class="s1">Timer nextTimer = mTimers.peek()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(nextTimer == </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s0">// Timers queue is empty</span>
+        <span class="s2">return false;</span>
+      <span class="s1">}</span>
+      <span class="s2">if </span><span class="s1">(isTimerInRange(nextTimer</span><span class="s2">, </span><span class="s1">rangeMs)) {</span>
+        <span class="s0">// First check the next timer, so we can avoid iterating over the entire queue if it's</span>
+        <span class="s0">// already within range.</span>
+        <span class="s2">return true;</span>
+      <span class="s1">}</span>
+      <span class="s2">for </span><span class="s1">(Timer timer : mTimers) {</span>
+        <span class="s2">if </span><span class="s1">(isTimerInRange(timer</span><span class="s2">, </span><span class="s1">rangeMs)) {</span>
+          <span class="s2">return true;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return false;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static boolean </span><span class="s1">isTimerInRange(Timer timer</span><span class="s2">, long </span><span class="s1">rangeMs) {</span>
+    <span class="s2">return </span><span class="s1">!timer.mRepeat &amp;&amp; timer.mInterval &lt; rangeMs</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

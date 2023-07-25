@@ -1,0 +1,270 @@
+<html>
+<head>
+<title>symbolicate.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #4646f1;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+symbolicate.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s0">// Symbolicates a JavaScript stack trace using a source map.</span>
+<span class="s0">// In our first form, we read a stack trace from stdin and symbolicate it via</span>
+<span class="s0">// the provided source map.</span>
+<span class="s0">// In our second form, we symbolicate using an explicit line number, and</span>
+<span class="s0">// optionally a column.</span>
+<span class="s0">// In our third form, we symbolicate using a module ID, a line number, and</span>
+<span class="s0">// optionally a column.</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const Symbolication = require(</span><span class="s2">&quot;./Symbolication.js&quot;</span><span class="s1">);</span>
+<span class="s1">const fs = require(</span><span class="s2">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s0">// flowlint-next-line untyped-import:off</span>
+<span class="s1">const SourceMapConsumer = require(</span><span class="s2">&quot;source-map&quot;</span><span class="s1">).SourceMapConsumer;</span>
+<span class="s0">// flowlint-next-line untyped-import:off</span>
+<span class="s1">const through2 = require(</span><span class="s2">&quot;through2&quot;</span><span class="s1">);</span>
+<span class="s3">function </span><span class="s1">printHelp() {</span>
+  <span class="s1">const usages = [</span>
+    <span class="s2">&quot;Usage: &quot; </span><span class="s1">+ __filename + </span><span class="s2">&quot; &lt;source-map-file&gt;&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;       &quot; </span><span class="s1">+ __filename + </span><span class="s2">&quot; &lt;source-map-file&gt; &lt;line&gt; [column]&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;       &quot; </span><span class="s1">+ __filename + </span><span class="s2">&quot; &lt;source-map-file&gt; &lt;moduleId&gt;.js &lt;line&gt; [column]&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;       &quot; </span><span class="s1">+ __filename + </span><span class="s2">&quot; &lt;source-map-file&gt; &lt;mapfile&gt;.profmap&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;       &quot; </span><span class="s1">+</span>
+      <span class="s1">__filename +</span>
+      <span class="s2">&quot; &lt;source-map-file&gt; --attribution &lt; in.jsonl &gt; out.jsonl&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;       &quot; </span><span class="s1">+ __filename + </span><span class="s2">&quot; &lt;source-map-file&gt; &lt;tracefile&gt;.cpuprofile&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot; Optional flags:&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;  --no-function-names&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;  --hermes-crash (mutually exclusive with --hermes-coverage)&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;  --hermes-coverage (mutually exclusive with --hermes-crash)&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;  --input-line-start &lt;line&gt; (default: 1)&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;  --input-column-start &lt;column&gt; (default: 0)&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;  --output-line-start &lt;line&gt; (default: 1)&quot;</span><span class="s1">,</span>
+    <span class="s2">&quot;  --output-column-start &lt;column&gt; (default: 0)&quot;</span><span class="s1">,</span>
+  <span class="s1">];</span>
+  <span class="s1">console.error(usages.join(</span><span class="s2">&quot;</span><span class="s4">\n</span><span class="s2">&quot;</span><span class="s1">));</span>
+<span class="s1">}</span>
+<span class="s1">async </span><span class="s3">function </span><span class="s1">main(</span>
+  <span class="s1">argvInput = process.argv.slice(</span><span class="s5">2</span><span class="s1">),</span>
+  <span class="s0">// prettier-ignore</span>
+  <span class="s1">{</span>
+  <span class="s1">stdin,</span>
+  <span class="s1">stderr,</span>
+  <span class="s1">stdout</span>
+<span class="s1">} = process</span>
+<span class="s1">) {</span>
+  <span class="s1">const argv = argvInput.slice();</span>
+  <span class="s3">function </span><span class="s1">checkAndRemoveArg(arg, valuesPerArg = </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">let values = </span><span class="s3">null</span><span class="s1">;</span>
+    <span class="s3">for </span><span class="s1">(let idx = argv.indexOf(arg); idx !== -</span><span class="s5">1</span><span class="s1">; idx = argv.indexOf(arg)) {</span>
+      <span class="s1">argv.splice(idx, </span><span class="s5">1</span><span class="s1">);</span>
+      <span class="s1">values = values || [];</span>
+      <span class="s1">values.push(argv.splice(idx, valuesPerArg));</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">values;</span>
+  <span class="s1">}</span>
+  <span class="s3">function </span><span class="s1">checkAndRemoveArgWithValue(arg) {</span>
+    <span class="s1">const values = checkAndRemoveArg(arg, </span><span class="s5">1</span><span class="s1">);</span>
+    <span class="s3">return </span><span class="s1">values ? values[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] : </span><span class="s3">null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s3">try </span><span class="s1">{</span>
+    <span class="s1">const noFunctionNames = checkAndRemoveArg(</span><span class="s2">&quot;--no-function-names&quot;</span><span class="s1">);</span>
+    <span class="s1">const isHermesCrash = checkAndRemoveArg(</span><span class="s2">&quot;--hermes-crash&quot;</span><span class="s1">);</span>
+    <span class="s1">const isCoverage = checkAndRemoveArg(</span><span class="s2">&quot;--hermes-coverage&quot;</span><span class="s1">);</span>
+    <span class="s1">const inputLineStart = Number.parseInt(</span>
+      <span class="s1">checkAndRemoveArgWithValue(</span><span class="s2">&quot;--input-line-start&quot;</span><span class="s1">) || </span><span class="s2">&quot;1&quot;</span><span class="s1">,</span>
+      <span class="s5">10</span>
+    <span class="s1">);</span>
+    <span class="s1">const inputColumnStart = Number.parseInt(</span>
+      <span class="s1">checkAndRemoveArgWithValue(</span><span class="s2">&quot;--input-column-start&quot;</span><span class="s1">) || </span><span class="s2">&quot;0&quot;</span><span class="s1">,</span>
+      <span class="s5">10</span>
+    <span class="s1">);</span>
+    <span class="s1">const outputLineStart = Number.parseInt(</span>
+      <span class="s1">checkAndRemoveArgWithValue(</span><span class="s2">&quot;--output-line-start&quot;</span><span class="s1">) || </span><span class="s2">&quot;1&quot;</span><span class="s1">,</span>
+      <span class="s5">10</span>
+    <span class="s1">);</span>
+    <span class="s1">const outputColumnStart = Number.parseInt(</span>
+      <span class="s1">checkAndRemoveArgWithValue(</span><span class="s2">&quot;--output-column-start&quot;</span><span class="s1">) || </span><span class="s2">&quot;0&quot;</span><span class="s1">,</span>
+      <span class="s5">10</span>
+    <span class="s1">);</span>
+    <span class="s3">if </span><span class="s1">(argv.length &lt; </span><span class="s5">1 </span><span class="s1">|| argv.length &gt; </span><span class="s5">4</span><span class="s1">) {</span>
+      <span class="s0">/* eslint no-path-concat: &quot;off&quot; */</span>
+      <span class="s1">printHelp();</span>
+      <span class="s3">return </span><span class="s5">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(isHermesCrash &amp;&amp; isCoverage) {</span>
+      <span class="s1">console.error(</span>
+        <span class="s2">&quot;Pass either --hermes-crash or --hermes-coverage, not both&quot;</span>
+      <span class="s1">);</span>
+      <span class="s1">printHelp();</span>
+      <span class="s3">return </span><span class="s5">1</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Read the source map.</span>
+    <span class="s1">const sourceMapFileName = argv.shift();</span>
+    <span class="s1">const options = {</span>
+      <span class="s1">nameSource: noFunctionNames ? </span><span class="s2">&quot;identifier_names&quot; </span><span class="s1">: </span><span class="s2">&quot;function_names&quot;</span><span class="s1">,</span>
+      <span class="s1">inputLineStart,</span>
+      <span class="s1">inputColumnStart,</span>
+      <span class="s1">outputLineStart,</span>
+      <span class="s1">outputColumnStart,</span>
+    <span class="s1">};</span>
+    <span class="s1">let context;</span>
+    <span class="s3">if </span><span class="s1">(fs.lstatSync(sourceMapFileName).isDirectory()) {</span>
+      <span class="s1">context = Symbolication.unstable_createDirectoryContext(</span>
+        <span class="s1">SourceMapConsumer,</span>
+        <span class="s1">sourceMapFileName,</span>
+        <span class="s1">options</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s1">const content = fs.readFileSync(sourceMapFileName, </span><span class="s2">&quot;utf8&quot;</span><span class="s1">);</span>
+      <span class="s1">context = Symbolication.createContext(</span>
+        <span class="s1">SourceMapConsumer,</span>
+        <span class="s1">content,</span>
+        <span class="s1">options</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(argv.length === </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">const stackTrace = await readAll(stdin);</span>
+      <span class="s3">if </span><span class="s1">(isHermesCrash) {</span>
+        <span class="s1">const stackTraceJSON = JSON.parse(stackTrace);</span>
+        <span class="s1">const symbolicatedTrace =</span>
+          <span class="s1">context.symbolicateHermesMinidumpTrace(stackTraceJSON);</span>
+        <span class="s1">stdout.write(JSON.stringify(symbolicatedTrace));</span>
+      <span class="s1">} </span><span class="s3">else if </span><span class="s1">(isCoverage) {</span>
+        <span class="s1">const stackTraceJSON = JSON.parse(stackTrace);</span>
+        <span class="s1">const symbolicatedTrace =</span>
+          <span class="s1">context.symbolicateHermesCoverageTrace(stackTraceJSON);</span>
+        <span class="s1">stdout.write(JSON.stringify(symbolicatedTrace));</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">stdout.write(context.symbolicate(stackTrace));</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(argv[</span><span class="s5">0</span><span class="s1">].endsWith(</span><span class="s2">&quot;.profmap&quot;</span><span class="s1">)) {</span>
+      <span class="s1">stdout.write(context.symbolicateProfilerMap(argv[</span><span class="s5">0</span><span class="s1">]));</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span>
+      <span class="s1">argv[</span><span class="s5">0</span><span class="s1">].endsWith(</span><span class="s2">&quot;.heapsnapshot&quot;</span><span class="s1">) ||</span>
+      <span class="s1">argv[</span><span class="s5">0</span><span class="s1">].endsWith(</span><span class="s2">&quot;.heaptimeline&quot;</span><span class="s1">)</span>
+    <span class="s1">) {</span>
+      <span class="s1">stdout.write(</span>
+        <span class="s1">JSON.stringify(</span>
+          <span class="s1">context.symbolicateHeapSnapshot(fs.readFileSync(argv[</span><span class="s5">0</span><span class="s1">], </span><span class="s2">&quot;utf8&quot;</span><span class="s1">))</span>
+        <span class="s1">)</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(argv[</span><span class="s5">0</span><span class="s1">] === </span><span class="s2">&quot;--attribution&quot;</span><span class="s1">) {</span>
+      <span class="s1">let buffer = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+      <span class="s1">await waitForStream(</span>
+        <span class="s1">stdin</span>
+          <span class="s1">.pipe(</span>
+            <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) 
+             * required by Flow's LTI update could not be added via codemod */</span>
+            <span class="s1">through2(</span><span class="s3">function </span><span class="s1">(data, enc, callback) {</span>
+              <span class="s0">// Take arbitrary strings, output single lines</span>
+              <span class="s1">buffer += data;</span>
+              <span class="s1">const lines = buffer.split(</span><span class="s2">&quot;</span><span class="s4">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+              <span class="s3">for </span><span class="s1">(let i = </span><span class="s5">0</span><span class="s1">, e = lines.length - </span><span class="s5">1</span><span class="s1">; i &lt; e; i++) {</span>
+                <span class="s3">this</span><span class="s1">.push(lines[i]);</span>
+              <span class="s1">}</span>
+              <span class="s1">buffer = lines[lines.length - </span><span class="s5">1</span><span class="s1">];</span>
+              <span class="s1">callback();</span>
+            <span class="s1">})</span>
+          <span class="s1">)</span>
+          <span class="s1">.pipe(</span>
+            <span class="s0">/* $FlowFixMe[missing-this-annot] The 'this' type annotation(s) 
+             * required by Flow's LTI update could not be added via codemod */</span>
+            <span class="s1">through2.obj(</span><span class="s3">function </span><span class="s1">(data, enc, callback) {</span>
+              <span class="s0">// This is JSONL, so each line is a separate JSON object</span>
+              <span class="s1">const obj = JSON.parse(data);</span>
+              <span class="s1">context.symbolicateAttribution(obj);</span>
+              <span class="s3">this</span><span class="s1">.push(JSON.stringify(obj) + </span><span class="s2">&quot;</span><span class="s4">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+              <span class="s1">callback();</span>
+            <span class="s1">})</span>
+          <span class="s1">)</span>
+          <span class="s1">.pipe(stdout)</span>
+      <span class="s1">);</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(argv[</span><span class="s5">0</span><span class="s1">].endsWith(</span><span class="s2">&quot;.cpuprofile&quot;</span><span class="s1">)) {</span>
+      <span class="s0">// NOTE: synchronous</span>
+      <span class="s1">context.symbolicateChromeTrace(argv[</span><span class="s5">0</span><span class="s1">], {</span>
+        <span class="s1">stdout,</span>
+        <span class="s1">stderr,</span>
+      <span class="s1">});</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s0">// read-from-argv form.</span>
+      <span class="s1">let moduleIds;</span>
+      <span class="s3">if </span><span class="s1">(argv[</span><span class="s5">0</span><span class="s1">].endsWith(</span><span class="s2">&quot;.js&quot;</span><span class="s1">)) {</span>
+        <span class="s1">moduleIds = context.parseFileName(argv[</span><span class="s5">0</span><span class="s1">]);</span>
+        <span class="s1">argv.shift();</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s1">moduleIds = </span><span class="s3">null</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">const lineNumber = argv.shift();</span>
+      <span class="s1">const columnNumber = argv.shift() || </span><span class="s5">0</span><span class="s1">;</span>
+      <span class="s1">const original = context.getOriginalPositionFor(</span>
+        <span class="s1">+lineNumber,</span>
+        <span class="s1">+columnNumber,</span>
+        <span class="s0">// $FlowFixMe context is a union here and so this parameter is a union</span>
+        <span class="s1">moduleIds</span>
+      <span class="s1">);</span>
+      <span class="s1">stdout.write(</span>
+        <span class="s1">[</span>
+          <span class="s1">original.source ?? </span><span class="s2">&quot;null&quot;</span><span class="s1">,</span>
+          <span class="s1">original.line ?? </span><span class="s2">&quot;null&quot;</span><span class="s1">,</span>
+          <span class="s1">original.name ?? </span><span class="s2">&quot;null&quot;</span><span class="s1">,</span>
+        <span class="s1">].join(</span><span class="s2">&quot;:&quot;</span><span class="s1">) + </span><span class="s2">&quot;</span><span class="s4">\n</span><span class="s2">&quot;</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s3">catch </span><span class="s1">(error) {</span>
+    <span class="s1">stderr.write(error + </span><span class="s2">&quot;</span><span class="s4">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+    <span class="s3">return </span><span class="s5">1</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s5">0</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">readAll(stream) {</span>
+  <span class="s3">return new </span><span class="s1">Promise((resolve) =&gt; {</span>
+    <span class="s1">let data = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+    <span class="s3">if </span><span class="s1">(stream.isTTY === </span><span class="s3">true</span><span class="s1">) {</span>
+      <span class="s1">resolve(data);</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">stream.setEncoding(</span><span class="s2">&quot;utf8&quot;</span><span class="s1">);</span>
+    <span class="s1">stream.on(</span><span class="s2">&quot;readable&quot;</span><span class="s1">, () =&gt; {</span>
+      <span class="s1">let chunk;</span>
+      <span class="s0">// flowlint-next-line sketchy-null-string:off</span>
+      <span class="s3">while </span><span class="s1">((chunk = stream.read())) {</span>
+        <span class="s1">data += chunk.toString();</span>
+      <span class="s1">}</span>
+    <span class="s1">});</span>
+    <span class="s1">stream.on(</span><span class="s2">&quot;end&quot;</span><span class="s1">, () =&gt; {</span>
+      <span class="s1">resolve(data);</span>
+    <span class="s1">});</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">waitForStream(stream) {</span>
+  <span class="s3">return new </span><span class="s1">Promise((resolve) =&gt; {</span>
+    <span class="s1">stream.on(</span><span class="s2">&quot;finish&quot;</span><span class="s1">, resolve);</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = main;</span>
+</pre>
+</body>
+</html>

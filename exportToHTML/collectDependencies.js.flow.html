@@ -1,0 +1,828 @@
+<html>
+<head>
+<title>collectDependencies.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+collectDependencies.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {NodePath} from '@babel/traverse';</span>
+<span class="s0">import type {CallExpression, Identifier, StringLiteral} from '@babel/types';</span>
+<span class="s0">import type {</span>
+  <span class="s0">AllowOptionalDependencies,</span>
+  <span class="s0">AsyncDependencyType,</span>
+<span class="s0">} from 'metro/src/DeltaBundler/types.flow.js';</span>
+
+<span class="s0">const crypto = require('crypto');</span>
+<span class="s0">const generate = require('@babel/generator').default;</span>
+<span class="s0">const template = require('@babel/template').default;</span>
+<span class="s0">const traverse = require('@babel/traverse').default;</span>
+<span class="s0">const types = require('@babel/types');</span>
+<span class="s0">const nullthrows = require('nullthrows');</span>
+
+<span class="s0">const {isImport} = types;</span>
+
+<span class="s0">type ImportDependencyOptions = $ReadOnly&lt;{</span>
+  <span class="s0">asyncType: AsyncDependencyType,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">export type Dependency = $ReadOnly&lt;{</span>
+  <span class="s0">data: DependencyData,</span>
+  <span class="s0">name: string,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">// TODO: Convert to a Flow enum</span>
+<span class="s0">export type ContextMode = 'sync' | 'eager' | 'lazy' | 'lazy-once';</span>
+
+<span class="s0">type ContextFilter = {pattern: string, flags: string};</span>
+
+<span class="s0">export type RequireContextParams = $ReadOnly&lt;{</span>
+  <span class="s0">/* Should search for files recursively. Optional, default `true` when `require.context` is used */</span>
+  <span class="s0">recursive: boolean,</span>
+  <span class="s0">/* Filename filter pattern for use in `require.context`. Optional, default `.*` (any file) when `require.context` is used */</span>
+  <span class="s0">filter: $ReadOnly&lt;ContextFilter&gt;,</span>
+  <span class="s0">/** Mode for resolving dynamic dependencies. Defaults to `sync` */</span>
+  <span class="s0">mode: ContextMode,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">type DependencyData = $ReadOnly&lt;{</span>
+  <span class="s0">// A locally unique key for this dependency within the current module.</span>
+  <span class="s0">key: string,</span>
+  <span class="s0">// If null, then the dependency is synchronous.</span>
+  <span class="s0">// (ex. `require('foo')`)</span>
+  <span class="s0">asyncType: AsyncDependencyType | null,</span>
+  <span class="s0">isOptional?: boolean,</span>
+  <span class="s0">locs: Array&lt;BabelSourceLocation&gt;,</span>
+  <span class="s0">/** Context for requiring a collection of modules. */</span>
+  <span class="s0">contextParams?: RequireContextParams,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">export type MutableInternalDependency = {</span>
+  <span class="s0">...DependencyData,</span>
+  <span class="s0">index: number,</span>
+  <span class="s0">name: string,</span>
+<span class="s0">};</span>
+
+<span class="s0">export type InternalDependency = $ReadOnly&lt;MutableInternalDependency&gt;;</span>
+
+<span class="s0">export type State = {</span>
+  <span class="s0">asyncRequireModulePathStringLiteral: ?StringLiteral,</span>
+  <span class="s0">dependencyCalls: Set&lt;string&gt;,</span>
+  <span class="s0">dependencyRegistry: DependencyRegistry,</span>
+  <span class="s0">dependencyTransformer: DependencyTransformer,</span>
+  <span class="s0">dynamicRequires: DynamicRequiresBehavior,</span>
+  <span class="s0">dependencyMapIdentifier: ?Identifier,</span>
+  <span class="s0">keepRequireNames: boolean,</span>
+  <span class="s0">allowOptionalDependencies: AllowOptionalDependencies,</span>
+  <span class="s0">/** Enable `require.context` statements which can be used to import multiple files in a directory. */</span>
+  <span class="s0">unstable_allowRequireContext: boolean,</span>
+<span class="s0">};</span>
+
+<span class="s0">export type Options = $ReadOnly&lt;{</span>
+  <span class="s0">asyncRequireModulePath: string,</span>
+  <span class="s0">dependencyMapName: ?string,</span>
+  <span class="s0">dynamicRequires: DynamicRequiresBehavior,</span>
+  <span class="s0">inlineableCalls: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">keepRequireNames: boolean,</span>
+  <span class="s0">allowOptionalDependencies: AllowOptionalDependencies,</span>
+  <span class="s0">dependencyTransformer?: DependencyTransformer,</span>
+  <span class="s0">/** Enable `require.context` statements which can be used to import multiple files in a directory. */</span>
+  <span class="s0">unstable_allowRequireContext: boolean,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">export type CollectedDependencies = $ReadOnly&lt;{</span>
+  <span class="s0">ast: BabelNodeFile,</span>
+  <span class="s0">dependencyMapName: string,</span>
+  <span class="s0">dependencies: $ReadOnlyArray&lt;Dependency&gt;,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">export interface DependencyTransformer {</span>
+  <span class="s0">transformSyncRequire(</span>
+    <span class="s0">path: NodePath&lt;CallExpression&gt;,</span>
+    <span class="s0">dependency: InternalDependency,</span>
+    <span class="s0">state: State,</span>
+  <span class="s0">): void;</span>
+  <span class="s0">transformImportCall(</span>
+    <span class="s0">path: NodePath&lt;&gt;,</span>
+    <span class="s0">dependency: InternalDependency,</span>
+    <span class="s0">state: State,</span>
+  <span class="s0">): void;</span>
+  <span class="s0">transformPrefetch(</span>
+    <span class="s0">path: NodePath&lt;&gt;,</span>
+    <span class="s0">dependency: InternalDependency,</span>
+    <span class="s0">state: State,</span>
+  <span class="s0">): void;</span>
+  <span class="s0">transformIllegalDynamicRequire(path: NodePath&lt;&gt;, state: State): void;</span>
+<span class="s0">}</span>
+
+<span class="s0">export type DynamicRequiresBehavior = 'throwAtRuntime' | 'reject';</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Transform all the calls to `require()` and `import()` in a file into ID-</span>
+ <span class="s0">* independent code, and return the list of dependencies. For example, a call</span>
+ <span class="s0">* like `require('Foo')` could be transformed to `require(_depMap[3], 'Foo')`</span>
+ <span class="s0">* where `_depMap` is provided by the outer scope. As such, we don't need to</span>
+ <span class="s0">* know the actual module ID.</span>
+ <span class="s0">*</span>
+ <span class="s0">* The second argument is only provided for debugging purposes.</span>
+ <span class="s0">*/</span>
+<span class="s0">function collectDependencies(</span>
+  <span class="s0">ast: BabelNodeFile,</span>
+  <span class="s0">options: Options,</span>
+<span class="s0">): CollectedDependencies {</span>
+  <span class="s0">const visited = new WeakSet&lt;BabelNodeCallExpression&gt;();</span>
+
+  <span class="s0">const state: State = {</span>
+    <span class="s0">asyncRequireModulePathStringLiteral: null,</span>
+    <span class="s0">dependencyCalls: new Set(),</span>
+    <span class="s0">dependencyRegistry: new DependencyRegistry(),</span>
+    <span class="s0">dependencyTransformer:</span>
+      <span class="s0">options.dependencyTransformer ?? DefaultDependencyTransformer,</span>
+    <span class="s0">dependencyMapIdentifier: null,</span>
+    <span class="s0">dynamicRequires: options.dynamicRequires,</span>
+    <span class="s0">keepRequireNames: options.keepRequireNames,</span>
+    <span class="s0">allowOptionalDependencies: options.allowOptionalDependencies,</span>
+    <span class="s0">unstable_allowRequireContext: options.unstable_allowRequireContext,</span>
+  <span class="s0">};</span>
+
+  <span class="s0">const visitor = {</span>
+    <span class="s0">CallExpression(</span>
+      <span class="s0">path: NodePath&lt;BabelNodeCallExpression&gt;,</span>
+      <span class="s0">state: State,</span>
+    <span class="s0">): void {</span>
+      <span class="s0">if (visited.has(path.node)) {</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">const callee = path.node.callee;</span>
+      <span class="s0">const name = callee.type === 'Identifier' ? callee.name : null;</span>
+
+      <span class="s0">if (isImport(callee)) {</span>
+        <span class="s0">processImportCall(path, state, {</span>
+          <span class="s0">asyncType: 'async',</span>
+        <span class="s0">});</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">if (name === '__prefetchImport' &amp;&amp; !path.scope.getBinding(name)) {</span>
+        <span class="s0">processImportCall(path, state, {</span>
+          <span class="s0">asyncType: 'prefetch',</span>
+        <span class="s0">});</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">// Match `require.context`</span>
+      <span class="s0">if (</span>
+        <span class="s0">// Feature gate, defaults to `false`.</span>
+        <span class="s0">state.unstable_allowRequireContext &amp;&amp;</span>
+        <span class="s0">callee.type === 'MemberExpression' &amp;&amp;</span>
+        <span class="s0">// `require`</span>
+        <span class="s0">callee.object.type === 'Identifier' &amp;&amp;</span>
+        <span class="s0">callee.object.name === 'require' &amp;&amp;</span>
+        <span class="s0">// `context`</span>
+        <span class="s0">callee.property.type === 'Identifier' &amp;&amp;</span>
+        <span class="s0">callee.property.name === 'context' &amp;&amp;</span>
+        <span class="s0">!callee.computed &amp;&amp;</span>
+        <span class="s0">// Ensure `require` refers to the global and not something else.</span>
+        <span class="s0">!path.scope.getBinding('require')</span>
+      <span class="s0">) {</span>
+        <span class="s0">processRequireContextCall(path, state);</span>
+        <span class="s0">visited.add(path.node);</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">// Match `require.resolveWeak`</span>
+      <span class="s0">if (</span>
+        <span class="s0">callee.type === 'MemberExpression' &amp;&amp;</span>
+        <span class="s0">// `require`</span>
+        <span class="s0">callee.object.type === 'Identifier' &amp;&amp;</span>
+        <span class="s0">callee.object.name === 'require' &amp;&amp;</span>
+        <span class="s0">// `resolveWeak`</span>
+        <span class="s0">callee.property.type === 'Identifier' &amp;&amp;</span>
+        <span class="s0">callee.property.name === 'resolveWeak' &amp;&amp;</span>
+        <span class="s0">!callee.computed &amp;&amp;</span>
+        <span class="s0">// Ensure `require` refers to the global and not something else.</span>
+        <span class="s0">!path.scope.getBinding('require')</span>
+      <span class="s0">) {</span>
+        <span class="s0">processResolveWeakCall(path, state);</span>
+        <span class="s0">visited.add(path.node);</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">if (</span>
+        <span class="s0">name != null &amp;&amp;</span>
+        <span class="s0">state.dependencyCalls.has(name) &amp;&amp;</span>
+        <span class="s0">!path.scope.getBinding(name)</span>
+      <span class="s0">) {</span>
+        <span class="s0">processRequireCall(path, state);</span>
+        <span class="s0">visited.add(path.node);</span>
+      <span class="s0">}</span>
+    <span class="s0">},</span>
+
+    <span class="s0">ImportDeclaration: collectImports,</span>
+    <span class="s0">ExportNamedDeclaration: collectImports,</span>
+    <span class="s0">ExportAllDeclaration: collectImports,</span>
+
+    <span class="s0">Program(path: NodePath&lt;BabelNodeProgram&gt;, state: State) {</span>
+      <span class="s0">state.asyncRequireModulePathStringLiteral = types.stringLiteral(</span>
+        <span class="s0">options.asyncRequireModulePath,</span>
+      <span class="s0">);</span>
+
+      <span class="s0">if (options.dependencyMapName != null) {</span>
+        <span class="s0">state.dependencyMapIdentifier = types.identifier(</span>
+          <span class="s0">options.dependencyMapName,</span>
+        <span class="s0">);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">state.dependencyMapIdentifier =</span>
+          <span class="s0">path.scope.generateUidIdentifier('dependencyMap');</span>
+      <span class="s0">}</span>
+
+      <span class="s0">state.dependencyCalls = new Set(['require', ...options.inlineableCalls]);</span>
+    <span class="s0">},</span>
+  <span class="s0">};</span>
+
+  <span class="s0">traverse(ast, visitor, null, state);</span>
+
+  <span class="s0">const collectedDependencies = state.dependencyRegistry.getDependencies();</span>
+  <span class="s0">// Compute the list of dependencies.</span>
+  <span class="s0">const dependencies = new Array&lt;Dependency&gt;(collectedDependencies.length);</span>
+
+  <span class="s0">for (const {index, name, ...dependencyData} of collectedDependencies) {</span>
+    <span class="s0">dependencies[index] = {</span>
+      <span class="s0">name,</span>
+      <span class="s0">data: dependencyData,</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return {</span>
+    <span class="s0">ast,</span>
+    <span class="s0">dependencies,</span>
+    <span class="s0">dependencyMapName: nullthrows(state.dependencyMapIdentifier).name,</span>
+  <span class="s0">};</span>
+<span class="s0">}</span>
+
+<span class="s0">/** Extract args passed to the `require.context` method. */</span>
+<span class="s0">function getRequireContextArgs(</span>
+  <span class="s0">path: NodePath&lt;CallExpression&gt;,</span>
+<span class="s0">): [string, RequireContextParams] {</span>
+  <span class="s0">const args = path.get('arguments');</span>
+
+  <span class="s0">let directory: string;</span>
+  <span class="s0">if (!Array.isArray(args) || args.length &lt; 1) {</span>
+    <span class="s0">throw new InvalidRequireCallError(path);</span>
+  <span class="s0">} else {</span>
+    <span class="s0">const result = args[0].evaluate();</span>
+    <span class="s0">if (result.confident &amp;&amp; typeof result.value === 'string') {</span>
+      <span class="s0">directory = result.value;</span>
+    <span class="s0">} else {</span>
+      <span class="s0">throw new InvalidRequireCallError(</span>
+        <span class="s0">result.deopt ?? args[0],</span>
+        <span class="s0">'First argument of `require.context` should be a string denoting the directory to require.',</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Default to requiring through all directories.</span>
+  <span class="s0">let recursive: boolean = true;</span>
+  <span class="s0">if (args.length &gt; 1) {</span>
+    <span class="s0">const result = args[1].evaluate();</span>
+    <span class="s0">if (result.confident &amp;&amp; typeof result.value === 'boolean') {</span>
+      <span class="s0">recursive = result.value;</span>
+    <span class="s0">} else if (!(result.confident &amp;&amp; typeof result.value === 'undefined')) {</span>
+      <span class="s0">throw new InvalidRequireCallError(</span>
+        <span class="s0">result.deopt ?? args[1],</span>
+        <span class="s0">'Second argument of `require.context` should be an optional boolean indicating if files should be imported recursively or not.',</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Default to all files.</span>
+  <span class="s0">let filter: ContextFilter = {pattern: '.*', flags: ''};</span>
+  <span class="s0">if (args.length &gt; 2) {</span>
+    <span class="s0">// evaluate() to check for undefined (because it's technically a scope lookup)</span>
+    <span class="s0">// but check the AST for the regex literal, since evaluate() doesn't do regex.</span>
+    <span class="s0">const result = args[2].evaluate();</span>
+    <span class="s0">const argNode = args[2].node;</span>
+    <span class="s0">if (argNode.type === 'RegExpLiteral') {</span>
+      <span class="s0">// TODO: Handle `new RegExp(...)` -- `argNode.type === 'NewExpression'`</span>
+      <span class="s0">filter = {</span>
+        <span class="s0">pattern: argNode.pattern,</span>
+        <span class="s0">flags: argNode.flags || '',</span>
+      <span class="s0">};</span>
+    <span class="s0">} else if (!(result.confident &amp;&amp; typeof result.value === 'undefined')) {</span>
+      <span class="s0">throw new InvalidRequireCallError(</span>
+        <span class="s0">args[2],</span>
+        <span class="s0">`Third argument of \`require.context\` should be an optional RegExp pattern matching all of the files to import, instead found node of type: ${argNode.type}.`,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Default to `sync`.</span>
+  <span class="s0">let mode: ContextMode = 'sync';</span>
+  <span class="s0">if (args.length &gt; 3) {</span>
+    <span class="s0">const result = args[3].evaluate();</span>
+    <span class="s0">if (result.confident &amp;&amp; typeof result.value === 'string') {</span>
+      <span class="s0">mode = getContextMode(args[3], result.value);</span>
+    <span class="s0">} else if (!(result.confident &amp;&amp; typeof result.value === 'undefined')) {</span>
+      <span class="s0">throw new InvalidRequireCallError(</span>
+        <span class="s0">result.deopt ?? args[3],</span>
+        <span class="s0">'Fourth argument of `require.context` should be an optional string &quot;mode&quot; denoting how the modules will be resolved.',</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (args.length &gt; 4) {</span>
+    <span class="s0">throw new InvalidRequireCallError(</span>
+      <span class="s0">path,</span>
+      <span class="s0">`Too many arguments provided to \`require.context\` call. Expected 4, got: ${args.length}`,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return [</span>
+    <span class="s0">directory,</span>
+    <span class="s0">{</span>
+      <span class="s0">recursive,</span>
+      <span class="s0">filter,</span>
+      <span class="s0">mode,</span>
+    <span class="s0">},</span>
+  <span class="s0">];</span>
+<span class="s0">}</span>
+
+<span class="s0">function getContextMode(path: NodePath&lt;&gt;, mode: string): ContextMode {</span>
+  <span class="s0">if (</span>
+    <span class="s0">mode === 'sync' ||</span>
+    <span class="s0">mode === 'eager' ||</span>
+    <span class="s0">mode === 'lazy' ||</span>
+    <span class="s0">mode === 'lazy-once'</span>
+  <span class="s0">) {</span>
+    <span class="s0">return mode;</span>
+  <span class="s0">}</span>
+  <span class="s0">throw new InvalidRequireCallError(</span>
+    <span class="s0">path,</span>
+    <span class="s0">`require.context &quot;${mode}&quot; mode is not supported. Expected one of: sync, eager, lazy, lazy-once`,</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function processRequireContextCall(</span>
+  <span class="s0">path: NodePath&lt;CallExpression&gt;,</span>
+  <span class="s0">state: State,</span>
+<span class="s0">): void {</span>
+  <span class="s0">const [directory, contextParams] = getRequireContextArgs(path);</span>
+  <span class="s0">const transformer = state.dependencyTransformer;</span>
+  <span class="s0">const dep = registerDependency(</span>
+    <span class="s0">state,</span>
+    <span class="s0">{</span>
+      <span class="s0">// We basically want to &quot;import&quot; every file in a folder and then filter them out with the given `filter` RegExp.</span>
+      <span class="s0">name: directory,</span>
+      <span class="s0">// Capture the matching context</span>
+      <span class="s0">contextParams,</span>
+      <span class="s0">asyncType: null,</span>
+      <span class="s0">optional: isOptionalDependency(directory, path, state),</span>
+    <span class="s0">},</span>
+    <span class="s0">path,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">// require() the generated module representing this context</span>
+  <span class="s0">path.get('callee').replaceWith(types.identifier('require'));</span>
+  <span class="s0">transformer.transformSyncRequire(path, dep, state);</span>
+<span class="s0">}</span>
+
+<span class="s0">function processResolveWeakCall(</span>
+  <span class="s0">path: NodePath&lt;CallExpression&gt;,</span>
+  <span class="s0">state: State,</span>
+<span class="s0">): void {</span>
+  <span class="s0">const name = getModuleNameFromCallArgs(path);</span>
+
+  <span class="s0">if (name == null) {</span>
+    <span class="s0">throw new InvalidRequireCallError(path);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const dependency = registerDependency(</span>
+    <span class="s0">state,</span>
+    <span class="s0">{</span>
+      <span class="s0">name,</span>
+      <span class="s0">asyncType: 'weak',</span>
+      <span class="s0">optional: isOptionalDependency(name, path, state),</span>
+    <span class="s0">},</span>
+    <span class="s0">path,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">path.replaceWith(</span>
+    <span class="s0">makeResolveWeakTemplate({</span>
+      <span class="s0">MODULE_ID: createModuleIDExpression(dependency, state),</span>
+    <span class="s0">}),</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function collectImports(path: NodePath&lt;&gt;, state: State): void {</span>
+  <span class="s0">if (path.node.source) {</span>
+    <span class="s0">registerDependency(</span>
+      <span class="s0">state,</span>
+      <span class="s0">{</span>
+        <span class="s0">name: path.node.source.value,</span>
+        <span class="s0">asyncType: null,</span>
+        <span class="s0">optional: false,</span>
+      <span class="s0">},</span>
+      <span class="s0">path,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function processImportCall(</span>
+  <span class="s0">path: NodePath&lt;CallExpression&gt;,</span>
+  <span class="s0">state: State,</span>
+  <span class="s0">options: ImportDependencyOptions,</span>
+<span class="s0">): void {</span>
+  <span class="s0">const name = getModuleNameFromCallArgs(path);</span>
+
+  <span class="s0">if (name == null) {</span>
+    <span class="s0">throw new InvalidRequireCallError(path);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const dep = registerDependency(</span>
+    <span class="s0">state,</span>
+    <span class="s0">{</span>
+      <span class="s0">name,</span>
+      <span class="s0">asyncType: options.asyncType,</span>
+      <span class="s0">optional: isOptionalDependency(name, path, state),</span>
+    <span class="s0">},</span>
+    <span class="s0">path,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const transformer = state.dependencyTransformer;</span>
+
+  <span class="s0">if (options.asyncType === 'async') {</span>
+    <span class="s0">transformer.transformImportCall(path, dep, state);</span>
+  <span class="s0">} else {</span>
+    <span class="s0">transformer.transformPrefetch(path, dep, state);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function processRequireCall(</span>
+  <span class="s0">path: NodePath&lt;CallExpression&gt;,</span>
+  <span class="s0">state: State,</span>
+<span class="s0">): void {</span>
+  <span class="s0">const name = getModuleNameFromCallArgs(path);</span>
+
+  <span class="s0">const transformer = state.dependencyTransformer;</span>
+
+  <span class="s0">if (name == null) {</span>
+    <span class="s0">if (state.dynamicRequires === 'reject') {</span>
+      <span class="s0">throw new InvalidRequireCallError(path);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">transformer.transformIllegalDynamicRequire(path, state);</span>
+    <span class="s0">return;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const dep = registerDependency(</span>
+    <span class="s0">state,</span>
+    <span class="s0">{</span>
+      <span class="s0">name,</span>
+      <span class="s0">asyncType: null,</span>
+      <span class="s0">optional: isOptionalDependency(name, path, state),</span>
+    <span class="s0">},</span>
+    <span class="s0">path,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">transformer.transformSyncRequire(path, dep, state);</span>
+<span class="s0">}</span>
+
+<span class="s0">function getNearestLocFromPath(path: NodePath&lt;&gt;): ?BabelSourceLocation {</span>
+  <span class="s0">let current: ?(NodePath&lt;&gt; | NodePath&lt;BabelNode&gt;) = path;</span>
+  <span class="s0">while (current &amp;&amp; !current.node.loc) {</span>
+    <span class="s0">current = current.parentPath;</span>
+  <span class="s0">}</span>
+  <span class="s0">return current?.node.loc;</span>
+<span class="s0">}</span>
+
+<span class="s0">export type ImportQualifier = $ReadOnly&lt;{</span>
+  <span class="s0">name: string,</span>
+  <span class="s0">asyncType: AsyncDependencyType | null,</span>
+  <span class="s0">optional: boolean,</span>
+  <span class="s0">contextParams?: RequireContextParams,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">function registerDependency(</span>
+  <span class="s0">state: State,</span>
+  <span class="s0">qualifier: ImportQualifier,</span>
+  <span class="s0">path: NodePath&lt;&gt;,</span>
+<span class="s0">): InternalDependency {</span>
+  <span class="s0">const dependency = state.dependencyRegistry.registerDependency(qualifier);</span>
+  <span class="s0">const loc = getNearestLocFromPath(path);</span>
+  <span class="s0">if (loc != null) {</span>
+    <span class="s0">dependency.locs.push(loc);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return dependency;</span>
+<span class="s0">}</span>
+
+<span class="s0">function isOptionalDependency(</span>
+  <span class="s0">name: string,</span>
+  <span class="s0">path: NodePath&lt;&gt;,</span>
+  <span class="s0">state: State,</span>
+<span class="s0">): boolean {</span>
+  <span class="s0">const {allowOptionalDependencies} = state;</span>
+
+  <span class="s0">// The async require module is a 'built-in'. Resolving should never fail -&gt; treat it as non-optional.</span>
+  <span class="s0">if (name === state.asyncRequireModulePathStringLiteral?.value) {</span>
+    <span class="s0">return false;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const isExcluded = () =&gt;</span>
+    <span class="s0">Array.isArray(allowOptionalDependencies.exclude) &amp;&amp;</span>
+    <span class="s0">allowOptionalDependencies.exclude.includes(name);</span>
+
+  <span class="s0">if (!allowOptionalDependencies || isExcluded()) {</span>
+    <span class="s0">return false;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Valid statement stack for single-level try-block: expressionStatement -&gt; blockStatement -&gt; tryStatement</span>
+  <span class="s0">let sCount = 0;</span>
+  <span class="s0">let p: ?(NodePath&lt;&gt; | NodePath&lt;BabelNode&gt;) = path;</span>
+  <span class="s0">while (p &amp;&amp; sCount &lt; 3) {</span>
+    <span class="s0">if (p.isStatement()) {</span>
+      <span class="s0">if (p.node.type === 'BlockStatement') {</span>
+        <span class="s0">// A single-level should have the tryStatement immediately followed BlockStatement</span>
+        <span class="s0">// with the key 'block' to distinguish from the finally block, which has key = 'finalizer'</span>
+        <span class="s0">return (</span>
+          <span class="s0">p.parentPath != null &amp;&amp;</span>
+          <span class="s0">p.parentPath.node.type === 'TryStatement' &amp;&amp;</span>
+          <span class="s0">p.key === 'block'</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+      <span class="s0">sCount += 1;</span>
+    <span class="s0">}</span>
+    <span class="s0">p = p.parentPath;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return false;</span>
+<span class="s0">}</span>
+
+<span class="s0">function getModuleNameFromCallArgs(path: NodePath&lt;CallExpression&gt;): ?string {</span>
+  <span class="s0">const args = path.get('arguments');</span>
+  <span class="s0">if (!Array.isArray(args) || args.length !== 1) {</span>
+    <span class="s0">throw new InvalidRequireCallError(path);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const result = args[0].evaluate();</span>
+
+  <span class="s0">if (result.confident &amp;&amp; typeof result.value === 'string') {</span>
+    <span class="s0">return result.value;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return null;</span>
+<span class="s0">}</span>
+
+<span class="s0">collectDependencies.getModuleNameFromCallArgs = getModuleNameFromCallArgs;</span>
+
+<span class="s0">class InvalidRequireCallError extends Error {</span>
+  <span class="s0">constructor({node}: NodePath&lt;&gt;, message?: string) {</span>
+    <span class="s0">const line = node.loc &amp;&amp; node.loc.start &amp;&amp; node.loc.start.line;</span>
+
+    <span class="s0">super(</span>
+      <span class="s0">[</span>
+        <span class="s0">`Invalid call at line ${line || '&lt;unknown&gt;'}: ${generate(node).code}`,</span>
+        <span class="s0">message,</span>
+      <span class="s0">]</span>
+        <span class="s0">.filter(Boolean)</span>
+        <span class="s0">.join('\n'),</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">collectDependencies.InvalidRequireCallError = InvalidRequireCallError;</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Produces a Babel template that will throw at runtime when the require call</span>
+ <span class="s0">* is reached. This makes dynamic require errors catchable by libraries that</span>
+ <span class="s0">* want to use them.</span>
+ <span class="s0">*/</span>
+<span class="s0">const dynamicRequireErrorTemplate = template.expression(`</span>
+  <span class="s0">(function(line) {</span>
+    <span class="s0">throw new Error(</span>
+      <span class="s0">'Dynamic require defined at line ' + line + '; not supported by Metro',</span>
+    <span class="s0">);</span>
+  <span class="s0">})(LINE)</span>
+<span class="s0">`);</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Produces a Babel template that transforms an &quot;import(...)&quot; call into a</span>
+ <span class="s0">* &quot;require(...)&quot; call to the asyncRequire specified.</span>
+ <span class="s0">*/</span>
+<span class="s0">const makeAsyncRequireTemplate = template.expression(`</span>
+  <span class="s0">require(ASYNC_REQUIRE_MODULE_PATH)(MODULE_ID, DEPENDENCY_MAP.paths)</span>
+<span class="s0">`);</span>
+
+<span class="s0">const makeAsyncRequireTemplateWithName = template.expression(`</span>
+  <span class="s0">require(ASYNC_REQUIRE_MODULE_PATH)(MODULE_ID, DEPENDENCY_MAP.paths, MODULE_NAME)</span>
+<span class="s0">`);</span>
+
+<span class="s0">const makeAsyncPrefetchTemplate = template.expression(`</span>
+  <span class="s0">require(ASYNC_REQUIRE_MODULE_PATH).prefetch(MODULE_ID, DEPENDENCY_MAP.paths)</span>
+<span class="s0">`);</span>
+
+<span class="s0">const makeAsyncPrefetchTemplateWithName = template.expression(`</span>
+  <span class="s0">require(ASYNC_REQUIRE_MODULE_PATH).prefetch(MODULE_ID, DEPENDENCY_MAP.paths, MODULE_NAME)</span>
+<span class="s0">`);</span>
+
+<span class="s0">const makeResolveWeakTemplate = template.expression(`</span>
+  <span class="s0">MODULE_ID</span>
+<span class="s0">`);</span>
+
+<span class="s0">const DefaultDependencyTransformer: DependencyTransformer = {</span>
+  <span class="s0">transformSyncRequire(</span>
+    <span class="s0">path: NodePath&lt;CallExpression&gt;,</span>
+    <span class="s0">dependency: InternalDependency,</span>
+    <span class="s0">state: State,</span>
+  <span class="s0">): void {</span>
+    <span class="s0">const moduleIDExpression = createModuleIDExpression(dependency, state);</span>
+    <span class="s0">path.node.arguments = ([moduleIDExpression]: Array&lt;</span>
+      <span class="s0">| BabelNodeExpression</span>
+      <span class="s0">| BabelNodeSpreadElement</span>
+      <span class="s0">| BabelNodeJSXNamespacedName</span>
+      <span class="s0">| BabelNodeArgumentPlaceholder,</span>
+    <span class="s0">&gt;);</span>
+    <span class="s0">// Always add the debug name argument last</span>
+    <span class="s0">if (state.keepRequireNames) {</span>
+      <span class="s0">path.node.arguments.push(types.stringLiteral(dependency.name));</span>
+    <span class="s0">}</span>
+  <span class="s0">},</span>
+
+  <span class="s0">transformImportCall(</span>
+    <span class="s0">path: NodePath&lt;&gt;,</span>
+    <span class="s0">dependency: InternalDependency,</span>
+    <span class="s0">state: State,</span>
+  <span class="s0">): void {</span>
+    <span class="s0">const makeNode = state.keepRequireNames</span>
+      <span class="s0">? makeAsyncRequireTemplateWithName</span>
+      <span class="s0">: makeAsyncRequireTemplate;</span>
+    <span class="s0">const opts = {</span>
+      <span class="s0">ASYNC_REQUIRE_MODULE_PATH: nullthrows(</span>
+        <span class="s0">state.asyncRequireModulePathStringLiteral,</span>
+      <span class="s0">),</span>
+      <span class="s0">MODULE_ID: createModuleIDExpression(dependency, state),</span>
+      <span class="s0">DEPENDENCY_MAP: nullthrows(state.dependencyMapIdentifier),</span>
+      <span class="s0">...(state.keepRequireNames</span>
+        <span class="s0">? {MODULE_NAME: createModuleNameLiteral(dependency)}</span>
+        <span class="s0">: null),</span>
+    <span class="s0">};</span>
+    <span class="s0">path.replaceWith(makeNode(opts));</span>
+  <span class="s0">},</span>
+
+  <span class="s0">transformPrefetch(</span>
+    <span class="s0">path: NodePath&lt;&gt;,</span>
+    <span class="s0">dependency: InternalDependency,</span>
+    <span class="s0">state: State,</span>
+  <span class="s0">): void {</span>
+    <span class="s0">const makeNode = state.keepRequireNames</span>
+      <span class="s0">? makeAsyncPrefetchTemplateWithName</span>
+      <span class="s0">: makeAsyncPrefetchTemplate;</span>
+    <span class="s0">const opts = {</span>
+      <span class="s0">ASYNC_REQUIRE_MODULE_PATH: nullthrows(</span>
+        <span class="s0">state.asyncRequireModulePathStringLiteral,</span>
+      <span class="s0">),</span>
+      <span class="s0">MODULE_ID: createModuleIDExpression(dependency, state),</span>
+      <span class="s0">DEPENDENCY_MAP: nullthrows(state.dependencyMapIdentifier),</span>
+      <span class="s0">...(state.keepRequireNames</span>
+        <span class="s0">? {MODULE_NAME: createModuleNameLiteral(dependency)}</span>
+        <span class="s0">: null),</span>
+    <span class="s0">};</span>
+    <span class="s0">path.replaceWith(makeNode(opts));</span>
+  <span class="s0">},</span>
+
+  <span class="s0">transformIllegalDynamicRequire(path: NodePath&lt;&gt;, state: State): void {</span>
+    <span class="s0">path.replaceWith(</span>
+      <span class="s0">dynamicRequireErrorTemplate({</span>
+        <span class="s0">LINE: types.numericLiteral(path.node.loc?.start.line ?? 0),</span>
+      <span class="s0">}),</span>
+    <span class="s0">);</span>
+  <span class="s0">},</span>
+<span class="s0">};</span>
+
+<span class="s0">function createModuleIDExpression(</span>
+  <span class="s0">dependency: InternalDependency,</span>
+  <span class="s0">state: State,</span>
+<span class="s0">): BabelNodeExpression {</span>
+  <span class="s0">return types.memberExpression(</span>
+    <span class="s0">nullthrows(state.dependencyMapIdentifier),</span>
+    <span class="s0">types.numericLiteral(dependency.index),</span>
+    <span class="s0">true,</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function createModuleNameLiteral(dependency: InternalDependency) {</span>
+  <span class="s0">return types.stringLiteral(dependency.name);</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Given an import qualifier, return a key used to register the dependency.</span>
+ <span class="s0">* Generally this return the `ImportQualifier.name` property, but more</span>
+ <span class="s0">* attributes can be appended to distinguish various combinations that would</span>
+ <span class="s0">* otherwise conflict.</span>
+ <span class="s0">*</span>
+ <span class="s0">* For example, the following case would have collision issues if they all utilized the `name` property:</span>
+ <span class="s0">* ```</span>
+ <span class="s0">* require('./foo');</span>
+ <span class="s0">* require.context('./foo');</span>
+ <span class="s0">* require.context('./foo', true, /something/);</span>
+ <span class="s0">* require.context('./foo', false, /something/);</span>
+ <span class="s0">* require.context('./foo', false, /something/, 'lazy');</span>
+ <span class="s0">* ```</span>
+ <span class="s0">*</span>
+ <span class="s0">* This method should be utilized by `registerDependency`.</span>
+ <span class="s0">*/</span>
+<span class="s0">function getKeyForDependency(qualifier: ImportQualifier): string {</span>
+  <span class="s0">let key = qualifier.name;</span>
+
+  <span class="s0">const {asyncType} = qualifier;</span>
+  <span class="s0">if (asyncType) {</span>
+    <span class="s0">key += ['', asyncType].join('\0');</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const {contextParams} = qualifier;</span>
+  <span class="s0">// Add extra qualifiers when using `require.context` to prevent collisions.</span>
+  <span class="s0">if (contextParams) {</span>
+    <span class="s0">// NOTE(EvanBacon): Keep this synchronized with `RequireContextParams`, if any other properties are added</span>
+    <span class="s0">// then this key algorithm should be updated to account for those properties.</span>
+    <span class="s0">// Example: `./directory__true__/foobar/m__lazy`</span>
+    <span class="s0">key += [</span>
+      <span class="s0">'',</span>
+      <span class="s0">'context',</span>
+      <span class="s0">String(contextParams.recursive),</span>
+      <span class="s0">String(contextParams.filter.pattern),</span>
+      <span class="s0">String(contextParams.filter.flags),</span>
+      <span class="s0">contextParams.mode,</span>
+      <span class="s0">// Join together and append to the name:</span>
+    <span class="s0">].join('\0');</span>
+  <span class="s0">}</span>
+  <span class="s0">return key;</span>
+<span class="s0">}</span>
+
+<span class="s0">class DependencyRegistry {</span>
+  <span class="s0">_dependencies: Map&lt;string, InternalDependency&gt; = new Map();</span>
+
+  <span class="s0">registerDependency(qualifier: ImportQualifier): InternalDependency {</span>
+    <span class="s0">const key = getKeyForDependency(qualifier);</span>
+    <span class="s0">let dependency: ?InternalDependency = this._dependencies.get(key);</span>
+
+    <span class="s0">if (dependency == null) {</span>
+      <span class="s0">const newDependency: MutableInternalDependency = {</span>
+        <span class="s0">name: qualifier.name,</span>
+        <span class="s0">asyncType: qualifier.asyncType,</span>
+        <span class="s0">locs: [],</span>
+        <span class="s0">index: this._dependencies.size,</span>
+        <span class="s0">key: crypto.createHash('sha1').update(key).digest('base64'),</span>
+      <span class="s0">};</span>
+
+      <span class="s0">if (qualifier.optional) {</span>
+        <span class="s0">newDependency.isOptional = true;</span>
+      <span class="s0">}</span>
+      <span class="s0">if (qualifier.contextParams) {</span>
+        <span class="s0">newDependency.contextParams = qualifier.contextParams;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">dependency = newDependency;</span>
+    <span class="s0">} else {</span>
+      <span class="s0">if (dependency.isOptional &amp;&amp; !qualifier.optional) {</span>
+        <span class="s0">// A previously optionally required dependency was required non-optionally.</span>
+        <span class="s0">// Mark it non optional for the whole module</span>
+        <span class="s0">dependency = {</span>
+          <span class="s0">...dependency,</span>
+          <span class="s0">isOptional: false,</span>
+        <span class="s0">};</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">this._dependencies.set(key, dependency);</span>
+
+    <span class="s0">return dependency;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getDependencies(): Array&lt;InternalDependency&gt; {</span>
+    <span class="s0">return Array.from(this._dependencies.values());</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = collectDependencies;</span>
+</pre>
+</body>
+</html>

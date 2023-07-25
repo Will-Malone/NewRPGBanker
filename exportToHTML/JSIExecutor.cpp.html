@@ -1,0 +1,605 @@
+<html>
+<head>
+<title>JSIExecutor.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JSIExecutor.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;jsireact/JSIExecutor.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/ErrorUtils.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSBigString.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/ModuleRegistry.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/ReactMarker.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/Conv.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/json.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/JSIDynamic.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsi/instrumentation.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;reactperflogger/BridgeNativeModulePerfLogger.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;sstream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;stdexcept&gt;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::jsi</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">class </span><span class="s1">JSIExecutor::NativeModuleProxy : </span><span class="s4">public </span><span class="s1">jsi::HostObject {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">NativeModuleProxy(std::shared_ptr&lt;JSINativeModules&gt; nativeModules)</span>
+      <span class="s1">: weakNativeModules_(nativeModules) {}</span>
+
+  <span class="s1">Value get(Runtime &amp;rt</span><span class="s4">, const </span><span class="s1">PropNameID &amp;name) override {</span>
+    <span class="s4">if </span><span class="s1">(name.utf8(rt) == </span><span class="s3">&quot;name&quot;</span><span class="s1">) {</span>
+      <span class="s4">return </span><span class="s1">jsi::String::createFromAscii(rt</span><span class="s4">, </span><span class="s3">&quot;NativeModules&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">nativeModules = weakNativeModules_.lock()</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!nativeModules) {</span>
+      <span class="s4">return nullptr;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return </span><span class="s1">nativeModules-&gt;getModule(rt</span><span class="s4">, </span><span class="s1">name)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">set(Runtime &amp;</span><span class="s4">, const </span><span class="s1">PropNameID &amp;</span><span class="s4">, const </span><span class="s1">Value &amp;) override {</span>
+    <span class="s4">throw </span><span class="s1">std::runtime_error(</span>
+        <span class="s3">&quot;Unable to put on NativeModules: Operation unsupported&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">std::weak_ptr&lt;JSINativeModules&gt; weakNativeModules_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s0">// basename_r isn't in all iOS SDKs, so use this simple version instead.</span>
+<span class="s1">std::string simpleBasename(</span><span class="s4">const </span><span class="s1">std::string &amp;path) {</span>
+  <span class="s1">size_t pos = path.rfind(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">(pos != std::string::npos) ? path.substr(pos) : path</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">JSIExecutor::JSIExecutor(</span>
+    <span class="s1">std::shared_ptr&lt;jsi::Runtime&gt; runtime</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; delegate</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">JSIScopedTimeoutInvoker &amp;scopedTimeoutInvoker</span><span class="s4">,</span>
+    <span class="s1">RuntimeInstaller runtimeInstaller)</span>
+    <span class="s1">: runtime_(runtime)</span><span class="s4">,</span>
+      <span class="s1">delegate_(delegate)</span><span class="s4">,</span>
+      <span class="s1">nativeModules_(std::make_shared&lt;JSINativeModules&gt;(</span>
+          <span class="s1">delegate ? delegate-&gt;getModuleRegistry() : </span><span class="s4">nullptr</span><span class="s1">))</span><span class="s4">,</span>
+      <span class="s1">moduleRegistry_(delegate ? delegate-&gt;getModuleRegistry() : </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">scopedTimeoutInvoker_(scopedTimeoutInvoker)</span><span class="s4">,</span>
+      <span class="s1">runtimeInstaller_(runtimeInstaller) {</span>
+  <span class="s1">runtime_-&gt;global().setProperty(</span>
+      <span class="s1">*runtime</span><span class="s4">, </span><span class="s3">&quot;__jsiExecutorDescription&quot;</span><span class="s4">, </span><span class="s1">runtime-&gt;description())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::initializeRuntime() {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;JSIExecutor::initializeRuntime&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">runtime_-&gt;global().setProperty(</span>
+      <span class="s1">*runtime_</span><span class="s4">,</span>
+      <span class="s3">&quot;nativeModuleProxy&quot;</span><span class="s4">,</span>
+      <span class="s1">Object::createFromHostObject(</span>
+          <span class="s1">*runtime_</span><span class="s4">, </span><span class="s1">std::make_shared&lt;NativeModuleProxy&gt;(nativeModules_)))</span><span class="s4">;</span>
+
+  <span class="s1">runtime_-&gt;global().setProperty(</span>
+      <span class="s1">*runtime_</span><span class="s4">,</span>
+      <span class="s3">&quot;nativeFlushQueueImmediate&quot;</span><span class="s4">,</span>
+      <span class="s1">Function::createFromHostFunction(</span>
+          <span class="s1">*runtime_</span><span class="s4">,</span>
+          <span class="s1">PropNameID::forAscii(*runtime_</span><span class="s4">, </span><span class="s3">&quot;nativeFlushQueueImmediate&quot;</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">1</span><span class="s4">,</span>
+          <span class="s1">[</span><span class="s4">this</span><span class="s1">](</span>
+              <span class="s1">jsi::Runtime &amp;</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value &amp;</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+              <span class="s1">size_t count) {</span>
+            <span class="s4">if </span><span class="s1">(count != </span><span class="s5">1</span><span class="s1">) {</span>
+              <span class="s4">throw </span><span class="s1">std::invalid_argument(</span>
+                  <span class="s3">&quot;nativeFlushQueueImmediate arg count must be 1&quot;</span><span class="s1">)</span><span class="s4">;</span>
+            <span class="s1">}</span>
+            <span class="s1">callNativeModules(args[</span><span class="s5">0</span><span class="s1">]</span><span class="s4">, false</span><span class="s1">)</span><span class="s4">;</span>
+            <span class="s4">return </span><span class="s1">Value::undefined()</span><span class="s4">;</span>
+          <span class="s1">}))</span><span class="s4">;</span>
+
+  <span class="s1">runtime_-&gt;global().setProperty(</span>
+      <span class="s1">*runtime_</span><span class="s4">,</span>
+      <span class="s3">&quot;nativeCallSyncHook&quot;</span><span class="s4">,</span>
+      <span class="s1">Function::createFromHostFunction(</span>
+          <span class="s1">*runtime_</span><span class="s4">,</span>
+          <span class="s1">PropNameID::forAscii(*runtime_</span><span class="s4">, </span><span class="s3">&quot;nativeCallSyncHook&quot;</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">1</span><span class="s4">,</span>
+          <span class="s1">[</span><span class="s4">this</span><span class="s1">](</span>
+              <span class="s1">jsi::Runtime &amp;</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value &amp;</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+              <span class="s1">size_t count) { </span><span class="s4">return </span><span class="s1">nativeCallSyncHook(args</span><span class="s4">, </span><span class="s1">count)</span><span class="s4">; </span><span class="s1">}))</span><span class="s4">;</span>
+
+  <span class="s1">runtime_-&gt;global().setProperty(</span>
+      <span class="s1">*runtime_</span><span class="s4">,</span>
+      <span class="s3">&quot;globalEvalWithSourceUrl&quot;</span><span class="s4">,</span>
+      <span class="s1">Function::createFromHostFunction(</span>
+          <span class="s1">*runtime_</span><span class="s4">,</span>
+          <span class="s1">PropNameID::forAscii(*runtime_</span><span class="s4">, </span><span class="s3">&quot;globalEvalWithSourceUrl&quot;</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">1</span><span class="s4">,</span>
+          <span class="s1">[</span><span class="s4">this</span><span class="s1">](</span>
+              <span class="s1">jsi::Runtime &amp;</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value &amp;</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+              <span class="s1">size_t count) { </span><span class="s4">return </span><span class="s1">globalEvalWithSourceUrl(args</span><span class="s4">, </span><span class="s1">count)</span><span class="s4">; </span><span class="s1">}))</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(runtimeInstaller_) {</span>
+    <span class="s1">runtimeInstaller_(*runtime_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">bool </span><span class="s1">hasLogger(ReactMarker::logTaggedMarkerImpl)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(hasLogger) {</span>
+    <span class="s1">ReactMarker::logMarker(ReactMarker::CREATE_REACT_CONTEXT_STOP)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::loadBundle(</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; script</span><span class="s4">,</span>
+    <span class="s1">std::string sourceURL) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;JSIExecutor::loadBundle&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">bool </span><span class="s1">hasLogger(ReactMarker::logTaggedMarkerImpl)</span><span class="s4">;</span>
+  <span class="s1">std::string scriptName = simpleBasename(sourceURL)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(hasLogger) {</span>
+    <span class="s1">ReactMarker::logTaggedMarker(</span>
+        <span class="s1">ReactMarker::RUN_JS_BUNDLE_START</span><span class="s4">, </span><span class="s1">scriptName.c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">runtime_-&gt;evaluateJavaScript(</span>
+      <span class="s1">std::make_unique&lt;BigStringBuffer&gt;(std::move(script))</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+  <span class="s1">flush()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(hasLogger) {</span>
+    <span class="s1">ReactMarker::logTaggedMarker(</span>
+        <span class="s1">ReactMarker::RUN_JS_BUNDLE_STOP</span><span class="s4">, </span><span class="s1">scriptName.c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::setBundleRegistry(std::unique_ptr&lt;RAMBundleRegistry&gt; r) {</span>
+  <span class="s4">if </span><span class="s1">(!bundleRegistry_) {</span>
+    <span class="s1">runtime_-&gt;global().setProperty(</span>
+        <span class="s1">*runtime_</span><span class="s4">,</span>
+        <span class="s3">&quot;nativeRequire&quot;</span><span class="s4">,</span>
+        <span class="s1">Function::createFromHostFunction(</span>
+            <span class="s1">*runtime_</span><span class="s4">,</span>
+            <span class="s1">PropNameID::forAscii(*runtime_</span><span class="s4">, </span><span class="s3">&quot;nativeRequire&quot;</span><span class="s1">)</span><span class="s4">,</span>
+            <span class="s5">2</span><span class="s4">,</span>
+            <span class="s1">[</span><span class="s4">this</span><span class="s1">](</span>
+                <span class="s1">[[maybe_unused]] Runtime &amp;rt</span><span class="s4">,</span>
+                <span class="s4">const </span><span class="s1">facebook::jsi::Value &amp;</span><span class="s4">,</span>
+                <span class="s4">const </span><span class="s1">facebook::jsi::Value *args</span><span class="s4">,</span>
+                <span class="s1">size_t count) { </span><span class="s4">return </span><span class="s1">nativeRequire(args</span><span class="s4">, </span><span class="s1">count)</span><span class="s4">; </span><span class="s1">}))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">bundleRegistry_ = std::move(r)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::registerBundle(</span>
+    <span class="s1">uint32_t bundleId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;bundlePath) {</span>
+  <span class="s4">const auto </span><span class="s1">tag = folly::to&lt;std::string&gt;(bundleId)</span><span class="s4">;</span>
+  <span class="s1">ReactMarker::logTaggedMarker(</span>
+      <span class="s1">ReactMarker::REGISTER_JS_SEGMENT_START</span><span class="s4">, </span><span class="s1">tag.c_str())</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(bundleRegistry_) {</span>
+    <span class="s1">bundleRegistry_-&gt;registerBundle(bundleId</span><span class="s4">, </span><span class="s1">bundlePath)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">auto </span><span class="s1">script = JSBigFileString::fromPath(bundlePath)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(script-&gt;size() == </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s4">throw </span><span class="s1">std::invalid_argument(</span>
+          <span class="s3">&quot;Empty bundle registered with ID &quot; </span><span class="s1">+ tag + </span><span class="s3">&quot; from &quot; </span><span class="s1">+ bundlePath)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">runtime_-&gt;evaluateJavaScript(</span>
+        <span class="s1">std::make_unique&lt;BigStringBuffer&gt;(std::move(script))</span><span class="s4">,</span>
+        <span class="s1">JSExecutor::getSyntheticBundlePath(bundleId</span><span class="s4">, </span><span class="s1">bundlePath))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">ReactMarker::logTaggedMarker(</span>
+      <span class="s1">ReactMarker::REGISTER_JS_SEGMENT_STOP</span><span class="s4">, </span><span class="s1">tag.c_str())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// Looping on \c drainMicrotasks until it completes or hits the retries bound.</span>
+<span class="s4">static void </span><span class="s1">performMicrotaskCheckpoint(jsi::Runtime &amp;runtime) {</span>
+  <span class="s1">uint8_t retries = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s0">// A heuristic number to guard infinite or absurd numbers of retries.</span>
+  <span class="s4">const static unsigned int </span><span class="s1">kRetriesBound = </span><span class="s5">255</span><span class="s4">;</span>
+
+  <span class="s4">while </span><span class="s1">(retries &lt; kRetriesBound) {</span>
+    <span class="s4">try </span><span class="s1">{</span>
+      <span class="s0">// The default behavior of \c drainMicrotasks is unbounded execution.</span>
+      <span class="s0">// We may want to make it bounded in the future.</span>
+      <span class="s4">if </span><span class="s1">(runtime.drainMicrotasks()) {</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">catch </span><span class="s1">(jsi::JSError &amp;error) {</span>
+      <span class="s1">handleJSError(runtime</span><span class="s4">, </span><span class="s1">error</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">retries++</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(retries == kRetriesBound) {</span>
+    <span class="s4">throw </span><span class="s1">std::runtime_error(</span><span class="s3">&quot;Hits microtasks retries bound.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::callFunction(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;moduleId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;methodId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;arguments) {</span>
+  <span class="s1">SystraceSection s(</span>
+      <span class="s3">&quot;JSIExecutor::callFunction&quot;</span><span class="s4">, </span><span class="s3">&quot;moduleId&quot;</span><span class="s4">, </span><span class="s1">moduleId</span><span class="s4">, </span><span class="s3">&quot;methodId&quot;</span><span class="s4">, </span><span class="s1">methodId)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!callFunctionReturnFlushedQueue_) {</span>
+    <span class="s1">bindBridge()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Construct the error message producer in case this times out.</span>
+  <span class="s0">// This is executed on a background thread, so it must capture its parameters</span>
+  <span class="s0">// by value.</span>
+  <span class="s4">auto </span><span class="s1">errorProducer = [=] {</span>
+    <span class="s1">std::stringstream ss</span><span class="s4">;</span>
+    <span class="s1">ss &lt;&lt; </span><span class="s3">&quot;moduleID: &quot; </span><span class="s1">&lt;&lt; moduleId &lt;&lt; </span><span class="s3">&quot; methodID: &quot; </span><span class="s1">&lt;&lt; methodId</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">ss.str()</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">Value ret = Value::undefined()</span><span class="s4">;</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s1">scopedTimeoutInvoker_(</span>
+        <span class="s1">[&amp;] {</span>
+          <span class="s1">ret = callFunctionReturnFlushedQueue_-&gt;call(</span>
+              <span class="s1">*runtime_</span><span class="s4">,</span>
+              <span class="s1">moduleId</span><span class="s4">,</span>
+              <span class="s1">methodId</span><span class="s4">,</span>
+              <span class="s1">valueFromDynamic(*runtime_</span><span class="s4">, </span><span class="s1">arguments))</span><span class="s4">;</span>
+        <span class="s1">}</span><span class="s4">,</span>
+        <span class="s1">std::move(errorProducer))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+    <span class="s1">std::throw_with_nested(</span>
+        <span class="s1">std::runtime_error(</span><span class="s3">&quot;Error calling &quot; </span><span class="s1">+ moduleId + </span><span class="s3">&quot;.&quot; </span><span class="s1">+ methodId))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">performMicrotaskCheckpoint(*runtime_)</span><span class="s4">;</span>
+
+  <span class="s1">callNativeModules(ret</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::invokeCallback(</span>
+    <span class="s4">const double </span><span class="s1">callbackId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;arguments) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;JSIExecutor::invokeCallback&quot;</span><span class="s4">, </span><span class="s3">&quot;callbackId&quot;</span><span class="s4">, </span><span class="s1">callbackId)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!invokeCallbackAndReturnFlushedQueue_) {</span>
+    <span class="s1">bindBridge()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">Value ret</span><span class="s4">;</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s1">ret = invokeCallbackAndReturnFlushedQueue_-&gt;call(</span>
+        <span class="s1">*runtime_</span><span class="s4">, </span><span class="s1">callbackId</span><span class="s4">, </span><span class="s1">valueFromDynamic(*runtime_</span><span class="s4">, </span><span class="s1">arguments))</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+    <span class="s1">std::throw_with_nested(std::runtime_error(</span>
+        <span class="s1">folly::to&lt;std::string&gt;(</span><span class="s3">&quot;Error invoking callback &quot;</span><span class="s4">, </span><span class="s1">callbackId)))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">performMicrotaskCheckpoint(*runtime_)</span><span class="s4">;</span>
+
+  <span class="s1">callNativeModules(ret</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::setGlobalVariable(</span>
+    <span class="s1">std::string propName</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; jsonValue) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;JSIExecutor::setGlobalVariable&quot;</span><span class="s4">, </span><span class="s3">&quot;propName&quot;</span><span class="s4">, </span><span class="s1">propName)</span><span class="s4">;</span>
+  <span class="s1">runtime_-&gt;global().setProperty(</span>
+      <span class="s1">*runtime_</span><span class="s4">,</span>
+      <span class="s1">propName.c_str()</span><span class="s4">,</span>
+      <span class="s1">Value::createFromJsonUtf8(</span>
+          <span class="s1">*runtime_</span><span class="s4">,</span>
+          <span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">const </span><span class="s1">uint8_t *&gt;(jsonValue-&gt;c_str())</span><span class="s4">,</span>
+          <span class="s1">jsonValue-&gt;size()))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string JSIExecutor::getDescription() {</span>
+  <span class="s4">return </span><span class="s3">&quot;JSI (&quot; </span><span class="s1">+ runtime_-&gt;description() + </span><span class="s3">&quot;)&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">*JSIExecutor::getJavaScriptContext() {</span>
+  <span class="s4">return </span><span class="s1">runtime_.get()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">JSIExecutor::isInspectable() {</span>
+  <span class="s4">return </span><span class="s1">runtime_-&gt;isInspectable()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::handleMemoryPressure(</span><span class="s4">int </span><span class="s1">pressureLevel) {</span>
+  <span class="s0">// The level is an enum value passed by the Android OS to an onTrimMemory</span>
+  <span class="s0">// event callback. Defined in ComponentCallbacks2.</span>
+  <span class="s4">enum </span><span class="s1">AndroidMemoryPressure {</span>
+    <span class="s1">TRIM_MEMORY_BACKGROUND = </span><span class="s5">40</span><span class="s4">,</span>
+    <span class="s1">TRIM_MEMORY_COMPLETE = </span><span class="s5">80</span><span class="s4">,</span>
+    <span class="s1">TRIM_MEMORY_MODERATE = </span><span class="s5">60</span><span class="s4">,</span>
+    <span class="s1">TRIM_MEMORY_RUNNING_CRITICAL = </span><span class="s5">15</span><span class="s4">,</span>
+    <span class="s1">TRIM_MEMORY_RUNNING_LOW = </span><span class="s5">10</span><span class="s4">,</span>
+    <span class="s1">TRIM_MEMORY_RUNNING_MODERATE = </span><span class="s5">5</span><span class="s4">,</span>
+    <span class="s1">TRIM_MEMORY_UI_HIDDEN = </span><span class="s5">20</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+  <span class="s4">const char </span><span class="s1">*levelName</span><span class="s4">;</span>
+  <span class="s4">switch </span><span class="s1">(pressureLevel) {</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_BACKGROUND:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;TRIM_MEMORY_BACKGROUND&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_COMPLETE:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;TRIM_MEMORY_COMPLETE&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_MODERATE:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;TRIM_MEMORY_MODERATE&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_RUNNING_CRITICAL:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;TRIM_MEMORY_RUNNING_CRITICAL&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_RUNNING_LOW:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;TRIM_MEMORY_RUNNING_LOW&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_RUNNING_MODERATE:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;TRIM_MEMORY_RUNNING_MODERATE&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_UI_HIDDEN:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;TRIM_MEMORY_UI_HIDDEN&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">default</span><span class="s1">:</span>
+      <span class="s1">levelName = </span><span class="s3">&quot;UNKNOWN&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">switch </span><span class="s1">(pressureLevel) {</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_RUNNING_LOW:</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_RUNNING_MODERATE:</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_UI_HIDDEN:</span>
+      <span class="s0">// For non-severe memory trims, do nothing.</span>
+      <span class="s1">LOG(INFO) &lt;&lt; </span><span class="s3">&quot;Memory warning (pressure level: &quot; </span><span class="s1">&lt;&lt; levelName</span>
+                <span class="s1">&lt;&lt; </span><span class="s3">&quot;) received by JS VM, ignoring because it's non-severe&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_BACKGROUND:</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_COMPLETE:</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_MODERATE:</span>
+    <span class="s4">case </span><span class="s1">TRIM_MEMORY_RUNNING_CRITICAL:</span>
+      <span class="s0">// For now, pressureLevel is unused by collectGarbage.</span>
+      <span class="s0">// This may change in the future if the JS GC has different styles of</span>
+      <span class="s0">// collections.</span>
+      <span class="s1">LOG(INFO) &lt;&lt; </span><span class="s3">&quot;Memory warning (pressure level: &quot; </span><span class="s1">&lt;&lt; levelName</span>
+                <span class="s1">&lt;&lt; </span><span class="s3">&quot;) received by JS VM, running a GC&quot;</span><span class="s4">;</span>
+      <span class="s1">runtime_-&gt;instrumentation().collectGarbage(levelName)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">default</span><span class="s1">:</span>
+      <span class="s0">// Use the raw number instead of the name here since the name is</span>
+      <span class="s0">// meaningless.</span>
+      <span class="s1">LOG(WARNING) &lt;&lt; </span><span class="s3">&quot;Memory warning (pressure level: &quot; </span><span class="s1">&lt;&lt; pressureLevel</span>
+                   <span class="s1">&lt;&lt; </span><span class="s3">&quot;) received by JS VM, unrecognized pressure level&quot;</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::bindBridge() {</span>
+  <span class="s1">std::call_once(bindFlag_</span><span class="s4">, </span><span class="s1">[</span><span class="s4">this</span><span class="s1">] {</span>
+    <span class="s1">SystraceSection s(</span><span class="s3">&quot;JSIExecutor::bindBridge (once)&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">Value batchedBridgeValue =</span>
+        <span class="s1">runtime_-&gt;global().getProperty(*runtime_</span><span class="s4">, </span><span class="s3">&quot;__fbBatchedBridge&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(batchedBridgeValue.isUndefined() || !batchedBridgeValue.isObject()) {</span>
+      <span class="s4">throw </span><span class="s1">JSINativeException(</span>
+          <span class="s3">&quot;Could not get BatchedBridge, make sure your bundle is packaged correctly&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Object batchedBridge = batchedBridgeValue.asObject(*runtime_)</span><span class="s4">;</span>
+    <span class="s1">callFunctionReturnFlushedQueue_ = batchedBridge.getPropertyAsFunction(</span>
+        <span class="s1">*runtime_</span><span class="s4">, </span><span class="s3">&quot;callFunctionReturnFlushedQueue&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">invokeCallbackAndReturnFlushedQueue_ = batchedBridge.getPropertyAsFunction(</span>
+        <span class="s1">*runtime_</span><span class="s4">, </span><span class="s3">&quot;invokeCallbackAndReturnFlushedQueue&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">flushedQueue_ =</span>
+        <span class="s1">batchedBridge.getPropertyAsFunction(*runtime_</span><span class="s4">, </span><span class="s3">&quot;flushedQueue&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::callNativeModules(</span><span class="s4">const </span><span class="s1">Value &amp;queue</span><span class="s4">, bool </span><span class="s1">isEndOfBatch) {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;JSIExecutor::callNativeModules&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s0">// If this fails, you need to pass a fully functional delegate with a</span>
+  <span class="s0">// module registry to the factory/ctor.</span>
+  <span class="s1">CHECK(delegate_) &lt;&lt; </span><span class="s3">&quot;Attempting to use native modules without a delegate&quot;</span><span class="s4">;</span>
+<span class="s2">#if </span><span class="s5">0 </span><span class="s0">// maybe useful for debugging</span>
+  <span class="s1">std::string json = runtime_-&gt;global().getPropertyAsObject(*runtime_</span><span class="s4">, </span><span class="s3">&quot;JSON&quot;</span><span class="s1">)</span>
+    <span class="s1">.getPropertyAsFunction(*runtime_</span><span class="s4">, </span><span class="s3">&quot;stringify&quot;</span><span class="s1">).call(*runtime_</span><span class="s4">, </span><span class="s1">queue)</span>
+    <span class="s1">.getString(*runtime_).utf8(*runtime_)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+  <span class="s1">BridgeNativeModulePerfLogger::asyncMethodCallBatchPreprocessStart()</span><span class="s4">;</span>
+
+  <span class="s1">delegate_-&gt;callNativeModules(</span>
+      <span class="s1">*</span><span class="s4">this, </span><span class="s1">dynamicFromValue(*runtime_</span><span class="s4">, </span><span class="s1">queue)</span><span class="s4">, </span><span class="s1">isEndOfBatch)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">JSIExecutor::flush() {</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;JSIExecutor::flush&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(flushedQueue_) {</span>
+    <span class="s1">Value ret = flushedQueue_-&gt;call(*runtime_)</span><span class="s4">;</span>
+    <span class="s1">performMicrotaskCheckpoint(*runtime_)</span><span class="s4">;</span>
+    <span class="s1">callNativeModules(ret</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// When a native module is called from JS, BatchedBridge.enqueueNativeCall()</span>
+  <span class="s0">// is invoked.  For that to work, require('BatchedBridge') has to be called,</span>
+  <span class="s0">// and when that happens, __fbBatchedBridge is set as a side effect.</span>
+  <span class="s1">Value batchedBridge =</span>
+      <span class="s1">runtime_-&gt;global().getProperty(*runtime_</span><span class="s4">, </span><span class="s3">&quot;__fbBatchedBridge&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s0">// So here, if __fbBatchedBridge doesn't exist, then we know no native calls</span>
+  <span class="s0">// have happened, and we were able to determine this without forcing</span>
+  <span class="s0">// BatchedBridge to be loaded as a side effect.</span>
+  <span class="s4">if </span><span class="s1">(!batchedBridge.isUndefined()) {</span>
+    <span class="s0">// If calls were made, we bind to the JS bridge methods, and use them to</span>
+    <span class="s0">// get the pending queue of native calls.</span>
+    <span class="s1">bindBridge()</span><span class="s4">;</span>
+    <span class="s1">Value ret = flushedQueue_-&gt;call(*runtime_)</span><span class="s4">;</span>
+    <span class="s1">performMicrotaskCheckpoint(*runtime_)</span><span class="s4">;</span>
+    <span class="s1">callNativeModules(ret</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(delegate_) {</span>
+    <span class="s0">// If we have a delegate, we need to call it; we pass a null list to</span>
+    <span class="s0">// callNativeModules, since we know there are no native calls, without</span>
+    <span class="s0">// calling into JS again.  If no calls were made and there's no delegate,</span>
+    <span class="s0">// nothing happens, which is correct.</span>
+    <span class="s1">callNativeModules(</span><span class="s4">nullptr, true</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">Value JSIExecutor::nativeRequire(</span><span class="s4">const </span><span class="s1">Value *args</span><span class="s4">, </span><span class="s1">size_t count) {</span>
+  <span class="s4">if </span><span class="s1">(count &gt; </span><span class="s5">2 </span><span class="s1">|| count == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">throw </span><span class="s1">std::invalid_argument(</span><span class="s3">&quot;Got wrong number of args&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">uint32_t moduleId = folly::to&lt;uint32_t&gt;(args[</span><span class="s5">0</span><span class="s1">].getNumber())</span><span class="s4">;</span>
+  <span class="s1">uint32_t bundleId = count == </span><span class="s5">2 </span><span class="s1">? folly::to&lt;uint32_t&gt;(args[</span><span class="s5">1</span><span class="s1">].getNumber()) : </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">module = bundleRegistry_-&gt;getModule(bundleId</span><span class="s4">, </span><span class="s1">moduleId)</span><span class="s4">;</span>
+
+  <span class="s1">runtime_-&gt;evaluateJavaScript(</span>
+      <span class="s1">std::make_unique&lt;StringBuffer&gt;(module.code)</span><span class="s4">, </span><span class="s1">module.name)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">facebook::jsi::Value()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">Value JSIExecutor::nativeCallSyncHook(</span><span class="s4">const </span><span class="s1">Value *args</span><span class="s4">, </span><span class="s1">size_t count) {</span>
+  <span class="s4">if </span><span class="s1">(count != </span><span class="s5">3</span><span class="s1">) {</span>
+    <span class="s4">throw </span><span class="s1">std::invalid_argument(</span><span class="s3">&quot;nativeCallSyncHook arg count must be 3&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!args[</span><span class="s5">2</span><span class="s1">].isObject() || !args[</span><span class="s5">2</span><span class="s1">].asObject(*runtime_).isArray(*runtime_)) {</span>
+    <span class="s4">throw </span><span class="s1">std::invalid_argument(</span>
+        <span class="s1">folly::to&lt;std::string&gt;(</span><span class="s3">&quot;method parameters should be array&quot;</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">unsigned int </span><span class="s1">moduleId = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">unsigned int</span><span class="s1">&gt;(args[</span><span class="s5">0</span><span class="s1">].getNumber())</span><span class="s4">;</span>
+  <span class="s4">unsigned int </span><span class="s1">methodId = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">unsigned int</span><span class="s1">&gt;(args[</span><span class="s5">1</span><span class="s1">].getNumber())</span><span class="s4">;</span>
+  <span class="s1">std::string moduleName</span><span class="s4">;</span>
+  <span class="s1">std::string methodName</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(moduleRegistry_) {</span>
+    <span class="s1">moduleName = moduleRegistry_-&gt;getModuleName(moduleId)</span><span class="s4">;</span>
+    <span class="s1">methodName = moduleRegistry_-&gt;getModuleSyncMethodName(moduleId</span><span class="s4">, </span><span class="s1">methodId)</span><span class="s4">;</span>
+
+    <span class="s1">BridgeNativeModulePerfLogger::syncMethodCallStart(</span>
+        <span class="s1">moduleName.c_str()</span><span class="s4">, </span><span class="s1">methodName.c_str())</span><span class="s4">;</span>
+
+    <span class="s1">BridgeNativeModulePerfLogger::syncMethodCallArgConversionStart(</span>
+        <span class="s1">moduleName.c_str()</span><span class="s4">, </span><span class="s1">methodName.c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">MethodCallResult result = delegate_-&gt;callSerializableNativeHook(</span>
+      <span class="s1">*</span><span class="s4">this, </span><span class="s1">moduleId</span><span class="s4">, </span><span class="s1">methodId</span><span class="s4">, </span><span class="s1">dynamicFromValue(*runtime_</span><span class="s4">, </span><span class="s1">args[</span><span class="s5">2</span><span class="s1">]))</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Note: 
+   * In RCTNativeModule, std::nullopt is returned from 
+   * callSerializableNativeHook when executing a NativeModule method fails. 
+   * Therefore, it's safe to not terminate the syncMethodCall when std::nullopt 
+   * is returned. 
+   * 
+   * TODO: In JavaNativeModule, std::nullopt is returned when the synchronous 
+   * NativeModule method has the void return type. Change this to return 
+   * folly::dynamic(nullptr) instead, so that std::nullopt is reserved for 
+   * exceptional scenarios. 
+   * 
+   * TODO: Investigate CxxModule infra to see if std::nullopt is used for 
+   * returns in exceptional scenarios. 
+   **/</span>
+
+  <span class="s4">if </span><span class="s1">(!result.has_value()) {</span>
+    <span class="s4">return </span><span class="s1">Value::undefined()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">Value returnValue = valueFromDynamic(*runtime_</span><span class="s4">, </span><span class="s1">result.value())</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(moduleRegistry_) {</span>
+    <span class="s1">BridgeNativeModulePerfLogger::syncMethodCallReturnConversionEnd(</span>
+        <span class="s1">moduleName.c_str()</span><span class="s4">, </span><span class="s1">methodName.c_str())</span><span class="s4">;</span>
+    <span class="s1">BridgeNativeModulePerfLogger::syncMethodCallEnd(</span>
+        <span class="s1">moduleName.c_str()</span><span class="s4">, </span><span class="s1">methodName.c_str())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">returnValue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">Value JSIExecutor::globalEvalWithSourceUrl(</span><span class="s4">const </span><span class="s1">Value *args</span><span class="s4">, </span><span class="s1">size_t count) {</span>
+  <span class="s4">if </span><span class="s1">(count != </span><span class="s5">1 </span><span class="s1">&amp;&amp; count != </span><span class="s5">2</span><span class="s1">) {</span>
+    <span class="s4">throw </span><span class="s1">std::invalid_argument(</span>
+        <span class="s3">&quot;globalEvalWithSourceUrl arg count must be 1 or 2&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">code = args[</span><span class="s5">0</span><span class="s1">].asString(*runtime_).utf8(*runtime_)</span><span class="s4">;</span>
+  <span class="s1">std::string url</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(count &gt; </span><span class="s5">1 </span><span class="s1">&amp;&amp; args[</span><span class="s5">1</span><span class="s1">].isString()) {</span>
+    <span class="s1">url = args[</span><span class="s5">1</span><span class="s1">].asString(*runtime_).utf8(*runtime_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">runtime_-&gt;evaluateJavaScript(</span>
+      <span class="s1">std::make_unique&lt;StringBuffer&gt;(std::move(code))</span><span class="s4">, </span><span class="s1">url)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">bindNativeLogger(Runtime &amp;runtime</span><span class="s4">, </span><span class="s1">Logger logger) {</span>
+  <span class="s1">runtime.global().setProperty(</span>
+      <span class="s1">runtime</span><span class="s4">,</span>
+      <span class="s3">&quot;nativeLoggingHook&quot;</span><span class="s4">,</span>
+      <span class="s1">Function::createFromHostFunction(</span>
+          <span class="s1">runtime</span><span class="s4">,</span>
+          <span class="s1">PropNameID::forAscii(runtime</span><span class="s4">, </span><span class="s3">&quot;nativeLoggingHook&quot;</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">2</span><span class="s4">,</span>
+          <span class="s1">[logger = std::move(logger)](</span>
+              <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value &amp;</span><span class="s4">,</span>
+              <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+              <span class="s1">size_t count) {</span>
+            <span class="s4">if </span><span class="s1">(count != </span><span class="s5">2</span><span class="s1">) {</span>
+              <span class="s4">throw </span><span class="s1">std::invalid_argument(</span>
+                  <span class="s3">&quot;nativeLoggingHook takes 2 arguments&quot;</span><span class="s1">)</span><span class="s4">;</span>
+            <span class="s1">}</span>
+            <span class="s1">logger(</span>
+                <span class="s1">args[</span><span class="s5">0</span><span class="s1">].asString(runtime).utf8(runtime)</span><span class="s4">,</span>
+                <span class="s1">folly::to&lt;</span><span class="s4">unsigned int</span><span class="s1">&gt;(args[</span><span class="s5">1</span><span class="s1">].asNumber()))</span><span class="s4">;</span>
+            <span class="s4">return </span><span class="s1">Value::undefined()</span><span class="s4">;</span>
+          <span class="s1">}))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">bindNativePerformanceNow(Runtime &amp;runtime) {</span>
+  <span class="s1">runtime.global().setProperty(</span>
+      <span class="s1">runtime</span><span class="s4">,</span>
+      <span class="s3">&quot;nativePerformanceNow&quot;</span><span class="s4">,</span>
+      <span class="s1">Function::createFromHostFunction(</span>
+          <span class="s1">runtime</span><span class="s4">,</span>
+          <span class="s1">PropNameID::forAscii(runtime</span><span class="s4">, </span><span class="s3">&quot;nativePerformanceNow&quot;</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">0</span><span class="s4">,</span>
+          <span class="s1">[](jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+             <span class="s4">const </span><span class="s1">jsi::Value &amp;</span><span class="s4">,</span>
+             <span class="s4">const </span><span class="s1">jsi::Value *args</span><span class="s4">,</span>
+             <span class="s1">size_t count) { </span><span class="s4">return </span><span class="s1">Value(JSExecutor::performanceNow())</span><span class="s4">; </span><span class="s1">}))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

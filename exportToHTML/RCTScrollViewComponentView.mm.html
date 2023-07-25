@@ -1,0 +1,804 @@
+<html>
+<head>
+<title>RCTScrollViewComponentView.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTScrollViewComponentView.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTScrollViewComponentView.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTAssert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBridge+Private.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConstants.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTScrollEvent.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/components/scrollview/RCTComponentViewHelpers.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/components/scrollview/ScrollViewComponentDescriptor.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/components/scrollview/ScrollViewEventEmitter.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/components/scrollview/ScrollViewProps.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/components/scrollview/ScrollViewState.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/components/scrollview/conversions.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTConversions.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTCustomPullToRefreshViewProtocol.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTEnhancedScrollView.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTFabricComponentsPlugins.h&quot;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::react</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">CGFloat </span><span class="s4">const </span><span class="s1">kClippingLeeway = </span><span class="s5">44.0</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">UIScrollViewKeyboardDismissMode RCTUIKeyboardDismissModeFromProps(ScrollViewProps </span><span class="s4">const </span><span class="s1">&amp;props)</span>
+<span class="s1">{</span>
+  <span class="s4">switch </span><span class="s1">(props.keyboardDismissMode) {</span>
+    <span class="s4">case </span><span class="s1">ScrollViewKeyboardDismissMode::None:</span>
+      <span class="s4">return </span><span class="s1">UIScrollViewKeyboardDismissModeNone</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">ScrollViewKeyboardDismissMode::OnDrag:</span>
+      <span class="s4">return </span><span class="s1">UIScrollViewKeyboardDismissModeOnDrag</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">ScrollViewKeyboardDismissMode::Interactive:</span>
+      <span class="s4">return </span><span class="s1">UIScrollViewKeyboardDismissModeInteractive</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">UIScrollViewIndicatorStyle RCTUIScrollViewIndicatorStyleFromProps(ScrollViewProps </span><span class="s4">const </span><span class="s1">&amp;props)</span>
+<span class="s1">{</span>
+  <span class="s4">switch </span><span class="s1">(props.indicatorStyle) {</span>
+    <span class="s4">case </span><span class="s1">ScrollViewIndicatorStyle::Default:</span>
+      <span class="s4">return </span><span class="s1">UIScrollViewIndicatorStyleDefault</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">ScrollViewIndicatorStyle::Black:</span>
+      <span class="s4">return </span><span class="s1">UIScrollViewIndicatorStyleBlack</span><span class="s4">;</span>
+    <span class="s4">case </span><span class="s1">ScrollViewIndicatorStyle::White:</span>
+      <span class="s4">return </span><span class="s1">UIScrollViewIndicatorStyleWhite</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// Once Fabric implements proper NativeAnimationDriver, this should be removed.</span>
+<span class="s0">// This is just a workaround to allow animations based on onScroll event.</span>
+<span class="s0">// This is only used to animate sticky headers in ScrollViews, and only the contentOffset and tag is used.</span>
+<span class="s0">// TODO: T116850910 [Fabric][iOS] Make Fabric not use legacy RCTEventDispatcher for native-driven AnimatedEvents</span>
+<span class="s4">static void </span><span class="s1">RCTSendScrollEventForNativeAnimations_DEPRECATED(UIScrollView *scrollView</span><span class="s4">, </span><span class="s1">NSInteger tag)</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">uint16_t coalescingKey = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">RCTScrollEvent *scrollEvent = [[RCTScrollEvent alloc] initWithEventName:</span><span class="s4">@</span><span class="s3">&quot;onScroll&quot;</span>
+                                                                 <span class="s1">reactTag:[NSNumber numberWithInt:tag]</span>
+                                                  <span class="s1">scrollViewContentOffset:scrollView.contentOffset</span>
+                                                   <span class="s1">scrollViewContentInset:scrollView.contentInset</span>
+                                                    <span class="s1">scrollViewContentSize:scrollView.contentSize</span>
+                                                          <span class="s1">scrollViewFrame:scrollView.frame</span>
+                                                      <span class="s1">scrollViewZoomScale:scrollView.zoomScale</span>
+                                                                 <span class="s1">userData:nil</span>
+                                                            <span class="s1">coalescingKey:coalescingKey]</span><span class="s4">;</span>
+  <span class="s1">RCTBridge *bridge = [RCTBridge currentBridge]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(bridge) {</span>
+    <span class="s1">[bridge.eventDispatcher sendEvent:scrollEvent]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">NSDictionary *userInfo = [NSDictionary dictionaryWithObjectsAndKeys:scrollEvent</span><span class="s4">, @</span><span class="s3">&quot;event&quot;</span><span class="s4">, </span><span class="s1">nil]</span><span class="s4">;</span>
+    <span class="s1">[[NSNotificationCenter defaultCenter] postNotificationName:</span><span class="s4">@</span><span class="s3">&quot;RCTNotifyEventDispatcherObserversOfEvent_DEPRECATED&quot;</span>
+                                                        <span class="s1">object:nil</span>
+                                                      <span class="s1">userInfo:userInfo]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">@interface </span><span class="s1">RCTScrollViewComponentView () &lt;</span>
+    <span class="s1">UIScrollViewDelegate</span><span class="s4">,</span>
+    <span class="s1">RCTScrollViewProtocol</span><span class="s4">,</span>
+    <span class="s1">RCTScrollableProtocol</span><span class="s4">,</span>
+    <span class="s1">RCTEnhancedScrollViewOverridingDelegate&gt;</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTScrollViewComponentView {</span>
+  <span class="s1">ScrollViewShadowNode::ConcreteState::Shared _state</span><span class="s4">;</span>
+  <span class="s1">CGSize _contentSize</span><span class="s4">;</span>
+  <span class="s1">NSTimeInterval _lastScrollEventDispatchTime</span><span class="s4">;</span>
+  <span class="s1">NSTimeInterval _scrollEventThrottle</span><span class="s4">;</span>
+  <span class="s0">// Flag indicating whether the scrolling that is currently happening</span>
+  <span class="s0">// is triggered by user or not.</span>
+  <span class="s0">// This helps to only update state from `scrollViewDidScroll` in case</span>
+  <span class="s0">// some other part of the system scrolls scroll view.</span>
+  <span class="s1">BOOL _isUserTriggeredScrolling</span><span class="s4">;</span>
+  <span class="s1">BOOL _shouldUpdateContentInsetAdjustmentBehavior</span><span class="s4">;</span>
+
+  <span class="s1">CGPoint _contentOffsetWhenClipped</span><span class="s4">;</span>
+
+  <span class="s4">__weak </span><span class="s1">UIView *_contentView</span><span class="s4">;</span>
+
+  <span class="s1">CGRect _prevFirstVisibleFrame</span><span class="s4">;</span>
+  <span class="s4">__weak </span><span class="s1">UIView *_firstVisibleView</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (RCTScrollViewComponentView *</span><span class="s4">_Nullable</span><span class="s1">)findScrollViewComponentViewForView:(UIView *)view</span>
+<span class="s1">{</span>
+  <span class="s4">do </span><span class="s1">{</span>
+    <span class="s1">view = view.superview</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">while </span><span class="s1">(view != nil &amp;&amp; ![view isKindOfClass:[RCTScrollViewComponentView </span><span class="s4">class</span><span class="s1">]])</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">(RCTScrollViewComponentView *)view</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithFrame:(CGRect)frame</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super initWithFrame:frame]) {</span>
+    <span class="s4">static const auto </span><span class="s1">defaultProps = std::make_shared&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;()</span><span class="s4">;</span>
+    <span class="s1">_props = defaultProps</span><span class="s4">;</span>
+
+    <span class="s1">_scrollView = [[RCTEnhancedScrollView alloc] initWithFrame:self.bounds]</span><span class="s4">;</span>
+    <span class="s1">_scrollView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight</span><span class="s4">;</span>
+    <span class="s1">_scrollView.delaysContentTouches = NO</span><span class="s4">;</span>
+    <span class="s1">((RCTEnhancedScrollView *)_scrollView).overridingDelegate = self</span><span class="s4">;</span>
+    <span class="s1">_isUserTriggeredScrolling = NO</span><span class="s4">;</span>
+    <span class="s1">_shouldUpdateContentInsetAdjustmentBehavior = YES</span><span class="s4">;</span>
+    <span class="s1">[self addSubview:_scrollView]</span><span class="s4">;</span>
+
+    <span class="s1">_containerView = [[UIView alloc] initWithFrame:CGRectZero]</span><span class="s4">;</span>
+    <span class="s1">[_scrollView addSubview:_containerView]</span><span class="s4">;</span>
+
+    <span class="s1">[self.scrollViewDelegateSplitter addDelegate:self]</span><span class="s4">;</span>
+
+    <span class="s1">_scrollEventThrottle = INFINITY</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dealloc</span>
+<span class="s1">{</span>
+  <span class="s0">// Removing all delegates from the splitter nils the actual delegate which prevents a crash on UIScrollView</span>
+  <span class="s0">// deallocation.</span>
+  <span class="s1">[self.scrollViewDelegateSplitter removeAllDelegates]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTGenericDelegateSplitter&lt;id&lt;UIScrollViewDelegate&gt;&gt; *)scrollViewDelegateSplitter</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">((RCTEnhancedScrollView *)_scrollView).delegateSplitter</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTMountingTransactionObserving</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)mountingTransactionWillMount:(</span><span class="s4">const </span><span class="s1">facebook::react::MountingTransaction &amp;)transaction</span>
+                <span class="s1">withSurfaceTelemetry:(</span><span class="s4">const </span><span class="s1">facebook::react::SurfaceTelemetry &amp;)surfaceTelemetry</span>
+<span class="s1">{</span>
+  <span class="s1">[self _prepareForMaintainVisibleScrollPosition]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)mountingTransactionDidMount:(MountingTransaction </span><span class="s4">const </span><span class="s1">&amp;)transaction</span>
+               <span class="s1">withSurfaceTelemetry:(facebook::react::SurfaceTelemetry </span><span class="s4">const </span><span class="s1">&amp;)surfaceTelemetry</span>
+<span class="s1">{</span>
+  <span class="s1">[self _remountChildren]</span><span class="s4">;</span>
+  <span class="s1">[self _adjustForMaintainVisibleContentPosition]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTComponentViewProtocol</span>
+
+<span class="s1">+ (ComponentDescriptorProvider)componentDescriptorProvider</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">concreteComponentDescriptorProvider&lt;ScrollViewComponentDescriptor&gt;()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)updateLayoutMetrics:(</span><span class="s4">const </span><span class="s1">LayoutMetrics &amp;)layoutMetrics</span>
+           <span class="s1">oldLayoutMetrics:(</span><span class="s4">const </span><span class="s1">LayoutMetrics &amp;)oldLayoutMetrics</span>
+<span class="s1">{</span>
+  <span class="s1">[super updateLayoutMetrics:layoutMetrics oldLayoutMetrics:oldLayoutMetrics]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(layoutMetrics.layoutDirection != oldLayoutMetrics.layoutDirection) {</span>
+    <span class="s1">CGAffineTransform transform = (layoutMetrics.layoutDirection == LayoutDirection::LeftToRight)</span>
+        <span class="s1">? CGAffineTransformIdentity</span>
+        <span class="s1">: CGAffineTransformMakeScale(-</span><span class="s5">1</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">_containerView.transform = transform</span><span class="s4">;</span>
+    <span class="s1">_scrollView.transform = transform</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)updateProps:(Props::Shared </span><span class="s4">const </span><span class="s1">&amp;)props oldProps:(Props::Shared </span><span class="s4">const </span><span class="s1">&amp;)oldProps</span>
+<span class="s1">{</span>
+  <span class="s4">const auto </span><span class="s1">&amp;oldScrollViewProps = *std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;(_props)</span><span class="s4">;</span>
+  <span class="s4">const auto </span><span class="s1">&amp;newScrollViewProps = *std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;(props)</span><span class="s4">;</span>
+
+<span class="s2">#define </span><span class="s1">REMAP_PROP(reactName</span><span class="s4">, </span><span class="s1">localName</span><span class="s4">, </span><span class="s1">target)                      \ 
+  </span><span class="s4">if </span><span class="s1">(oldScrollViewProps.reactName != newScrollViewProps.reactName) { \ 
+    target.localName = newScrollViewProps.reactName</span><span class="s4">;                  </span><span class="s1">\ 
+  }</span>
+
+<span class="s2">#define </span><span class="s1">REMAP_VIEW_PROP(reactName</span><span class="s4">, </span><span class="s1">localName) REMAP_PROP(reactName</span><span class="s4">, </span><span class="s1">localName</span><span class="s4">, </span><span class="s1">self)</span>
+<span class="s2">#define </span><span class="s1">MAP_VIEW_PROP(name) REMAP_VIEW_PROP(name</span><span class="s4">, </span><span class="s1">name)</span>
+<span class="s2">#define </span><span class="s1">REMAP_SCROLL_VIEW_PROP(reactName</span><span class="s4">, </span><span class="s1">localName) \ 
+  REMAP_PROP(reactName</span><span class="s4">, </span><span class="s1">localName</span><span class="s4">, </span><span class="s1">((RCTEnhancedScrollView *)_scrollView))</span>
+<span class="s2">#define </span><span class="s1">MAP_SCROLL_VIEW_PROP(name) REMAP_SCROLL_VIEW_PROP(name</span><span class="s4">, </span><span class="s1">name)</span>
+
+  <span class="s0">// FIXME: Commented props are not supported yet.</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(alwaysBounceHorizontal)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(alwaysBounceVertical)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(bounces)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(bouncesZoom)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(canCancelContentTouches)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(centerContent)</span><span class="s4">;</span>
+  <span class="s0">// MAP_SCROLL_VIEW_PROP(automaticallyAdjustContentInsets);</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(decelerationRate)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(directionalLockEnabled)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(maximumZoomScale)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(minimumZoomScale)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(scrollEnabled)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(pagingEnabled)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(pinchGestureEnabled)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(scrollsToTop)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(showsHorizontalScrollIndicator)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(showsVerticalScrollIndicator)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.scrollIndicatorInsets != newScrollViewProps.scrollIndicatorInsets) {</span>
+    <span class="s1">_scrollView.scrollIndicatorInsets = RCTUIEdgeInsetsFromEdgeInsets(newScrollViewProps.scrollIndicatorInsets)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.indicatorStyle != newScrollViewProps.indicatorStyle) {</span>
+    <span class="s1">_scrollView.indicatorStyle = RCTUIScrollViewIndicatorStyleFromProps(newScrollViewProps)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.scrollEventThrottle != newScrollViewProps.scrollEventThrottle) {</span>
+    <span class="s0">// Zero means &quot;send value only once per significant logical event&quot;.</span>
+    <span class="s0">// Prop value is in milliseconds.</span>
+    <span class="s0">// iOS implementation uses `NSTimeInterval` (in seconds).</span>
+    <span class="s1">CGFloat throttleInSeconds = newScrollViewProps.scrollEventThrottle / </span><span class="s5">1000.0</span><span class="s4">;</span>
+    <span class="s1">CGFloat msPerFrame = </span><span class="s5">1.0 </span><span class="s1">/ </span><span class="s5">60.0</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(throttleInSeconds &lt; </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">_scrollEventThrottle = INFINITY</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(throttleInSeconds &lt;= msPerFrame) {</span>
+      <span class="s1">_scrollEventThrottle = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">_scrollEventThrottle = throttleInSeconds</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">MAP_SCROLL_VIEW_PROP(zoomScale)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.contentInset != newScrollViewProps.contentInset) {</span>
+    <span class="s1">_scrollView.contentInset = RCTUIEdgeInsetsFromEdgeInsets(newScrollViewProps.contentInset)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">RCTEnhancedScrollView *scrollView = (RCTEnhancedScrollView *)_scrollView</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.contentOffset != newScrollViewProps.contentOffset) {</span>
+    <span class="s1">_scrollView.contentOffset = RCTCGPointFromPoint(newScrollViewProps.contentOffset)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.snapToAlignment != newScrollViewProps.snapToAlignment) {</span>
+    <span class="s1">scrollView.snapToAlignment = RCTNSStringFromString(toString(newScrollViewProps.snapToAlignment))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">scrollView.snapToStart = newScrollViewProps.snapToStart</span><span class="s4">;</span>
+  <span class="s1">scrollView.snapToEnd = newScrollViewProps.snapToEnd</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.snapToOffsets != newScrollViewProps.snapToOffsets) {</span>
+    <span class="s1">NSMutableArray&lt;NSNumber *&gt; *snapToOffsets = [NSMutableArray array]</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;snapToOffset : newScrollViewProps.snapToOffsets) {</span>
+      <span class="s1">[snapToOffsets addObject:[NSNumber numberWithFloat:snapToOffset]]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">scrollView.snapToOffsets = snapToOffsets</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(</span><span class="s4">@available</span><span class="s1">(iOS </span><span class="s5">13.0</span><span class="s4">, </span><span class="s1">*)) {</span>
+    <span class="s4">if </span><span class="s1">(oldScrollViewProps.automaticallyAdjustsScrollIndicatorInsets !=</span>
+        <span class="s1">newScrollViewProps.automaticallyAdjustsScrollIndicatorInsets) {</span>
+      <span class="s1">scrollView.automaticallyAdjustsScrollIndicatorInsets =</span>
+          <span class="s1">newScrollViewProps.automaticallyAdjustsScrollIndicatorInsets</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">((oldScrollViewProps.contentInsetAdjustmentBehavior != newScrollViewProps.contentInsetAdjustmentBehavior) ||</span>
+      <span class="s1">_shouldUpdateContentInsetAdjustmentBehavior) {</span>
+    <span class="s4">auto const </span><span class="s1">contentInsetAdjustmentBehavior = newScrollViewProps.contentInsetAdjustmentBehavior</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(contentInsetAdjustmentBehavior == ContentInsetAdjustmentBehavior::Never) {</span>
+      <span class="s1">scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(contentInsetAdjustmentBehavior == ContentInsetAdjustmentBehavior::Automatic) {</span>
+      <span class="s1">scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(contentInsetAdjustmentBehavior == ContentInsetAdjustmentBehavior::ScrollableAxes) {</span>
+      <span class="s1">scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(contentInsetAdjustmentBehavior == ContentInsetAdjustmentBehavior::Always) {</span>
+      <span class="s1">scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAlways</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">_shouldUpdateContentInsetAdjustmentBehavior = NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">MAP_SCROLL_VIEW_PROP(disableIntervalMomentum)</span><span class="s4">;</span>
+  <span class="s1">MAP_SCROLL_VIEW_PROP(snapToInterval)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(oldScrollViewProps.keyboardDismissMode != newScrollViewProps.keyboardDismissMode) {</span>
+    <span class="s1">scrollView.keyboardDismissMode = RCTUIKeyboardDismissModeFromProps(newScrollViewProps)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[super updateProps:props oldProps:oldProps]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)updateState:(State::Shared </span><span class="s4">const </span><span class="s1">&amp;)state oldState:(State::Shared </span><span class="s4">const </span><span class="s1">&amp;)oldState</span>
+<span class="s1">{</span>
+  <span class="s1">assert(std::dynamic_pointer_cast&lt;ScrollViewShadowNode::ConcreteState </span><span class="s4">const</span><span class="s1">&gt;(state))</span><span class="s4">;</span>
+  <span class="s1">_state = std::static_pointer_cast&lt;ScrollViewShadowNode::ConcreteState </span><span class="s4">const</span><span class="s1">&gt;(state)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;data = _state-&gt;getData()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">contentOffset = RCTCGPointFromPoint(data.contentOffset)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!oldState &amp;&amp; !CGPointEqualToPoint(contentOffset</span><span class="s4">, </span><span class="s1">CGPointZero)) {</span>
+    <span class="s1">_scrollView.contentOffset = contentOffset</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">CGSize contentSize = RCTCGSizeFromSize(data.getContentSize())</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(CGSizeEqualToSize(_contentSize</span><span class="s4">, </span><span class="s1">contentSize)) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_contentSize = contentSize</span><span class="s4">;</span>
+  <span class="s1">_containerView.frame = CGRect{RCTCGPointFromPoint(data.contentBoundingRect.origin)</span><span class="s4">, </span><span class="s1">contentSize}</span><span class="s4">;</span>
+
+  <span class="s1">[self _preserveContentOffsetIfNeededWithBlock:^{</span>
+    <span class="s1">self-&gt;_scrollView.contentSize = contentSize</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Disables programmatical changing of ScrollView's `contentOffset` if a touch gesture is in progress. 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_preserveContentOffsetIfNeededWithBlock:(</span><span class="s4">void </span><span class="s1">(^)())block</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!block) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!_isUserTriggeredScrolling) {</span>
+    <span class="s4">return </span><span class="s1">block()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[((RCTEnhancedScrollView *)_scrollView) preserveContentOffsetWithBlock:block]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)mountChildComponentView:(UIView&lt;RCTComponentViewProtocol&gt; *)childComponentView index:(NSInteger)index</span>
+<span class="s1">{</span>
+  <span class="s1">[_containerView insertSubview:childComponentView atIndex:index]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(![childComponentView conformsToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTCustomPullToRefreshViewProtocol)]) {</span>
+    <span class="s1">_contentView = childComponentView</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)unmountChildComponentView:(UIView&lt;RCTComponentViewProtocol&gt; *)childComponentView index:(NSInteger)index</span>
+<span class="s1">{</span>
+  <span class="s1">[childComponentView removeFromSuperview]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(![childComponentView conformsToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTCustomPullToRefreshViewProtocol)] &amp;&amp;</span>
+      <span class="s1">_contentView == childComponentView) {</span>
+    <span class="s1">_contentView = nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * Returns whether or not the scroll view interaction should be blocked because 
+ * JavaScript was found to be the responder. 
+ */</span>
+<span class="s1">- (BOOL)_shouldDisableScrollInteraction</span>
+<span class="s1">{</span>
+  <span class="s1">UIView *ancestorView = self.superview</span><span class="s4">;</span>
+
+  <span class="s4">while </span><span class="s1">(ancestorView) {</span>
+    <span class="s4">if </span><span class="s1">([ancestorView respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(isJSResponder)]) {</span>
+      <span class="s1">BOOL isJSResponder = ((UIView&lt;RCTComponentViewProtocol&gt; *)ancestorView).isJSResponder</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(isJSResponder) {</span>
+        <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ancestorView = ancestorView.superview</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (ScrollViewMetrics)_scrollViewMetrics</span>
+<span class="s1">{</span>
+  <span class="s1">ScrollViewMetrics metrics</span><span class="s4">;</span>
+  <span class="s1">metrics.contentSize = RCTSizeFromCGSize(_scrollView.contentSize)</span><span class="s4">;</span>
+  <span class="s1">metrics.contentOffset = RCTPointFromCGPoint(_scrollView.contentOffset)</span><span class="s4">;</span>
+  <span class="s1">metrics.contentInset = RCTEdgeInsetsFromUIEdgeInsets(_scrollView.contentInset)</span><span class="s4">;</span>
+  <span class="s1">metrics.containerSize = RCTSizeFromCGSize(_scrollView.bounds.size)</span><span class="s4">;</span>
+  <span class="s1">metrics.zoomScale = _scrollView.zoomScale</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">metrics</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_updateStateWithContentOffset</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_state) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s4">auto </span><span class="s1">contentOffset = RCTPointFromCGPoint(_scrollView.contentOffset)</span><span class="s4">;</span>
+  <span class="s1">_state-&gt;updateState([contentOffset](ScrollViewShadowNode::ConcreteState::Data </span><span class="s4">const </span><span class="s1">&amp;data) {</span>
+    <span class="s4">auto </span><span class="s1">newData = data</span><span class="s4">;</span>
+    <span class="s1">newData.contentOffset = contentOffset</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">std::make_shared&lt;ScrollViewShadowNode::ConcreteState::Data </span><span class="s4">const</span><span class="s1">&gt;(newData)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)prepareForRecycle</span>
+<span class="s1">{</span>
+  <span class="s4">const auto </span><span class="s1">&amp;props = *std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;(_props)</span><span class="s4">;</span>
+  <span class="s1">_scrollView.contentOffset = RCTCGPointFromPoint(props.contentOffset)</span><span class="s4">;</span>
+  <span class="s0">// We set the default behavior to &quot;never&quot; so that iOS</span>
+  <span class="s0">// doesn't do weird things to UIScrollView insets automatically</span>
+  <span class="s0">// and keeps it as an opt-in behavior.</span>
+  <span class="s1">_scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever</span><span class="s4">;</span>
+  <span class="s1">_shouldUpdateContentInsetAdjustmentBehavior = YES</span><span class="s4">;</span>
+  <span class="s1">_state.reset()</span><span class="s4">;</span>
+  <span class="s1">_isUserTriggeredScrolling = NO</span><span class="s4">;</span>
+  <span class="s1">CGRect oldFrame = self.frame</span><span class="s4">;</span>
+  <span class="s1">self.frame = CGRectZero</span><span class="s4">;</span>
+  <span class="s1">self.frame = oldFrame</span><span class="s4">;</span>
+  <span class="s1">_contentView = nil</span><span class="s4">;</span>
+  <span class="s1">_prevFirstVisibleFrame = CGRectZero</span><span class="s4">;</span>
+  <span class="s1">_firstVisibleView = nil</span><span class="s4">;</span>
+  <span class="s1">[super prepareForRecycle]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - UIScrollViewDelegate</span>
+
+<span class="s1">- (BOOL)touchesShouldCancelInContentView:(__unused UIView *)view</span>
+<span class="s1">{</span>
+  <span class="s0">// Historically, `UIScrollView`s in React Native do not cancel touches</span>
+  <span class="s0">// started on `UIControl`-based views (as normal iOS `UIScrollView`s do).</span>
+  <span class="s4">return </span><span class="s1">![self _shouldDisableScrollInteraction]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewDidScroll:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_isUserTriggeredScrolling) {</span>
+    <span class="s1">[self _updateStateWithContentOffset]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSTimeInterval now = CACurrentMediaTime()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">((_lastScrollEventDispatchTime == </span><span class="s5">0</span><span class="s1">) || (now - _lastScrollEventDispatchTime &gt; _scrollEventThrottle)) {</span>
+    <span class="s1">_lastScrollEventDispatchTime = now</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(_eventEmitter) {</span>
+      <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)-&gt;onScroll([self _scrollViewMetrics])</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">RCTSendScrollEventForNativeAnimations_DEPRECATED(scrollView</span><span class="s4">, </span><span class="s1">self.tag)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _remountChildrenIfNeeded]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewDidZoom:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">[self scrollViewDidScroll:scrollView]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)scrollViewShouldScrollToTop:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">_isUserTriggeredScrolling = YES</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewDidScrollToTop:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">_isUserTriggeredScrolling = NO</span><span class="s4">;</span>
+  <span class="s1">[self _updateStateWithContentOffset]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewWillBeginDragging:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_eventEmitter) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)-&gt;onScrollBeginDrag([self _scrollViewMetrics])</span><span class="s4">;</span>
+  <span class="s1">_isUserTriggeredScrolling = YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate</span>
+<span class="s1">{</span>
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_eventEmitter) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)-&gt;onScrollEndDrag([self _scrollViewMetrics])</span><span class="s4">;</span>
+  <span class="s1">[self _updateStateWithContentOffset]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewWillBeginDecelerating:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_eventEmitter) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)</span>
+      <span class="s1">-&gt;onMomentumScrollBegin([self _scrollViewMetrics])</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewDidEndDecelerating:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_eventEmitter) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)-&gt;onMomentumScrollEnd([self _scrollViewMetrics])</span><span class="s4">;</span>
+  <span class="s1">[self _updateStateWithContentOffset]</span><span class="s4">;</span>
+  <span class="s1">_isUserTriggeredScrolling = NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewDidEndScrollingAnimation:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">[self _handleFinishedScrolling:scrollView]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_handleFinishedScrolling:(UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+  <span class="s1">[self scrollViewDidScroll:scrollView]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_eventEmitter) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)-&gt;onMomentumScrollEnd([self _scrollViewMetrics])</span><span class="s4">;</span>
+  <span class="s1">[self _updateStateWithContentOffset]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewWillBeginZooming:(UIScrollView *)scrollView withView:(nullable UIView *)view</span>
+<span class="s1">{</span>
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_eventEmitter) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)-&gt;onScrollBeginDrag([self _scrollViewMetrics])</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollViewDidEndZooming:(UIScrollView *)scrollView withView:(nullable UIView *)view atScale:(CGFloat)scale</span>
+<span class="s1">{</span>
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_eventEmitter) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::static_pointer_cast&lt;ScrollViewEventEmitter </span><span class="s4">const</span><span class="s1">&gt;(_eventEmitter)-&gt;onScrollEndDrag([self _scrollViewMetrics])</span><span class="s4">;</span>
+  <span class="s1">[self _updateStateWithContentOffset]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (UIView *)viewForZoomingInScrollView:(__unused UIScrollView *)scrollView</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_containerView</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark -</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_forceDispatchNextScrollEvent</span>
+<span class="s1">{</span>
+  <span class="s1">_lastScrollEventDispatchTime = </span><span class="s5">0</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Native commands</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleCommand:(</span><span class="s4">const </span><span class="s1">NSString *)commandName args:(</span><span class="s4">const </span><span class="s1">NSArray *)args</span>
+<span class="s1">{</span>
+  <span class="s1">RCTScrollViewHandleCommand(self</span><span class="s4">, </span><span class="s1">commandName</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)flashScrollIndicators</span>
+<span class="s1">{</span>
+  <span class="s1">[_scrollView flashScrollIndicators]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollTo:(</span><span class="s4">double</span><span class="s1">)x y:(</span><span class="s4">double</span><span class="s1">)y animated:(BOOL)animated</span>
+<span class="s1">{</span>
+  <span class="s1">CGPoint offset = CGPointMake(x</span><span class="s4">, </span><span class="s1">y)</span><span class="s4">;</span>
+  <span class="s1">CGRect maxRect = CGRectMake(</span>
+      <span class="s1">fmin(-_scrollView.contentInset.left</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">fmin(-_scrollView.contentInset.top</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">fmax(</span>
+          <span class="s1">_scrollView.contentSize.width - _scrollView.bounds.size.width + _scrollView.contentInset.right +</span>
+              <span class="s1">fmax(_scrollView.contentInset.left</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">0.01</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">fmax(</span>
+          <span class="s1">_scrollView.contentSize.height - _scrollView.bounds.size.height + _scrollView.contentInset.bottom +</span>
+              <span class="s1">fmax(_scrollView.contentInset.top</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">,</span>
+          <span class="s5">0.01</span><span class="s1">))</span><span class="s4">; </span><span class="s0">// Make width and height greater than 0</span>
+
+  <span class="s4">const auto </span><span class="s1">&amp;props = *std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;(_props)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!CGRectContainsPoint(maxRect</span><span class="s4">, </span><span class="s1">offset) &amp;&amp; !props.scrollToOverflowEnabled) {</span>
+    <span class="s1">CGFloat localX = fmax(offset.x</span><span class="s4">, </span><span class="s1">CGRectGetMinX(maxRect))</span><span class="s4">;</span>
+    <span class="s1">localX = fmin(localX</span><span class="s4">, </span><span class="s1">CGRectGetMaxX(maxRect))</span><span class="s4">;</span>
+    <span class="s1">CGFloat localY = fmax(offset.y</span><span class="s4">, </span><span class="s1">CGRectGetMinY(maxRect))</span><span class="s4">;</span>
+    <span class="s1">localY = fmin(localY</span><span class="s4">, </span><span class="s1">CGRectGetMaxY(maxRect))</span><span class="s4">;</span>
+    <span class="s1">offset = CGPointMake(localX</span><span class="s4">, </span><span class="s1">localY)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self scrollToOffset:offset animated:animated]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollToEnd:(BOOL)animated</span>
+<span class="s1">{</span>
+  <span class="s1">BOOL isHorizontal = _scrollView.contentSize.width &gt; self.frame.size.width</span><span class="s4">;</span>
+  <span class="s1">CGPoint offset</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(isHorizontal) {</span>
+    <span class="s1">CGFloat offsetX = _scrollView.contentSize.width - _scrollView.bounds.size.width + _scrollView.contentInset.right</span><span class="s4">;</span>
+    <span class="s1">offset = CGPointMake(fmax(offsetX</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">CGFloat offsetY = _scrollView.contentSize.height - _scrollView.bounds.size.height + _scrollView.contentInset.bottom</span><span class="s4">;</span>
+    <span class="s1">offset = CGPointMake(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">fmax(offsetY</span><span class="s4">, </span><span class="s5">0</span><span class="s1">))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self scrollToOffset:offset animated:animated]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Child views mounting</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)updateClippedSubviewsWithClipRect:(CGRect)clipRect relativeToView:(UIView *)clipView</span>
+<span class="s1">{</span>
+  <span class="s0">// Do nothing. ScrollView manages its subview clipping individually in `_remountChildren`.</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_remountChildrenIfNeeded</span>
+<span class="s1">{</span>
+  <span class="s1">CGPoint contentOffset = _scrollView.contentOffset</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(std::abs(_contentOffsetWhenClipped.x - contentOffset.x) &lt; kClippingLeeway &amp;&amp;</span>
+      <span class="s1">std::abs(_contentOffsetWhenClipped.y - contentOffset.y) &lt; kClippingLeeway) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_contentOffsetWhenClipped = contentOffset</span><span class="s4">;</span>
+
+  <span class="s1">[self _remountChildren]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_remountChildren</span>
+<span class="s1">{</span>
+  <span class="s1">[_scrollView updateClippedSubviewsWithClipRect:CGRectInset(_scrollView.bounds</span><span class="s4">, </span><span class="s1">-kClippingLeeway</span><span class="s4">, </span><span class="s1">-kClippingLeeway)</span>
+                                  <span class="s1">relativeToView:_scrollView]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTScrollableProtocol</span>
+
+<span class="s1">- (CGSize)contentSize</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_contentSize</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollToOffset:(CGPoint)offset</span>
+<span class="s1">{</span>
+  <span class="s1">[self scrollToOffset:offset animated:YES]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)scrollToOffset:(CGPoint)offset animated:(BOOL)animated</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(CGPointEqualToPoint(_scrollView.contentOffset</span><span class="s4">, </span><span class="s1">offset)) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(_layoutMetrics.layoutDirection == LayoutDirection::RightToLeft) {</span>
+    <span class="s0">// Adjusting offset.x in right to left layout direction.</span>
+    <span class="s1">offset.x = self.contentSize.width - _scrollView.frame.size.width - offset.x</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[_scrollView setContentOffset:offset animated:animated]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!animated) {</span>
+    <span class="s0">// When not animated, the expected workflow in ``scrollViewDidEndScrollingAnimation`` after scrolling is not going</span>
+    <span class="s0">// to get triggered. We will need to manually execute here.</span>
+    <span class="s1">[self _handleFinishedScrolling:_scrollView]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)zoomToRect:(CGRect)rect animated:(BOOL)animated</span>
+<span class="s1">{</span>
+  <span class="s1">[_scrollView zoomToRect:rect animated:animated]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)addScrollListener:(NSObject&lt;UIScrollViewDelegate&gt; *)scrollListener</span>
+<span class="s1">{</span>
+  <span class="s1">[self.scrollViewDelegateSplitter addDelegate:scrollListener]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)removeScrollListener:(NSObject&lt;UIScrollViewDelegate&gt; *)scrollListener</span>
+<span class="s1">{</span>
+  <span class="s1">[self.scrollViewDelegateSplitter removeDelegate:scrollListener]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Maintain visible content position</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_prepareForMaintainVisibleScrollPosition</span>
+<span class="s1">{</span>
+  <span class="s4">const auto </span><span class="s1">&amp;props = *std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;(_props)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!props.maintainVisibleContentPosition) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">BOOL horizontal = _scrollView.contentSize.width &gt; self.frame.size.width</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">minIdx = props.maintainVisibleContentPosition.value().minIndexForVisible</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(NSUInteger ii = minIdx</span><span class="s4">; </span><span class="s1">ii &lt; _contentView.subviews.count</span><span class="s4">; </span><span class="s1">++ii) {</span>
+    <span class="s0">// Find the first entirely visible view.</span>
+    <span class="s1">UIView *subview = _contentView.subviews[ii]</span><span class="s4">;</span>
+    <span class="s1">BOOL hasNewView = NO</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(horizontal) {</span>
+      <span class="s1">hasNewView = subview.frame.origin.x &gt; _scrollView.contentOffset.x</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">hasNewView = subview.frame.origin.y &gt; _scrollView.contentOffset.y</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(hasNewView || ii == _contentView.subviews.count - </span><span class="s5">1</span><span class="s1">) {</span>
+      <span class="s1">_prevFirstVisibleFrame = subview.frame</span><span class="s4">;</span>
+      <span class="s1">_firstVisibleView = subview</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_adjustForMaintainVisibleContentPosition</span>
+<span class="s1">{</span>
+  <span class="s4">const auto </span><span class="s1">&amp;props = *std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;(_props)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!props.maintainVisibleContentPosition) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">std::</span><span class="s4">optional</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt; autoscrollThreshold = props.maintainVisibleContentPosition.value().autoscrollToTopThreshold</span><span class="s4">;</span>
+  <span class="s1">BOOL horizontal = _scrollView.contentSize.width &gt; self.frame.size.width</span><span class="s4">;</span>
+  <span class="s0">// TODO: detect and handle/ignore re-ordering</span>
+  <span class="s4">if </span><span class="s1">(horizontal) {</span>
+    <span class="s1">CGFloat deltaX = _firstVisibleView.frame.origin.x - _prevFirstVisibleFrame.origin.x</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(ABS(deltaX) &gt; </span><span class="s5">0.5</span><span class="s1">) {</span>
+      <span class="s1">CGFloat x = _scrollView.contentOffset.x</span><span class="s4">;</span>
+      <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+      <span class="s1">_scrollView.contentOffset = CGPointMake(_scrollView.contentOffset.x + deltaX</span><span class="s4">, </span><span class="s1">_scrollView.contentOffset.y)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(autoscrollThreshold) {</span>
+        <span class="s0">// If the offset WAS within the threshold of the start, animate to the start.</span>
+        <span class="s4">if </span><span class="s1">(x &lt;= autoscrollThreshold.value()) {</span>
+          <span class="s1">[self scrollToOffset:CGPointMake(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">_scrollView.contentOffset.y) animated:YES]</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">CGRect newFrame = _firstVisibleView.frame</span><span class="s4">;</span>
+    <span class="s1">CGFloat deltaY = newFrame.origin.y - _prevFirstVisibleFrame.origin.y</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(ABS(deltaY) &gt; </span><span class="s5">0.5</span><span class="s1">) {</span>
+      <span class="s1">CGFloat y = _scrollView.contentOffset.y</span><span class="s4">;</span>
+      <span class="s1">[self _forceDispatchNextScrollEvent]</span><span class="s4">;</span>
+      <span class="s1">_scrollView.contentOffset = CGPointMake(_scrollView.contentOffset.x</span><span class="s4">, </span><span class="s1">_scrollView.contentOffset.y + deltaY)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(autoscrollThreshold) {</span>
+        <span class="s0">// If the offset WAS within the threshold of the start, animate to the start.</span>
+        <span class="s4">if </span><span class="s1">(y &lt;= autoscrollThreshold.value()) {</span>
+          <span class="s1">[self scrollToOffset:CGPointMake(_scrollView.contentOffset.x</span><span class="s4">, </span><span class="s5">0</span><span class="s1">) animated:YES]</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s1">Class&lt;RCTComponentViewProtocol&gt; RCTScrollViewCls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTScrollViewComponentView.</span><span class="s4">class;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

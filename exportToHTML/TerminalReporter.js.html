@@ -1,0 +1,476 @@
+<html>
+<head>
+<title>TerminalReporter.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #4646f1;}
+.s4 { color: #6897bb;}
+.s5 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+TerminalReporter.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const logToConsole = require(</span><span class="s2">&quot;./logToConsole&quot;</span><span class="s1">);</span>
+<span class="s1">const reporting = require(</span><span class="s2">&quot;./reporting&quot;</span><span class="s1">);</span>
+<span class="s1">const chalk = require(</span><span class="s2">&quot;chalk&quot;</span><span class="s1">);</span>
+<span class="s1">const throttle = require(</span><span class="s2">&quot;lodash.throttle&quot;</span><span class="s1">);</span>
+<span class="s1">const { AmbiguousModuleResolutionError } = require(</span><span class="s2">&quot;metro-core&quot;</span><span class="s1">);</span>
+<span class="s1">const path = require(</span><span class="s2">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s1">const GLOBAL_CACHE_DISABLED_MESSAGE_FORMAT =</span>
+  <span class="s2">&quot;The global cache is now disabled because %s&quot;</span><span class="s1">;</span>
+<span class="s1">const DARK_BLOCK_CHAR = </span><span class="s2">&quot;</span><span class="s3">\u2593</span><span class="s2">&quot;</span><span class="s1">;</span>
+<span class="s1">const LIGHT_BLOCK_CHAR = </span><span class="s2">&quot;</span><span class="s3">\u2591</span><span class="s2">&quot;</span><span class="s1">;</span>
+<span class="s1">const MAX_PROGRESS_BAR_CHAR_WIDTH = </span><span class="s4">16</span><span class="s1">;</span>
+
+<span class="s0">/** 
+ * We try to print useful information to the terminal for interactive builds. 
+ * This implements the `Reporter` interface from the './reporting' module. 
+ */</span>
+<span class="s1">class TerminalReporter {</span>
+  <span class="s0">/** 
+   * The bundle builds for which we are actively maintaining the status on the 
+   * terminal, ie. showing a progress bar. There can be several bundles being 
+   * built at the same time. 
+   */</span>
+
+  <span class="s1">constructor(terminal) {</span>
+    <span class="s5">this</span><span class="s1">._activeBundles = </span><span class="s5">new </span><span class="s1">Map();</span>
+    <span class="s5">this</span><span class="s1">._scheduleUpdateBundleProgress = throttle((data) =&gt; {</span>
+      <span class="s5">this</span><span class="s1">.update({</span>
+        <span class="s1">...data,</span>
+        <span class="s1">type: </span><span class="s2">&quot;bundle_transform_progressed_throttled&quot;</span><span class="s1">,</span>
+      <span class="s1">});</span>
+    <span class="s1">}, </span><span class="s4">100</span><span class="s1">);</span>
+    <span class="s5">this</span><span class="s1">.terminal = terminal;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Construct a message that represents the progress of a 
+   * single bundle build, for example: 
+   * 
+   *     BUNDLE path/to/bundle.js ▓▓▓▓▓░░░░░░░░░░░ 36.6% (4790/7922) 
+   */</span>
+  <span class="s1">_getBundleStatusMessage(</span>
+    <span class="s1">{</span>
+      <span class="s1">bundleDetails: { entryFile, bundleType },</span>
+      <span class="s1">transformedFileCount,</span>
+      <span class="s1">totalFileCount,</span>
+      <span class="s1">ratio,</span>
+      <span class="s1">isPrefetch,</span>
+    <span class="s1">},</span>
+    <span class="s1">phase</span>
+  <span class="s1">) {</span>
+    <span class="s5">if </span><span class="s1">(isPrefetch) {</span>
+      <span class="s1">bundleType = </span><span class="s2">&quot;PREBUNDLE&quot;</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const localPath = path.relative(</span><span class="s2">&quot;.&quot;</span><span class="s1">, entryFile);</span>
+    <span class="s1">const filledBar = Math.floor(ratio * MAX_PROGRESS_BAR_CHAR_WIDTH);</span>
+    <span class="s1">const bundleTypeColor =</span>
+      <span class="s1">phase === </span><span class="s2">&quot;done&quot;</span>
+        <span class="s1">? chalk.green</span>
+        <span class="s1">: phase === </span><span class="s2">&quot;failed&quot;</span>
+        <span class="s1">? chalk.red</span>
+        <span class="s1">: chalk.yellow;</span>
+    <span class="s1">const progress =</span>
+      <span class="s1">phase === </span><span class="s2">&quot;in_progress&quot;</span>
+        <span class="s1">? chalk.green.bgGreen(DARK_BLOCK_CHAR.repeat(filledBar)) +</span>
+          <span class="s1">chalk.bgWhite.white(</span>
+            <span class="s1">LIGHT_BLOCK_CHAR.repeat(MAX_PROGRESS_BAR_CHAR_WIDTH - filledBar)</span>
+          <span class="s1">) +</span>
+          <span class="s1">chalk.bold(` ${(</span><span class="s4">100 </span><span class="s1">* ratio).toFixed(</span><span class="s4">1</span><span class="s1">)}% `) +</span>
+          <span class="s1">chalk.dim(`(${transformedFileCount}/${totalFileCount})`)</span>
+        <span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+    <span class="s5">return </span><span class="s1">(</span>
+      <span class="s1">bundleTypeColor.inverse.bold(` ${bundleType.toUpperCase()} `) +</span>
+      <span class="s1">chalk.reset.dim(` ${path.dirname(localPath)}/`) +</span>
+      <span class="s1">chalk.bold(path.basename(localPath)) +</span>
+      <span class="s2">&quot; &quot; </span><span class="s1">+</span>
+      <span class="s1">progress +</span>
+      <span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot;</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">_logCacheDisabled(reason) {</span>
+    <span class="s1">const format = GLOBAL_CACHE_DISABLED_MESSAGE_FORMAT;</span>
+    <span class="s5">switch </span><span class="s1">(reason) {</span>
+      <span class="s5">case </span><span class="s2">&quot;too_many_errors&quot;</span><span class="s1">:</span>
+        <span class="s1">reporting.logWarning(</span>
+          <span class="s5">this</span><span class="s1">.terminal,</span>
+          <span class="s1">format,</span>
+          <span class="s2">&quot;it has been failing too many times.&quot;</span>
+        <span class="s1">);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;too_many_misses&quot;</span><span class="s1">:</span>
+        <span class="s1">reporting.logWarning(</span>
+          <span class="s5">this</span><span class="s1">.terminal,</span>
+          <span class="s1">format,</span>
+          <span class="s2">&quot;it has been missing too many consecutive keys.&quot;</span>
+        <span class="s1">);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">_logBundleBuildDone(buildID) {</span>
+    <span class="s1">const progress = </span><span class="s5">this</span><span class="s1">._activeBundles.get(buildID);</span>
+    <span class="s5">if </span><span class="s1">(progress != </span><span class="s5">null</span><span class="s1">) {</span>
+      <span class="s1">const msg = </span><span class="s5">this</span><span class="s1">._getBundleStatusMessage(</span>
+        <span class="s1">{</span>
+          <span class="s1">...progress,</span>
+          <span class="s1">ratio: </span><span class="s4">1</span><span class="s1">,</span>
+          <span class="s1">transformedFileCount: progress.totalFileCount,</span>
+        <span class="s1">},</span>
+        <span class="s2">&quot;done&quot;</span>
+      <span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(msg);</span>
+      <span class="s5">this</span><span class="s1">._activeBundles.</span><span class="s5">delete</span><span class="s1">(buildID);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">_logBundleBuildFailed(buildID) {</span>
+    <span class="s1">const progress = </span><span class="s5">this</span><span class="s1">._activeBundles.get(buildID);</span>
+    <span class="s5">if </span><span class="s1">(progress != </span><span class="s5">null</span><span class="s1">) {</span>
+      <span class="s1">const msg = </span><span class="s5">this</span><span class="s1">._getBundleStatusMessage(progress, </span><span class="s2">&quot;failed&quot;</span><span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(msg);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">_logInitializing(port, hasReducedPerformance) {</span>
+    <span class="s1">const logo = [</span>
+      <span class="s2">&quot;&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                        ▒▒▓▓▓▓▒▒&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                     ▒▓▓▓▒▒░░▒▒▓▓▓▒&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                  ▒▓▓▓▓░░░▒▒▒▒░░░▓▓▓▓▒&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                 ▓▓▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▓▓&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                 ▓▓░░░░░▒▓▓▓▓▓▓▒░░░░░▓▓&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                 ▓▓░░▓▓▒░░░▒▒░░░▒▓▒░░▓▓&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                 ▓▓░░▓▓▓▓▓▒▒▒▒▓▓▓▓▒░░▓▓&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                 ▓▓░░▓▓▓▓▓▓▓▓▓▓▓▓▓▒░░▓▓&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                 ▓▓▒░░▒▒▓▓▓▓▓▓▓▓▒░░░▒▓▓&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                  ▒▓▓▓▒░░░▒▓▓▒░░░▒▓▓▓▒&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                     ▒▓▓▓▒░░░░▒▓▓▓▒&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;                        ▒▒▓▓▓▓▒▒&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;&quot;</span><span class="s1">,</span>
+      <span class="s2">&quot;&quot;</span><span class="s1">,</span>
+    <span class="s1">];</span>
+    <span class="s1">const color = hasReducedPerformance ? chalk.red : chalk.blue;</span>
+    <span class="s5">this</span><span class="s1">.terminal.log(color(logo.join(</span><span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot;</span><span class="s1">)));</span>
+  <span class="s1">}</span>
+  <span class="s1">_logInitializingFailed(port, error) {</span>
+    <span class="s5">if </span><span class="s1">(error.code === </span><span class="s2">&quot;EADDRINUSE&quot;</span><span class="s1">) {</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(</span>
+        <span class="s1">chalk.bgRed.bold(</span><span class="s2">&quot; ERROR &quot;</span><span class="s1">),</span>
+        <span class="s1">chalk.red(</span><span class="s2">&quot;Metro can't listen on port&quot;</span><span class="s1">, chalk.bold(String(port)))</span>
+      <span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(</span>
+        <span class="s2">&quot;Most likely another process is already using this port&quot;</span>
+      <span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(</span><span class="s2">&quot;Run the following command to find out which process:&quot;</span><span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(</span><span class="s2">&quot;</span><span class="s3">\n  </span><span class="s2">&quot;</span><span class="s1">, chalk.bold(</span><span class="s2">&quot;lsof -i :&quot; </span><span class="s1">+ port), </span><span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(</span><span class="s2">&quot;Then, you can either shut down the other process:&quot;</span><span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(</span><span class="s2">&quot;</span><span class="s3">\n  </span><span class="s2">&quot;</span><span class="s1">, chalk.bold(</span><span class="s2">&quot;kill -9 &lt;PID&gt;&quot;</span><span class="s1">), </span><span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(</span><span class="s2">&quot;or run Metro on different port.&quot;</span><span class="s1">);</span>
+    <span class="s1">} </span><span class="s5">else </span><span class="s1">{</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(chalk.bgRed.bold(</span><span class="s2">&quot; ERROR &quot;</span><span class="s1">), chalk.red(error.message));</span>
+      <span class="s1">const errorAttributes = JSON.stringify(error);</span>
+      <span class="s5">if </span><span class="s1">(errorAttributes !== </span><span class="s2">&quot;{}&quot;</span><span class="s1">) {</span>
+        <span class="s5">this</span><span class="s1">.terminal.log(chalk.red(errorAttributes));</span>
+      <span class="s1">}</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(chalk.red(error.stack));</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * This function is only concerned with logging and should not do state 
+   * or terminal status updates. 
+   */</span>
+  <span class="s1">_log(event) {</span>
+    <span class="s5">switch </span><span class="s1">(event.type) {</span>
+      <span class="s5">case </span><span class="s2">&quot;initialize_started&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logInitializing(event.port, event.hasReducedPerformance);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;initialize_failed&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logInitializingFailed(event.port, event.error);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;bundle_build_done&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logBundleBuildDone(event.buildID);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;bundle_build_failed&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logBundleBuildFailed(event.buildID);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;bundling_error&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logBundlingError(event.error);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;global_cache_disabled&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logCacheDisabled(event.reason);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;resolver_warning&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logWarning(event.message);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;transform_cache_reset&quot;</span><span class="s1">:</span>
+        <span class="s1">reporting.logWarning(</span><span class="s5">this</span><span class="s1">.terminal, </span><span class="s2">&quot;the transform cache was reset.&quot;</span><span class="s1">);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;worker_stdout_chunk&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logWorkerChunk(</span><span class="s2">&quot;stdout&quot;</span><span class="s1">, event.chunk);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;worker_stderr_chunk&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logWorkerChunk(</span><span class="s2">&quot;stderr&quot;</span><span class="s1">, event.chunk);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;hmr_client_error&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logHmrClientError(event.error);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;client_log&quot;</span><span class="s1">:</span>
+        <span class="s1">logToConsole(</span><span class="s5">this</span><span class="s1">.terminal, event.level, event.mode, ...event.data);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;dep_graph_loading&quot;</span><span class="s1">:</span>
+        <span class="s1">const color = event.hasReducedPerformance ? chalk.red : chalk.blue;</span>
+        <span class="s1">const version = </span><span class="s2">&quot;v&quot; </span><span class="s1">+ require(</span><span class="s2">&quot;../../package.json&quot;</span><span class="s1">).version;</span>
+        <span class="s5">this</span><span class="s1">.terminal.log(</span>
+          <span class="s1">color.bold(</span>
+            <span class="s2">&quot; &quot;</span><span class="s1">.repeat(</span><span class="s4">19 </span><span class="s1">- version.length / </span><span class="s4">2</span><span class="s1">),</span>
+            <span class="s2">&quot;Welcome to Metro &quot; </span><span class="s1">+ chalk.white(version) + </span><span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot;</span>
+          <span class="s1">) + chalk.dim(</span><span class="s2">&quot;              Fast - Scalable - Integrated</span><span class="s3">\n\n</span><span class="s2">&quot;</span><span class="s1">)</span>
+        <span class="s1">);</span>
+        <span class="s5">if </span><span class="s1">(event.hasReducedPerformance) {</span>
+          <span class="s5">this</span><span class="s1">.terminal.log(</span>
+            <span class="s1">chalk.red(</span>
+              <span class="s2">&quot;Metro is operating with reduced performance.</span><span class="s3">\n</span><span class="s2">&quot; </span><span class="s1">+</span>
+                <span class="s2">&quot;Please fix the problem above and restart Metro.</span><span class="s3">\n\n</span><span class="s2">&quot;</span>
+            <span class="s1">)</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;watcher_health_check_result&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logWatcherHealthCheckResult(event.result);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;watcher_status&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._logWatcherStatus(event.status);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * We do not want to log the whole stacktrace for bundling error, because 
+   * these are operational errors, not programming errors, and the stacktrace 
+   * is not actionable to end users. 
+   */</span>
+  <span class="s1">_logBundlingError(error) {</span>
+    <span class="s5">if </span><span class="s1">(error </span><span class="s5">instanceof </span><span class="s1">AmbiguousModuleResolutionError) {</span>
+      <span class="s1">const he = error.hasteError;</span>
+      <span class="s1">const message =</span>
+        <span class="s2">&quot;ambiguous resolution: module `&quot; </span><span class="s1">+</span>
+        <span class="s1">`${error.fromModulePath}\` tries to require \`${he.hasteName}\`, ` +</span>
+        <span class="s2">&quot;but there are several files providing this module. You can delete &quot; </span><span class="s1">+</span>
+        <span class="s2">&quot;or fix them: </span><span class="s3">\n\n</span><span class="s2">&quot; </span><span class="s1">+</span>
+        <span class="s1">Object.keys(he.duplicatesSet)</span>
+          <span class="s1">.sort()</span>
+          <span class="s1">.map((dupFilePath) =&gt; `  * \`${dupFilePath}\`\n`)</span>
+          <span class="s1">.join(</span><span class="s2">&quot;&quot;</span><span class="s1">);</span>
+      <span class="s1">reporting.logError(</span><span class="s5">this</span><span class="s1">.terminal, message);</span>
+      <span class="s5">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">let { message } = error;</span>
+
+    <span class="s0">// Do not log the stack trace for SyntaxError (because it will always be in</span>
+    <span class="s0">// the parser, which is not helpful).</span>
+    <span class="s5">if </span><span class="s1">(!(error </span><span class="s5">instanceof </span><span class="s1">SyntaxError)) {</span>
+      <span class="s5">if </span><span class="s1">(error.snippet == </span><span class="s5">null </span><span class="s1">&amp;&amp; error.stack != </span><span class="s5">null</span><span class="s1">) {</span>
+        <span class="s1">message = error.stack;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s5">if </span><span class="s1">(error.filename &amp;&amp; !message.includes(error.filename)) {</span>
+      <span class="s0">// $FlowFixMe[incompatible-type]</span>
+      <span class="s1">message += ` [${error.filename}]`;</span>
+    <span class="s1">}</span>
+    <span class="s5">if </span><span class="s1">(error.snippet != </span><span class="s5">null</span><span class="s1">) {</span>
+      <span class="s1">message += </span><span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot; </span><span class="s1">+ error.snippet;</span>
+    <span class="s1">}</span>
+    <span class="s1">reporting.logError(</span><span class="s5">this</span><span class="s1">.terminal, message);</span>
+  <span class="s1">}</span>
+  <span class="s1">_logWorkerChunk(origin, chunk) {</span>
+    <span class="s1">const lines = chunk.split(</span><span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+    <span class="s5">if </span><span class="s1">(lines.length &gt;= </span><span class="s4">1 </span><span class="s1">&amp;&amp; lines[lines.length - </span><span class="s4">1</span><span class="s1">] === </span><span class="s2">&quot;&quot;</span><span class="s1">) {</span>
+      <span class="s1">lines.splice(lines.length - </span><span class="s4">1</span><span class="s1">, </span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">lines.forEach((line) =&gt; {</span>
+      <span class="s5">this</span><span class="s1">.terminal.log(`transform[${origin}]: ${line}`);</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * We use Math.pow(ratio, 2) to as a conservative measure of progress because 
+   * we know the `totalCount` is going to progressively increase as well. We 
+   * also prevent the ratio from going backwards. 
+   */</span>
+  <span class="s1">_updateBundleProgress({ buildID, transformedFileCount, totalFileCount }) {</span>
+    <span class="s1">const currentProgress = </span><span class="s5">this</span><span class="s1">._activeBundles.get(buildID);</span>
+    <span class="s5">if </span><span class="s1">(currentProgress == </span><span class="s5">null</span><span class="s1">) {</span>
+      <span class="s5">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const rawRatio = transformedFileCount / totalFileCount;</span>
+    <span class="s1">const conservativeRatio = Math.pow(rawRatio, </span><span class="s4">2</span><span class="s1">);</span>
+    <span class="s1">const ratio = Math.max(conservativeRatio, currentProgress.ratio);</span>
+    <span class="s1">Object.assign(currentProgress, {</span>
+      <span class="s1">ratio,</span>
+      <span class="s1">transformedFileCount,</span>
+      <span class="s1">totalFileCount,</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * This function is exclusively concerned with updating the internal state. 
+   * No logging or status updates should be done at this point. 
+   */</span>
+  <span class="s1">_updateState(event) {</span>
+    <span class="s5">switch </span><span class="s1">(event.type) {</span>
+      <span class="s5">case </span><span class="s2">&quot;bundle_build_done&quot;</span><span class="s1">:</span>
+      <span class="s5">case </span><span class="s2">&quot;bundle_build_failed&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._activeBundles.</span><span class="s5">delete</span><span class="s1">(event.buildID);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;bundle_build_started&quot;</span><span class="s1">:</span>
+        <span class="s1">const bundleProgress = {</span>
+          <span class="s1">bundleDetails: event.bundleDetails,</span>
+          <span class="s1">transformedFileCount: </span><span class="s4">0</span><span class="s1">,</span>
+          <span class="s1">totalFileCount: </span><span class="s4">1</span><span class="s1">,</span>
+          <span class="s1">ratio: </span><span class="s4">0</span><span class="s1">,</span>
+          <span class="s1">isPrefetch: event.isPrefetch,</span>
+        <span class="s1">};</span>
+        <span class="s5">this</span><span class="s1">._activeBundles.set(event.buildID, bundleProgress);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;bundle_transform_progressed_throttled&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">._updateBundleProgress(event);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Return a status message that is always consistent with the current state 
+   * of the application. Having this single function ensures we don't have 
+   * different callsites overriding each other status messages. 
+   */</span>
+  <span class="s1">_getStatusMessage() {</span>
+    <span class="s5">return </span><span class="s1">Array.from(</span><span class="s5">this</span><span class="s1">._activeBundles.entries())</span>
+      <span class="s1">.map(([_, progress]) =&gt;</span>
+        <span class="s5">this</span><span class="s1">._getBundleStatusMessage(progress, </span><span class="s2">&quot;in_progress&quot;</span><span class="s1">)</span>
+      <span class="s1">)</span>
+      <span class="s1">.filter((str) =&gt; str != </span><span class="s5">null</span><span class="s1">)</span>
+      <span class="s1">.join(</span><span class="s2">&quot;</span><span class="s3">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">_logHmrClientError(e) {</span>
+    <span class="s1">reporting.logError(</span>
+      <span class="s5">this</span><span class="s1">.terminal,</span>
+      <span class="s2">&quot;A WebSocket client got a connection error. Please reload your device &quot; </span><span class="s1">+</span>
+        <span class="s2">&quot;to get HMR working again: %s&quot;</span><span class="s1">,</span>
+      <span class="s1">e</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">_logWarning(message) {</span>
+    <span class="s1">reporting.logWarning(</span><span class="s5">this</span><span class="s1">.terminal, message);</span>
+  <span class="s1">}</span>
+  <span class="s1">_logWatcherHealthCheckResult(result) {</span>
+    <span class="s0">// Don't be spammy; only report changes in status.</span>
+    <span class="s5">if </span><span class="s1">(</span>
+      <span class="s1">!</span><span class="s5">this</span><span class="s1">._prevHealthCheckResult ||</span>
+      <span class="s1">result.type !== </span><span class="s5">this</span><span class="s1">._prevHealthCheckResult.type ||</span>
+      <span class="s1">(result.type === </span><span class="s2">&quot;timeout&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s5">this</span><span class="s1">._prevHealthCheckResult.type === </span><span class="s2">&quot;timeout&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">(result.pauseReason ?? </span><span class="s5">null</span><span class="s1">) !==</span>
+          <span class="s1">(</span><span class="s5">this</span><span class="s1">._prevHealthCheckResult.pauseReason ?? </span><span class="s5">null</span><span class="s1">))</span>
+    <span class="s1">) {</span>
+      <span class="s1">const watcherName = </span><span class="s2">&quot;'&quot; </span><span class="s1">+ (result.watcher ?? </span><span class="s2">&quot;unknown&quot;</span><span class="s1">) + </span><span class="s2">&quot;'&quot;</span><span class="s1">;</span>
+      <span class="s5">switch </span><span class="s1">(result.type) {</span>
+        <span class="s5">case </span><span class="s2">&quot;success&quot;</span><span class="s1">:</span>
+          <span class="s0">// Only report success after a prior failure.</span>
+          <span class="s5">if </span><span class="s1">(</span><span class="s5">this</span><span class="s1">._prevHealthCheckResult) {</span>
+            <span class="s5">this</span><span class="s1">.terminal.log(</span>
+              <span class="s1">chalk.green(`Watcher ${watcherName} is now healthy.`)</span>
+            <span class="s1">);</span>
+          <span class="s1">}</span>
+          <span class="s5">break</span><span class="s1">;</span>
+        <span class="s5">case </span><span class="s2">&quot;error&quot;</span><span class="s1">:</span>
+          <span class="s1">reporting.logWarning(</span>
+            <span class="s5">this</span><span class="s1">.terminal,</span>
+            <span class="s2">&quot;Failed to perform watcher health check. Check whether the project root is writable.&quot;</span>
+          <span class="s1">);</span>
+          <span class="s5">break</span><span class="s1">;</span>
+        <span class="s5">case </span><span class="s2">&quot;timeout&quot;</span><span class="s1">:</span>
+          <span class="s1">const why =</span>
+            <span class="s1">result.pauseReason != </span><span class="s5">null</span>
+              <span class="s1">? ` This may be because: ${result.pauseReason}`</span>
+              <span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+          <span class="s1">reporting.logWarning(</span>
+            <span class="s5">this</span><span class="s1">.terminal,</span>
+            <span class="s1">`Watcher ${watcherName} failed to detect a file change within ${result.timeout}ms.` +</span>
+              <span class="s1">why</span>
+          <span class="s1">);</span>
+          <span class="s5">break</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s5">this</span><span class="s1">._prevHealthCheckResult = result;</span>
+  <span class="s1">}</span>
+  <span class="s1">_logWatcherStatus(status) {</span>
+    <span class="s5">switch </span><span class="s1">(status.type) {</span>
+      <span class="s5">case </span><span class="s2">&quot;watchman_warning&quot;</span><span class="s1">:</span>
+        <span class="s1">const warning =</span>
+          <span class="s5">typeof </span><span class="s1">status.warning === </span><span class="s2">&quot;string&quot;</span>
+            <span class="s1">? status.warning</span>
+            <span class="s1">: `unknown warning (type: ${</span><span class="s5">typeof </span><span class="s1">status.warning})`;</span>
+        <span class="s1">reporting.logWarning(</span>
+          <span class="s5">this</span><span class="s1">.terminal,</span>
+          <span class="s1">`Watchman \`${status.command}\` returned a warning: ${warning}`</span>
+        <span class="s1">);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;watchman_slow_command&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">.terminal.log(</span>
+          <span class="s1">chalk.dim(</span>
+            <span class="s1">`Waiting </span><span class="s5">for </span><span class="s1">Watchman \`${status.command}\` (${Math.round(</span>
+              <span class="s1">status.timeElapsed / </span><span class="s4">1000</span>
+            <span class="s1">)}s)...`</span>
+          <span class="s1">)</span>
+        <span class="s1">);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+      <span class="s5">case </span><span class="s2">&quot;watchman_slow_command_complete&quot;</span><span class="s1">:</span>
+        <span class="s5">this</span><span class="s1">.terminal.log(</span>
+          <span class="s1">chalk.green(</span>
+            <span class="s1">`Watchman \`${status.command}\` finished after ${(</span>
+              <span class="s1">status.timeElapsed / </span><span class="s4">1000</span>
+            <span class="s1">).toFixed(</span><span class="s4">1</span><span class="s1">)}s.`</span>
+          <span class="s1">)</span>
+        <span class="s1">);</span>
+        <span class="s5">break</span><span class="s1">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Single entry point for reporting events. That allows us to implement the 
+   * corresponding JSON reporter easily and have a consistent reporting. 
+   */</span>
+  <span class="s1">update(event) {</span>
+    <span class="s5">if </span><span class="s1">(event.type === </span><span class="s2">&quot;bundle_transform_progressed&quot;</span><span class="s1">) {</span>
+      <span class="s5">this</span><span class="s1">._scheduleUpdateBundleProgress(event);</span>
+      <span class="s5">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s5">this</span><span class="s1">._log(event);</span>
+    <span class="s5">this</span><span class="s1">._updateState(event);</span>
+    <span class="s5">this</span><span class="s1">.terminal.status(</span><span class="s5">this</span><span class="s1">._getStatusMessage());</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = TerminalReporter;</span>
+</pre>
+</body>
+</html>

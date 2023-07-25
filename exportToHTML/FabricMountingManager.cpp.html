@@ -1,0 +1,1002 @@
+<html>
+<head>
+<title>FabricMountingManager.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+FabricMountingManager.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;FabricMountingManager.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;EventEmitterWrapper.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;StateWrapperImpl.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/jni/ReadableNativeMap.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/components/scrollview/ScrollViewProps.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/CoreFeatures.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/conversions.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/ShadowViewMutation.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;fbjni/fbjni.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cfenv&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cmath&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;vector&gt;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::jni</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">static bool </span><span class="s1">getFeatureFlagValue(</span><span class="s4">const char </span><span class="s1">*name) {</span>
+  <span class="s4">static const auto </span><span class="s1">reactFeatureFlagsJavaDescriptor = jni::findClassStatic(</span>
+      <span class="s1">FabricMountingManager::ReactFeatureFlagsJavaDescriptor)</span><span class="s4">;</span>
+  <span class="s4">const auto </span><span class="s1">field =</span>
+      <span class="s1">reactFeatureFlagsJavaDescriptor-&gt;getStaticField&lt;jboolean&gt;(name)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">reactFeatureFlagsJavaDescriptor-&gt;getStaticFieldValue(field)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">FabricMountingManager::FabricMountingManager(</span>
+    <span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">ReactNativeConfig&gt; &amp;config</span><span class="s4">,</span>
+    <span class="s1">global_ref&lt;jobject&gt; &amp;javaUIManager)</span>
+    <span class="s1">: javaUIManager_(javaUIManager)</span><span class="s4">,</span>
+      <span class="s1">reduceDeleteCreateMutation_(</span>
+          <span class="s1">getFeatureFlagValue(</span><span class="s3">&quot;reduceDeleteCreateMutation&quot;</span><span class="s1">)) {</span>
+  <span class="s1">CoreFeatures::enableMapBuffer = getFeatureFlagValue(</span><span class="s3">&quot;useMapBufferProps&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::onSurfaceStart(SurfaceId surfaceId) {</span>
+  <span class="s1">std::lock_guard lock(allocatedViewsMutex_)</span><span class="s4">;</span>
+  <span class="s1">allocatedViewRegistry_.emplace(surfaceId</span><span class="s4">, </span><span class="s1">butter::set&lt;Tag&gt;{})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::onSurfaceStop(SurfaceId surfaceId) {</span>
+  <span class="s1">std::lock_guard lock(allocatedViewsMutex_)</span><span class="s4">;</span>
+  <span class="s1">allocatedViewRegistry_.erase(surfaceId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static inline int </span><span class="s1">getIntBufferSizeForType(CppMountItem::Type mountItemType) {</span>
+  <span class="s4">switch </span><span class="s1">(mountItemType) {</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::Create:</span>
+      <span class="s4">return </span><span class="s5">2</span><span class="s4">; </span><span class="s0">// tag, isLayoutable</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::Insert:</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::Remove:</span>
+      <span class="s4">return </span><span class="s5">3</span><span class="s4">; </span><span class="s0">// tag, parentTag, index</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::RemoveDeleteTree:</span>
+      <span class="s4">return </span><span class="s5">3</span><span class="s4">; </span><span class="s0">// tag, parentTag, index</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::Delete:</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::UpdateProps:</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::UpdateState:</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::UpdateEventEmitter:</span>
+      <span class="s4">return </span><span class="s5">1</span><span class="s4">; </span><span class="s0">// tag</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::UpdatePadding:</span>
+      <span class="s4">return </span><span class="s5">5</span><span class="s4">; </span><span class="s0">// tag, top, left, bottom, right</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::UpdateLayout:</span>
+      <span class="s4">return </span><span class="s5">7</span><span class="s4">; </span><span class="s0">// tag, parentTag, x, y, w, h, DisplayType</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Type::UpdateOverflowInset:</span>
+      <span class="s4">return </span><span class="s5">5</span><span class="s4">; </span><span class="s0">// tag, left, top, right, bottom</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Undefined:</span>
+    <span class="s4">case </span><span class="s1">CppMountItem::Multiple:</span>
+      <span class="s4">return </span><span class="s1">-</span><span class="s5">1</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static inline void </span><span class="s1">updateBufferSizes(</span>
+    <span class="s1">CppMountItem::Type mountItemType</span><span class="s4">,</span>
+    <span class="s4">int </span><span class="s1">numInstructions</span><span class="s4">,</span>
+    <span class="s4">int </span><span class="s1">&amp;batchMountItemIntsSize</span><span class="s4">,</span>
+    <span class="s4">int </span><span class="s1">&amp;batchMountItemObjectsSize) {</span>
+  <span class="s4">if </span><span class="s1">(numInstructions == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">batchMountItemIntsSize +=</span>
+      <span class="s1">numInstructions == </span><span class="s5">1 </span><span class="s1">? </span><span class="s5">1 </span><span class="s1">: </span><span class="s5">2</span><span class="s4">; </span><span class="s0">// instructionType[, numInstructions]</span>
+  <span class="s1">batchMountItemIntsSize +=</span>
+      <span class="s1">numInstructions * getIntBufferSizeForType(mountItemType)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(mountItemType == CppMountItem::Type::UpdateProps) {</span>
+    <span class="s1">batchMountItemObjectsSize +=</span>
+        <span class="s1">numInstructions</span><span class="s4">; </span><span class="s0">// props object * numInstructions</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mountItemType == CppMountItem::Type::UpdateState) {</span>
+    <span class="s1">batchMountItemObjectsSize +=</span>
+        <span class="s1">numInstructions</span><span class="s4">; </span><span class="s0">// state object * numInstructions</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mountItemType == CppMountItem::Type::UpdateEventEmitter) {</span>
+    <span class="s1">batchMountItemObjectsSize +=</span>
+        <span class="s1">numInstructions</span><span class="s4">; </span><span class="s0">// EventEmitter object * numInstructions</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static inline void </span><span class="s1">computeBufferSizes(</span>
+    <span class="s4">int </span><span class="s1">&amp;batchMountItemIntsSize</span><span class="s4">,</span>
+    <span class="s4">int </span><span class="s1">&amp;batchMountItemObjectsSize</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppCommonMountItems</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppDeleteMountItems</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppUpdatePropsMountItems</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppUpdateStateMountItems</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppUpdatePaddingMountItems</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppUpdateLayoutMountItems</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppUpdateOverflowInsetMountItems</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;CppMountItem&gt; &amp;cppUpdateEventEmitterMountItems</span><span class="s4">,</span>
+    <span class="s1">ShadowViewMutationList &amp;cppViewMutations) {</span>
+  <span class="s1">CppMountItem::Type lastType = CppMountItem::Type::Undefined</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">numSameType = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;mountItem : cppCommonMountItems) {</span>
+    <span class="s4">const auto </span><span class="s1">&amp;mountItemType = mountItem.type</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(lastType == mountItemType) {</span>
+      <span class="s1">numSameType++</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(numSameType == </span><span class="s5">2</span><span class="s1">) {</span>
+        <span class="s1">batchMountItemIntsSize += </span><span class="s5">1</span><span class="s4">; </span><span class="s0">// numInstructions</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">numSameType = </span><span class="s5">1</span><span class="s4">;</span>
+      <span class="s1">lastType = mountItemType</span><span class="s4">;</span>
+      <span class="s1">batchMountItemIntsSize += </span><span class="s5">1</span><span class="s4">; </span><span class="s0">// instructionType</span>
+    <span class="s1">}</span>
+
+    <span class="s1">batchMountItemIntsSize += getIntBufferSizeForType(mountItemType)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(mountItemType == CppMountItem::Type::Create) {</span>
+      <span class="s1">batchMountItemObjectsSize +=</span>
+          <span class="s5">4</span><span class="s4">; </span><span class="s0">// component name, props, state, event emitter</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">updateBufferSizes(</span>
+      <span class="s1">CppMountItem::Type::UpdateProps</span><span class="s4">,</span>
+      <span class="s1">cppUpdatePropsMountItems.size()</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize)</span><span class="s4">;</span>
+  <span class="s1">updateBufferSizes(</span>
+      <span class="s1">CppMountItem::Type::UpdateState</span><span class="s4">,</span>
+      <span class="s1">cppUpdateStateMountItems.size()</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize)</span><span class="s4">;</span>
+  <span class="s1">updateBufferSizes(</span>
+      <span class="s1">CppMountItem::Type::UpdatePadding</span><span class="s4">,</span>
+      <span class="s1">cppUpdatePaddingMountItems.size()</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize)</span><span class="s4">;</span>
+  <span class="s1">updateBufferSizes(</span>
+      <span class="s1">CppMountItem::Type::UpdateLayout</span><span class="s4">,</span>
+      <span class="s1">cppUpdateLayoutMountItems.size()</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize)</span><span class="s4">;</span>
+  <span class="s1">updateBufferSizes(</span>
+      <span class="s1">CppMountItem::Type::UpdateOverflowInset</span><span class="s4">,</span>
+      <span class="s1">cppUpdateOverflowInsetMountItems.size()</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize)</span><span class="s4">;</span>
+  <span class="s1">updateBufferSizes(</span>
+      <span class="s1">CppMountItem::Type::UpdateEventEmitter</span><span class="s4">,</span>
+      <span class="s1">cppUpdateEventEmitterMountItems.size()</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize)</span><span class="s4">;</span>
+  <span class="s1">updateBufferSizes(</span>
+      <span class="s1">CppMountItem::Type::Delete</span><span class="s4">,</span>
+      <span class="s1">cppDeleteMountItems.size()</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(cppViewMutations.size() &gt; </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">batchMountItemIntsSize++</span><span class="s4">;</span>
+    <span class="s1">batchMountItemObjectsSize++</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static inline void </span><span class="s1">writeIntBufferTypePreamble(</span>
+    <span class="s4">int </span><span class="s1">mountItemType</span><span class="s4">,</span>
+    <span class="s4">int </span><span class="s1">numItems</span><span class="s4">,</span>
+    <span class="s1">_JNIEnv *env</span><span class="s4">,</span>
+    <span class="s1">jintArray &amp;intBufferArray</span><span class="s4">,</span>
+    <span class="s4">int </span><span class="s1">&amp;intBufferPosition) {</span>
+  <span class="s1">jint temp[</span><span class="s5">2</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(numItems == </span><span class="s5">1</span><span class="s1">) {</span>
+    <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItemType</span><span class="s4">;</span>
+    <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+    <span class="s1">intBufferPosition += </span><span class="s5">1</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItemType | CppMountItem::Type::Multiple</span><span class="s4">;</span>
+    <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = numItems</span><span class="s4">;</span>
+    <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">2</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+    <span class="s1">intBufferPosition += </span><span class="s5">2</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">inline </span><span class="s1">local_ref&lt;ReadableArray::javaobject&gt; castReadableArray(</span>
+    <span class="s1">local_ref&lt;ReadableNativeArray::javaobject&gt; </span><span class="s4">const </span><span class="s1">&amp;nativeArray) {</span>
+  <span class="s4">return </span><span class="s1">make_local(</span>
+      <span class="s4">reinterpret_cast</span><span class="s1">&lt;ReadableArray::javaobject&gt;(nativeArray.get()))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">// TODO: this method will be removed when binding for components are code-gen</span>
+<span class="s1">local_ref&lt;JString&gt; getPlatformComponentName(ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView) {</span>
+  <span class="s4">static </span><span class="s1">std::string scrollViewComponentName = std::string(</span><span class="s3">&quot;ScrollView&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">local_ref&lt;JString&gt; componentName</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(scrollViewComponentName == shadowView.componentName) {</span>
+    <span class="s4">auto </span><span class="s1">newViewProps =</span>
+        <span class="s1">std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">ScrollViewProps&gt;(shadowView.props)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(newViewProps-&gt;getProbablyMoreHorizontalThanVertical_DEPRECATED()) {</span>
+      <span class="s1">componentName = make_jstring(</span><span class="s3">&quot;AndroidHorizontalScrollView&quot;</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">componentName</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">componentName = make_jstring(shadowView.componentName)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">componentName</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static inline float </span><span class="s1">scale(Float value</span><span class="s4">, </span><span class="s1">Float pointScaleFactor) {</span>
+  <span class="s1">std::feclearexcept(FE_ALL_EXCEPT)</span><span class="s4">;</span>
+  <span class="s4">float </span><span class="s1">result = value * pointScaleFactor</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(std::fetestexcept(FE_OVERFLOW)) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::scale - FE_OVERFLOW - value: &quot; </span><span class="s1">&lt;&lt; value</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot; pointScaleFactor: &quot; </span><span class="s1">&lt;&lt; pointScaleFactor</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot; result: &quot; </span><span class="s1">&lt;&lt; result</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(std::fetestexcept(FE_UNDERFLOW)) {</span>
+    <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Binding::scale - FE_UNDERFLOW - value: &quot; </span><span class="s1">&lt;&lt; value</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot; pointScaleFactor: &quot; </span><span class="s1">&lt;&lt; pointScaleFactor</span>
+               <span class="s1">&lt;&lt; </span><span class="s3">&quot; result: &quot; </span><span class="s1">&lt;&lt; result</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">local_ref&lt;jobject&gt; FabricMountingManager::getProps(</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;oldShadowView</span><span class="s4">,</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;newShadowView) {</span>
+  <span class="s4">if </span><span class="s1">(CoreFeatures::enableMapBuffer &amp;&amp;</span>
+      <span class="s1">newShadowView.traits.check(</span>
+          <span class="s1">ShadowNodeTraits::Trait::AndroidMapBufferPropsSupported)) {</span>
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">newShadowView.props-&gt;rawProps.empty() &amp;&amp;</span>
+        <span class="s3">&quot;Raw props must be empty when views are using mapbuffer&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s0">// MapBufferBuilder must be constructed and live in this scope,</span>
+    <span class="s1">MapBufferBuilder builder</span><span class="s4">;</span>
+    <span class="s1">newShadowView.props-&gt;propsDiffMapBuffer(&amp;*oldShadowView.props</span><span class="s4">, </span><span class="s1">builder)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">JReadableMapBuffer::createWithContents(builder.build())</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">ReadableNativeMap::newObjectCxxArgs(newShadowView.props-&gt;rawProps)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::executeMount(</span>
+    <span class="s1">MountingCoordinator::Shared mountingCoordinator) {</span>
+  <span class="s1">std::lock_guard&lt;std::recursive_mutex&gt; lock(commitMutex_)</span><span class="s4">;</span>
+
+  <span class="s1">SystraceSection s(</span>
+      <span class="s3">&quot;FabricUIManagerBinding::schedulerDidFinishTransactionIntBuffer&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">finishTransactionStartTime = telemetryTimePointNow()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">mountingTransaction = mountingCoordinator-&gt;pullTransaction()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!mountingTransaction.has_value()) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">env = Environment::current()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">telemetry = mountingTransaction-&gt;getTelemetry()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">surfaceId = mountingTransaction-&gt;getSurfaceId()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;mutations = mountingTransaction-&gt;getMutations()</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">revisionNumber = telemetry.getRevisionNumber()</span><span class="s4">;</span>
+
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppCommonMountItems</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppDeleteMountItems</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppUpdatePropsMountItems</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppUpdateStateMountItems</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppUpdatePaddingMountItems</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppUpdateLayoutMountItems</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppUpdateOverflowInsetMountItems</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;CppMountItem&gt; cppUpdateEventEmitterMountItems</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">cppViewMutations = ShadowViewMutationList()</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard allocatedViewsLock(allocatedViewsMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">auto </span><span class="s1">allocatedViewsIterator = allocatedViewRegistry_.find(surfaceId)</span><span class="s4">;</span>
+    <span class="s4">auto const </span><span class="s1">&amp;allocatedViewTags =</span>
+        <span class="s1">allocatedViewsIterator != allocatedViewRegistry_.end()</span>
+        <span class="s1">? allocatedViewsIterator-&gt;second</span>
+        <span class="s1">: butter::set&lt;Tag&gt;{}</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(allocatedViewsIterator == allocatedViewRegistry_.end()) {</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Executing commit after surface was stopped!&quot;</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mutation : mutations) {</span>
+      <span class="s4">const auto </span><span class="s1">&amp;parentShadowView = mutation.parentShadowView</span><span class="s4">;</span>
+      <span class="s4">const auto </span><span class="s1">&amp;oldChildShadowView = mutation.oldChildShadowView</span><span class="s4">;</span>
+      <span class="s4">const auto </span><span class="s1">&amp;newChildShadowView = mutation.newChildShadowView</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">&amp;mutationType = mutation.type</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">&amp;index = mutation.index</span><span class="s4">;</span>
+
+      <span class="s4">bool </span><span class="s1">isVirtual = mutation.mutatedViewIsVirtual()</span><span class="s4">;</span>
+      <span class="s4">switch </span><span class="s1">(mutationType) {</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Create: {</span>
+          <span class="s4">bool </span><span class="s1">shouldCreateView =</span>
+              <span class="s1">!allocatedViewTags.contains(newChildShadowView.tag)</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">(reduceDeleteCreateMutation_) {</span>
+            <span class="s0">// Detect DELETE...CREATE situation on the same node and do NOT push</span>
+            <span class="s0">// back to the mount items. This is an edge case that may happen</span>
+            <span class="s0">// when for example animation runs while commit happened, and we</span>
+            <span class="s0">// want to filter them out here to capture all possible sources of</span>
+            <span class="s0">// such mutations. The re-ordering logic here assumes no</span>
+            <span class="s0">// DELETE...CREATE in the mutations, as we will re-order mutations</span>
+            <span class="s0">// and batch all DELETE instructions in the end.</span>
+            <span class="s4">auto </span><span class="s1">it = std::remove_if(</span>
+                <span class="s1">cppDeleteMountItems.begin()</span><span class="s4">,</span>
+                <span class="s1">cppDeleteMountItems.end()</span><span class="s4">,</span>
+                <span class="s1">[&amp;](</span><span class="s4">auto </span><span class="s1">&amp;deletedMountItem) -&gt; </span><span class="s4">bool </span><span class="s1">{</span>
+                  <span class="s4">return </span><span class="s1">deletedMountItem.oldChildShadowView.tag ==</span>
+                      <span class="s1">newChildShadowView.tag</span><span class="s4">;</span>
+                <span class="s1">})</span><span class="s4">;</span>
+            <span class="s4">bool </span><span class="s1">hasDeletedViewsWithSameTag = it != cppDeleteMountItems.end()</span><span class="s4">;</span>
+            <span class="s1">cppDeleteMountItems.erase(it</span><span class="s4">, </span><span class="s1">cppDeleteMountItems.end())</span><span class="s4">;</span>
+
+            <span class="s4">if </span><span class="s1">(hasDeletedViewsWithSameTag) {</span>
+              <span class="s1">shouldCreateView = </span><span class="s4">false;</span>
+              <span class="s1">LOG(ERROR)</span>
+                  <span class="s1">&lt;&lt; </span><span class="s3">&quot;XIN: Detect DELETE...CREATE on the same tag from mutations in the same batch. The DELETE and CREATE mutations are removed before sending to the native platforms&quot;</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s4">if </span><span class="s1">(shouldCreateView) {</span>
+            <span class="s1">cppCommonMountItems.push_back(</span>
+                <span class="s1">CppMountItem::CreateMountItem(newChildShadowView))</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Remove: {</span>
+          <span class="s4">if </span><span class="s1">(!isVirtual &amp;&amp; !mutation.isRedundantOperation) {</span>
+            <span class="s1">cppCommonMountItems.push_back(CppMountItem::RemoveMountItem(</span>
+                <span class="s1">parentShadowView</span><span class="s4">, </span><span class="s1">oldChildShadowView</span><span class="s4">, </span><span class="s1">index))</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::RemoveDeleteTree: {</span>
+          <span class="s4">if </span><span class="s1">(!isVirtual) {</span>
+            <span class="s1">cppCommonMountItems.push_back(</span>
+                <span class="s1">CppMountItem::RemoveDeleteTreeMountItem(</span>
+                    <span class="s1">parentShadowView</span><span class="s4">, </span><span class="s1">oldChildShadowView</span><span class="s4">, </span><span class="s1">index))</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Delete: {</span>
+          <span class="s4">if </span><span class="s1">(!mutation.isRedundantOperation) {</span>
+            <span class="s1">cppDeleteMountItems.push_back(</span>
+                <span class="s1">CppMountItem::DeleteMountItem(oldChildShadowView))</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Update: {</span>
+          <span class="s4">if </span><span class="s1">(!isVirtual) {</span>
+            <span class="s4">if </span><span class="s1">(oldChildShadowView.props != newChildShadowView.props) {</span>
+              <span class="s1">cppUpdatePropsMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdatePropsMountItem(</span>
+                      <span class="s1">oldChildShadowView</span><span class="s4">, </span><span class="s1">newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+            <span class="s4">if </span><span class="s1">(oldChildShadowView.state != newChildShadowView.state) {</span>
+              <span class="s1">cppUpdateStateMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdateStateMountItem(newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Padding: padding mountItems must be executed before layout props</span>
+            <span class="s0">// are updated in the view. This is necessary to ensure that events</span>
+            <span class="s0">// (resulting from layout changes) are dispatched with the correct</span>
+            <span class="s0">// padding information.</span>
+            <span class="s4">if </span><span class="s1">(oldChildShadowView.layoutMetrics.contentInsets !=</span>
+                <span class="s1">newChildShadowView.layoutMetrics.contentInsets) {</span>
+              <span class="s1">cppUpdatePaddingMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdatePaddingMountItem(newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+
+            <span class="s4">if </span><span class="s1">(oldChildShadowView.layoutMetrics !=</span>
+                <span class="s1">newChildShadowView.layoutMetrics) {</span>
+              <span class="s1">cppUpdateLayoutMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdateLayoutMountItem(</span>
+                      <span class="s1">mutation.newChildShadowView</span><span class="s4">, </span><span class="s1">parentShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// OverflowInset: This is the values indicating boundaries including</span>
+            <span class="s0">// children of the current view. The layout of current view may not</span>
+            <span class="s0">// change, and we separate this part from layout mount items to not</span>
+            <span class="s0">// pack too much data there.</span>
+            <span class="s4">if </span><span class="s1">((oldChildShadowView.layoutMetrics.overflowInset !=</span>
+                 <span class="s1">newChildShadowView.layoutMetrics.overflowInset)) {</span>
+              <span class="s1">cppUpdateOverflowInsetMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdateOverflowInsetMountItem(</span>
+                      <span class="s1">newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s4">if </span><span class="s1">(oldChildShadowView.eventEmitter !=</span>
+              <span class="s1">newChildShadowView.eventEmitter) {</span>
+            <span class="s1">cppUpdateEventEmitterMountItems.push_back(</span>
+                <span class="s1">CppMountItem::UpdateEventEmitterMountItem(</span>
+                    <span class="s1">mutation.newChildShadowView))</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+        <span class="s4">case </span><span class="s1">ShadowViewMutation::Insert: {</span>
+          <span class="s4">if </span><span class="s1">(!isVirtual) {</span>
+            <span class="s0">// Insert item</span>
+            <span class="s1">cppCommonMountItems.push_back(CppMountItem::InsertMountItem(</span>
+                <span class="s1">parentShadowView</span><span class="s4">, </span><span class="s1">newChildShadowView</span><span class="s4">, </span><span class="s1">index))</span><span class="s4">;</span>
+
+            <span class="s4">bool </span><span class="s1">allocationCheck =</span>
+                <span class="s1">allocatedViewTags.find(newChildShadowView.tag) ==</span>
+                <span class="s1">allocatedViewTags.end()</span><span class="s4">;</span>
+            <span class="s4">bool </span><span class="s1">shouldCreateView = allocationCheck</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">(shouldCreateView) {</span>
+              <span class="s1">cppUpdatePropsMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdatePropsMountItem({}</span><span class="s4">, </span><span class="s1">newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// State</span>
+            <span class="s4">if </span><span class="s1">(newChildShadowView.state) {</span>
+              <span class="s1">cppUpdateStateMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdateStateMountItem(newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Padding: padding mountItems must be executed before layout props</span>
+            <span class="s0">// are updated in the view. This is necessary to ensure that events</span>
+            <span class="s0">// (resulting from layout changes) are dispatched with the correct</span>
+            <span class="s0">// padding information.</span>
+            <span class="s4">if </span><span class="s1">(newChildShadowView.layoutMetrics.contentInsets !=</span>
+                <span class="s1">EdgeInsets::ZERO) {</span>
+              <span class="s1">cppUpdatePaddingMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdatePaddingMountItem(newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Layout</span>
+            <span class="s1">cppUpdateLayoutMountItems.push_back(</span>
+                <span class="s1">CppMountItem::UpdateLayoutMountItem(</span>
+                    <span class="s1">newChildShadowView</span><span class="s4">, </span><span class="s1">parentShadowView))</span><span class="s4">;</span>
+
+            <span class="s0">// OverflowInset: This is the values indicating boundaries including</span>
+            <span class="s0">// children of the current view. The layout of current view may not</span>
+            <span class="s0">// change, and we separate this part from layout mount items to not</span>
+            <span class="s0">// pack too much data there.</span>
+            <span class="s4">if </span><span class="s1">(newChildShadowView.layoutMetrics.overflowInset !=</span>
+                <span class="s1">EdgeInsets::ZERO) {</span>
+              <span class="s1">cppUpdateOverflowInsetMountItems.push_back(</span>
+                  <span class="s1">CppMountItem::UpdateOverflowInsetMountItem(</span>
+                      <span class="s1">newChildShadowView))</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s0">// EventEmitter</span>
+          <span class="s1">cppUpdateEventEmitterMountItems.push_back(</span>
+              <span class="s1">CppMountItem::UpdateEventEmitterMountItem(</span>
+                  <span class="s1">mutation.newChildShadowView))</span><span class="s4">;</span>
+
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+        <span class="s4">default</span><span class="s1">: {</span>
+          <span class="s4">break;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(allocatedViewsIterator != allocatedViewRegistry_.end()) {</span>
+      <span class="s4">auto </span><span class="s1">&amp;views = allocatedViewsIterator-&gt;second</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;mutation : mutations) {</span>
+        <span class="s4">switch </span><span class="s1">(mutation.type) {</span>
+          <span class="s4">case </span><span class="s1">ShadowViewMutation::Create:</span>
+            <span class="s1">views.insert(mutation.newChildShadowView.tag)</span><span class="s4">;</span>
+            <span class="s4">break;</span>
+          <span class="s4">case </span><span class="s1">ShadowViewMutation::Delete:</span>
+            <span class="s1">views.erase(mutation.oldChildShadowView.tag)</span><span class="s4">;</span>
+            <span class="s4">break;</span>
+          <span class="s4">default</span><span class="s1">:</span>
+            <span class="s4">break;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// We now have all the information we need, including ordering of mount items,</span>
+  <span class="s0">// to know exactly how much space must be allocated</span>
+  <span class="s4">int </span><span class="s1">batchMountItemIntsSize = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">batchMountItemObjectsSize = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s1">computeBufferSizes(</span>
+      <span class="s1">batchMountItemIntsSize</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize</span><span class="s4">,</span>
+      <span class="s1">cppCommonMountItems</span><span class="s4">,</span>
+      <span class="s1">cppDeleteMountItems</span><span class="s4">,</span>
+      <span class="s1">cppUpdatePropsMountItems</span><span class="s4">,</span>
+      <span class="s1">cppUpdateStateMountItems</span><span class="s4">,</span>
+      <span class="s1">cppUpdatePaddingMountItems</span><span class="s4">,</span>
+      <span class="s1">cppUpdateLayoutMountItems</span><span class="s4">,</span>
+      <span class="s1">cppUpdateOverflowInsetMountItems</span><span class="s4">,</span>
+      <span class="s1">cppUpdateEventEmitterMountItems</span><span class="s4">,</span>
+      <span class="s1">cppViewMutations)</span><span class="s4">;</span>
+
+  <span class="s4">static auto </span><span class="s1">createMountItemsIntBufferBatchContainer =</span>
+      <span class="s1">jni::findClassStatic(UIManagerJavaDescriptor)</span>
+          <span class="s1">-&gt;getMethod&lt;alias_ref&lt;JMountItem&gt;(</span>
+              <span class="s1">jint</span><span class="s4">, </span><span class="s1">jintArray</span><span class="s4">, </span><span class="s1">jtypeArray&lt;jobject&gt;</span><span class="s4">, </span><span class="s1">jint)&gt;(</span>
+              <span class="s3">&quot;createIntBufferBatchMountItem&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">static auto </span><span class="s1">scheduleMountItem = jni::findClassStatic(UIManagerJavaDescriptor)</span>
+                                      <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">(</span>
+                                          <span class="s1">JMountItem::javaobject</span><span class="s4">,</span>
+                                          <span class="s1">jint</span><span class="s4">,</span>
+                                          <span class="s1">jlong</span><span class="s4">,</span>
+                                          <span class="s1">jlong</span><span class="s4">,</span>
+                                          <span class="s1">jlong</span><span class="s4">,</span>
+                                          <span class="s1">jlong</span><span class="s4">,</span>
+                                          <span class="s1">jlong</span><span class="s4">,</span>
+                                          <span class="s1">jlong</span><span class="s4">,</span>
+                                          <span class="s1">jlong)&gt;(</span><span class="s3">&quot;scheduleMountItem&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(batchMountItemIntsSize == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">auto </span><span class="s1">finishTransactionEndTime = telemetryTimePointNow()</span><span class="s4">;</span>
+
+    <span class="s1">scheduleMountItem(</span>
+        <span class="s1">javaUIManager_</span><span class="s4">,</span>
+        <span class="s4">nullptr,</span>
+        <span class="s1">telemetry.getRevisionNumber()</span><span class="s4">,</span>
+        <span class="s1">telemetryTimePointToMilliseconds(telemetry.getCommitStartTime())</span><span class="s4">,</span>
+        <span class="s1">telemetryTimePointToMilliseconds(telemetry.getDiffStartTime())</span><span class="s4">,</span>
+        <span class="s1">telemetryTimePointToMilliseconds(telemetry.getDiffEndTime())</span><span class="s4">,</span>
+        <span class="s1">telemetryTimePointToMilliseconds(telemetry.getLayoutStartTime())</span><span class="s4">,</span>
+        <span class="s1">telemetryTimePointToMilliseconds(telemetry.getLayoutEndTime())</span><span class="s4">,</span>
+        <span class="s1">telemetryTimePointToMilliseconds(finishTransactionStartTime)</span><span class="s4">,</span>
+        <span class="s1">telemetryTimePointToMilliseconds(finishTransactionEndTime))</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Allocate the intBuffer and object array, now that we know exact sizes</span>
+  <span class="s0">// necessary</span>
+  <span class="s1">jintArray intBufferArray = env-&gt;NewIntArray(batchMountItemIntsSize)</span><span class="s4">;</span>
+  <span class="s1">local_ref&lt;JArrayClass&lt;jobject&gt;&gt; objBufferArray =</span>
+      <span class="s1">JArrayClass&lt;jobject&gt;::newArray(batchMountItemObjectsSize)</span><span class="s4">;</span>
+
+  <span class="s0">// Fill in arrays</span>
+  <span class="s4">int </span><span class="s1">intBufferPosition = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">objBufferPosition = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">int </span><span class="s1">prevMountItemType = -</span><span class="s5">1</span><span class="s4">;</span>
+  <span class="s1">jint temp[</span><span class="s5">7</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">int </span><span class="s1">i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; cppCommonMountItems.size()</span><span class="s4">; </span><span class="s1">i++) {</span>
+    <span class="s4">const auto </span><span class="s1">&amp;mountItem = cppCommonMountItems[i]</span><span class="s4">;</span>
+    <span class="s4">const auto </span><span class="s1">&amp;mountItemType = mountItem.type</span><span class="s4">;</span>
+
+    <span class="s0">// Get type here, and count forward how many items of this type are in a</span>
+    <span class="s0">// row. Write preamble to any common type here.</span>
+    <span class="s4">if </span><span class="s1">(prevMountItemType != mountItemType) {</span>
+      <span class="s4">int </span><span class="s1">numSameItemTypes = </span><span class="s5">1</span><span class="s4">;</span>
+      <span class="s4">for </span><span class="s1">(</span><span class="s4">int </span><span class="s1">j = i + </span><span class="s5">1</span><span class="s4">; </span><span class="s1">j &lt; cppCommonMountItems.size() &amp;&amp;</span>
+           <span class="s1">cppCommonMountItems[j].type == mountItemType</span><span class="s4">;</span>
+           <span class="s1">j++) {</span>
+        <span class="s1">numSameItemTypes++</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">writeIntBufferTypePreamble(</span>
+          <span class="s1">mountItemType</span><span class="s4">,</span>
+          <span class="s1">numSameItemTypes</span><span class="s4">,</span>
+          <span class="s1">env</span><span class="s4">,</span>
+          <span class="s1">intBufferArray</span><span class="s4">,</span>
+          <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">prevMountItemType = mountItemType</span><span class="s4">;</span>
+
+    <span class="s0">// TODO: multi-create, multi-insert, etc</span>
+    <span class="s4">if </span><span class="s1">(mountItemType == CppMountItem::Type::Create) {</span>
+      <span class="s1">local_ref&lt;JString&gt; componentName =</span>
+          <span class="s1">getPlatformComponentName(mountItem.newChildShadowView)</span><span class="s4">;</span>
+
+      <span class="s4">int </span><span class="s1">isLayoutable =</span>
+          <span class="s1">mountItem.newChildShadowView.layoutMetrics != EmptyLayoutMetrics ? </span><span class="s5">1</span>
+                                                                           <span class="s1">: </span><span class="s5">0</span><span class="s4">;</span>
+      <span class="s1">local_ref&lt;JObject&gt; props =</span>
+          <span class="s1">getProps(mountItem.oldChildShadowView</span><span class="s4">, </span><span class="s1">mountItem.newChildShadowView)</span><span class="s4">;</span>
+
+      <span class="s0">// Do not hold onto Java object from C</span>
+      <span class="s0">// We DO want to hold onto C object from Java, since we don't know the</span>
+      <span class="s0">// lifetime of the Java object</span>
+      <span class="s1">local_ref&lt;StateWrapperImpl::JavaPart&gt; javaStateWrapper = </span><span class="s4">nullptr;</span>
+      <span class="s4">if </span><span class="s1">(mountItem.newChildShadowView.state != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+        <span class="s1">javaStateWrapper = StateWrapperImpl::newObjectJavaArgs()</span><span class="s4">;</span>
+        <span class="s1">StateWrapperImpl *cStateWrapper = cthis(javaStateWrapper)</span><span class="s4">;</span>
+        <span class="s1">cStateWrapper-&gt;state_ = mountItem.newChildShadowView.state</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// Do not hold a reference to javaEventEmitter from the C++ side.</span>
+      <span class="s1">SharedEventEmitter eventEmitter =</span>
+          <span class="s1">mountItem.newChildShadowView.eventEmitter</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">javaEventEmitter = EventEmitterWrapper::newObjectJavaArgs()</span><span class="s4">;</span>
+      <span class="s1">EventEmitterWrapper *cEventEmitter = cthis(javaEventEmitter)</span><span class="s4">;</span>
+      <span class="s1">cEventEmitter-&gt;eventEmitter = eventEmitter</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = isLayoutable</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">2</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">2</span><span class="s4">;</span>
+
+      <span class="s1">(*objBufferArray)[objBufferPosition++] = componentName.get()</span><span class="s4">;</span>
+      <span class="s1">(*objBufferArray)[objBufferPosition++] = props.get()</span><span class="s4">;</span>
+      <span class="s1">(*objBufferArray)[objBufferPosition++] =</span>
+          <span class="s1">javaStateWrapper != </span><span class="s4">nullptr </span><span class="s1">? javaStateWrapper.get() : </span><span class="s4">nullptr;</span>
+      <span class="s1">(*objBufferArray)[objBufferPosition++] = javaEventEmitter.get()</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mountItemType == CppMountItem::Type::Insert) {</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = mountItem.parentShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">2</span><span class="s1">] = mountItem.index</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">3</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">3</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mountItemType == CppMountItem::Remove) {</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.oldChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = mountItem.parentShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">2</span><span class="s1">] = mountItem.index</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">3</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">3</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(mountItemType == CppMountItem::RemoveDeleteTree) {</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.oldChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = mountItem.parentShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">2</span><span class="s1">] = mountItem.index</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">3</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">3</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; </span><span class="s3">&quot;Unexpected CppMountItem type&quot;</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!cppUpdatePropsMountItems.empty()) {</span>
+    <span class="s1">writeIntBufferTypePreamble(</span>
+        <span class="s1">CppMountItem::Type::UpdateProps</span><span class="s4">,</span>
+        <span class="s1">cppUpdatePropsMountItems.size()</span><span class="s4">,</span>
+        <span class="s1">env</span><span class="s4">,</span>
+        <span class="s1">intBufferArray</span><span class="s4">,</span>
+        <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mountItem : cppUpdatePropsMountItems) {</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">1</span><span class="s4">;</span>
+      <span class="s1">(*objBufferArray)[objBufferPosition++] =</span>
+          <span class="s1">getProps(mountItem.oldChildShadowView</span><span class="s4">, </span><span class="s1">mountItem.newChildShadowView)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!cppUpdateStateMountItems.empty()) {</span>
+    <span class="s1">writeIntBufferTypePreamble(</span>
+        <span class="s1">CppMountItem::Type::UpdateState</span><span class="s4">,</span>
+        <span class="s1">cppUpdateStateMountItems.size()</span><span class="s4">,</span>
+        <span class="s1">env</span><span class="s4">,</span>
+        <span class="s1">intBufferArray</span><span class="s4">,</span>
+        <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mountItem : cppUpdateStateMountItems) {</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">1</span><span class="s4">;</span>
+
+      <span class="s4">auto </span><span class="s1">state = mountItem.newChildShadowView.state</span><span class="s4">;</span>
+      <span class="s0">// Do not hold onto Java object from C</span>
+      <span class="s0">// We DO want to hold onto C object from Java, since we don't know the</span>
+      <span class="s0">// lifetime of the Java object</span>
+      <span class="s1">local_ref&lt;StateWrapperImpl::JavaPart&gt; javaStateWrapper = </span><span class="s4">nullptr;</span>
+      <span class="s4">if </span><span class="s1">(state != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+        <span class="s1">javaStateWrapper = StateWrapperImpl::newObjectJavaArgs()</span><span class="s4">;</span>
+        <span class="s1">StateWrapperImpl *cStateWrapper = cthis(javaStateWrapper)</span><span class="s4">;</span>
+        <span class="s1">cStateWrapper-&gt;state_ = state</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">(*objBufferArray)[objBufferPosition++] =</span>
+          <span class="s1">(javaStateWrapper != </span><span class="s4">nullptr </span><span class="s1">? javaStateWrapper.get() : </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!cppUpdatePaddingMountItems.empty()) {</span>
+    <span class="s1">writeIntBufferTypePreamble(</span>
+        <span class="s1">CppMountItem::Type::UpdatePadding</span><span class="s4">,</span>
+        <span class="s1">cppUpdatePaddingMountItems.size()</span><span class="s4">,</span>
+        <span class="s1">env</span><span class="s4">,</span>
+        <span class="s1">intBufferArray</span><span class="s4">,</span>
+        <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mountItem : cppUpdatePaddingMountItems) {</span>
+      <span class="s4">auto </span><span class="s1">layoutMetrics = mountItem.newChildShadowView.layoutMetrics</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">pointScaleFactor = layoutMetrics.pointScaleFactor</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">contentInsets = layoutMetrics.contentInsets</span><span class="s4">;</span>
+
+      <span class="s4">int </span><span class="s1">left = floor(scale(contentInsets.left</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">top = floor(scale(contentInsets.top</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">right = floor(scale(contentInsets.right</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">bottom = floor(scale(contentInsets.bottom</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = left</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">2</span><span class="s1">] = top</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">3</span><span class="s1">] = right</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">4</span><span class="s1">] = bottom</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">5</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">5</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!cppUpdateLayoutMountItems.empty()) {</span>
+    <span class="s1">writeIntBufferTypePreamble(</span>
+        <span class="s1">CppMountItem::Type::UpdateLayout</span><span class="s4">,</span>
+        <span class="s1">cppUpdateLayoutMountItems.size()</span><span class="s4">,</span>
+        <span class="s1">env</span><span class="s4">,</span>
+        <span class="s1">intBufferArray</span><span class="s4">,</span>
+        <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mountItem : cppUpdateLayoutMountItems) {</span>
+      <span class="s4">auto </span><span class="s1">layoutMetrics = mountItem.newChildShadowView.layoutMetrics</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">pointScaleFactor = layoutMetrics.pointScaleFactor</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">frame = layoutMetrics.frame</span><span class="s4">;</span>
+
+      <span class="s4">int </span><span class="s1">x = round(scale(frame.origin.x</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">y = round(scale(frame.origin.y</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">w = round(scale(frame.size.width</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">h = round(scale(frame.size.height</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">displayType =</span>
+          <span class="s1">toInt(mountItem.newChildShadowView.layoutMetrics.displayType)</span><span class="s4">;</span>
+
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = mountItem.parentShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">2</span><span class="s1">] = x</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">3</span><span class="s1">] = y</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">4</span><span class="s1">] = w</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">5</span><span class="s1">] = h</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">6</span><span class="s1">] = displayType</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">7</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">7</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!cppUpdateOverflowInsetMountItems.empty()) {</span>
+    <span class="s1">writeIntBufferTypePreamble(</span>
+        <span class="s1">CppMountItem::Type::UpdateOverflowInset</span><span class="s4">,</span>
+        <span class="s1">cppUpdateOverflowInsetMountItems.size()</span><span class="s4">,</span>
+        <span class="s1">env</span><span class="s4">,</span>
+        <span class="s1">intBufferArray</span><span class="s4">,</span>
+        <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mountItem : cppUpdateOverflowInsetMountItems) {</span>
+      <span class="s4">auto </span><span class="s1">layoutMetrics = mountItem.newChildShadowView.layoutMetrics</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">pointScaleFactor = layoutMetrics.pointScaleFactor</span><span class="s4">;</span>
+      <span class="s4">auto </span><span class="s1">overflowInset = layoutMetrics.overflowInset</span><span class="s4">;</span>
+
+      <span class="s4">int </span><span class="s1">overflowInsetLeft =</span>
+          <span class="s1">round(scale(overflowInset.left</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">overflowInsetTop = round(scale(overflowInset.top</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">overflowInsetRight =</span>
+          <span class="s1">round(scale(overflowInset.right</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+      <span class="s4">int </span><span class="s1">overflowInsetBottom =</span>
+          <span class="s1">round(scale(overflowInset.bottom</span><span class="s4">, </span><span class="s1">pointScaleFactor))</span><span class="s4">;</span>
+
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">1</span><span class="s1">] = overflowInsetLeft</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">2</span><span class="s1">] = overflowInsetTop</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">3</span><span class="s1">] = overflowInsetRight</span><span class="s4">;</span>
+      <span class="s1">temp[</span><span class="s5">4</span><span class="s1">] = overflowInsetBottom</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">5</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">5</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">if </span><span class="s1">(!cppUpdateEventEmitterMountItems.empty()) {</span>
+    <span class="s1">writeIntBufferTypePreamble(</span>
+        <span class="s1">CppMountItem::Type::UpdateEventEmitter</span><span class="s4">,</span>
+        <span class="s1">cppUpdateEventEmitterMountItems.size()</span><span class="s4">,</span>
+        <span class="s1">env</span><span class="s4">,</span>
+        <span class="s1">intBufferArray</span><span class="s4">,</span>
+        <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mountItem : cppUpdateEventEmitterMountItems) {</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.newChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">1</span><span class="s4">;</span>
+
+      <span class="s1">SharedEventEmitter eventEmitter =</span>
+          <span class="s1">mountItem.newChildShadowView.eventEmitter</span><span class="s4">;</span>
+
+      <span class="s0">// Do not hold a reference to javaEventEmitter from the C++ side.</span>
+      <span class="s4">auto </span><span class="s1">javaEventEmitter = EventEmitterWrapper::newObjectJavaArgs()</span><span class="s4">;</span>
+      <span class="s1">EventEmitterWrapper *cEventEmitter = cthis(javaEventEmitter)</span><span class="s4">;</span>
+      <span class="s1">cEventEmitter-&gt;eventEmitter = eventEmitter</span><span class="s4">;</span>
+
+      <span class="s1">(*objBufferArray)[objBufferPosition++] = javaEventEmitter.get()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Write deletes last - so that all prop updates, etc, for the tag in the same</span>
+  <span class="s0">// batch don't fail. Without additional machinery, moving deletes here</span>
+  <span class="s0">// requires that the differ never produces &quot;DELETE...CREATE&quot; in that order for</span>
+  <span class="s0">// the same tag. It's nice to be able to batch all similar operations together</span>
+  <span class="s0">// for space efficiency.</span>
+  <span class="s4">if </span><span class="s1">(!cppDeleteMountItems.empty()) {</span>
+    <span class="s1">writeIntBufferTypePreamble(</span>
+        <span class="s1">CppMountItem::Type::Delete</span><span class="s4">,</span>
+        <span class="s1">cppDeleteMountItems.size()</span><span class="s4">,</span>
+        <span class="s1">env</span><span class="s4">,</span>
+        <span class="s1">intBufferArray</span><span class="s4">,</span>
+        <span class="s1">intBufferPosition)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;mountItem : cppDeleteMountItems) {</span>
+      <span class="s1">temp[</span><span class="s5">0</span><span class="s1">] = mountItem.oldChildShadowView.tag</span><span class="s4">;</span>
+      <span class="s1">env-&gt;SetIntArrayRegion(intBufferArray</span><span class="s4">, </span><span class="s1">intBufferPosition</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">temp)</span><span class="s4">;</span>
+      <span class="s1">intBufferPosition += </span><span class="s5">1</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// If there are no items, we pass a nullptr instead of passing the object</span>
+  <span class="s0">// through the JNI</span>
+  <span class="s4">auto </span><span class="s1">batch = createMountItemsIntBufferBatchContainer(</span>
+      <span class="s1">javaUIManager_</span><span class="s4">,</span>
+      <span class="s1">surfaceId</span><span class="s4">,</span>
+      <span class="s1">batchMountItemIntsSize == </span><span class="s5">0 </span><span class="s1">? </span><span class="s4">nullptr </span><span class="s1">: intBufferArray</span><span class="s4">,</span>
+      <span class="s1">batchMountItemObjectsSize == </span><span class="s5">0 </span><span class="s1">? </span><span class="s4">nullptr </span><span class="s1">: objBufferArray.get()</span><span class="s4">,</span>
+      <span class="s1">revisionNumber)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">finishTransactionEndTime = telemetryTimePointNow()</span><span class="s4">;</span>
+
+  <span class="s1">scheduleMountItem(</span>
+      <span class="s1">javaUIManager_</span><span class="s4">,</span>
+      <span class="s1">batch.get()</span><span class="s4">,</span>
+      <span class="s1">telemetry.getRevisionNumber()</span><span class="s4">,</span>
+      <span class="s1">telemetryTimePointToMilliseconds(telemetry.getCommitStartTime())</span><span class="s4">,</span>
+      <span class="s1">telemetryTimePointToMilliseconds(telemetry.getDiffStartTime())</span><span class="s4">,</span>
+      <span class="s1">telemetryTimePointToMilliseconds(telemetry.getDiffEndTime())</span><span class="s4">,</span>
+      <span class="s1">telemetryTimePointToMilliseconds(telemetry.getLayoutStartTime())</span><span class="s4">,</span>
+      <span class="s1">telemetryTimePointToMilliseconds(telemetry.getLayoutEndTime())</span><span class="s4">,</span>
+      <span class="s1">telemetryTimePointToMilliseconds(finishTransactionStartTime)</span><span class="s4">,</span>
+      <span class="s1">telemetryTimePointToMilliseconds(finishTransactionEndTime))</span><span class="s4">;</span>
+
+  <span class="s1">env-&gt;DeleteLocalRef(intBufferArray)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::preallocateShadowView(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView) {</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard lock(allocatedViewsMutex_)</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">allocatedViewsIterator = allocatedViewRegistry_.find(surfaceId)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(allocatedViewsIterator == allocatedViewRegistry_.end()) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+    <span class="s4">auto </span><span class="s1">&amp;allocatedViews = allocatedViewsIterator-&gt;second</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(allocatedViews.find(shadowView.tag) != allocatedViews.end()) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">allocatedViews.insert(shadowView.tag)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">bool </span><span class="s1">isLayoutableShadowNode = shadowView.layoutMetrics != EmptyLayoutMetrics</span><span class="s4">;</span>
+
+  <span class="s4">static auto </span><span class="s1">preallocateView =</span>
+      <span class="s1">jni::findClassStatic(UIManagerJavaDescriptor)</span>
+          <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">(</span>
+              <span class="s1">jint</span><span class="s4">, </span><span class="s1">jint</span><span class="s4">, </span><span class="s1">jstring</span><span class="s4">, </span><span class="s1">jobject</span><span class="s4">, </span><span class="s1">jobject</span><span class="s4">, </span><span class="s1">jobject</span><span class="s4">, </span><span class="s1">jboolean)&gt;(</span>
+              <span class="s3">&quot;preallocateView&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// Do not hold onto Java object from C</span>
+  <span class="s0">// We DO want to hold onto C object from Java, since we don't know the</span>
+  <span class="s0">// lifetime of the Java object</span>
+  <span class="s1">local_ref&lt;StateWrapperImpl::JavaPart&gt; javaStateWrapper = </span><span class="s4">nullptr;</span>
+  <span class="s4">if </span><span class="s1">(shadowView.state != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+    <span class="s1">javaStateWrapper = StateWrapperImpl::newObjectJavaArgs()</span><span class="s4">;</span>
+    <span class="s1">StateWrapperImpl *cStateWrapper = cthis(javaStateWrapper)</span><span class="s4">;</span>
+    <span class="s1">cStateWrapper-&gt;state_ = shadowView.state</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Do not hold a reference to javaEventEmitter from the C++ side.</span>
+  <span class="s1">local_ref&lt;EventEmitterWrapper::JavaPart&gt; javaEventEmitter = </span><span class="s4">nullptr;</span>
+
+  <span class="s1">local_ref&lt;JObject&gt; props = getProps({}</span><span class="s4">, </span><span class="s1">shadowView)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">component = getPlatformComponentName(shadowView)</span><span class="s4">;</span>
+
+  <span class="s1">preallocateView(</span>
+      <span class="s1">javaUIManager_</span><span class="s4">,</span>
+      <span class="s1">surfaceId</span><span class="s4">,</span>
+      <span class="s1">shadowView.tag</span><span class="s4">,</span>
+      <span class="s1">component.get()</span><span class="s4">,</span>
+      <span class="s1">props.get()</span><span class="s4">,</span>
+      <span class="s1">(javaStateWrapper != </span><span class="s4">nullptr </span><span class="s1">? javaStateWrapper.get() : </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">(javaEventEmitter != </span><span class="s4">nullptr </span><span class="s1">? javaEventEmitter.get() : </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">isLayoutableShadowNode)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::dispatchCommand(</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;commandName</span><span class="s4">,</span>
+    <span class="s1">folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;args) {</span>
+  <span class="s4">static auto </span><span class="s1">dispatchCommand =</span>
+      <span class="s1">jni::findClassStatic(UIManagerJavaDescriptor)</span>
+          <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">(jint</span><span class="s4">, </span><span class="s1">jint</span><span class="s4">, </span><span class="s1">jstring</span><span class="s4">, </span><span class="s1">ReadableArray::javaobject)&gt;(</span>
+              <span class="s3">&quot;dispatchCommand&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">local_ref&lt;JString&gt; command = make_jstring(commandName)</span><span class="s4">;</span>
+
+  <span class="s1">local_ref&lt;ReadableArray::javaobject&gt; argsArray =</span>
+      <span class="s1">castReadableArray(ReadableNativeArray::newObjectCxxArgs(args))</span><span class="s4">;</span>
+
+  <span class="s1">dispatchCommand(</span>
+      <span class="s1">javaUIManager_</span><span class="s4">,</span>
+      <span class="s1">shadowView.surfaceId</span><span class="s4">,</span>
+      <span class="s1">shadowView.tag</span><span class="s4">,</span>
+      <span class="s1">command.get()</span><span class="s4">,</span>
+      <span class="s1">argsArray.get())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::sendAccessibilityEvent(</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView</span><span class="s4">,</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;eventType) {</span>
+  <span class="s1">local_ref&lt;JString&gt; eventTypeStr = make_jstring(eventType)</span><span class="s4">;</span>
+
+  <span class="s4">static auto </span><span class="s1">sendAccessibilityEventFromJS =</span>
+      <span class="s1">jni::findClassStatic(UIManagerJavaDescriptor)</span>
+          <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">(jint</span><span class="s4">, </span><span class="s1">jint</span><span class="s4">, </span><span class="s1">jstring)&gt;(</span>
+              <span class="s3">&quot;sendAccessibilityEventFromJS&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">sendAccessibilityEventFromJS(</span>
+      <span class="s1">javaUIManager_</span><span class="s4">, </span><span class="s1">shadowView.surfaceId</span><span class="s4">, </span><span class="s1">shadowView.tag</span><span class="s4">, </span><span class="s1">eventTypeStr.get())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::setIsJSResponder(</span>
+    <span class="s1">ShadowView </span><span class="s4">const </span><span class="s1">&amp;shadowView</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">isJSResponder</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">blockNativeResponder) {</span>
+  <span class="s4">static auto </span><span class="s1">setJSResponder =</span>
+      <span class="s1">jni::findClassStatic(UIManagerJavaDescriptor)</span>
+          <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">(jint</span><span class="s4">, </span><span class="s1">jint</span><span class="s4">, </span><span class="s1">jint</span><span class="s4">, </span><span class="s1">jboolean)&gt;(</span><span class="s3">&quot;setJSResponder&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">static auto </span><span class="s1">clearJSResponder = jni::findClassStatic(UIManagerJavaDescriptor)</span>
+                                     <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">()&gt;(</span><span class="s3">&quot;clearJSResponder&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(isJSResponder) {</span>
+    <span class="s1">setJSResponder(</span>
+        <span class="s1">javaUIManager_</span><span class="s4">,</span>
+        <span class="s1">shadowView.surfaceId</span><span class="s4">,</span>
+        <span class="s1">shadowView.tag</span><span class="s4">,</span>
+        <span class="s0">// The closest non-flattened ancestor of the same value if the node is</span>
+        <span class="s0">// not flattened. For now, we don't support the case when the node can</span>
+        <span class="s0">// be flattened because the only component that uses this feature -</span>
+        <span class="s0">// ScrollView - cannot be flattened.</span>
+        <span class="s1">shadowView.tag</span><span class="s4">,</span>
+        <span class="s1">(jboolean)blockNativeResponder)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">clearJSResponder(javaUIManager_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::onAnimationStarted() {</span>
+  <span class="s4">static auto </span><span class="s1">layoutAnimationsStartedJNI =</span>
+      <span class="s1">jni::findClassStatic(UIManagerJavaDescriptor)</span>
+          <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">()&gt;(</span><span class="s3">&quot;onAnimationStarted&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">layoutAnimationsStartedJNI(javaUIManager_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">FabricMountingManager::onAllAnimationsComplete() {</span>
+  <span class="s4">static auto </span><span class="s1">allAnimationsCompleteJNI =</span>
+      <span class="s1">jni::findClassStatic(UIManagerJavaDescriptor)</span>
+          <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">()&gt;(</span><span class="s3">&quot;onAllAnimationsComplete&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">allAnimationsCompleteJNI(javaUIManager_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

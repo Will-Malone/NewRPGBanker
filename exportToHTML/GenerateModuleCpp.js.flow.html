@@ -1,0 +1,303 @@
+<html>
+<head>
+<title>GenerateModuleCpp.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+GenerateModuleCpp.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">SchemaType,</span>
+  <span class="s0">Nullable,</span>
+  <span class="s0">NamedShape,</span>
+  <span class="s0">NativeModulePropertyShape,</span>
+  <span class="s0">NativeModuleFunctionTypeAnnotation,</span>
+  <span class="s0">NativeModuleParamTypeAnnotation,</span>
+  <span class="s0">NativeModuleTypeAnnotation,</span>
+  <span class="s0">NativeModuleEnumMap,</span>
+<span class="s0">} from '../../CodegenSchema';</span>
+
+<span class="s0">import type {AliasResolver} from './Utils';</span>
+<span class="s0">const {createAliasResolver, getModules} = require('./Utils');</span>
+<span class="s0">const {unwrapNullable} = require('../../parsers/parsers-commons');</span>
+
+<span class="s0">type FilesOutput = Map&lt;string, string&gt;;</span>
+
+<span class="s0">const HostFunctionTemplate = ({</span>
+  <span class="s0">hasteModuleName,</span>
+  <span class="s0">methodName,</span>
+  <span class="s0">returnTypeAnnotation,</span>
+  <span class="s0">args,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">methodName: string,</span>
+  <span class="s0">returnTypeAnnotation: Nullable&lt;NativeModuleTypeAnnotation&gt;,</span>
+  <span class="s0">args: Array&lt;string&gt;,</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">const isNullable = returnTypeAnnotation.type === 'NullableTypeAnnotation';</span>
+  <span class="s0">const isVoid = returnTypeAnnotation.type === 'VoidTypeAnnotation';</span>
+  <span class="s0">const methodCallArgs = ['rt', ...args].join(', ');</span>
+  <span class="s0">const methodCall = `static_cast&lt;${hasteModuleName}CxxSpecJSI *&gt;(&amp;turboModule)-&gt;${methodName}(${methodCallArgs})`;</span>
+
+  <span class="s0">return `static jsi::Value __hostFunction_${hasteModuleName}CxxSpecJSI_${methodName}(jsi::Runtime &amp;rt, TurboModule &amp;turboModule, const jsi::Value* args, size_t count) {${</span>
+    <span class="s0">isVoid</span>
+      <span class="s0">? `\n  ${methodCall};`</span>
+      <span class="s0">: isNullable</span>
+      <span class="s0">? `\n  auto result = ${methodCall};`</span>
+      <span class="s0">: ''</span>
+  <span class="s0">}</span>
+  <span class="s0">return ${</span>
+    <span class="s0">isVoid</span>
+      <span class="s0">? 'jsi::Value::undefined()'</span>
+      <span class="s0">: isNullable</span>
+      <span class="s0">? 'result ? jsi::Value(std::move(*result)) : jsi::Value::null()'</span>
+      <span class="s0">: methodCall</span>
+  <span class="s0">};</span>
+<span class="s0">}`;</span>
+<span class="s0">};</span>
+
+<span class="s0">const ModuleTemplate = ({</span>
+  <span class="s0">hasteModuleName,</span>
+  <span class="s0">hostFunctions,</span>
+  <span class="s0">moduleName,</span>
+  <span class="s0">methods,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">hostFunctions: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">methods: $ReadOnlyArray&lt;$ReadOnly&lt;{methodName: string, paramCount: number}&gt;&gt;,</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `${hostFunctions.join('\n')}</span>
+
+<span class="s0">${hasteModuleName}CxxSpecJSI::${hasteModuleName}CxxSpecJSI(std::shared_ptr&lt;CallInvoker&gt; jsInvoker)</span>
+  <span class="s0">: TurboModule(&quot;${moduleName}&quot;, jsInvoker) {</span>
+<span class="s0">${methods</span>
+  <span class="s0">.map(({methodName, paramCount}) =&gt; {</span>
+    <span class="s0">return `  methodMap_[&quot;${methodName}&quot;] = MethodMetadata {${paramCount}, __hostFunction_${hasteModuleName}CxxSpecJSI_${methodName}};`;</span>
+  <span class="s0">})</span>
+  <span class="s0">.join('\n')}</span>
+<span class="s0">}`;</span>
+<span class="s0">};</span>
+
+<span class="s0">const FileTemplate = ({</span>
+  <span class="s0">libraryName,</span>
+  <span class="s0">modules,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">libraryName: string,</span>
+  <span class="s0">modules: string,</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `/**</span>
+ <span class="s0">* This code was generated by [react-native-codegen](https://www.npmjs.com/package/react-native-codegen).</span>
+ <span class="s0">*</span>
+ <span class="s0">* Do not edit this file as changes may cause incorrect behavior and will be lost</span>
+ <span class="s0">* once the code is regenerated.</span>
+ <span class="s0">*</span>
+ <span class="s0">* ${'@'}generated by codegen project: GenerateModuleH.js</span>
+ <span class="s0">*/</span>
+
+<span class="s0">#include &quot;${libraryName}JSI.h&quot;</span>
+
+<span class="s0">namespace facebook {</span>
+<span class="s0">namespace react {</span>
+
+<span class="s0">${modules}</span>
+
+
+<span class="s0">} // namespace react</span>
+<span class="s0">} // namespace facebook</span>
+<span class="s0">`;</span>
+<span class="s0">};</span>
+
+<span class="s0">type Param = NamedShape&lt;Nullable&lt;NativeModuleParamTypeAnnotation&gt;&gt;;</span>
+
+<span class="s0">function serializeArg(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">arg: Param,</span>
+  <span class="s0">index: number,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+  <span class="s0">enumMap: NativeModuleEnumMap,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const {typeAnnotation: nullableTypeAnnotation, optional} = arg;</span>
+  <span class="s0">const [typeAnnotation, nullable] =</span>
+    <span class="s0">unwrapNullable&lt;NativeModuleParamTypeAnnotation&gt;(nullableTypeAnnotation);</span>
+  <span class="s0">const isRequired = !optional &amp;&amp; !nullable;</span>
+
+  <span class="s0">let realTypeAnnotation = typeAnnotation;</span>
+  <span class="s0">if (realTypeAnnotation.type === 'TypeAliasTypeAnnotation') {</span>
+    <span class="s0">realTypeAnnotation = resolveAlias(realTypeAnnotation.name);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">function wrap(callback: (val: string) =&gt; string) {</span>
+    <span class="s0">const val = `args[${index}]`;</span>
+    <span class="s0">const expression = callback(val);</span>
+    <span class="s0">if (isRequired) {</span>
+      <span class="s0">return expression;</span>
+    <span class="s0">} else {</span>
+      <span class="s0">let condition = `${val}.isNull() || ${val}.isUndefined()`;</span>
+      <span class="s0">if (optional) {</span>
+        <span class="s0">condition = `count &lt; ${index} || ${condition}`;</span>
+      <span class="s0">}</span>
+      <span class="s0">return `${condition} ? std::nullopt : std::make_optional(${expression})`;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">switch (realTypeAnnotation.type) {</span>
+    <span class="s0">case 'ReservedTypeAnnotation':</span>
+      <span class="s0">switch (realTypeAnnotation.name) {</span>
+        <span class="s0">case 'RootTag':</span>
+          <span class="s0">return wrap(val =&gt; `${val}.getNumber()`);</span>
+        <span class="s0">default:</span>
+          <span class="s0">(realTypeAnnotation.name: empty);</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unknown prop type for &quot;${arg.name}, found: ${realTypeAnnotation.name}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'StringTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asString(rt)`);</span>
+    <span class="s0">case 'BooleanTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asBool()`);</span>
+    <span class="s0">case 'EnumDeclaration':</span>
+      <span class="s0">switch (realTypeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return wrap(val =&gt; `${val}.asNumber()`);</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return wrap(val =&gt; `${val}.asString(rt)`);</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unknown enum type for &quot;${arg.name}, found: ${realTypeAnnotation.type}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'NumberTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asNumber()`);</span>
+    <span class="s0">case 'FloatTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asNumber()`);</span>
+    <span class="s0">case 'DoubleTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asNumber()`);</span>
+    <span class="s0">case 'Int32TypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asNumber()`);</span>
+    <span class="s0">case 'ArrayTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asObject(rt).asArray(rt)`);</span>
+    <span class="s0">case 'FunctionTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asObject(rt).asFunction(rt)`);</span>
+    <span class="s0">case 'GenericObjectTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asObject(rt)`);</span>
+    <span class="s0">case 'UnionTypeAnnotation':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return wrap(val =&gt; `${val}.asNumber()`);</span>
+        <span class="s0">case 'ObjectTypeAnnotation':</span>
+          <span class="s0">return wrap(val =&gt; `${val}.asObject(rt)`);</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return wrap(val =&gt; `${val}.asString(rt)`);</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(</span>
+            <span class="s0">`Unsupported union member type for param  &quot;${arg.name}, found: ${realTypeAnnotation.memberType}&quot;`,</span>
+          <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'ObjectTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `${val}.asObject(rt)`);</span>
+    <span class="s0">case 'MixedTypeAnnotation':</span>
+      <span class="s0">return wrap(val =&gt; `jsi::Value(rt, ${val})`);</span>
+    <span class="s0">default:</span>
+      <span class="s0">(realTypeAnnotation.type: empty);</span>
+      <span class="s0">throw new Error(</span>
+        <span class="s0">`Unknown prop type for &quot;${arg.name}, found: ${realTypeAnnotation.type}&quot;`,</span>
+      <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function serializePropertyIntoHostFunction(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">property: NativeModulePropertyShape,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+  <span class="s0">enumMap: NativeModuleEnumMap,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const [propertyTypeAnnotation] =</span>
+    <span class="s0">unwrapNullable&lt;NativeModuleFunctionTypeAnnotation&gt;(property.typeAnnotation);</span>
+
+  <span class="s0">return HostFunctionTemplate({</span>
+    <span class="s0">hasteModuleName,</span>
+    <span class="s0">methodName: property.name,</span>
+    <span class="s0">returnTypeAnnotation: propertyTypeAnnotation.returnTypeAnnotation,</span>
+    <span class="s0">args: propertyTypeAnnotation.params.map((p, i) =&gt;</span>
+      <span class="s0">serializeArg(moduleName, p, i, resolveAlias, enumMap),</span>
+    <span class="s0">),</span>
+  <span class="s0">});</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">generate(</span>
+    <span class="s0">libraryName: string,</span>
+    <span class="s0">schema: SchemaType,</span>
+    <span class="s0">packageName?: string,</span>
+    <span class="s0">assumeNonnull: boolean = false,</span>
+  <span class="s0">): FilesOutput {</span>
+    <span class="s0">const nativeModules = getModules(schema);</span>
+
+    <span class="s0">const modules = Object.keys(nativeModules)</span>
+      <span class="s0">.map((hasteModuleName: string) =&gt; {</span>
+        <span class="s0">const nativeModule = nativeModules[hasteModuleName];</span>
+        <span class="s0">const {</span>
+          <span class="s0">aliasMap,</span>
+          <span class="s0">enumMap,</span>
+          <span class="s0">spec: {properties},</span>
+          <span class="s0">moduleName,</span>
+        <span class="s0">} = nativeModule;</span>
+        <span class="s0">const resolveAlias = createAliasResolver(aliasMap);</span>
+        <span class="s0">const hostFunctions = properties.map(property =&gt;</span>
+          <span class="s0">serializePropertyIntoHostFunction(</span>
+            <span class="s0">moduleName,</span>
+            <span class="s0">hasteModuleName,</span>
+            <span class="s0">property,</span>
+            <span class="s0">resolveAlias,</span>
+            <span class="s0">enumMap,</span>
+          <span class="s0">),</span>
+        <span class="s0">);</span>
+
+        <span class="s0">return ModuleTemplate({</span>
+          <span class="s0">hasteModuleName,</span>
+          <span class="s0">hostFunctions,</span>
+          <span class="s0">moduleName,</span>
+          <span class="s0">methods: properties.map(</span>
+            <span class="s0">({name: propertyName, typeAnnotation: nullableTypeAnnotation}) =&gt; {</span>
+              <span class="s0">const [{params}] = unwrapNullable(nullableTypeAnnotation);</span>
+              <span class="s0">return {</span>
+                <span class="s0">methodName: propertyName,</span>
+                <span class="s0">paramCount: params.length,</span>
+              <span class="s0">};</span>
+            <span class="s0">},</span>
+          <span class="s0">),</span>
+        <span class="s0">});</span>
+      <span class="s0">})</span>
+      <span class="s0">.join('\n');</span>
+
+    <span class="s0">const fileName = `${libraryName}JSI-generated.cpp`;</span>
+    <span class="s0">const replacedTemplate = FileTemplate({</span>
+      <span class="s0">modules,</span>
+      <span class="s0">libraryName,</span>
+    <span class="s0">});</span>
+    <span class="s0">return new Map([[fileName, replacedTemplate]]);</span>
+  <span class="s0">},</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

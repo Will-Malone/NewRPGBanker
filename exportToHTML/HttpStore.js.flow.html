@@ -1,0 +1,231 @@
+<html>
+<head>
+<title>HttpStore.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+HttpStore.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {Agent as HttpAgent} from 'http';</span>
+<span class="s0">import type {Agent as HttpsAgent} from 'https';</span>
+
+<span class="s0">const HttpError = require('./HttpError');</span>
+<span class="s0">const NetworkError = require('./NetworkError');</span>
+<span class="s0">const http = require('http');</span>
+<span class="s0">const https = require('https');</span>
+<span class="s0">const url = require('url');</span>
+<span class="s0">const zlib = require('zlib');</span>
+
+<span class="s0">export type Options = {</span>
+  <span class="s0">endpoint: string,</span>
+  <span class="s0">family?: 4 | 6,</span>
+  <span class="s0">timeout?: number,</span>
+  <span class="s0">key?: string | $ReadOnlyArray&lt;string&gt; | Buffer | $ReadOnlyArray&lt;Buffer&gt;,</span>
+  <span class="s0">cert?: string | $ReadOnlyArray&lt;string&gt; | Buffer | $ReadOnlyArray&lt;Buffer&gt;,</span>
+  <span class="s0">ca?: string | $ReadOnlyArray&lt;string&gt; | Buffer | $ReadOnlyArray&lt;Buffer&gt;,</span>
+<span class="s0">};</span>
+
+<span class="s0">const ZLIB_OPTIONS = {</span>
+  <span class="s0">level: 9,</span>
+<span class="s0">};</span>
+
+<span class="s0">const NULL_BYTE = 0x00;</span>
+<span class="s0">const NULL_BYTE_BUFFER = Buffer.from([NULL_BYTE]);</span>
+
+<span class="s0">class HttpStore&lt;T&gt; {</span>
+  <span class="s0">static HttpError: typeof HttpError = HttpError;</span>
+  <span class="s0">static NetworkError: typeof NetworkError = NetworkError;</span>
+
+  <span class="s0">_module: typeof http | typeof https;</span>
+  <span class="s0">_timeout: number;</span>
+
+  <span class="s0">_host: string;</span>
+  <span class="s0">_port: number;</span>
+  <span class="s0">_path: string;</span>
+
+  <span class="s0">_getAgent: HttpAgent | HttpsAgent;</span>
+  <span class="s0">_setAgent: HttpAgent | HttpsAgent;</span>
+
+  <span class="s0">constructor(options: Options) {</span>
+    <span class="s0">const uri = url.parse(options.endpoint);</span>
+    <span class="s0">const module = uri.protocol === 'http:' ? http : https;</span>
+
+    <span class="s0">const agentConfig: http$agentOptions = {</span>
+      <span class="s0">family: options.family,</span>
+      <span class="s0">keepAlive: true,</span>
+      <span class="s0">keepAliveMsecs: options.timeout || 5000,</span>
+      <span class="s0">maxSockets: 64,</span>
+      <span class="s0">maxFreeSockets: 64,</span>
+    <span class="s0">};</span>
+
+    <span class="s0">if (options.key != null) {</span>
+      <span class="s0">// $FlowFixMe `key` is missing in the Flow definition</span>
+      <span class="s0">agentConfig.key = options.key;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (options.cert != null) {</span>
+      <span class="s0">// $FlowFixMe `cert` is missing in the Flow definition</span>
+      <span class="s0">agentConfig.cert = options.cert;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (options.ca != null) {</span>
+      <span class="s0">// $FlowFixMe `ca` is missing in the Flow definition</span>
+      <span class="s0">agentConfig.ca = options.ca;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (!uri.hostname || !uri.pathname) {</span>
+      <span class="s0">throw new TypeError('Invalid endpoint: ' + options.endpoint);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">this._module = module;</span>
+    <span class="s0">this._timeout = options.timeout || 5000;</span>
+
+    <span class="s0">this._host = uri.hostname;</span>
+    <span class="s0">this._path = uri.pathname;</span>
+    <span class="s0">this._port = +uri.port;</span>
+
+    <span class="s0">this._getAgent = new module.Agent(agentConfig);</span>
+    <span class="s0">this._setAgent = new module.Agent(agentConfig);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">get(key: Buffer): Promise&lt;?T&gt; {</span>
+    <span class="s0">return new Promise((resolve, reject) =&gt; {</span>
+      <span class="s0">const options = {</span>
+        <span class="s0">agent: this._getAgent,</span>
+        <span class="s0">host: this._host,</span>
+        <span class="s0">method: 'GET',</span>
+        <span class="s0">path: this._path + '/' + key.toString('hex'),</span>
+        <span class="s0">port: this._port,</span>
+        <span class="s0">timeout: this._timeout,</span>
+      <span class="s0">};</span>
+
+      <span class="s0">/* $FlowFixMe(&gt;=0.101.0 site=react_native_fb) This comment suppresses an</span>
+       <span class="s0">* error found when Flow v0.101 was deployed. To see the error, delete</span>
+       <span class="s0">* this comment and run Flow. */</span>
+      <span class="s0">const req = this._module.request(options, res =&gt; {</span>
+        <span class="s0">const code = res.statusCode;</span>
+        <span class="s0">const data = [];</span>
+
+        <span class="s0">if (code === 404) {</span>
+          <span class="s0">res.resume();</span>
+          <span class="s0">resolve(null);</span>
+
+          <span class="s0">return;</span>
+        <span class="s0">} else if (code !== 200) {</span>
+          <span class="s0">res.resume();</span>
+          <span class="s0">reject(new HttpError('HTTP error: ' + code, code));</span>
+
+          <span class="s0">return;</span>
+        <span class="s0">}</span>
+
+        <span class="s0">const gunzipped = res.pipe(zlib.createGunzip());</span>
+
+        <span class="s0">gunzipped.on('data', chunk =&gt; {</span>
+          <span class="s0">data.push(chunk);</span>
+        <span class="s0">});</span>
+
+        <span class="s0">gunzipped.on('error', err =&gt; {</span>
+          <span class="s0">reject(err);</span>
+        <span class="s0">});</span>
+
+        <span class="s0">gunzipped.on('end', () =&gt; {</span>
+          <span class="s0">try {</span>
+            <span class="s0">const buffer = Buffer.concat(data);</span>
+
+            <span class="s0">if (buffer.length &gt; 0 &amp;&amp; buffer[0] === NULL_BYTE) {</span>
+              <span class="s0">resolve((buffer.slice(1): any));</span>
+            <span class="s0">} else {</span>
+              <span class="s0">resolve(JSON.parse(buffer.toString('utf8')));</span>
+            <span class="s0">}</span>
+          <span class="s0">} catch (err) {</span>
+            <span class="s0">reject(err);</span>
+          <span class="s0">}</span>
+        <span class="s0">});</span>
+
+        <span class="s0">res.on('error', err =&gt; gunzipped.emit('error', err));</span>
+      <span class="s0">});</span>
+
+      <span class="s0">req.on('error', err =&gt; {</span>
+        <span class="s0">reject(new NetworkError(err.message, err.code));</span>
+      <span class="s0">});</span>
+
+      <span class="s0">req.end();</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">set(key: Buffer, value: T): Promise&lt;void&gt; {</span>
+    <span class="s0">return new Promise((resolve, reject) =&gt; {</span>
+      <span class="s0">const gzip = zlib.createGzip(ZLIB_OPTIONS);</span>
+
+      <span class="s0">const options = {</span>
+        <span class="s0">agent: this._setAgent,</span>
+        <span class="s0">host: this._host,</span>
+        <span class="s0">method: 'PUT',</span>
+        <span class="s0">path: this._path + '/' + key.toString('hex'),</span>
+        <span class="s0">port: this._port,</span>
+        <span class="s0">timeout: this._timeout,</span>
+      <span class="s0">};</span>
+
+      <span class="s0">/* $FlowFixMe(&gt;=0.101.0 site=react_native_fb) This comment suppresses an</span>
+       <span class="s0">* error found when Flow v0.101 was deployed. To see the error, delete</span>
+       <span class="s0">* this comment and run Flow. */</span>
+      <span class="s0">const req = this._module.request(options, res =&gt; {</span>
+        <span class="s0">const code = res.statusCode;</span>
+
+        <span class="s0">if (code &lt; 200 || code &gt; 299) {</span>
+          <span class="s0">res.resume();</span>
+          <span class="s0">reject(new HttpError('HTTP error: ' + code, code));</span>
+
+          <span class="s0">return;</span>
+        <span class="s0">}</span>
+
+        <span class="s0">res.on('error', err =&gt; {</span>
+          <span class="s0">reject(err);</span>
+        <span class="s0">});</span>
+
+        <span class="s0">res.on('end', () =&gt; {</span>
+          <span class="s0">resolve();</span>
+        <span class="s0">});</span>
+
+        <span class="s0">// Consume all the data from the response without processing it.</span>
+        <span class="s0">res.resume();</span>
+      <span class="s0">});</span>
+
+      <span class="s0">gzip.pipe(req);</span>
+
+      <span class="s0">if (value instanceof Buffer) {</span>
+        <span class="s0">gzip.write(NULL_BYTE_BUFFER);</span>
+        <span class="s0">gzip.end(value);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">gzip.end(JSON.stringify(value) || 'null');</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+  <span class="s0">}</span>
+
+  <span class="s0">clear() {</span>
+    <span class="s0">// Not implemented.</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = HttpStore;</span>
+</pre>
+</body>
+</html>

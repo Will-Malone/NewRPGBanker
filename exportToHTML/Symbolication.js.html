@@ -1,0 +1,738 @@
+<html>
+<head>
+<title>Symbolication.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #6a8759;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Symbolication.js</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s2">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">// flowlint-next-line untyped-type-import:off</span>
+
+<span class="s1">const { ChromeHeapSnapshotProcessor } = require(</span><span class="s0">&quot;./ChromeHeapSnapshot&quot;</span><span class="s1">);</span>
+<span class="s1">const GoogleIgnoreListConsumer = require(</span><span class="s0">&quot;./GoogleIgnoreListConsumer&quot;</span><span class="s1">);</span>
+<span class="s1">const SourceMetadataMapConsumer = require(</span><span class="s0">&quot;./SourceMetadataMapConsumer&quot;</span><span class="s1">);</span>
+<span class="s1">const fs = require(</span><span class="s0">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const invariant = require(</span><span class="s0">&quot;invariant&quot;</span><span class="s1">);</span>
+<span class="s1">const nullthrows = require(</span><span class="s0">&quot;nullthrows&quot;</span><span class="s1">);</span>
+<span class="s1">const path = require(</span><span class="s0">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s1">const UNKNOWN_MODULE_IDS = {</span>
+  <span class="s1">segmentId: </span><span class="s3">0</span><span class="s1">,</span>
+  <span class="s1">localId: undefined,</span>
+<span class="s1">};</span>
+<span class="s1">class SymbolicationContext {</span>
+  <span class="s1">constructor(options) {</span>
+    <span class="s4">this</span><span class="s1">.options = {</span>
+      <span class="s1">inputLineStart: </span><span class="s3">1</span><span class="s1">,</span>
+      <span class="s1">inputColumnStart: </span><span class="s3">0</span><span class="s1">,</span>
+      <span class="s1">outputLineStart: </span><span class="s3">1</span><span class="s1">,</span>
+      <span class="s1">outputColumnStart: </span><span class="s3">0</span><span class="s1">,</span>
+      <span class="s1">nameSource: </span><span class="s0">&quot;function_names&quot;</span><span class="s1">,</span>
+    <span class="s1">};</span>
+    <span class="s4">if </span><span class="s1">(options) {</span>
+      <span class="s4">for </span><span class="s1">(const option of [</span>
+        <span class="s0">&quot;inputLineStart&quot;</span><span class="s1">,</span>
+        <span class="s0">&quot;inputColumnStart&quot;</span><span class="s1">,</span>
+        <span class="s0">&quot;outputLineStart&quot;</span><span class="s1">,</span>
+        <span class="s0">&quot;outputColumnStart&quot;</span><span class="s1">,</span>
+      <span class="s1">]) {</span>
+        <span class="s4">if </span><span class="s1">(options[option] != </span><span class="s4">null</span><span class="s1">) {</span>
+          <span class="s4">this</span><span class="s1">.options[option] = options[option];</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">(options.nameSource != </span><span class="s4">null</span><span class="s1">) {</span>
+        <span class="s2">// $FlowFixMe[cannot-write]</span>
+        <span class="s4">this</span><span class="s1">.options.nameSource = options.nameSource;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">// parse stack trace with String.replace</span>
+  <span class="s2">// replace the matched part of stack trace to symbolicated result</span>
+  <span class="s2">// sample stack trace:</span>
+  <span class="s2">//  IOS: foo@4:18131, Android: bar:4:18063</span>
+  <span class="s2">// sample stack trace with module id:</span>
+  <span class="s2">//  IOS: foo@123.js:4:18131, Android: bar:123.js:4:18063</span>
+  <span class="s2">// sample stack trace without function name:</span>
+  <span class="s2">//  123.js:4:18131</span>
+  <span class="s2">// sample result:</span>
+  <span class="s2">//  IOS: foo.js:57:foo, Android: bar.js:75:bar</span>
+  <span class="s1">symbolicate(stackTrace) {</span>
+    <span class="s4">return </span><span class="s1">stackTrace.replace(</span>
+      <span class="s1">/(?:([^@: \n(]+)(@|:))?(?:(?:([^@: \n(]+):)?(\d+):(\d+)|\[native code\])/g,</span>
+      <span class="s1">(match, func, delimiter, fileName, line, column) =&gt; {</span>
+        <span class="s4">if </span><span class="s1">(delimiter === </span><span class="s0">&quot;:&quot; </span><span class="s1">&amp;&amp; func &amp;&amp; !fileName) {</span>
+          <span class="s1">fileName = func;</span>
+          <span class="s1">func = </span><span class="s4">null</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">const original = </span><span class="s4">this</span><span class="s1">.getOriginalPositionFor(</span>
+          <span class="s1">line,</span>
+          <span class="s1">column,</span>
+          <span class="s4">this</span><span class="s1">.parseFileName(fileName || </span><span class="s0">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">);</span>
+        <span class="s4">return </span><span class="s1">(</span>
+          <span class="s1">(original.source ?? </span><span class="s0">&quot;null&quot;</span><span class="s1">) +</span>
+          <span class="s0">&quot;:&quot; </span><span class="s1">+</span>
+          <span class="s1">(original.line ?? </span><span class="s0">&quot;null&quot;</span><span class="s1">) +</span>
+          <span class="s0">&quot;:&quot; </span><span class="s1">+</span>
+          <span class="s1">(original.name ?? </span><span class="s0">&quot;null&quot;</span><span class="s1">)</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s2">// Taking in a map like</span>
+  <span class="s2">// trampoline offset (optional js function name)</span>
+  <span class="s2">// JS_0158_xxxxxxxxxxxxxxxxxxxxxx fe 91081</span>
+  <span class="s2">// JS_0159_xxxxxxxxxxxxxxxxxxxxxx Ft 68651</span>
+  <span class="s2">// JS_0160_xxxxxxxxxxxxxxxxxxxxxx value 50700</span>
+  <span class="s2">// JS_0161_xxxxxxxxxxxxxxxxxxxxxx setGapAtCursor 0</span>
+  <span class="s2">// JS_0162_xxxxxxxxxxxxxxxxxxxxxx (unknown) 50818</span>
+  <span class="s2">// JS_0163_xxxxxxxxxxxxxxxxxxxxxx value 108267</span>
+
+  <span class="s1">symbolicateProfilerMap(mapFile) {</span>
+    <span class="s4">return </span><span class="s1">fs</span>
+      <span class="s1">.readFileSync(mapFile, </span><span class="s0">&quot;utf8&quot;</span><span class="s1">)</span>
+      <span class="s1">.split(</span><span class="s0">&quot;</span><span class="s5">\n</span><span class="s0">&quot;</span><span class="s1">)</span>
+      <span class="s1">.slice(</span><span class="s3">0</span><span class="s1">, -</span><span class="s3">1</span><span class="s1">)</span>
+      <span class="s1">.map((line) =&gt; {</span>
+        <span class="s1">const line_list = line.split(</span><span class="s0">&quot; &quot;</span><span class="s1">);</span>
+        <span class="s1">const trampoline = line_list[</span><span class="s3">0</span><span class="s1">];</span>
+        <span class="s1">const js_name = line_list[</span><span class="s3">1</span><span class="s1">];</span>
+        <span class="s1">const offset = parseInt(line_list[</span><span class="s3">2</span><span class="s1">], </span><span class="s3">10</span><span class="s1">);</span>
+        <span class="s4">if </span><span class="s1">(!offset) {</span>
+          <span class="s4">return </span><span class="s1">trampoline + </span><span class="s0">&quot; &quot; </span><span class="s1">+ trampoline;</span>
+        <span class="s1">}</span>
+        <span class="s1">const original = </span><span class="s4">this</span><span class="s1">.getOriginalPositionFor(</span>
+          <span class="s4">this</span><span class="s1">.options.inputLineStart,</span>
+          <span class="s1">offset</span>
+        <span class="s1">);</span>
+        <span class="s4">return </span><span class="s1">(</span>
+          <span class="s1">trampoline +</span>
+          <span class="s0">&quot; &quot; </span><span class="s1">+</span>
+          <span class="s1">(original.name || js_name) +</span>
+          <span class="s0">&quot;::&quot; </span><span class="s1">+</span>
+          <span class="s1">[original.source, original.line, original.column].join(</span><span class="s0">&quot;:&quot;</span><span class="s1">)</span>
+        <span class="s1">);</span>
+      <span class="s1">})</span>
+      <span class="s1">.join(</span><span class="s0">&quot;</span><span class="s5">\n</span><span class="s0">&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">symbolicateAttribution(obj) {</span>
+    <span class="s1">const loc = obj.location;</span>
+    <span class="s1">const line = loc.line != </span><span class="s4">null </span><span class="s1">? loc.line : </span><span class="s4">this</span><span class="s1">.options.inputLineStart;</span>
+    <span class="s1">let column = Number(loc.column != </span><span class="s4">null </span><span class="s1">? loc.column : loc.virtualOffset);</span>
+    <span class="s1">const file = loc.filename ? </span><span class="s4">this</span><span class="s1">.parseFileName(loc.filename) : </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">let original = </span><span class="s4">this</span><span class="s1">.getOriginalPositionFor(line, column, file);</span>
+    <span class="s1">const isBytecodeRange =</span>
+      <span class="s1">loc.bytecodeSize != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">loc.virtualOffset != </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">loc.column == </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">const virtualOffset = Number(loc.virtualOffset);</span>
+    <span class="s1">const bytecodeSize = Number(loc.bytecodeSize);</span>
+
+    <span class="s2">// Functions compiled from Metro-bundled modules will often have a little bit</span>
+    <span class="s2">// of unmapped wrapper code right at the beginning - which is where we query.</span>
+    <span class="s2">// Let's attribute them to where the inner module code originates instead.</span>
+    <span class="s2">// This loop is O(n*log(n)) in the size of the function, but we will generally</span>
+    <span class="s2">// either:</span>
+    <span class="s2">// 1. Find a non-null mapping within one or two iterations; or</span>
+    <span class="s2">// 2. Reach the end of the function without encountering mappings - this might</span>
+    <span class="s2">//    happen for function bodies that never throw (generally very short).</span>
+    <span class="s4">while </span><span class="s1">(</span>
+      <span class="s1">isBytecodeRange &amp;&amp;</span>
+      <span class="s1">original.source == </span><span class="s4">null </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">++column &lt; virtualOffset + bytecodeSize</span>
+    <span class="s1">) {</span>
+      <span class="s1">original = </span><span class="s4">this</span><span class="s1">.getOriginalPositionFor(line, column, file);</span>
+    <span class="s1">}</span>
+    <span class="s1">obj.location = {</span>
+      <span class="s1">file: original.source,</span>
+      <span class="s1">line: original.line,</span>
+      <span class="s1">column: original.column,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s2">// Symbolicate chrome trace &quot;stackFrames&quot; section.</span>
+  <span class="s2">// Each frame in it has three fields: name, funcVirtAddr(optional), offset(optional).</span>
+  <span class="s2">// funcVirtAddr and offset are only available if trace is generated from</span>
+  <span class="s2">// hbc bundle without debug info.</span>
+  <span class="s1">symbolicateChromeTrace(traceFile, { stdout, stderr }) {</span>
+    <span class="s1">const content = JSON.parse(fs.readFileSync(traceFile, </span><span class="s0">&quot;utf8&quot;</span><span class="s1">));</span>
+    <span class="s4">if </span><span class="s1">(content.stackFrames == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">throw new </span><span class="s1">Error(</span><span class="s0">&quot;Unable to locate `stackFrames` section in trace.&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s1">const keys = Object.keys(content.stackFrames);</span>
+    <span class="s1">stdout.write(</span><span class="s0">&quot;Processing &quot; </span><span class="s1">+ keys.length + </span><span class="s0">&quot; frames</span><span class="s5">\n</span><span class="s0">&quot;</span><span class="s1">);</span>
+    <span class="s1">keys.forEach((key) =&gt; {</span>
+      <span class="s1">const entry = content.stackFrames[key];</span>
+      <span class="s1">let line;</span>
+      <span class="s1">let column;</span>
+
+      <span class="s2">// Function entrypoint line/column; used for symbolicating function name</span>
+      <span class="s2">// with legacy source maps (or when --no-function-names is set).</span>
+      <span class="s1">let funcLine;</span>
+      <span class="s1">let funcColumn;</span>
+      <span class="s4">if </span><span class="s1">(entry.funcVirtAddr != </span><span class="s4">null </span><span class="s1">&amp;&amp; entry.offset != </span><span class="s4">null</span><span class="s1">) {</span>
+        <span class="s2">// Without debug information.</span>
+        <span class="s1">const funcVirtAddr = parseInt(entry.funcVirtAddr, </span><span class="s3">10</span><span class="s1">);</span>
+        <span class="s1">const offsetInFunction = parseInt(entry.offset, </span><span class="s3">10</span><span class="s1">);</span>
+        <span class="s2">// Main bundle always use hard-coded line value 1.</span>
+        <span class="s2">// TODO: support multiple bundle/module.</span>
+        <span class="s1">line = </span><span class="s4">this</span><span class="s1">.options.inputLineStart;</span>
+        <span class="s1">column = funcVirtAddr + offsetInFunction;</span>
+        <span class="s1">funcLine = </span><span class="s4">this</span><span class="s1">.options.inputLineStart;</span>
+        <span class="s1">funcColumn = funcVirtAddr;</span>
+      <span class="s1">} </span><span class="s4">else if </span><span class="s1">(entry.line != </span><span class="s4">null </span><span class="s1">&amp;&amp; entry.column != </span><span class="s4">null</span><span class="s1">) {</span>
+        <span class="s2">// For hbc bundle with debug info, name field may already have source</span>
+        <span class="s2">// information for the bundle; we still can use the Metro</span>
+        <span class="s2">// source map to symbolicate the bundle frame addresses further to its</span>
+        <span class="s2">// original source code.</span>
+        <span class="s1">line = entry.line;</span>
+        <span class="s1">column = entry.column;</span>
+        <span class="s1">funcLine = entry.funcLine;</span>
+        <span class="s1">funcColumn = entry.funcColumn;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s2">// Native frames.</span>
+        <span class="s4">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s2">// Symbolicate original file/line/column.</span>
+      <span class="s1">const addressOriginal = </span><span class="s4">this</span><span class="s1">.getOriginalPositionDetailsFor(line, column);</span>
+      <span class="s1">let frameName;</span>
+      <span class="s4">if </span><span class="s1">(addressOriginal.functionName) {</span>
+        <span class="s1">frameName = addressOriginal.functionName;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">frameName = entry.name;</span>
+        <span class="s2">// Symbolicate function name.</span>
+        <span class="s4">if </span><span class="s1">(funcLine != </span><span class="s4">null </span><span class="s1">&amp;&amp; funcColumn != </span><span class="s4">null</span><span class="s1">) {</span>
+          <span class="s1">const funcOriginal = </span><span class="s4">this</span><span class="s1">.getOriginalPositionFor(</span>
+            <span class="s1">funcLine,</span>
+            <span class="s1">funcColumn</span>
+          <span class="s1">);</span>
+          <span class="s4">if </span><span class="s1">(funcOriginal.name != </span><span class="s4">null</span><span class="s1">) {</span>
+            <span class="s1">frameName = funcOriginal.name;</span>
+          <span class="s1">}</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s2">// No function line/column info.</span>
+          <span class="s1">(stderr || stdout).write(</span>
+            <span class="s0">&quot;Warning: no function prolog line/column info; name may be wrong</span><span class="s5">\n</span><span class="s0">&quot;</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s2">// Output format is: funcName(file:line:column)</span>
+      <span class="s1">entry.name = [</span>
+        <span class="s1">frameName,</span>
+        <span class="s0">&quot;(&quot;</span><span class="s1">,</span>
+        <span class="s1">[</span>
+          <span class="s1">addressOriginal.source ?? </span><span class="s0">&quot;null&quot;</span><span class="s1">,</span>
+          <span class="s1">addressOriginal.line ?? </span><span class="s0">&quot;null&quot;</span><span class="s1">,</span>
+          <span class="s1">addressOriginal.column ?? </span><span class="s0">&quot;null&quot;</span><span class="s1">,</span>
+        <span class="s1">].join(</span><span class="s0">&quot;:&quot;</span><span class="s1">),</span>
+        <span class="s0">&quot;)&quot;</span><span class="s1">,</span>
+      <span class="s1">].join(</span><span class="s0">&quot;&quot;</span><span class="s1">);</span>
+    <span class="s1">});</span>
+    <span class="s1">stdout.write(</span><span class="s0">&quot;Writing to &quot; </span><span class="s1">+ traceFile + </span><span class="s0">&quot;</span><span class="s5">\n</span><span class="s0">&quot;</span><span class="s1">);</span>
+    <span class="s1">fs.writeFileSync(traceFile, JSON.stringify(content));</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/* 
+   * A helper function to return a mapping {line, column} object for a given input 
+   * line and column, and optionally a module ID. 
+   */</span>
+  <span class="s1">getOriginalPositionFor(lineNumber, columnNumber, moduleIds) {</span>
+    <span class="s1">const position = </span><span class="s4">this</span><span class="s1">.getOriginalPositionDetailsFor(</span>
+      <span class="s1">lineNumber,</span>
+      <span class="s1">columnNumber,</span>
+      <span class="s1">moduleIds</span>
+    <span class="s1">);</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">line: position.line,</span>
+      <span class="s1">column: position.column,</span>
+      <span class="s1">source: position.source,</span>
+      <span class="s1">name: position.functionName ? position.functionName : position.name,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/* 
+   * Symbolicates the JavaScript stack trace extracted from the minidump 
+   * produced by hermes 
+   */</span>
+  <span class="s1">symbolicateHermesMinidumpTrace(crashInfo) {</span>
+    <span class="s4">throw new </span><span class="s1">Error(</span><span class="s0">&quot;Not implemented&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/** 
+   * Symbolicates heap alloction stacks in a Chrome-formatted heap 
+   * snapshot/timeline. 
+   * Line and column offsets in options (both input and output) are _ignored_, 
+   * because this format has a well-defined convention (1-based lines and 
+   * columns). 
+   */</span>
+  <span class="s1">symbolicateHeapSnapshot(snapshotContents) {</span>
+    <span class="s1">const snapshotData =</span>
+      <span class="s4">typeof </span><span class="s1">snapshotContents === </span><span class="s0">&quot;string&quot;</span>
+        <span class="s1">? JSON.parse(snapshotContents)</span>
+        <span class="s1">: snapshotContents;</span>
+    <span class="s1">const processor = </span><span class="s4">new </span><span class="s1">ChromeHeapSnapshotProcessor(snapshotData);</span>
+    <span class="s4">for </span><span class="s1">(const frame of processor.traceFunctionInfos()) {</span>
+      <span class="s1">const moduleIds = </span><span class="s4">this</span><span class="s1">.parseFileName(frame.getString(</span><span class="s0">&quot;script_name&quot;</span><span class="s1">));</span>
+      <span class="s1">const generatedLine = frame.getNumber(</span><span class="s0">&quot;line&quot;</span><span class="s1">);</span>
+      <span class="s1">const generatedColumn = frame.getNumber(</span><span class="s0">&quot;column&quot;</span><span class="s1">);</span>
+      <span class="s4">if </span><span class="s1">(generatedLine === </span><span class="s3">0 </span><span class="s1">&amp;&amp; generatedColumn === </span><span class="s3">0</span><span class="s1">) {</span>
+        <span class="s4">continue</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s1">const {</span>
+        <span class="s1">line: originalLine,</span>
+        <span class="s1">column: originalColumn,</span>
+        <span class="s1">source: originalSource,</span>
+        <span class="s1">functionName: originalFunctionName,</span>
+      <span class="s1">} = </span><span class="s4">this</span><span class="s1">.getOriginalPositionDetailsFor(</span>
+        <span class="s1">frame.getNumber(</span><span class="s0">&quot;line&quot;</span><span class="s1">) - </span><span class="s3">1 </span><span class="s1">+ </span><span class="s4">this</span><span class="s1">.options.inputLineStart,</span>
+        <span class="s1">frame.getNumber(</span><span class="s0">&quot;column&quot;</span><span class="s1">) - </span><span class="s3">1 </span><span class="s1">+ </span><span class="s4">this</span><span class="s1">.options.inputColumnStart,</span>
+        <span class="s1">moduleIds</span>
+      <span class="s1">);</span>
+      <span class="s4">if </span><span class="s1">(originalSource != </span><span class="s4">null</span><span class="s1">) {</span>
+        <span class="s1">frame.setString(</span><span class="s0">&quot;script_name&quot;</span><span class="s1">, originalSource);</span>
+        <span class="s4">if </span><span class="s1">(originalLine != </span><span class="s4">null</span><span class="s1">) {</span>
+          <span class="s1">frame.setNumber(</span>
+            <span class="s0">&quot;line&quot;</span><span class="s1">,</span>
+            <span class="s1">originalLine - </span><span class="s4">this</span><span class="s1">.options.outputLineStart + </span><span class="s3">1</span>
+          <span class="s1">);</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">frame.setNumber(</span><span class="s0">&quot;line&quot;</span><span class="s1">, </span><span class="s3">0</span><span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(originalColumn != </span><span class="s4">null</span><span class="s1">) {</span>
+          <span class="s1">frame.setNumber(</span>
+            <span class="s0">&quot;column&quot;</span><span class="s1">,</span>
+            <span class="s1">originalColumn - </span><span class="s4">this</span><span class="s1">.options.outputColumnStart + </span><span class="s3">1</span>
+          <span class="s1">);</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">frame.setNumber(</span><span class="s0">&quot;column&quot;</span><span class="s1">, </span><span class="s3">0</span><span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">frame.setString(</span><span class="s0">&quot;name&quot;</span><span class="s1">, originalFunctionName ?? frame.getString(</span><span class="s0">&quot;name&quot;</span><span class="s1">));</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">snapshotData;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/* 
+   * Symbolicates the JavaScript stack trace extracted from the coverage information 
+   * produced by HermesRuntime::getExecutedFunctions. 
+   */</span>
+  <span class="s1">symbolicateHermesCoverageTrace(coverageInfo) {</span>
+    <span class="s1">const symbolicatedTrace = [];</span>
+    <span class="s1">const { executedFunctions } = coverageInfo;</span>
+    <span class="s4">if </span><span class="s1">(executedFunctions != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">for </span><span class="s1">(const stackItem of executedFunctions) {</span>
+        <span class="s1">const { line, column, SourceURL } = stackItem;</span>
+        <span class="s1">const generatedLine = line + </span><span class="s4">this</span><span class="s1">.options.inputLineStart;</span>
+        <span class="s1">const generatedColumn = column + </span><span class="s4">this</span><span class="s1">.options.inputColumnStart;</span>
+        <span class="s1">const originalPosition = </span><span class="s4">this</span><span class="s1">.getOriginalPositionDetailsFor(</span>
+          <span class="s1">generatedLine,</span>
+          <span class="s1">generatedColumn,</span>
+          <span class="s4">this</span><span class="s1">.parseFileName(SourceURL || </span><span class="s0">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">);</span>
+        <span class="s1">symbolicatedTrace.push(originalPosition);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">symbolicatedTrace;</span>
+  <span class="s1">}</span>
+  <span class="s2">/* 
+   * An internal helper function similar to getOriginalPositionFor. This one 
+   * returns both `name` and `functionName` fields so callers can distinguish the 
+   * source of the name. 
+   */</span>
+  <span class="s1">getOriginalPositionDetailsFor(lineNumber, columnNumber, moduleIds) {</span>
+    <span class="s4">throw new </span><span class="s1">Error(</span><span class="s0">&quot;Not implemented&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">parseFileName(str) {</span>
+    <span class="s4">throw new </span><span class="s1">Error(</span><span class="s0">&quot;Not implemented&quot;</span><span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">class SingleMapSymbolicationContext extends SymbolicationContext {</span>
+  <span class="s2">// $FlowFixMe[value-as-type]</span>
+
+  <span class="s1">constructor(</span>
+    <span class="s2">// $FlowFixMe[value-as-type]</span>
+    <span class="s1">SourceMapConsumer,</span>
+    <span class="s1">sourceMapContent,</span>
+    <span class="s1">options = {}</span>
+  <span class="s1">) {</span>
+    <span class="s1">super(options);</span>
+    <span class="s4">this</span><span class="s1">._SourceMapConsumer = SourceMapConsumer;</span>
+    <span class="s1">const sourceMapJson =</span>
+      <span class="s4">typeof </span><span class="s1">sourceMapContent === </span><span class="s0">&quot;string&quot;</span>
+        <span class="s1">? JSON.parse(sourceMapContent.replace(/^\)\]\}</span><span class="s0">'/, &quot;&quot;))</span>
+        <span class="s1">: sourceMapContent;</span>
+    <span class="s1">const segments = {</span>
+      <span class="s3">0</span><span class="s1">: </span><span class="s4">this</span><span class="s1">._initSegment(sourceMapJson),</span>
+    <span class="s1">};</span>
+    <span class="s4">if </span><span class="s1">(sourceMapJson.x_facebook_segments) {</span>
+      <span class="s4">for </span><span class="s1">(const key of Object.keys(sourceMapJson.x_facebook_segments)) {</span>
+        <span class="s2">// $FlowFixMe[incompatible-use]</span>
+        <span class="s1">const map = sourceMapJson.x_facebook_segments[key];</span>
+        <span class="s2">// $FlowFixMe[prop-missing]</span>
+        <span class="s1">segments[key] = </span><span class="s4">this</span><span class="s1">._initSegment(map);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._legacyFormat =</span>
+      <span class="s1">sourceMapJson.x_facebook_segments != </span><span class="s4">null </span><span class="s1">||</span>
+      <span class="s1">sourceMapJson.x_facebook_offsets != </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._segments = segments;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">// $FlowFixMe[missing-local-annot]</span>
+  <span class="s1">_initSegment(map) {</span>
+    <span class="s1">const useFunctionNames = </span><span class="s4">this</span><span class="s1">.options.nameSource === </span><span class="s0">&quot;function_names&quot;</span><span class="s1">;</span>
+    <span class="s1">const { _SourceMapConsumer: SourceMapConsumer } = </span><span class="s4">this</span><span class="s1">;</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">get consumer() {</span>
+        <span class="s2">// $FlowFixMe[object-this-reference]</span>
+        <span class="s1">Object.defineProperty(</span><span class="s4">this</span><span class="s1">, </span><span class="s0">&quot;consumer&quot;</span><span class="s1">, {</span>
+          <span class="s1">value: </span><span class="s4">new </span><span class="s1">SourceMapConsumer(map),</span>
+        <span class="s1">});</span>
+        <span class="s2">// $FlowFixMe[object-this-reference]</span>
+        <span class="s4">return this</span><span class="s1">.consumer;</span>
+      <span class="s1">},</span>
+      <span class="s1">moduleOffsets: map.x_facebook_offsets || [],</span>
+      <span class="s1">get sourceFunctionsConsumer() {</span>
+        <span class="s2">// $FlowFixMe[object-this-reference]</span>
+        <span class="s1">Object.defineProperty(</span><span class="s4">this</span><span class="s1">, </span><span class="s0">&quot;sourceFunctionsConsumer&quot;</span><span class="s1">, {</span>
+          <span class="s1">value: useFunctionNames ? </span><span class="s4">new </span><span class="s1">SourceMetadataMapConsumer(map) : </span><span class="s4">null</span><span class="s1">,</span>
+        <span class="s1">});</span>
+        <span class="s2">// $FlowFixMe[object-this-reference]</span>
+        <span class="s4">return this</span><span class="s1">.sourceFunctionsConsumer;</span>
+      <span class="s1">},</span>
+      <span class="s1">get googleIgnoreListConsumer() {</span>
+        <span class="s2">// $FlowFixMe[object-this-reference]</span>
+        <span class="s1">Object.defineProperty(</span><span class="s4">this</span><span class="s1">, </span><span class="s0">&quot;googleIgnoreListConsumer&quot;</span><span class="s1">, {</span>
+          <span class="s1">value: </span><span class="s4">new </span><span class="s1">GoogleIgnoreListConsumer(map),</span>
+        <span class="s1">});</span>
+        <span class="s2">// $FlowFixMe[object-this-reference]</span>
+        <span class="s4">return this</span><span class="s1">.googleIgnoreListConsumer;</span>
+      <span class="s1">},</span>
+      <span class="s1">hermesOffsets: map.x_hermes_function_offsets,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+  <span class="s1">symbolicateHermesMinidumpTrace(crashInfo) {</span>
+    <span class="s1">const symbolicatedTrace = [];</span>
+    <span class="s1">const { callstack } = crashInfo;</span>
+    <span class="s4">if </span><span class="s1">(callstack != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">for </span><span class="s1">(const stackItem of callstack) {</span>
+        <span class="s4">if </span><span class="s1">(stackItem.NativeCode) {</span>
+          <span class="s1">symbolicatedTrace.push(stackItem);</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">const {</span>
+            <span class="s1">CJSModuleOffset,</span>
+            <span class="s1">SegmentID,</span>
+            <span class="s1">SourceURL,</span>
+            <span class="s1">FunctionID,</span>
+            <span class="s1">ByteCodeOffset: localOffset,</span>
+          <span class="s1">} = stackItem;</span>
+          <span class="s1">const cjsModuleOffsetOrSegmentID = nullthrows(</span>
+            <span class="s1">CJSModuleOffset ?? SegmentID,</span>
+            <span class="s0">&quot;Either CJSModuleOffset or SegmentID must be specified in the Hermes stack frame&quot;</span>
+          <span class="s1">);</span>
+          <span class="s1">const moduleInformation = </span><span class="s4">this</span><span class="s1">.parseFileName(SourceURL);</span>
+          <span class="s1">const generatedLine =</span>
+            <span class="s1">cjsModuleOffsetOrSegmentID + </span><span class="s4">this</span><span class="s1">.options.inputLineStart;</span>
+          <span class="s1">const segment =</span>
+            <span class="s4">this</span><span class="s1">._segments[moduleInformation.segmentId.toString()];</span>
+          <span class="s1">const hermesOffsets = segment?.hermesOffsets;</span>
+          <span class="s4">if </span><span class="s1">(!hermesOffsets) {</span>
+            <span class="s1">symbolicatedTrace.push({</span>
+              <span class="s1">line: </span><span class="s4">null</span><span class="s1">,</span>
+              <span class="s1">column: </span><span class="s4">null</span><span class="s1">,</span>
+              <span class="s1">source: </span><span class="s4">null</span><span class="s1">,</span>
+              <span class="s1">functionName: </span><span class="s4">null</span><span class="s1">,</span>
+              <span class="s1">name: </span><span class="s4">null</span><span class="s1">,</span>
+              <span class="s1">isIgnored: </span><span class="s4">false</span><span class="s1">,</span>
+            <span class="s1">});</span>
+          <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+            <span class="s1">const segmentOffsets =</span>
+              <span class="s1">hermesOffsets[Number(cjsModuleOffsetOrSegmentID)];</span>
+            <span class="s1">const generatedColumn =</span>
+              <span class="s1">segmentOffsets[FunctionID] +</span>
+              <span class="s1">localOffset +</span>
+              <span class="s4">this</span><span class="s1">.options.inputColumnStart;</span>
+            <span class="s1">const originalPosition = </span><span class="s4">this</span><span class="s1">.getOriginalPositionDetailsFor(</span>
+              <span class="s1">generatedLine,</span>
+              <span class="s1">generatedColumn,</span>
+              <span class="s1">moduleInformation</span>
+            <span class="s1">);</span>
+            <span class="s1">symbolicatedTrace.push(originalPosition);</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">symbolicatedTrace;</span>
+  <span class="s1">}</span>
+  <span class="s1">symbolicateHermesCoverageTrace(coverageInfo) {</span>
+    <span class="s1">const symbolicatedTrace = [];</span>
+    <span class="s1">const { executedFunctions } = coverageInfo;</span>
+    <span class="s4">if </span><span class="s1">(executedFunctions != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s4">for </span><span class="s1">(const stackItem of executedFunctions) {</span>
+        <span class="s1">const { line, column, SourceURL } = stackItem;</span>
+        <span class="s1">const generatedLine = line + </span><span class="s4">this</span><span class="s1">.options.inputLineStart;</span>
+        <span class="s1">const generatedColumn = column + </span><span class="s4">this</span><span class="s1">.options.inputColumnStart;</span>
+        <span class="s1">const originalPosition = </span><span class="s4">this</span><span class="s1">.getOriginalPositionDetailsFor(</span>
+          <span class="s1">generatedLine,</span>
+          <span class="s1">generatedColumn,</span>
+          <span class="s4">this</span><span class="s1">.parseFileName(SourceURL || </span><span class="s0">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">);</span>
+        <span class="s1">symbolicatedTrace.push(originalPosition);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">symbolicatedTrace;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/* 
+   * An internal helper function similar to getOriginalPositionFor. This one 
+   * returns both `name` and `functionName` fields so callers can distinguish the 
+   * source of the name. 
+   */</span>
+  <span class="s1">getOriginalPositionDetailsFor(lineNumber, columnNumber, moduleIds) {</span>
+    <span class="s2">// Adjust arguments to source-map's input coordinates</span>
+    <span class="s1">lineNumber =</span>
+      <span class="s1">lineNumber != </span><span class="s4">null</span>
+        <span class="s1">? lineNumber - </span><span class="s4">this</span><span class="s1">.options.inputLineStart + </span><span class="s3">1</span>
+        <span class="s1">: lineNumber;</span>
+    <span class="s1">columnNumber =</span>
+      <span class="s1">columnNumber != </span><span class="s4">null</span>
+        <span class="s1">? columnNumber - </span><span class="s4">this</span><span class="s1">.options.inputColumnStart + </span><span class="s3">0</span>
+        <span class="s1">: columnNumber;</span>
+    <span class="s4">if </span><span class="s1">(!moduleIds) {</span>
+      <span class="s1">moduleIds = UNKNOWN_MODULE_IDS;</span>
+    <span class="s1">}</span>
+    <span class="s1">let moduleLineOffset = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">const metadata = </span><span class="s4">this</span><span class="s1">._segments[moduleIds.segmentId + </span><span class="s0">&quot;&quot;</span><span class="s1">];</span>
+    <span class="s1">const { localId } = moduleIds;</span>
+    <span class="s4">if </span><span class="s1">(localId != </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">const { moduleOffsets } = metadata;</span>
+      <span class="s4">if </span><span class="s1">(!moduleOffsets) {</span>
+        <span class="s4">throw new </span><span class="s1">Error(</span>
+          <span class="s0">&quot;Module ID given for a source map that does not have &quot; </span><span class="s1">+</span>
+            <span class="s0">&quot;an x_facebook_offsets field&quot;</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">(moduleOffsets[localId] == </span><span class="s4">null</span><span class="s1">) {</span>
+        <span class="s4">throw new </span><span class="s1">Error(</span><span class="s0">&quot;Unknown module ID: &quot; </span><span class="s1">+ localId);</span>
+      <span class="s1">}</span>
+      <span class="s1">moduleLineOffset = moduleOffsets[localId];</span>
+    <span class="s1">}</span>
+    <span class="s1">const original = metadata.consumer.originalPositionFor({</span>
+      <span class="s1">line: Number(lineNumber) + moduleLineOffset,</span>
+      <span class="s1">column: Number(columnNumber),</span>
+    <span class="s1">});</span>
+    <span class="s4">if </span><span class="s1">(metadata.sourceFunctionsConsumer) {</span>
+      <span class="s1">original.functionName =</span>
+        <span class="s1">metadata.sourceFunctionsConsumer.functionNameFor(original) || </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">original.functionName = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">original.isIgnored = metadata.googleIgnoreListConsumer.isIgnored(original);</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">...original,</span>
+      <span class="s1">line:</span>
+        <span class="s1">original.line != </span><span class="s4">null</span>
+          <span class="s1">? original.line - </span><span class="s3">1 </span><span class="s1">+ </span><span class="s4">this</span><span class="s1">.options.outputLineStart</span>
+          <span class="s1">: original.line,</span>
+      <span class="s1">column:</span>
+        <span class="s1">original.column != </span><span class="s4">null</span>
+          <span class="s1">? original.column - </span><span class="s3">0 </span><span class="s1">+ </span><span class="s4">this</span><span class="s1">.options.outputColumnStart</span>
+          <span class="s1">: original.column,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+  <span class="s1">parseFileName(str) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._legacyFormat) {</span>
+      <span class="s4">return </span><span class="s1">parseSingleMapFileName(str);</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">UNKNOWN_MODULE_IDS;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">class DirectorySymbolicationContext extends SymbolicationContext {</span>
+  <span class="s2">// $FlowFixMe[value-as-type]</span>
+
+  <span class="s1">constructor(</span>
+    <span class="s2">// $FlowFixMe[value-as-type]</span>
+    <span class="s1">SourceMapConsumer,</span>
+    <span class="s1">rootDir,</span>
+    <span class="s1">options = {}</span>
+  <span class="s1">) {</span>
+    <span class="s1">super(options);</span>
+    <span class="s4">this</span><span class="s1">._fileMaps = </span><span class="s4">new </span><span class="s1">Map();</span>
+    <span class="s4">this</span><span class="s1">._rootDir = rootDir;</span>
+    <span class="s4">this</span><span class="s1">._SourceMapConsumer = SourceMapConsumer;</span>
+  <span class="s1">}</span>
+  <span class="s1">_loadMap(mapFilename) {</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">fs.existsSync(mapFilename),</span>
+      <span class="s1">`Could not read source map from </span><span class="s0">'${mapFilename}'</span><span class="s1">`</span>
+    <span class="s1">);</span>
+    <span class="s1">let fileMap = </span><span class="s4">this</span><span class="s1">._fileMaps.get(mapFilename);</span>
+    <span class="s4">if </span><span class="s1">(fileMap == </span><span class="s4">null</span><span class="s1">) {</span>
+      <span class="s1">fileMap = </span><span class="s4">new </span><span class="s1">SingleMapSymbolicationContext(</span>
+        <span class="s4">this</span><span class="s1">._SourceMapConsumer,</span>
+        <span class="s1">fs.readFileSync(mapFilename, </span><span class="s0">&quot;utf8&quot;</span><span class="s1">),</span>
+        <span class="s4">this</span><span class="s1">.options</span>
+      <span class="s1">);</span>
+      <span class="s4">this</span><span class="s1">._fileMaps.set(mapFilename, fileMap);</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">fileMap;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">/* 
+   * An internal helper function similar to getOriginalPositionFor. This one 
+   * returns both `name` and `functionName` fields so callers can distinguish the 
+   * source of the name. 
+   */</span>
+  <span class="s1">getOriginalPositionDetailsFor(lineNumber, columnNumber, filename) {</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">filename != </span><span class="s4">null</span><span class="s1">,</span>
+      <span class="s0">&quot;filename is required for DirectorySymbolicationContext&quot;</span>
+    <span class="s1">);</span>
+    <span class="s1">let mapFilename;</span>
+    <span class="s1">const relativeFilename = path.relative(</span>
+      <span class="s4">this</span><span class="s1">._rootDir,</span>
+      <span class="s1">path.resolve(</span><span class="s4">this</span><span class="s1">._rootDir, filename)</span>
+    <span class="s1">);</span>
+    <span class="s2">// Lock down access to files outside the root dir.</span>
+    <span class="s4">if </span><span class="s1">(!relativeFilename.startsWith(</span><span class="s0">&quot;..&quot;</span><span class="s1">)) {</span>
+      <span class="s1">mapFilename = path.join(</span><span class="s4">this</span><span class="s1">._rootDir, relativeFilename + </span><span class="s0">&quot;.map&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(mapFilename == </span><span class="s4">null </span><span class="s1">|| !fs.existsSync(mapFilename)) {</span>
+      <span class="s2">// Adjust arguments to the output coordinates</span>
+      <span class="s1">lineNumber =</span>
+        <span class="s1">lineNumber != </span><span class="s4">null</span>
+          <span class="s1">? lineNumber -</span>
+            <span class="s4">this</span><span class="s1">.options.inputLineStart +</span>
+            <span class="s4">this</span><span class="s1">.options.outputLineStart</span>
+          <span class="s1">: lineNumber;</span>
+      <span class="s1">columnNumber =</span>
+        <span class="s1">columnNumber != </span><span class="s4">null</span>
+          <span class="s1">? columnNumber -</span>
+            <span class="s4">this</span><span class="s1">.options.inputColumnStart +</span>
+            <span class="s4">this</span><span class="s1">.options.outputColumnStart</span>
+          <span class="s1">: columnNumber;</span>
+      <span class="s4">return </span><span class="s1">{</span>
+        <span class="s1">line: lineNumber,</span>
+        <span class="s1">column: columnNumber,</span>
+        <span class="s1">source: filename,</span>
+        <span class="s1">name: </span><span class="s4">null</span><span class="s1">,</span>
+        <span class="s1">functionName: </span><span class="s4">null</span><span class="s1">,</span>
+        <span class="s1">isIgnored: </span><span class="s4">false</span><span class="s1">,</span>
+      <span class="s1">};</span>
+    <span class="s1">}</span>
+    <span class="s4">return this</span><span class="s1">._loadMap(mapFilename).getOriginalPositionDetailsFor(</span>
+      <span class="s1">lineNumber,</span>
+      <span class="s1">columnNumber</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">parseFileName(str) {</span>
+    <span class="s4">return </span><span class="s1">str;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">/* 
+ * If the file name of a stack frame is numeric (+ &quot;.js&quot;), we assume it's a 
+ * lazily injected module coming from a &quot;random access bundle&quot;. We are using 
+ * special source maps for these bundles, so that we can symbolicate stack 
+ * traces for multiple injected files with a single source map. 
+ * 
+ * There is also a convention for callsites that are in split segments of a 
+ * bundle, named either `seg-3.js` for segment #3 for example, or `seg-3_5.js` 
+ * for module #5 of segment #3 of a segmented RAM bundle. 
+ */</span>
+<span class="s4">function </span><span class="s1">parseSingleMapFileName(str) {</span>
+  <span class="s1">const modMatch = str.match(/^(\d+).js$/);</span>
+  <span class="s4">if </span><span class="s1">(modMatch != </span><span class="s4">null</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">segmentId: </span><span class="s3">0</span><span class="s1">,</span>
+      <span class="s1">localId: Number(modMatch[</span><span class="s3">1</span><span class="s1">]),</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+  <span class="s1">const segMatch = str.match(/^seg-(\d+)(?:_(\d+))?.js$/);</span>
+  <span class="s4">if </span><span class="s1">(segMatch != </span><span class="s4">null</span><span class="s1">) {</span>
+    <span class="s4">return </span><span class="s1">{</span>
+      <span class="s1">segmentId: Number(segMatch[</span><span class="s3">1</span><span class="s1">]),</span>
+      <span class="s1">localId: segMatch[</span><span class="s3">2</span><span class="s1">] ? Number(segMatch[</span><span class="s3">2</span><span class="s1">]) : </span><span class="s4">null</span><span class="s1">,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">UNKNOWN_MODULE_IDS;</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">createContext(</span>
+  <span class="s2">// $FlowFixMe[value-as-type]</span>
+  <span class="s1">SourceMapConsumer,</span>
+  <span class="s1">sourceMapContent,</span>
+  <span class="s1">options = {}</span>
+<span class="s1">) {</span>
+  <span class="s4">return new </span><span class="s1">SingleMapSymbolicationContext(</span>
+    <span class="s1">SourceMapConsumer,</span>
+    <span class="s1">sourceMapContent,</span>
+    <span class="s1">options</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">unstable_createDirectoryContext(</span>
+  <span class="s2">// $FlowFixMe[value-as-type]</span>
+  <span class="s1">SourceMapConsumer,</span>
+  <span class="s1">rootDir,</span>
+  <span class="s1">options = {}</span>
+<span class="s1">) {</span>
+  <span class="s4">return new </span><span class="s1">DirectorySymbolicationContext(SourceMapConsumer, rootDir, options);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">getOriginalPositionFor(lineNumber, columnNumber, moduleIds, context) {</span>
+  <span class="s4">return </span><span class="s1">context.getOriginalPositionFor(lineNumber, columnNumber, moduleIds);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">symbolicate(stackTrace, context) {</span>
+  <span class="s4">return </span><span class="s1">context.symbolicate(stackTrace);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">symbolicateProfilerMap(mapFile, context) {</span>
+  <span class="s4">return </span><span class="s1">context.symbolicateProfilerMap(mapFile);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">symbolicateAttribution(obj, context) {</span>
+  <span class="s1">context.symbolicateAttribution(obj);</span>
+<span class="s1">}</span>
+<span class="s4">function </span><span class="s1">symbolicateChromeTrace(traceFile, { stdout, stderr }, context) {</span>
+  <span class="s4">return </span><span class="s1">context.symbolicateChromeTrace(traceFile, {</span>
+    <span class="s1">stdout,</span>
+    <span class="s1">stderr,</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = {</span>
+  <span class="s1">createContext,</span>
+  <span class="s1">unstable_createDirectoryContext,</span>
+  <span class="s1">getOriginalPositionFor,</span>
+  <span class="s1">parseFileName: parseSingleMapFileName,</span>
+  <span class="s1">symbolicate,</span>
+  <span class="s1">symbolicateProfilerMap,</span>
+  <span class="s1">symbolicateAttribution,</span>
+  <span class="s1">symbolicateChromeTrace,</span>
+  <span class="s1">SourceMetadataMapConsumer,</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

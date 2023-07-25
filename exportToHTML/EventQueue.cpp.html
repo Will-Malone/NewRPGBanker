@@ -1,0 +1,138 @@
+<html>
+<head>
+<title>EventQueue.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+EventQueue.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;EventQueue.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;EventEmitter.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;ShadowNodeFamily.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s1">EventQueue::EventQueue(</span>
+    <span class="s1">EventQueueProcessor eventProcessor</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;EventBeat&gt; eventBeat)</span>
+    <span class="s1">: eventProcessor_(std::move(eventProcessor))</span><span class="s4">,</span>
+      <span class="s1">eventBeat_(std::move(eventBeat)) {</span>
+  <span class="s1">eventBeat_-&gt;setBeatCallback(</span>
+      <span class="s1">[</span><span class="s4">this</span><span class="s1">](jsi::Runtime &amp;runtime) { onBeat(runtime)</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventQueue::enqueueEvent(RawEvent &amp;&amp;rawEvent) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(queueMutex_)</span><span class="s4">;</span>
+    <span class="s1">eventQueue_.push_back(std::move(rawEvent))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">onEnqueue()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventQueue::enqueueUniqueEvent(RawEvent &amp;&amp;rawEvent) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(queueMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">auto </span><span class="s1">repeatedEvent = eventQueue_.rend()</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">it = eventQueue_.rbegin()</span><span class="s4">; </span><span class="s1">it != eventQueue_.rend()</span><span class="s4">; </span><span class="s1">++it) {</span>
+      <span class="s4">if </span><span class="s1">(it-&gt;type == rawEvent.type &amp;&amp;</span>
+          <span class="s1">it-&gt;eventTarget == rawEvent.eventTarget) {</span>
+        <span class="s1">repeatedEvent = it</span><span class="s4">;</span>
+        <span class="s4">break;</span>
+      <span class="s1">} </span><span class="s4">else if </span><span class="s1">(it-&gt;eventTarget == rawEvent.eventTarget) {</span>
+        <span class="s0">// It is necessary to maintain order of different event types</span>
+        <span class="s0">// for the same target. If the same target has event types A1, B1</span>
+        <span class="s0">// in the event queue and event A2 occurs. A1 has to stay in the</span>
+        <span class="s0">// queue.</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(repeatedEvent == eventQueue_.rend()) {</span>
+      <span class="s1">eventQueue_.push_back(std::move(rawEvent))</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">*repeatedEvent = std::move(rawEvent)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">onEnqueue()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventQueue::enqueueStateUpdate(StateUpdate &amp;&amp;stateUpdate) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(queueMutex_)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!stateUpdateQueue_.empty()) {</span>
+      <span class="s4">auto const </span><span class="s1">position = stateUpdateQueue_.back()</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(stateUpdate.family == position.family) {</span>
+        <span class="s1">stateUpdateQueue_.pop_back()</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">stateUpdateQueue_.push_back(std::move(stateUpdate))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">onEnqueue()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventQueue::onBeat(jsi::Runtime &amp;runtime) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">flushStateUpdates()</span><span class="s4">;</span>
+  <span class="s1">flushEvents(runtime)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventQueue::flushEvents(jsi::Runtime &amp;runtime) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::vector&lt;RawEvent&gt; queue</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(queueMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(eventQueue_.empty()) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">queue = std::move(eventQueue_)</span><span class="s4">;</span>
+    <span class="s1">eventQueue_.clear()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">eventProcessor_.flushEvents(runtime</span><span class="s4">, </span><span class="s1">std::move(queue))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventQueue::flushStateUpdates() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::vector&lt;StateUpdate&gt; stateUpdateQueue</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(queueMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(stateUpdateQueue_.empty()) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">stateUpdateQueue = std::move(stateUpdateQueue_)</span><span class="s4">;</span>
+    <span class="s1">stateUpdateQueue_.clear()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">eventProcessor_.flushStateUpdates(std::move(stateUpdateQueue))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

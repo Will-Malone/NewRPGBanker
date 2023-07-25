@@ -1,0 +1,204 @@
+<html>
+<head>
+<title>jsx-no-leaked-render.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+jsx-no-leaked-render.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Prevent problematic leaked values from being rendered 
+ * @author Mario Beltrán 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const docsUrl = require(</span><span class="s2">'../util/docsUrl'</span><span class="s1">);</span>
+<span class="s1">const report = require(</span><span class="s2">'../util/report'</span><span class="s1">);</span>
+<span class="s1">const testReactVersion = require(</span><span class="s2">'../util/version'</span><span class="s1">).testReactVersion;</span>
+<span class="s1">const isParenthesized = require(</span><span class="s2">'../util/ast'</span><span class="s1">).isParenthesized;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Rule Definition</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const messages = {</span>
+  <span class="s1">noPotentialLeakedRender: </span><span class="s2">'Potential leaked value that might cause unintentionally rendered values or rendering crashes'</span><span class="s1">,</span>
+<span class="s1">};</span>
+
+<span class="s1">const COERCE_STRATEGY = </span><span class="s2">'coerce'</span><span class="s1">;</span>
+<span class="s1">const TERNARY_STRATEGY = </span><span class="s2">'ternary'</span><span class="s1">;</span>
+<span class="s1">const DEFAULT_VALID_STRATEGIES = [TERNARY_STRATEGY, COERCE_STRATEGY];</span>
+<span class="s1">const COERCE_VALID_LEFT_SIDE_EXPRESSIONS = [</span><span class="s2">'UnaryExpression'</span><span class="s1">, </span><span class="s2">'BinaryExpression'</span><span class="s1">, </span><span class="s2">'CallExpression'</span><span class="s1">];</span>
+<span class="s1">const TERNARY_INVALID_ALTERNATE_VALUES = [undefined, </span><span class="s3">null</span><span class="s1">, </span><span class="s3">false</span><span class="s1">];</span>
+
+<span class="s3">function </span><span class="s1">trimLeftNode(node) {</span>
+  <span class="s0">// Remove double unary expression (boolean coercion), so we avoid trimming valid negations</span>
+  <span class="s3">if </span><span class="s1">(node.type === </span><span class="s2">'UnaryExpression' </span><span class="s1">&amp;&amp; node.argument.type === </span><span class="s2">'UnaryExpression'</span><span class="s1">) {</span>
+    <span class="s3">return </span><span class="s1">trimLeftNode(node.argument.argument);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">node;</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">getIsCoerceValidNestedLogicalExpression(node) {</span>
+  <span class="s3">if </span><span class="s1">(node.type === </span><span class="s2">'LogicalExpression'</span><span class="s1">) {</span>
+    <span class="s3">return </span><span class="s1">getIsCoerceValidNestedLogicalExpression(node.left) &amp;&amp; getIsCoerceValidNestedLogicalExpression(node.right);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">return </span><span class="s1">COERCE_VALID_LEFT_SIDE_EXPRESSIONS.some((validExpression) =&gt; validExpression === node.type);</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">extractExpressionBetweenLogicalAnds(node) {</span>
+  <span class="s3">if </span><span class="s1">(node.type !== </span><span class="s2">'LogicalExpression'</span><span class="s1">) </span><span class="s3">return </span><span class="s1">[node];</span>
+  <span class="s3">if </span><span class="s1">(node.operator !== </span><span class="s2">'&amp;&amp;'</span><span class="s1">) </span><span class="s3">return </span><span class="s1">[node];</span>
+  <span class="s3">return </span><span class="s1">[].concat(</span>
+    <span class="s1">extractExpressionBetweenLogicalAnds(node.left),</span>
+    <span class="s1">extractExpressionBetweenLogicalAnds(node.right)</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s3">function </span><span class="s1">ruleFixer(context, fixStrategy, fixer, reportedNode, leftNode, rightNode) {</span>
+  <span class="s1">const sourceCode = context.getSourceCode();</span>
+  <span class="s1">const rightSideText = sourceCode.getText(rightNode);</span>
+
+  <span class="s3">if </span><span class="s1">(fixStrategy === COERCE_STRATEGY) {</span>
+    <span class="s1">const expressions = extractExpressionBetweenLogicalAnds(leftNode);</span>
+    <span class="s1">const newText = expressions.map((node) =&gt; {</span>
+      <span class="s1">let nodeText = sourceCode.getText(node);</span>
+      <span class="s3">if </span><span class="s1">(isParenthesized(context, node)) {</span>
+        <span class="s1">nodeText = `(${nodeText})`;</span>
+      <span class="s1">}</span>
+      <span class="s3">if </span><span class="s1">(node.parent &amp;&amp; node.parent.type === </span><span class="s2">'ConditionalExpression' </span><span class="s1">&amp;&amp; node.parent.consequent.value === </span><span class="s3">false</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">`${getIsCoerceValidNestedLogicalExpression(node) ? </span><span class="s2">'' </span><span class="s1">: </span><span class="s2">'!'</span><span class="s1">}${nodeText}`;</span>
+      <span class="s1">}</span>
+      <span class="s3">return </span><span class="s1">`${getIsCoerceValidNestedLogicalExpression(node) ? </span><span class="s2">'' </span><span class="s1">: </span><span class="s2">'!!'</span><span class="s1">}${nodeText}`;</span>
+    <span class="s1">}).join(</span><span class="s2">' &amp;&amp; '</span><span class="s1">);</span>
+
+    <span class="s3">if </span><span class="s1">(rightNode.parent &amp;&amp; rightNode.parent.type === </span><span class="s2">'ConditionalExpression' </span><span class="s1">&amp;&amp; rightNode.parent.consequent.value === </span><span class="s3">false</span><span class="s1">) {</span>
+      <span class="s1">const consequentVal = rightNode.parent.consequent.raw || rightNode.parent.consequent.name;</span>
+      <span class="s1">const alternateVal = rightNode.parent.alternate.raw || rightNode.parent.alternate.name;</span>
+      <span class="s3">if </span><span class="s1">(rightNode.parent.test &amp;&amp; rightNode.parent.test.type === </span><span class="s2">'LogicalExpression'</span><span class="s1">) {</span>
+        <span class="s3">return </span><span class="s1">fixer.replaceText(reportedNode, `${newText} ? ${consequentVal} : ${alternateVal}`);</span>
+      <span class="s1">}</span>
+      <span class="s3">return </span><span class="s1">fixer.replaceText(reportedNode, `${newText} &amp;&amp; ${alternateVal}`);</span>
+    <span class="s1">}</span>
+
+    <span class="s3">if </span><span class="s1">(rightNode.type === </span><span class="s2">'ConditionalExpression'</span><span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">fixer.replaceText(reportedNode, `${newText} &amp;&amp; (${rightSideText})`);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(rightNode.type === </span><span class="s2">'Literal'</span><span class="s1">) {</span>
+      <span class="s3">return null</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">fixer.replaceText(reportedNode, `${newText} &amp;&amp; ${rightSideText}`);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">if </span><span class="s1">(fixStrategy === TERNARY_STRATEGY) {</span>
+    <span class="s1">let leftSideText = sourceCode.getText(trimLeftNode(leftNode));</span>
+    <span class="s3">if </span><span class="s1">(isParenthesized(context, leftNode)) {</span>
+      <span class="s1">leftSideText = `(${leftSideText})`;</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">fixer.replaceText(reportedNode, `${leftSideText} ? ${rightSideText} : </span><span class="s3">null</span><span class="s1">`);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">throw new </span><span class="s1">TypeError(</span><span class="s2">'Invalid value for &quot;validStrategies&quot; option'</span><span class="s1">);</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * @type {import('eslint').Rule.RuleModule} 
+ */</span>
+<span class="s1">module.exports = {</span>
+  <span class="s1">meta: {</span>
+    <span class="s1">docs: {</span>
+      <span class="s1">description: </span><span class="s2">'Disallow problematic leaked values from being rendered'</span><span class="s1">,</span>
+      <span class="s1">category: </span><span class="s2">'Possible Errors'</span><span class="s1">,</span>
+      <span class="s1">recommended: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">url: docsUrl(</span><span class="s2">'jsx-no-leaked-render'</span><span class="s1">),</span>
+    <span class="s1">},</span>
+
+    <span class="s1">messages,</span>
+
+    <span class="s1">fixable: </span><span class="s2">'code'</span><span class="s1">,</span>
+    <span class="s1">schema: [</span>
+      <span class="s1">{</span>
+        <span class="s1">type: </span><span class="s2">'object'</span><span class="s1">,</span>
+        <span class="s1">properties: {</span>
+          <span class="s1">validStrategies: {</span>
+            <span class="s1">type: </span><span class="s2">'array'</span><span class="s1">,</span>
+            <span class="s1">items: {</span>
+              <span class="s1">enum: [</span>
+                <span class="s1">TERNARY_STRATEGY,</span>
+                <span class="s1">COERCE_STRATEGY,</span>
+              <span class="s1">],</span>
+            <span class="s1">},</span>
+            <span class="s1">uniqueItems: </span><span class="s3">true</span><span class="s1">,</span>
+            <span class="s3">default</span><span class="s1">: DEFAULT_VALID_STRATEGIES,</span>
+          <span class="s1">},</span>
+        <span class="s1">},</span>
+        <span class="s1">additionalProperties: </span><span class="s3">false</span><span class="s1">,</span>
+      <span class="s1">},</span>
+    <span class="s1">],</span>
+  <span class="s1">},</span>
+
+  <span class="s1">create(context) {</span>
+    <span class="s1">const config = context.options[</span><span class="s4">0</span><span class="s1">] || {};</span>
+    <span class="s1">const validStrategies = </span><span class="s3">new </span><span class="s1">Set(config.validStrategies || DEFAULT_VALID_STRATEGIES);</span>
+    <span class="s1">const fixStrategy = Array.from(validStrategies)[</span><span class="s4">0</span><span class="s1">];</span>
+
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s2">'JSXExpressionContainer &gt; LogicalExpression[operator=&quot;&amp;&amp;&quot;]'</span><span class="s1">(node) {</span>
+        <span class="s1">const leftSide = node.left;</span>
+
+        <span class="s1">const isCoerceValidLeftSide = COERCE_VALID_LEFT_SIDE_EXPRESSIONS</span>
+          <span class="s1">.some((validExpression) =&gt; validExpression === leftSide.type);</span>
+        <span class="s3">if </span><span class="s1">(validStrategies.has(COERCE_STRATEGY)) {</span>
+          <span class="s3">if </span><span class="s1">(isCoerceValidLeftSide || getIsCoerceValidNestedLogicalExpression(leftSide)) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s3">if </span><span class="s1">(testReactVersion(context, </span><span class="s2">'&gt;= 18'</span><span class="s1">) &amp;&amp; leftSide.type === </span><span class="s2">'Literal' </span><span class="s1">&amp;&amp; leftSide.value === </span><span class="s2">''</span><span class="s1">) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">report(context, messages.noPotentialLeakedRender, </span><span class="s2">'noPotentialLeakedRender'</span><span class="s1">, {</span>
+          <span class="s1">node,</span>
+          <span class="s1">fix(fixer) {</span>
+            <span class="s3">return </span><span class="s1">ruleFixer(context, fixStrategy, fixer, node, leftSide, node.right);</span>
+          <span class="s1">},</span>
+        <span class="s1">});</span>
+      <span class="s1">},</span>
+
+      <span class="s2">'JSXExpressionContainer &gt; ConditionalExpression'</span><span class="s1">(node) {</span>
+        <span class="s3">if </span><span class="s1">(validStrategies.has(TERNARY_STRATEGY)) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const isValidTernaryAlternate = TERNARY_INVALID_ALTERNATE_VALUES.indexOf(node.alternate.value) === -</span><span class="s4">1</span><span class="s1">;</span>
+        <span class="s1">const isJSXElementAlternate = node.alternate.type === </span><span class="s2">'JSXElement'</span><span class="s1">;</span>
+        <span class="s3">if </span><span class="s1">(isValidTernaryAlternate || isJSXElementAlternate) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">report(context, messages.noPotentialLeakedRender, </span><span class="s2">'noPotentialLeakedRender'</span><span class="s1">, {</span>
+          <span class="s1">node,</span>
+          <span class="s1">fix(fixer) {</span>
+            <span class="s3">return </span><span class="s1">ruleFixer(context, fixStrategy, fixer, node, node.test, node.consequent);</span>
+          <span class="s1">},</span>
+        <span class="s1">});</span>
+      <span class="s1">},</span>
+    <span class="s1">};</span>
+  <span class="s1">},</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

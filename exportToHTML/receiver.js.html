@@ -1,0 +1,513 @@
+<html>
+<head>
+<title>receiver.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #6a8759;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6897bb;}
+.s3 { color: #808080;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+receiver.js</font>
+</center></td></tr></table>
+<pre><span class="s0">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const { Writable } = require(</span><span class="s0">'stream'</span><span class="s1">);</span>
+
+<span class="s1">const PerMessageDeflate = require(</span><span class="s0">'./permessage-deflate'</span><span class="s1">);</span>
+<span class="s1">const {</span>
+  <span class="s1">BINARY_TYPES,</span>
+  <span class="s1">EMPTY_BUFFER,</span>
+  <span class="s1">kStatusCode,</span>
+  <span class="s1">kWebSocket</span>
+<span class="s1">} = require(</span><span class="s0">'./constants'</span><span class="s1">);</span>
+<span class="s1">const { concat, toArrayBuffer, unmask } = require(</span><span class="s0">'./buffer-util'</span><span class="s1">);</span>
+<span class="s1">const { isValidStatusCode, isValidUTF8 } = require(</span><span class="s0">'./validation'</span><span class="s1">);</span>
+
+<span class="s1">const GET_INFO = </span><span class="s2">0</span><span class="s1">;</span>
+<span class="s1">const GET_PAYLOAD_LENGTH_16 = </span><span class="s2">1</span><span class="s1">;</span>
+<span class="s1">const GET_PAYLOAD_LENGTH_64 = </span><span class="s2">2</span><span class="s1">;</span>
+<span class="s1">const GET_MASK = </span><span class="s2">3</span><span class="s1">;</span>
+<span class="s1">const GET_DATA = </span><span class="s2">4</span><span class="s1">;</span>
+<span class="s1">const INFLATING = </span><span class="s2">5</span><span class="s1">;</span>
+
+<span class="s3">/** 
+ * HyBi Receiver implementation. 
+ * 
+ * @extends stream.Writable 
+ */</span>
+<span class="s1">class Receiver extends Writable {</span>
+  <span class="s3">/** 
+   * Creates a Receiver instance. 
+   * 
+   * @param {String} binaryType The type for binary data 
+   * @param {Object} extensions An object containing the negotiated extensions 
+   * @param {Number} maxPayload The maximum allowed message length 
+   */</span>
+  <span class="s1">constructor(binaryType, extensions, maxPayload) {</span>
+    <span class="s1">super();</span>
+
+    <span class="s4">this</span><span class="s1">._binaryType = binaryType || BINARY_TYPES[</span><span class="s2">0</span><span class="s1">];</span>
+    <span class="s4">this</span><span class="s1">[kWebSocket] = undefined;</span>
+    <span class="s4">this</span><span class="s1">._extensions = extensions || {};</span>
+    <span class="s4">this</span><span class="s1">._maxPayload = maxPayload | </span><span class="s2">0</span><span class="s1">;</span>
+
+    <span class="s4">this</span><span class="s1">._bufferedBytes = </span><span class="s2">0</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._buffers = [];</span>
+
+    <span class="s4">this</span><span class="s1">._compressed = </span><span class="s4">false</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._payloadLength = </span><span class="s2">0</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._mask = undefined;</span>
+    <span class="s4">this</span><span class="s1">._fragmented = </span><span class="s2">0</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._masked = </span><span class="s4">false</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._fin = </span><span class="s4">false</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._opcode = </span><span class="s2">0</span><span class="s1">;</span>
+
+    <span class="s4">this</span><span class="s1">._totalPayloadLength = </span><span class="s2">0</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._messageLength = </span><span class="s2">0</span><span class="s1">;</span>
+    <span class="s4">this</span><span class="s1">._fragments = [];</span>
+
+    <span class="s4">this</span><span class="s1">._state = GET_INFO;</span>
+    <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Implements `Writable.prototype._write()`. 
+   * 
+   * @param {Buffer} chunk The chunk of data to write 
+   * @param {String} encoding The character encoding of `chunk` 
+   * @param {Function} cb Callback 
+   */</span>
+  <span class="s1">_write(chunk, encoding, cb) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode === </span><span class="s2">0</span><span class="s1">x08 &amp;&amp; </span><span class="s4">this</span><span class="s1">._state == GET_INFO) </span><span class="s4">return </span><span class="s1">cb();</span>
+
+    <span class="s4">this</span><span class="s1">._bufferedBytes += chunk.length;</span>
+    <span class="s4">this</span><span class="s1">._buffers.push(chunk);</span>
+    <span class="s4">this</span><span class="s1">.startLoop(cb);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Consumes `n` bytes from the buffered data. 
+   * 
+   * @param {Number} n The number of bytes to consume 
+   * @return {Buffer} The consumed bytes 
+   * @private 
+   */</span>
+  <span class="s1">consume(n) {</span>
+    <span class="s4">this</span><span class="s1">._bufferedBytes -= n;</span>
+
+    <span class="s4">if </span><span class="s1">(n === </span><span class="s4">this</span><span class="s1">._buffers[</span><span class="s2">0</span><span class="s1">].length) </span><span class="s4">return this</span><span class="s1">._buffers.shift();</span>
+
+    <span class="s4">if </span><span class="s1">(n &lt; </span><span class="s4">this</span><span class="s1">._buffers[</span><span class="s2">0</span><span class="s1">].length) {</span>
+      <span class="s1">const buf = </span><span class="s4">this</span><span class="s1">._buffers[</span><span class="s2">0</span><span class="s1">];</span>
+      <span class="s4">this</span><span class="s1">._buffers[</span><span class="s2">0</span><span class="s1">] = buf.slice(n);</span>
+      <span class="s4">return </span><span class="s1">buf.slice(</span><span class="s2">0</span><span class="s1">, n);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const dst = Buffer.allocUnsafe(n);</span>
+
+    <span class="s4">do </span><span class="s1">{</span>
+      <span class="s1">const buf = </span><span class="s4">this</span><span class="s1">._buffers[</span><span class="s2">0</span><span class="s1">];</span>
+
+      <span class="s4">if </span><span class="s1">(n &gt;= buf.length) {</span>
+        <span class="s4">this</span><span class="s1">._buffers.shift().copy(dst, dst.length - n);</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">buf.copy(dst, dst.length - n, </span><span class="s2">0</span><span class="s1">, n);</span>
+        <span class="s4">this</span><span class="s1">._buffers[</span><span class="s2">0</span><span class="s1">] = buf.slice(n);</span>
+      <span class="s1">}</span>
+
+      <span class="s1">n -= buf.length;</span>
+    <span class="s1">} </span><span class="s4">while </span><span class="s1">(n &gt; </span><span class="s2">0</span><span class="s1">);</span>
+
+    <span class="s4">return </span><span class="s1">dst;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Starts the parsing loop. 
+   * 
+   * @param {Function} cb Callback 
+   * @private 
+   */</span>
+  <span class="s1">startLoop(cb) {</span>
+    <span class="s4">var </span><span class="s1">err;</span>
+    <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">true</span><span class="s1">;</span>
+
+    <span class="s4">do </span><span class="s1">{</span>
+      <span class="s4">switch </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._state) {</span>
+        <span class="s4">case </span><span class="s1">GET_INFO:</span>
+          <span class="s1">err = </span><span class="s4">this</span><span class="s1">.getInfo();</span>
+          <span class="s4">break</span><span class="s1">;</span>
+        <span class="s4">case </span><span class="s1">GET_PAYLOAD_LENGTH_16:</span>
+          <span class="s1">err = </span><span class="s4">this</span><span class="s1">.getPayloadLength16();</span>
+          <span class="s4">break</span><span class="s1">;</span>
+        <span class="s4">case </span><span class="s1">GET_PAYLOAD_LENGTH_64:</span>
+          <span class="s1">err = </span><span class="s4">this</span><span class="s1">.getPayloadLength64();</span>
+          <span class="s4">break</span><span class="s1">;</span>
+        <span class="s4">case </span><span class="s1">GET_MASK:</span>
+          <span class="s4">this</span><span class="s1">.getMask();</span>
+          <span class="s4">break</span><span class="s1">;</span>
+        <span class="s4">case </span><span class="s1">GET_DATA:</span>
+          <span class="s1">err = </span><span class="s4">this</span><span class="s1">.getData(cb);</span>
+          <span class="s4">break</span><span class="s1">;</span>
+        <span class="s4">default</span><span class="s1">:</span>
+          <span class="s3">// `INFLATING`</span>
+          <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+          <span class="s4">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">while </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._loop);</span>
+
+    <span class="s1">cb(err);</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Reads the first two bytes of a frame. 
+   * 
+   * @return {(RangeError|undefined)} A possible error 
+   * @private 
+   */</span>
+  <span class="s1">getInfo() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._bufferedBytes &lt; </span><span class="s2">2</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const buf = </span><span class="s4">this</span><span class="s1">.consume(</span><span class="s2">2</span><span class="s1">);</span>
+
+    <span class="s4">if </span><span class="s1">((buf[</span><span class="s2">0</span><span class="s1">] &amp; </span><span class="s2">0</span><span class="s1">x30) !== </span><span class="s2">0</span><span class="s1">x00) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'RSV2 and RSV3 must be clear'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const compressed = (buf[</span><span class="s2">0</span><span class="s1">] &amp; </span><span class="s2">0</span><span class="s1">x40) === </span><span class="s2">0</span><span class="s1">x40;</span>
+
+    <span class="s4">if </span><span class="s1">(compressed &amp;&amp; !</span><span class="s4">this</span><span class="s1">._extensions[PerMessageDeflate.extensionName]) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'RSV1 must be clear'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._fin = (buf[</span><span class="s2">0</span><span class="s1">] &amp; </span><span class="s2">0</span><span class="s1">x80) === </span><span class="s2">0</span><span class="s1">x80;</span>
+    <span class="s4">this</span><span class="s1">._opcode = buf[</span><span class="s2">0</span><span class="s1">] &amp; </span><span class="s2">0</span><span class="s1">x0f;</span>
+    <span class="s4">this</span><span class="s1">._payloadLength = buf[</span><span class="s2">1</span><span class="s1">] &amp; </span><span class="s2">0</span><span class="s1">x7f;</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode === </span><span class="s2">0</span><span class="s1">x00) {</span>
+      <span class="s4">if </span><span class="s1">(compressed) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'RSV1 must be clear'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+      <span class="s1">}</span>
+
+      <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._fragmented) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'invalid opcode 0'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+      <span class="s1">}</span>
+
+      <span class="s4">this</span><span class="s1">._opcode = </span><span class="s4">this</span><span class="s1">._fragmented;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode === </span><span class="s2">0</span><span class="s1">x01 || </span><span class="s4">this</span><span class="s1">._opcode === </span><span class="s2">0</span><span class="s1">x02) {</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._fragmented) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return </span><span class="s1">error(RangeError, `invalid opcode ${</span><span class="s4">this</span><span class="s1">._opcode}`, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+      <span class="s1">}</span>
+
+      <span class="s4">this</span><span class="s1">._compressed = compressed;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode &gt; </span><span class="s2">0</span><span class="s1">x07 &amp;&amp; </span><span class="s4">this</span><span class="s1">._opcode &lt; </span><span class="s2">0</span><span class="s1">x0b) {</span>
+      <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._fin) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'FIN must be set'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+      <span class="s1">}</span>
+
+      <span class="s4">if </span><span class="s1">(compressed) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'RSV1 must be clear'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+      <span class="s1">}</span>
+
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._payloadLength &gt; </span><span class="s2">0</span><span class="s1">x7d) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return </span><span class="s1">error(</span>
+          <span class="s1">RangeError,</span>
+          <span class="s1">`invalid payload length ${</span><span class="s4">this</span><span class="s1">._payloadLength}`,</span>
+          <span class="s4">true</span><span class="s1">,</span>
+          <span class="s2">1002</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return </span><span class="s1">error(RangeError, `invalid opcode ${</span><span class="s4">this</span><span class="s1">._opcode}`, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._fin &amp;&amp; !</span><span class="s4">this</span><span class="s1">._fragmented) </span><span class="s4">this</span><span class="s1">._fragmented = </span><span class="s4">this</span><span class="s1">._opcode;</span>
+    <span class="s4">this</span><span class="s1">._masked = (buf[</span><span class="s2">1</span><span class="s1">] &amp; </span><span class="s2">0</span><span class="s1">x80) === </span><span class="s2">0</span><span class="s1">x80;</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._payloadLength === </span><span class="s2">126</span><span class="s1">) </span><span class="s4">this</span><span class="s1">._state = GET_PAYLOAD_LENGTH_16;</span>
+    <span class="s4">else if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._payloadLength === </span><span class="s2">127</span><span class="s1">) </span><span class="s4">this</span><span class="s1">._state = GET_PAYLOAD_LENGTH_64;</span>
+    <span class="s4">else return this</span><span class="s1">.haveLength();</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Gets extended payload length (7+16). 
+   * 
+   * @return {(RangeError|undefined)} A possible error 
+   * @private 
+   */</span>
+  <span class="s1">getPayloadLength16() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._bufferedBytes &lt; </span><span class="s2">2</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._payloadLength = </span><span class="s4">this</span><span class="s1">.consume(</span><span class="s2">2</span><span class="s1">).readUInt16BE(</span><span class="s2">0</span><span class="s1">);</span>
+    <span class="s4">return this</span><span class="s1">.haveLength();</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Gets extended payload length (7+64). 
+   * 
+   * @return {(RangeError|undefined)} A possible error 
+   * @private 
+   */</span>
+  <span class="s1">getPayloadLength64() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._bufferedBytes &lt; </span><span class="s2">8</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">const buf = </span><span class="s4">this</span><span class="s1">.consume(</span><span class="s2">8</span><span class="s1">);</span>
+    <span class="s1">const num = buf.readUInt32BE(</span><span class="s2">0</span><span class="s1">);</span>
+
+    <span class="s3">//</span>
+    <span class="s3">// The maximum safe integer in JavaScript is 2^53 - 1. An error is returned</span>
+    <span class="s3">// if payload length is greater than this number.</span>
+    <span class="s3">//</span>
+    <span class="s4">if </span><span class="s1">(num &gt; Math.pow(</span><span class="s2">2</span><span class="s1">, </span><span class="s2">53 </span><span class="s1">- </span><span class="s2">32</span><span class="s1">) - </span><span class="s2">1</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return </span><span class="s1">error(</span>
+        <span class="s1">RangeError,</span>
+        <span class="s0">'Unsupported WebSocket frame: payload length &gt; 2^53 - 1'</span><span class="s1">,</span>
+        <span class="s4">false</span><span class="s1">,</span>
+        <span class="s2">1009</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._payloadLength = num * Math.pow(</span><span class="s2">2</span><span class="s1">, </span><span class="s2">32</span><span class="s1">) + buf.readUInt32BE(</span><span class="s2">4</span><span class="s1">);</span>
+    <span class="s4">return this</span><span class="s1">.haveLength();</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Payload length has been read. 
+   * 
+   * @return {(RangeError|undefined)} A possible error 
+   * @private 
+   */</span>
+  <span class="s1">haveLength() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._payloadLength &amp;&amp; </span><span class="s4">this</span><span class="s1">._opcode &lt; </span><span class="s2">0</span><span class="s1">x08) {</span>
+      <span class="s4">this</span><span class="s1">._totalPayloadLength += </span><span class="s4">this</span><span class="s1">._payloadLength;</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._totalPayloadLength &gt; </span><span class="s4">this</span><span class="s1">._maxPayload &amp;&amp; </span><span class="s4">this</span><span class="s1">._maxPayload &gt; </span><span class="s2">0</span><span class="s1">) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'Max payload size exceeded'</span><span class="s1">, </span><span class="s4">false</span><span class="s1">, </span><span class="s2">1009</span><span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._masked) </span><span class="s4">this</span><span class="s1">._state = GET_MASK;</span>
+    <span class="s4">else this</span><span class="s1">._state = GET_DATA;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Reads mask bytes. 
+   * 
+   * @private 
+   */</span>
+  <span class="s1">getMask() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._bufferedBytes &lt; </span><span class="s2">4</span><span class="s1">) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._mask = </span><span class="s4">this</span><span class="s1">.consume(</span><span class="s2">4</span><span class="s1">);</span>
+    <span class="s4">this</span><span class="s1">._state = GET_DATA;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Reads data bytes. 
+   * 
+   * @param {Function} cb Callback 
+   * @return {(Error|RangeError|undefined)} A possible error 
+   * @private 
+   */</span>
+  <span class="s1">getData(cb) {</span>
+    <span class="s4">var </span><span class="s1">data = EMPTY_BUFFER;</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._payloadLength) {</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._bufferedBytes &lt; </span><span class="s4">this</span><span class="s1">._payloadLength) {</span>
+        <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+        <span class="s4">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">data = </span><span class="s4">this</span><span class="s1">.consume(</span><span class="s4">this</span><span class="s1">._payloadLength);</span>
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._masked) unmask(data, </span><span class="s4">this</span><span class="s1">._mask);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode &gt; </span><span class="s2">0</span><span class="s1">x07) </span><span class="s4">return this</span><span class="s1">.controlMessage(data);</span>
+
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._compressed) {</span>
+      <span class="s4">this</span><span class="s1">._state = INFLATING;</span>
+      <span class="s4">this</span><span class="s1">.decompress(data, cb);</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(data.length) {</span>
+      <span class="s3">//</span>
+      <span class="s3">// This message is not compressed so its lenght is the sum of the payload</span>
+      <span class="s3">// length of all fragments.</span>
+      <span class="s3">//</span>
+      <span class="s4">this</span><span class="s1">._messageLength = </span><span class="s4">this</span><span class="s1">._totalPayloadLength;</span>
+      <span class="s4">this</span><span class="s1">._fragments.push(data);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return this</span><span class="s1">.dataMessage();</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Decompresses data. 
+   * 
+   * @param {Buffer} data Compressed data 
+   * @param {Function} cb Callback 
+   * @private 
+   */</span>
+  <span class="s1">decompress(data, cb) {</span>
+    <span class="s1">const perMessageDeflate = </span><span class="s4">this</span><span class="s1">._extensions[PerMessageDeflate.extensionName];</span>
+
+    <span class="s1">perMessageDeflate.decompress(data, </span><span class="s4">this</span><span class="s1">._fin, (err, buf) =&gt; {</span>
+      <span class="s4">if </span><span class="s1">(err) </span><span class="s4">return </span><span class="s1">cb(err);</span>
+
+      <span class="s4">if </span><span class="s1">(buf.length) {</span>
+        <span class="s4">this</span><span class="s1">._messageLength += buf.length;</span>
+        <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._messageLength &gt; </span><span class="s4">this</span><span class="s1">._maxPayload &amp;&amp; </span><span class="s4">this</span><span class="s1">._maxPayload &gt; </span><span class="s2">0</span><span class="s1">) {</span>
+          <span class="s4">return </span><span class="s1">cb(</span>
+            <span class="s1">error(RangeError, </span><span class="s0">'Max payload size exceeded'</span><span class="s1">, </span><span class="s4">false</span><span class="s1">, </span><span class="s2">1009</span><span class="s1">)</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s4">this</span><span class="s1">._fragments.push(buf);</span>
+      <span class="s1">}</span>
+
+      <span class="s1">const er = </span><span class="s4">this</span><span class="s1">.dataMessage();</span>
+      <span class="s4">if </span><span class="s1">(er) </span><span class="s4">return </span><span class="s1">cb(er);</span>
+
+      <span class="s4">this</span><span class="s1">.startLoop(cb);</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Handles a data message. 
+   * 
+   * @return {(Error|undefined)} A possible error 
+   * @private 
+   */</span>
+  <span class="s1">dataMessage() {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._fin) {</span>
+      <span class="s1">const messageLength = </span><span class="s4">this</span><span class="s1">._messageLength;</span>
+      <span class="s1">const fragments = </span><span class="s4">this</span><span class="s1">._fragments;</span>
+
+      <span class="s4">this</span><span class="s1">._totalPayloadLength = </span><span class="s2">0</span><span class="s1">;</span>
+      <span class="s4">this</span><span class="s1">._messageLength = </span><span class="s2">0</span><span class="s1">;</span>
+      <span class="s4">this</span><span class="s1">._fragmented = </span><span class="s2">0</span><span class="s1">;</span>
+      <span class="s4">this</span><span class="s1">._fragments = [];</span>
+
+      <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode === </span><span class="s2">2</span><span class="s1">) {</span>
+        <span class="s4">var </span><span class="s1">data;</span>
+
+        <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._binaryType === </span><span class="s0">'nodebuffer'</span><span class="s1">) {</span>
+          <span class="s1">data = concat(fragments, messageLength);</span>
+        <span class="s1">} </span><span class="s4">else if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._binaryType === </span><span class="s0">'arraybuffer'</span><span class="s1">) {</span>
+          <span class="s1">data = toArrayBuffer(concat(fragments, messageLength));</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">data = fragments;</span>
+        <span class="s1">}</span>
+
+        <span class="s4">this</span><span class="s1">.emit(</span><span class="s0">'message'</span><span class="s1">, data);</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">const buf = concat(fragments, messageLength);</span>
+
+        <span class="s4">if </span><span class="s1">(!isValidUTF8(buf)) {</span>
+          <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+          <span class="s4">return </span><span class="s1">error(Error, </span><span class="s0">'invalid UTF-8 sequence'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1007</span><span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s4">this</span><span class="s1">.emit(</span><span class="s0">'message'</span><span class="s1">, buf.toString());</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._state = GET_INFO;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** 
+   * Handles a control message. 
+   * 
+   * @param {Buffer} data Data to handle 
+   * @return {(Error|RangeError|undefined)} A possible error 
+   * @private 
+   */</span>
+  <span class="s1">controlMessage(data) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode === </span><span class="s2">0</span><span class="s1">x08) {</span>
+      <span class="s4">this</span><span class="s1">._loop = </span><span class="s4">false</span><span class="s1">;</span>
+
+      <span class="s4">if </span><span class="s1">(data.length === </span><span class="s2">0</span><span class="s1">) {</span>
+        <span class="s4">this</span><span class="s1">.emit(</span><span class="s0">'conclude'</span><span class="s1">, </span><span class="s2">1005</span><span class="s1">, </span><span class="s0">''</span><span class="s1">);</span>
+        <span class="s4">this</span><span class="s1">.end();</span>
+      <span class="s1">} </span><span class="s4">else if </span><span class="s1">(data.length === </span><span class="s2">1</span><span class="s1">) {</span>
+        <span class="s4">return </span><span class="s1">error(RangeError, </span><span class="s0">'invalid payload length 1'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">const code = data.readUInt16BE(</span><span class="s2">0</span><span class="s1">);</span>
+
+        <span class="s4">if </span><span class="s1">(!isValidStatusCode(code)) {</span>
+          <span class="s4">return </span><span class="s1">error(RangeError, `invalid status code ${code}`, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1002</span><span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s1">const buf = data.slice(</span><span class="s2">2</span><span class="s1">);</span>
+
+        <span class="s4">if </span><span class="s1">(!isValidUTF8(buf)) {</span>
+          <span class="s4">return </span><span class="s1">error(Error, </span><span class="s0">'invalid UTF-8 sequence'</span><span class="s1">, </span><span class="s4">true</span><span class="s1">, </span><span class="s2">1007</span><span class="s1">);</span>
+        <span class="s1">}</span>
+
+        <span class="s4">this</span><span class="s1">.emit(</span><span class="s0">'conclude'</span><span class="s1">, code, buf.toString());</span>
+        <span class="s4">this</span><span class="s1">.end();</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._opcode === </span><span class="s2">0</span><span class="s1">x09) {</span>
+      <span class="s4">this</span><span class="s1">.emit(</span><span class="s0">'ping'</span><span class="s1">, data);</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">.emit(</span><span class="s0">'pong'</span><span class="s1">, data);</span>
+    <span class="s1">}</span>
+
+    <span class="s4">this</span><span class="s1">._state = GET_INFO;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = Receiver;</span>
+
+<span class="s3">/** 
+ * Builds an error object. 
+ * 
+ * @param {(Error|RangeError)} ErrorCtor The error constructor 
+ * @param {String} message The error message 
+ * @param {Boolean} prefix Specifies whether or not to add a default prefix to 
+ *     `message` 
+ * @param {Number} statusCode The status code 
+ * @return {(Error|RangeError)} The error 
+ * @private 
+ */</span>
+<span class="s4">function </span><span class="s1">error(ErrorCtor, message, prefix, statusCode) {</span>
+  <span class="s1">const err = </span><span class="s4">new </span><span class="s1">ErrorCtor(</span>
+    <span class="s1">prefix ? `Invalid WebSocket frame: ${message}` : message</span>
+  <span class="s1">);</span>
+
+  <span class="s1">Error.captureStackTrace(err, error);</span>
+  <span class="s1">err[kStatusCode] = statusCode;</span>
+  <span class="s4">return </span><span class="s1">err;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

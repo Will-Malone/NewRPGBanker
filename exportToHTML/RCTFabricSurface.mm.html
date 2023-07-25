@@ -1,0 +1,324 @@
+<html>
+<head>
+<title>RCTFabricSurface.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTFabricSurface.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTFabricSurface.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;mutex&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTAssert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConstants.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConversions.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTFollyConvert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTI18nUtil.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTMountingManager.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceDelegate.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceRootView.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceTouchHandler.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceView+Internal.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceView.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUIManagerUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/mounting/MountingCoordinator.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfacePresenter.h&quot;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::react</span><span class="s4">;</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTFabricSurface {</span>
+  <span class="s4">__weak </span><span class="s1">RCTSurfacePresenter *_surfacePresenter</span><span class="s4">;</span>
+
+  <span class="s0">// `SurfaceHandler` is a thread-safe object, so we don't need additional synchronization.</span>
+  <span class="s0">// Objective-C++ classes cannot have instance variables without default constructors,</span>
+  <span class="s0">// hence we wrap a value into `optional` to workaround it.</span>
+  <span class="s1">std::</span><span class="s4">optional</span><span class="s1">&lt;SurfaceHandler&gt; _surfaceHandler</span><span class="s4">;</span>
+
+  <span class="s0">// Protects Surface's start and stop processes.</span>
+  <span class="s0">// Even though SurfaceHandler is tread-safe, it will crash if we try to stop a surface that is not running.</span>
+  <span class="s0">// To make the API easy to use, we check the status of the surface before calling `start` or `stop`,</span>
+  <span class="s0">// and we need this mutex to prevent races.</span>
+  <span class="s1">std::mutex _surfaceMutex</span><span class="s4">;</span>
+
+  <span class="s0">// Can be accessed from the main thread only.</span>
+  <span class="s1">RCTSurfaceView *</span><span class="s4">_Nullable </span><span class="s1">_view</span><span class="s4">;</span>
+  <span class="s1">RCTSurfaceTouchHandler *</span><span class="s4">_Nullable </span><span class="s1">_touchHandler</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@synthesize </span><span class="s1">delegate = _delegate</span><span class="s4">;</span>
+
+<span class="s1">- (instancetype)initWithSurfacePresenter:(RCTSurfacePresenter *)surfacePresenter</span>
+                              <span class="s1">moduleName:(NSString *)moduleName</span>
+                       <span class="s1">initialProperties:(NSDictionary *)initialProperties</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_surfacePresenter = surfacePresenter</span><span class="s4">;</span>
+
+    <span class="s1">_surfaceHandler =</span>
+        <span class="s1">SurfaceHandler{RCTStringFromNSString(moduleName)</span><span class="s4">, </span><span class="s1">(SurfaceId)[RCTAllocateRootViewTag() integerValue]}</span><span class="s4">;</span>
+    <span class="s1">_surfaceHandler-&gt;setProps(convertIdToFollyDynamic(initialProperties))</span><span class="s4">;</span>
+
+    <span class="s1">[_surfacePresenter registerSurface:self]</span><span class="s4">;</span>
+
+    <span class="s1">[self setMinimumSize:CGSizeZero maximumSize:RCTViewportSize()]</span><span class="s4">;</span>
+
+    <span class="s1">[self _updateLayoutContext]</span><span class="s4">;</span>
+
+    <span class="s1">[[NSNotificationCenter defaultCenter] addObserver:self</span>
+                                             <span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(handleContentSizeCategoryDidChangeNotification:)</span>
+                                                 <span class="s1">name:UIContentSizeCategoryDidChangeNotification</span>
+                                               <span class="s1">object:nil]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)resetWithSurfacePresenter:(RCTSurfacePresenter *)surfacePresenter</span>
+<span class="s1">{</span>
+  <span class="s1">_view = nil</span><span class="s4">;</span>
+  <span class="s1">_surfacePresenter = surfacePresenter</span><span class="s4">;</span>
+  <span class="s1">[_surfacePresenter registerSurface:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dealloc</span>
+<span class="s1">{</span>
+  <span class="s1">[_surfacePresenter unregisterSurface:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Life-cycle management</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)start</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_surfaceMutex)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(_surfaceHandler-&gt;getStatus() != SurfaceHandler::Status::Registered) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// We need to register a root view component here synchronously because right after</span>
+  <span class="s0">// we start a surface, it can initiate an update that can query the root component.</span>
+  <span class="s1">RCTUnsafeExecuteOnMainQueueSync(^{</span>
+    <span class="s1">[self-&gt;_surfacePresenter.mountingManager attachSurfaceToView:self.view</span>
+                                                       <span class="s1">surfaceId:self-&gt;_surfaceHandler-&gt;getSurfaceId()]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">_surfaceHandler-&gt;start()</span><span class="s4">;</span>
+  <span class="s1">[self _propagateStageChange]</span><span class="s4">;</span>
+
+  <span class="s1">[_surfacePresenter setupAnimationDriverWithSurfaceHandler:*_surfaceHandler]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)stop</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_surfaceMutex)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(_surfaceHandler-&gt;getStatus() != SurfaceHandler::Status::Running) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_surfaceHandler-&gt;stop()</span><span class="s4">;</span>
+  <span class="s1">[self _propagateStageChange]</span><span class="s4">;</span>
+
+  <span class="s1">RCTExecuteOnMainQueue(^{</span>
+    <span class="s1">[self-&gt;_surfacePresenter.mountingManager detachSurfaceFromView:self.view</span>
+                                                         <span class="s1">surfaceId:self-&gt;_surfaceHandler-&gt;getSurfaceId()]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Immutable Properties (no need to enforce synchronization)</span>
+
+<span class="s1">- (NSString *)moduleName</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTNSStringFromString(_surfaceHandler-&gt;getModuleName())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Main-Threaded Routines</span>
+
+<span class="s1">- (RCTSurfaceView *)view</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_view) {</span>
+    <span class="s1">_view = [[RCTSurfaceView alloc] initWithSurface:(RCTSurface *)self]</span><span class="s4">;</span>
+    <span class="s1">_touchHandler = [RCTSurfaceTouchHandler </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">[_touchHandler attachToView:_view]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">_view</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Stage management</span>
+
+<span class="s1">- (RCTSurfaceStage)stage</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_surfaceHandler-&gt;getStatus() == SurfaceHandler::Status::Running ? RCTSurfaceStageRunning</span>
+                                                                         <span class="s1">: RCTSurfaceStagePreparing</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_propagateStageChange</span>
+<span class="s1">{</span>
+  <span class="s1">RCTSurfaceStage stage = self.stage</span><span class="s4">;</span>
+
+  <span class="s0">// Notifying the `delegate`</span>
+  <span class="s1">id&lt;RCTSurfaceDelegate&gt; delegate = self.delegate</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([delegate respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(surface:didChangeStage:)]) {</span>
+    <span class="s1">[delegate surface:(RCTSurface *)self didChangeStage:stage]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_updateLayoutContext</span>
+<span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">layoutConstraints = _surfaceHandler-&gt;getLayoutConstraints()</span><span class="s4">;</span>
+  <span class="s1">layoutConstraints.layoutDirection = RCTLayoutDirection([[RCTI18nUtil sharedInstance] isRTL])</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">layoutContext = _surfaceHandler-&gt;getLayoutContext()</span><span class="s4">;</span>
+
+  <span class="s1">layoutContext.pointScaleFactor = RCTScreenScale()</span><span class="s4">;</span>
+  <span class="s1">layoutContext.swapLeftAndRightInRTL =</span>
+      <span class="s1">[[RCTI18nUtil sharedInstance] isRTL] &amp;&amp; [[RCTI18nUtil sharedInstance] doLeftAndRightSwapInRTL]</span><span class="s4">;</span>
+  <span class="s1">layoutContext.fontSizeMultiplier = RCTFontSizeMultiplier()</span><span class="s4">;</span>
+
+  <span class="s1">_surfaceHandler-&gt;constraintLayout(layoutConstraints</span><span class="s4">, </span><span class="s1">layoutContext)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Properties Management</span>
+
+<span class="s1">- (NSDictionary *)properties</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">convertFollyDynamicToId(_surfaceHandler-&gt;getProps())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setProperties:(NSDictionary *)properties</span>
+<span class="s1">{</span>
+  <span class="s1">_surfaceHandler-&gt;setProps(convertIdToFollyDynamic(properties))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Layout</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setMinimumSize:(CGSize)minimumSize maximumSize:(CGSize)maximumSize viewportOffset:(CGPoint)viewportOffset</span>
+<span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">layoutConstraints = _surfaceHandler-&gt;getLayoutConstraints()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">layoutContext = _surfaceHandler-&gt;getLayoutContext()</span><span class="s4">;</span>
+
+  <span class="s1">layoutConstraints.minimumSize = RCTSizeFromCGSize(minimumSize)</span><span class="s4">;</span>
+  <span class="s1">layoutConstraints.maximumSize = RCTSizeFromCGSize(maximumSize)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!isnan(viewportOffset.x) &amp;&amp; !isnan(viewportOffset.y)) {</span>
+    <span class="s1">layoutContext.viewportOffset = RCTPointFromCGPoint(viewportOffset)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_surfaceHandler-&gt;constraintLayout(layoutConstraints</span><span class="s4">, </span><span class="s1">layoutContext)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setMinimumSize:(CGSize)minimumSize maximumSize:(CGSize)maximumSize</span>
+<span class="s1">{</span>
+  <span class="s1">[self setMinimumSize:minimumSize maximumSize:maximumSize viewportOffset:CGPointMake(NAN</span><span class="s4">, </span><span class="s1">NAN)]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setSize:(CGSize)size</span>
+<span class="s1">{</span>
+  <span class="s1">[self setMinimumSize:size maximumSize:size]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (CGSize)sizeThatFitsMinimumSize:(CGSize)minimumSize maximumSize:(CGSize)maximumSize</span>
+<span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">layoutConstraints = _surfaceHandler-&gt;getLayoutConstraints()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">layoutContext = _surfaceHandler-&gt;getLayoutContext()</span><span class="s4">;</span>
+
+  <span class="s1">layoutConstraints.minimumSize = RCTSizeFromCGSize(minimumSize)</span><span class="s4">;</span>
+  <span class="s1">layoutConstraints.maximumSize = RCTSizeFromCGSize(maximumSize)</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">RCTCGSizeFromSize(_surfaceHandler-&gt;measure(layoutConstraints</span><span class="s4">, </span><span class="s1">layoutContext))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (CGSize)minimumSize</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTCGSizeFromSize(_surfaceHandler-&gt;getLayoutConstraints().minimumSize)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (CGSize)maximumSize</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTCGSizeFromSize(_surfaceHandler-&gt;getLayoutConstraints().maximumSize)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (CGPoint)viewportOffset</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTCGPointFromPoint(_surfaceHandler-&gt;getLayoutContext().viewportOffset)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Synchronous Waiting</span>
+
+<span class="s1">- (BOOL)synchronouslyWaitFor:(NSTimeInterval)timeout</span>
+<span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">mountingCoordinator = _surfaceHandler-&gt;getMountingCoordinator()</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!mountingCoordinator) {</span>
+    <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!mountingCoordinator-&gt;waitForTransaction(std::chrono::duration&lt;NSTimeInterval&gt;(timeout))) {</span>
+    <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[_surfacePresenter.mountingManager scheduleTransaction:mountingCoordinator]</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)handleContentSizeCategoryDidChangeNotification:(NSNotification *)notification</span>
+<span class="s1">{</span>
+  <span class="s1">[self _updateLayoutContext]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private</span>
+
+<span class="s1">- (SurfaceHandler </span><span class="s4">const </span><span class="s1">&amp;)surfaceHandler</span><span class="s4">;</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">*_surfaceHandler</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Deprecated</span>
+
+<span class="s1">- (instancetype)initWithBridge:(RCTBridge *)bridge</span>
+                    <span class="s1">moduleName:(NSString *)moduleName</span>
+             <span class="s1">initialProperties:(NSDictionary *)initialProperties</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self initWithSurfacePresenter:bridge.surfacePresenter</span>
+                             <span class="s1">moduleName:moduleName</span>
+                      <span class="s1">initialProperties:initialProperties]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSNumber *)rootViewTag</span>
+<span class="s1">{</span>
+  <span class="s4">return @</span><span class="s1">(_surfaceHandler-&gt;getSurfaceId())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSInteger)rootTag</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">(NSInteger)(_surfaceHandler-&gt;getSurfaceId())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

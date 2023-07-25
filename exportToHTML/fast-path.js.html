@@ -1,0 +1,554 @@
+<html>
+<head>
+<title>fast-path.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #6a8759;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+fast-path.js</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;use strict&quot;</span><span class="s1">;</span>
+<span class="s1">Object.defineProperty(exports, </span><span class="s0">&quot;__esModule&quot;</span><span class="s1">, { value: </span><span class="s2">true </span><span class="s1">});</span>
+<span class="s2">var </span><span class="s1">tslib_1 = require(</span><span class="s0">&quot;tslib&quot;</span><span class="s1">);</span>
+<span class="s2">var </span><span class="s1">assert_1 = tslib_1.__importDefault(require(</span><span class="s0">&quot;assert&quot;</span><span class="s1">));</span>
+<span class="s2">var </span><span class="s1">types = tslib_1.__importStar(require(</span><span class="s0">&quot;ast-types&quot;</span><span class="s1">));</span>
+<span class="s2">var </span><span class="s1">util = tslib_1.__importStar(require(</span><span class="s0">&quot;./util&quot;</span><span class="s1">));</span>
+<span class="s2">var </span><span class="s1">n = types.namedTypes;</span>
+<span class="s2">var </span><span class="s1">isArray = types.builtInTypes.array;</span>
+<span class="s2">var </span><span class="s1">isNumber = types.builtInTypes.number;</span>
+<span class="s2">var </span><span class="s1">PRECEDENCE = {};</span>
+<span class="s1">[</span>
+    <span class="s1">[</span><span class="s0">&quot;??&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;||&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;&amp;&amp;&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;|&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;^&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;&amp;&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;==&quot;</span><span class="s1">, </span><span class="s0">&quot;===&quot;</span><span class="s1">, </span><span class="s0">&quot;!=&quot;</span><span class="s1">, </span><span class="s0">&quot;!==&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;&lt;&quot;</span><span class="s1">, </span><span class="s0">&quot;&gt;&quot;</span><span class="s1">, </span><span class="s0">&quot;&lt;=&quot;</span><span class="s1">, </span><span class="s0">&quot;&gt;=&quot;</span><span class="s1">, </span><span class="s0">&quot;in&quot;</span><span class="s1">, </span><span class="s0">&quot;instanceof&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;&gt;&gt;&quot;</span><span class="s1">, </span><span class="s0">&quot;&lt;&lt;&quot;</span><span class="s1">, </span><span class="s0">&quot;&gt;&gt;&gt;&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;+&quot;</span><span class="s1">, </span><span class="s0">&quot;-&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;*&quot;</span><span class="s1">, </span><span class="s0">&quot;/&quot;</span><span class="s1">, </span><span class="s0">&quot;%&quot;</span><span class="s1">],</span>
+    <span class="s1">[</span><span class="s0">&quot;**&quot;</span><span class="s1">],</span>
+<span class="s1">].forEach(</span><span class="s2">function </span><span class="s1">(tier, i) {</span>
+    <span class="s1">tier.forEach(</span><span class="s2">function </span><span class="s1">(op) {</span>
+        <span class="s1">PRECEDENCE[op] = i;</span>
+    <span class="s1">});</span>
+<span class="s1">});</span>
+<span class="s2">var </span><span class="s1">FastPath = </span><span class="s2">function </span><span class="s1">FastPath(value) {</span>
+    <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.ok(</span><span class="s2">this instanceof </span><span class="s1">FastPath);</span>
+    <span class="s2">this</span><span class="s1">.stack = [value];</span>
+<span class="s1">};</span>
+<span class="s2">var </span><span class="s1">FPp = FastPath.prototype;</span>
+<span class="s3">// Static convenience function for coercing a value to a FastPath.</span>
+<span class="s1">FastPath.from = </span><span class="s2">function </span><span class="s1">(obj) {</span>
+    <span class="s2">if </span><span class="s1">(obj </span><span class="s2">instanceof </span><span class="s1">FastPath) {</span>
+        <span class="s3">// Return a defensive copy of any existing FastPath instances.</span>
+        <span class="s2">return </span><span class="s1">obj.copy();</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(obj </span><span class="s2">instanceof </span><span class="s1">types.NodePath) {</span>
+        <span class="s3">// For backwards compatibility, unroll NodePath instances into</span>
+        <span class="s3">// lightweight FastPath [..., name, value] stacks.</span>
+        <span class="s2">var </span><span class="s1">copy = Object.create(FastPath.prototype);</span>
+        <span class="s2">var </span><span class="s1">stack = [obj.value];</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">pp = </span><span class="s2">void </span><span class="s4">0</span><span class="s1">; (pp = obj.parentPath); obj = pp)</span>
+            <span class="s1">stack.push(obj.name, pp.value);</span>
+        <span class="s1">copy.stack = stack.reverse();</span>
+        <span class="s2">return </span><span class="s1">copy;</span>
+    <span class="s1">}</span>
+    <span class="s3">// Otherwise use obj as the value of the new FastPath instance.</span>
+    <span class="s2">return new </span><span class="s1">FastPath(obj);</span>
+<span class="s1">};</span>
+<span class="s1">FPp.copy = </span><span class="s2">function </span><span class="s1">copy() {</span>
+    <span class="s2">var </span><span class="s1">copy = Object.create(FastPath.prototype);</span>
+    <span class="s1">copy.stack = </span><span class="s2">this</span><span class="s1">.stack.slice(</span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s2">return </span><span class="s1">copy;</span>
+<span class="s1">};</span>
+<span class="s3">// The name of the current property is always the penultimate element of</span>
+<span class="s3">// this.stack, and always a String.</span>
+<span class="s1">FPp.getName = </span><span class="s2">function </span><span class="s1">getName() {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">var </span><span class="s1">len = s.length;</span>
+    <span class="s2">if </span><span class="s1">(len &gt; </span><span class="s4">1</span><span class="s1">) {</span>
+        <span class="s2">return </span><span class="s1">s[len - </span><span class="s4">2</span><span class="s1">];</span>
+    <span class="s1">}</span>
+    <span class="s3">// Since the name is always a string, null is a safe sentinel value to</span>
+    <span class="s3">// return if we do not know the name of the (root) value.</span>
+    <span class="s2">return null</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s3">// The value of the current property is always the final element of</span>
+<span class="s3">// this.stack.</span>
+<span class="s1">FPp.getValue = </span><span class="s2">function </span><span class="s1">getValue() {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">return </span><span class="s1">s[s.length - </span><span class="s4">1</span><span class="s1">];</span>
+<span class="s1">};</span>
+<span class="s1">FPp.valueIsDuplicate = </span><span class="s2">function </span><span class="s1">() {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">var </span><span class="s1">valueIndex = s.length - </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s2">return </span><span class="s1">s.lastIndexOf(s[valueIndex], valueIndex - </span><span class="s4">1</span><span class="s1">) &gt;= </span><span class="s4">0</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s2">function </span><span class="s1">getNodeHelper(path, count) {</span>
+    <span class="s2">var </span><span class="s1">s = path.stack;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">i = s.length - </span><span class="s4">1</span><span class="s1">; i &gt;= </span><span class="s4">0</span><span class="s1">; i -= </span><span class="s4">2</span><span class="s1">) {</span>
+        <span class="s2">var </span><span class="s1">value = s[i];</span>
+        <span class="s2">if </span><span class="s1">(n.Node.check(value) &amp;&amp; --count &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s2">return </span><span class="s1">value;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return null</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s1">FPp.getNode = </span><span class="s2">function </span><span class="s1">getNode(count) {</span>
+    <span class="s2">if </span><span class="s1">(count === </span><span class="s2">void </span><span class="s4">0</span><span class="s1">) { count = </span><span class="s4">0</span><span class="s1">; }</span>
+    <span class="s2">return </span><span class="s1">getNodeHelper(</span><span class="s2">this</span><span class="s1">, ~~count);</span>
+<span class="s1">};</span>
+<span class="s1">FPp.getParentNode = </span><span class="s2">function </span><span class="s1">getParentNode(count) {</span>
+    <span class="s2">if </span><span class="s1">(count === </span><span class="s2">void </span><span class="s4">0</span><span class="s1">) { count = </span><span class="s4">0</span><span class="s1">; }</span>
+    <span class="s2">return </span><span class="s1">getNodeHelper(</span><span class="s2">this</span><span class="s1">, ~~count + </span><span class="s4">1</span><span class="s1">);</span>
+<span class="s1">};</span>
+<span class="s3">// The length of the stack can be either even or odd, depending on whether</span>
+<span class="s3">// or not we have a name for the root value. The difference between the</span>
+<span class="s3">// index of the root value and the index of the final value is always</span>
+<span class="s3">// even, though, which allows us to return the root value in constant time</span>
+<span class="s3">// (i.e. without iterating backwards through the stack).</span>
+<span class="s1">FPp.getRootValue = </span><span class="s2">function </span><span class="s1">getRootValue() {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">if </span><span class="s1">(s.length % </span><span class="s4">2 </span><span class="s1">=== </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s2">return </span><span class="s1">s[</span><span class="s4">1</span><span class="s1">];</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">s[</span><span class="s4">0</span><span class="s1">];</span>
+<span class="s1">};</span>
+<span class="s3">// Temporarily push properties named by string arguments given after the</span>
+<span class="s3">// callback function onto this.stack, then call the callback with a</span>
+<span class="s3">// reference to this (modified) FastPath object. Note that the stack will</span>
+<span class="s3">// be restored to its original state after the callback is finished, so it</span>
+<span class="s3">// is probably a mistake to retain a reference to the path.</span>
+<span class="s1">FPp.call = </span><span class="s2">function </span><span class="s1">call(callback </span><span class="s3">/*, name1, name2, ... */</span><span class="s1">) {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">var </span><span class="s1">origLen = s.length;</span>
+    <span class="s2">var </span><span class="s1">value = s[origLen - </span><span class="s4">1</span><span class="s1">];</span>
+    <span class="s2">var </span><span class="s1">argc = arguments.length;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">i = </span><span class="s4">1</span><span class="s1">; i &lt; argc; ++i) {</span>
+        <span class="s2">var </span><span class="s1">name = arguments[i];</span>
+        <span class="s1">value = value[name];</span>
+        <span class="s1">s.push(name, value);</span>
+    <span class="s1">}</span>
+    <span class="s2">var </span><span class="s1">result = callback(</span><span class="s2">this</span><span class="s1">);</span>
+    <span class="s1">s.length = origLen;</span>
+    <span class="s2">return </span><span class="s1">result;</span>
+<span class="s1">};</span>
+<span class="s3">// Similar to FastPath.prototype.call, except that the value obtained by</span>
+<span class="s3">// accessing this.getValue()[name1][name2]... should be array-like. The</span>
+<span class="s3">// callback will be called with a reference to this path object for each</span>
+<span class="s3">// element of the array.</span>
+<span class="s1">FPp.each = </span><span class="s2">function </span><span class="s1">each(callback </span><span class="s3">/*, name1, name2, ... */</span><span class="s1">) {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">var </span><span class="s1">origLen = s.length;</span>
+    <span class="s2">var </span><span class="s1">value = s[origLen - </span><span class="s4">1</span><span class="s1">];</span>
+    <span class="s2">var </span><span class="s1">argc = arguments.length;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">i = </span><span class="s4">1</span><span class="s1">; i &lt; argc; ++i) {</span>
+        <span class="s2">var </span><span class="s1">name = arguments[i];</span>
+        <span class="s1">value = value[name];</span>
+        <span class="s1">s.push(name, value);</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">i = </span><span class="s4">0</span><span class="s1">; i &lt; value.length; ++i) {</span>
+        <span class="s2">if </span><span class="s1">(i </span><span class="s2">in </span><span class="s1">value) {</span>
+            <span class="s1">s.push(i, value[i]);</span>
+            <span class="s3">// If the callback needs to know the value of i, call</span>
+            <span class="s3">// path.getName(), assuming path is the parameter name.</span>
+            <span class="s1">callback(</span><span class="s2">this</span><span class="s1">);</span>
+            <span class="s1">s.length -= </span><span class="s4">2</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">s.length = origLen;</span>
+<span class="s1">};</span>
+<span class="s3">// Similar to FastPath.prototype.each, except that the results of the</span>
+<span class="s3">// callback function invocations are stored in an array and returned at</span>
+<span class="s3">// the end of the iteration.</span>
+<span class="s1">FPp.map = </span><span class="s2">function </span><span class="s1">map(callback </span><span class="s3">/*, name1, name2, ... */</span><span class="s1">) {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">var </span><span class="s1">origLen = s.length;</span>
+    <span class="s2">var </span><span class="s1">value = s[origLen - </span><span class="s4">1</span><span class="s1">];</span>
+    <span class="s2">var </span><span class="s1">argc = arguments.length;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">i = </span><span class="s4">1</span><span class="s1">; i &lt; argc; ++i) {</span>
+        <span class="s2">var </span><span class="s1">name = arguments[i];</span>
+        <span class="s1">value = value[name];</span>
+        <span class="s1">s.push(name, value);</span>
+    <span class="s1">}</span>
+    <span class="s2">var </span><span class="s1">result = </span><span class="s2">new </span><span class="s1">Array(value.length);</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">i = </span><span class="s4">0</span><span class="s1">; i &lt; value.length; ++i) {</span>
+        <span class="s2">if </span><span class="s1">(i </span><span class="s2">in </span><span class="s1">value) {</span>
+            <span class="s1">s.push(i, value[i]);</span>
+            <span class="s1">result[i] = callback(</span><span class="s2">this</span><span class="s1">, i);</span>
+            <span class="s1">s.length -= </span><span class="s4">2</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">s.length = origLen;</span>
+    <span class="s2">return </span><span class="s1">result;</span>
+<span class="s1">};</span>
+<span class="s3">// Returns true if the node at the tip of the path is wrapped with</span>
+<span class="s3">// parentheses, OR if the only reason the node needed parentheses was that</span>
+<span class="s3">// it couldn't be the first expression in the enclosing statement (see</span>
+<span class="s3">// FastPath#canBeFirstInStatement), and it has an opening `(` character.</span>
+<span class="s3">// For example, the FunctionExpression in `(function(){}())` appears to</span>
+<span class="s3">// need parentheses only because it's the first expression in the AST, but</span>
+<span class="s3">// since it happens to be preceded by a `(` (which is not apparent from</span>
+<span class="s3">// the AST but can be determined using FastPath#getPrevToken), there is no</span>
+<span class="s3">// ambiguity about how to parse it, so it counts as having parentheses,</span>
+<span class="s3">// even though it is not immediately followed by a `)`.</span>
+<span class="s1">FPp.hasParens = </span><span class="s2">function </span><span class="s1">() {</span>
+    <span class="s2">var </span><span class="s1">node = </span><span class="s2">this</span><span class="s1">.getNode();</span>
+    <span class="s2">var </span><span class="s1">prevToken = </span><span class="s2">this</span><span class="s1">.getPrevToken(node);</span>
+    <span class="s2">if </span><span class="s1">(!prevToken) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">var </span><span class="s1">nextToken = </span><span class="s2">this</span><span class="s1">.getNextToken(node);</span>
+    <span class="s2">if </span><span class="s1">(!nextToken) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(prevToken.value === </span><span class="s0">&quot;(&quot;</span><span class="s1">) {</span>
+        <span class="s2">if </span><span class="s1">(nextToken.value === </span><span class="s0">&quot;)&quot;</span><span class="s1">) {</span>
+            <span class="s3">// If the node preceded by a `(` token and followed by a `)` token,</span>
+            <span class="s3">// then of course it has parentheses.</span>
+            <span class="s2">return true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">// If this is one of the few Expression types that can't come first in</span>
+        <span class="s3">// the enclosing statement because of parsing ambiguities (namely,</span>
+        <span class="s3">// FunctionExpression, ObjectExpression, and ClassExpression) and</span>
+        <span class="s3">// this.firstInStatement() returns true, and the node would not need</span>
+        <span class="s3">// parentheses in an expression context because this.needsParens(true)</span>
+        <span class="s3">// returns false, then it just needs an opening parenthesis to resolve</span>
+        <span class="s3">// the parsing ambiguity that made it appear to need parentheses.</span>
+        <span class="s2">var </span><span class="s1">justNeedsOpeningParen = !</span><span class="s2">this</span><span class="s1">.canBeFirstInStatement() &amp;&amp;</span>
+            <span class="s2">this</span><span class="s1">.firstInStatement() &amp;&amp;</span>
+            <span class="s1">!</span><span class="s2">this</span><span class="s1">.needsParens(</span><span class="s2">true</span><span class="s1">);</span>
+        <span class="s2">if </span><span class="s1">(justNeedsOpeningParen) {</span>
+            <span class="s2">return true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return false</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s1">FPp.getPrevToken = </span><span class="s2">function </span><span class="s1">(node) {</span>
+    <span class="s1">node = node || </span><span class="s2">this</span><span class="s1">.getNode();</span>
+    <span class="s2">var </span><span class="s1">loc = node &amp;&amp; node.loc;</span>
+    <span class="s2">var </span><span class="s1">tokens = loc &amp;&amp; loc.tokens;</span>
+    <span class="s2">if </span><span class="s1">(tokens &amp;&amp; loc.start.token &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+        <span class="s2">var </span><span class="s1">token = tokens[loc.start.token - </span><span class="s4">1</span><span class="s1">];</span>
+        <span class="s2">if </span><span class="s1">(token) {</span>
+            <span class="s3">// Do not return tokens that fall outside the root subtree.</span>
+            <span class="s2">var </span><span class="s1">rootLoc = </span><span class="s2">this</span><span class="s1">.getRootValue().loc;</span>
+            <span class="s2">if </span><span class="s1">(util.comparePos(rootLoc.start, token.loc.start) &lt;= </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s2">return </span><span class="s1">token;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return null</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s1">FPp.getNextToken = </span><span class="s2">function </span><span class="s1">(node) {</span>
+    <span class="s1">node = node || </span><span class="s2">this</span><span class="s1">.getNode();</span>
+    <span class="s2">var </span><span class="s1">loc = node &amp;&amp; node.loc;</span>
+    <span class="s2">var </span><span class="s1">tokens = loc &amp;&amp; loc.tokens;</span>
+    <span class="s2">if </span><span class="s1">(tokens &amp;&amp; loc.end.token &lt; tokens.length) {</span>
+        <span class="s2">var </span><span class="s1">token = tokens[loc.end.token];</span>
+        <span class="s2">if </span><span class="s1">(token) {</span>
+            <span class="s3">// Do not return tokens that fall outside the root subtree.</span>
+            <span class="s2">var </span><span class="s1">rootLoc = </span><span class="s2">this</span><span class="s1">.getRootValue().loc;</span>
+            <span class="s2">if </span><span class="s1">(util.comparePos(token.loc.end, rootLoc.end) &lt;= </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s2">return </span><span class="s1">token;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return null</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s3">// Inspired by require(&quot;ast-types&quot;).NodePath.prototype.needsParens, but</span>
+<span class="s3">// more efficient because we're iterating backwards through a stack.</span>
+<span class="s1">FPp.needsParens = </span><span class="s2">function </span><span class="s1">(assumeExpressionContext) {</span>
+    <span class="s2">var </span><span class="s1">node = </span><span class="s2">this</span><span class="s1">.getNode();</span>
+    <span class="s3">// This needs to come before `if (!parent) { return false }` because</span>
+    <span class="s3">// an object destructuring assignment requires parens for</span>
+    <span class="s3">// correctness even when it's the topmost expression.</span>
+    <span class="s2">if </span><span class="s1">(node.type === </span><span class="s0">&quot;AssignmentExpression&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">node.left.type === </span><span class="s0">&quot;ObjectPattern&quot;</span><span class="s1">) {</span>
+        <span class="s2">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">var </span><span class="s1">parent = </span><span class="s2">this</span><span class="s1">.getParentNode();</span>
+    <span class="s2">var </span><span class="s1">name = </span><span class="s2">this</span><span class="s1">.getName();</span>
+    <span class="s3">// If the value of this path is some child of a Node and not a Node</span>
+    <span class="s3">// itself, then it doesn't need parentheses. Only Node objects (in fact,</span>
+    <span class="s3">// only Expression nodes) need parentheses.</span>
+    <span class="s2">if </span><span class="s1">(</span><span class="s2">this</span><span class="s1">.getValue() !== node) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">// Only statements don't need parentheses.</span>
+    <span class="s2">if </span><span class="s1">(n.Statement.check(node)) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">// Identifiers never need parentheses.</span>
+    <span class="s2">if </span><span class="s1">(node.type === </span><span class="s0">&quot;Identifier&quot;</span><span class="s1">) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(parent &amp;&amp; parent.type === </span><span class="s0">&quot;ParenthesizedExpression&quot;</span><span class="s1">) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(node.extra &amp;&amp; node.extra.parenthesized) {</span>
+        <span class="s2">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(!parent)</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s2">switch </span><span class="s1">(node.type) {</span>
+        <span class="s2">case </span><span class="s0">&quot;UnaryExpression&quot;</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s0">&quot;SpreadElement&quot;</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s0">&quot;SpreadProperty&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(parent.type === </span><span class="s0">&quot;MemberExpression&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;object&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.object === node);</span>
+        <span class="s2">case </span><span class="s0">&quot;BinaryExpression&quot;</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s0">&quot;LogicalExpression&quot;</span><span class="s1">:</span>
+            <span class="s2">switch </span><span class="s1">(parent.type) {</span>
+                <span class="s2">case </span><span class="s0">&quot;CallExpression&quot;</span><span class="s1">:</span>
+                    <span class="s2">return </span><span class="s1">name === </span><span class="s0">&quot;callee&quot; </span><span class="s1">&amp;&amp; parent.callee === node;</span>
+                <span class="s2">case </span><span class="s0">&quot;UnaryExpression&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;SpreadElement&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;SpreadProperty&quot;</span><span class="s1">:</span>
+                    <span class="s2">return true</span><span class="s1">;</span>
+                <span class="s2">case </span><span class="s0">&quot;MemberExpression&quot;</span><span class="s1">:</span>
+                    <span class="s2">return </span><span class="s1">name === </span><span class="s0">&quot;object&quot; </span><span class="s1">&amp;&amp; parent.object === node;</span>
+                <span class="s2">case </span><span class="s0">&quot;BinaryExpression&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;LogicalExpression&quot;</span><span class="s1">: {</span>
+                    <span class="s2">var </span><span class="s1">po = parent.operator;</span>
+                    <span class="s2">var </span><span class="s1">pp = PRECEDENCE[po];</span>
+                    <span class="s2">var </span><span class="s1">no = node.operator;</span>
+                    <span class="s2">var </span><span class="s1">np = PRECEDENCE[no];</span>
+                    <span class="s2">if </span><span class="s1">(pp &gt; np) {</span>
+                        <span class="s2">return true</span><span class="s1">;</span>
+                    <span class="s1">}</span>
+                    <span class="s2">if </span><span class="s1">(pp === np &amp;&amp; name === </span><span class="s0">&quot;right&quot;</span><span class="s1">) {</span>
+                        <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.right, node);</span>
+                        <span class="s2">return true</span><span class="s1">;</span>
+                    <span class="s1">}</span>
+                    <span class="s2">break</span><span class="s1">;</span>
+                <span class="s1">}</span>
+                <span class="s2">default</span><span class="s1">:</span>
+                    <span class="s2">return false</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s0">&quot;SequenceExpression&quot;</span><span class="s1">:</span>
+            <span class="s2">switch </span><span class="s1">(parent.type) {</span>
+                <span class="s2">case </span><span class="s0">&quot;ReturnStatement&quot;</span><span class="s1">:</span>
+                    <span class="s2">return false</span><span class="s1">;</span>
+                <span class="s2">case </span><span class="s0">&quot;ForStatement&quot;</span><span class="s1">:</span>
+                    <span class="s3">// Although parentheses wouldn't hurt around sequence expressions in</span>
+                    <span class="s3">// the head of for loops, traditional style dictates that e.g. i++,</span>
+                    <span class="s3">// j++ should not be wrapped with parentheses.</span>
+                    <span class="s2">return false</span><span class="s1">;</span>
+                <span class="s2">case </span><span class="s0">&quot;ExpressionStatement&quot;</span><span class="s1">:</span>
+                    <span class="s2">return </span><span class="s1">name !== </span><span class="s0">&quot;expression&quot;</span><span class="s1">;</span>
+                <span class="s2">default</span><span class="s1">:</span>
+                    <span class="s3">// Otherwise err on the side of overparenthesization, adding</span>
+                    <span class="s3">// explicit exceptions above if this proves overzealous.</span>
+                    <span class="s2">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+        <span class="s2">case </span><span class="s0">&quot;OptionalIndexedAccessType&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">node.optional &amp;&amp; parent.type === </span><span class="s0">&quot;IndexedAccessType&quot;</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s0">&quot;IntersectionTypeAnnotation&quot;</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s0">&quot;UnionTypeAnnotation&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">parent.type === </span><span class="s0">&quot;NullableTypeAnnotation&quot;</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s0">&quot;Literal&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(parent.type === </span><span class="s0">&quot;MemberExpression&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">isNumber.check(node.value) &amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;object&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.object === node);</span>
+        <span class="s3">// Babel 6 Literal split</span>
+        <span class="s2">case </span><span class="s0">&quot;NumericLiteral&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(parent.type === </span><span class="s0">&quot;MemberExpression&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;object&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.object === node);</span>
+        <span class="s2">case </span><span class="s0">&quot;YieldExpression&quot;</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s0">&quot;AwaitExpression&quot;</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s0">&quot;AssignmentExpression&quot;</span><span class="s1">:</span>
+        <span class="s2">case </span><span class="s0">&quot;ConditionalExpression&quot;</span><span class="s1">:</span>
+            <span class="s2">switch </span><span class="s1">(parent.type) {</span>
+                <span class="s2">case </span><span class="s0">&quot;UnaryExpression&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;SpreadElement&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;SpreadProperty&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;BinaryExpression&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;LogicalExpression&quot;</span><span class="s1">:</span>
+                    <span class="s2">return true</span><span class="s1">;</span>
+                <span class="s2">case </span><span class="s0">&quot;CallExpression&quot;</span><span class="s1">:</span>
+                <span class="s2">case </span><span class="s0">&quot;NewExpression&quot;</span><span class="s1">:</span>
+                    <span class="s2">return </span><span class="s1">name === </span><span class="s0">&quot;callee&quot; </span><span class="s1">&amp;&amp; parent.callee === node;</span>
+                <span class="s2">case </span><span class="s0">&quot;ConditionalExpression&quot;</span><span class="s1">:</span>
+                    <span class="s2">return </span><span class="s1">name === </span><span class="s0">&quot;test&quot; </span><span class="s1">&amp;&amp; parent.test === node;</span>
+                <span class="s2">case </span><span class="s0">&quot;MemberExpression&quot;</span><span class="s1">:</span>
+                    <span class="s2">return </span><span class="s1">name === </span><span class="s0">&quot;object&quot; </span><span class="s1">&amp;&amp; parent.object === node;</span>
+                <span class="s2">default</span><span class="s1">:</span>
+                    <span class="s2">return false</span><span class="s1">;</span>
+            <span class="s1">}</span>
+        <span class="s2">case </span><span class="s0">&quot;ArrowFunctionExpression&quot;</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">(n.CallExpression.check(parent) &amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;callee&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.callee === node) {</span>
+                <span class="s2">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s2">if </span><span class="s1">(n.MemberExpression.check(parent) &amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;object&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.object === node) {</span>
+                <span class="s2">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s2">if </span><span class="s1">(n.TSAsExpression &amp;&amp;</span>
+                <span class="s1">n.TSAsExpression.check(parent) &amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;expression&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.expression === node) {</span>
+                <span class="s2">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s2">return </span><span class="s1">isBinary(parent);</span>
+        <span class="s2">case </span><span class="s0">&quot;ObjectExpression&quot;</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">(parent.type === </span><span class="s0">&quot;ArrowFunctionExpression&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;body&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.body === node) {</span>
+                <span class="s2">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s0">&quot;TSAsExpression&quot;</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">(parent.type === </span><span class="s0">&quot;ArrowFunctionExpression&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">name === </span><span class="s0">&quot;body&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">parent.body === node &amp;&amp;</span>
+                <span class="s1">node.expression.type === </span><span class="s0">&quot;ObjectExpression&quot;</span><span class="s1">) {</span>
+                <span class="s2">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+            <span class="s2">break</span><span class="s1">;</span>
+        <span class="s2">case </span><span class="s0">&quot;CallExpression&quot;</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">(name === </span><span class="s0">&quot;declaration&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">n.ExportDefaultDeclaration.check(parent) &amp;&amp;</span>
+                <span class="s1">n.FunctionExpression.check(node.callee)) {</span>
+                <span class="s2">return true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(parent.type === </span><span class="s0">&quot;NewExpression&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">name === </span><span class="s0">&quot;callee&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">parent.callee === node) {</span>
+        <span class="s2">return </span><span class="s1">containsCallExpression(node);</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(assumeExpressionContext !== </span><span class="s2">true </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">!</span><span class="s2">this</span><span class="s1">.canBeFirstInStatement() &amp;&amp;</span>
+        <span class="s2">this</span><span class="s1">.firstInStatement()) {</span>
+        <span class="s2">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return false</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s2">function </span><span class="s1">isBinary(node) {</span>
+    <span class="s2">return </span><span class="s1">n.BinaryExpression.check(node) || n.LogicalExpression.check(node);</span>
+<span class="s1">}</span>
+<span class="s3">// @ts-ignore 'isUnaryLike' is declared but its value is never read. [6133]</span>
+<span class="s2">function </span><span class="s1">isUnaryLike(node) {</span>
+    <span class="s2">return </span><span class="s1">(n.UnaryExpression.check(node) ||</span>
+        <span class="s3">// I considered making SpreadElement and SpreadProperty subtypes of</span>
+        <span class="s3">// UnaryExpression, but they're not really Expression nodes.</span>
+        <span class="s1">(n.SpreadElement &amp;&amp; n.SpreadElement.check(node)) ||</span>
+        <span class="s1">(n.SpreadProperty &amp;&amp; n.SpreadProperty.check(node)));</span>
+<span class="s1">}</span>
+<span class="s2">function </span><span class="s1">containsCallExpression(node) {</span>
+    <span class="s2">if </span><span class="s1">(n.CallExpression.check(node)) {</span>
+        <span class="s2">return true</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(isArray.check(node)) {</span>
+        <span class="s2">return </span><span class="s1">node.some(containsCallExpression);</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(n.Node.check(node)) {</span>
+        <span class="s2">return </span><span class="s1">types.someField(node, </span><span class="s2">function </span><span class="s1">(_name, child) {</span>
+            <span class="s2">return </span><span class="s1">containsCallExpression(child);</span>
+        <span class="s1">});</span>
+    <span class="s1">}</span>
+    <span class="s2">return false</span><span class="s1">;</span>
+<span class="s1">}</span>
+<span class="s1">FPp.canBeFirstInStatement = </span><span class="s2">function </span><span class="s1">() {</span>
+    <span class="s2">var </span><span class="s1">node = </span><span class="s2">this</span><span class="s1">.getNode();</span>
+    <span class="s2">if </span><span class="s1">(n.FunctionExpression.check(node)) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(n.ObjectExpression.check(node)) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(n.ClassExpression.check(node)) {</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return true</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s1">FPp.firstInStatement = </span><span class="s2">function </span><span class="s1">() {</span>
+    <span class="s2">var </span><span class="s1">s = </span><span class="s2">this</span><span class="s1">.stack;</span>
+    <span class="s2">var </span><span class="s1">parentName, parent;</span>
+    <span class="s2">var </span><span class="s1">childName, child;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">var </span><span class="s1">i = s.length - </span><span class="s4">1</span><span class="s1">; i &gt;= </span><span class="s4">0</span><span class="s1">; i -= </span><span class="s4">2</span><span class="s1">) {</span>
+        <span class="s2">if </span><span class="s1">(n.Node.check(s[i])) {</span>
+            <span class="s1">childName = parentName;</span>
+            <span class="s1">child = parent;</span>
+            <span class="s1">parentName = s[i - </span><span class="s4">1</span><span class="s1">];</span>
+            <span class="s1">parent = s[i];</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(!parent || !child) {</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.BlockStatement.check(parent) &amp;&amp;</span>
+            <span class="s1">parentName === </span><span class="s0">&quot;body&quot; </span><span class="s1">&amp;&amp;</span>
+            <span class="s1">childName === </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.body[</span><span class="s4">0</span><span class="s1">], child);</span>
+            <span class="s2">return true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.ExpressionStatement.check(parent) &amp;&amp; childName === </span><span class="s0">&quot;expression&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.expression, child);</span>
+            <span class="s2">return true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.AssignmentExpression.check(parent) &amp;&amp; childName === </span><span class="s0">&quot;left&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.left, child);</span>
+            <span class="s2">return true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.ArrowFunctionExpression.check(parent) &amp;&amp; childName === </span><span class="s0">&quot;body&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.body, child);</span>
+            <span class="s2">return true</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s3">// s[i + 1] and s[i + 2] represent the array between the parent</span>
+        <span class="s3">// SequenceExpression node and its child nodes</span>
+        <span class="s2">if </span><span class="s1">(n.SequenceExpression.check(parent) &amp;&amp;</span>
+            <span class="s1">s[i + </span><span class="s4">1</span><span class="s1">] === </span><span class="s0">&quot;expressions&quot; </span><span class="s1">&amp;&amp;</span>
+            <span class="s1">childName === </span><span class="s4">0</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.expressions[</span><span class="s4">0</span><span class="s1">], child);</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.CallExpression.check(parent) &amp;&amp; childName === </span><span class="s0">&quot;callee&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.callee, child);</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.MemberExpression.check(parent) &amp;&amp; childName === </span><span class="s0">&quot;object&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.object, child);</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.ConditionalExpression.check(parent) &amp;&amp; childName === </span><span class="s0">&quot;test&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.test, child);</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(isBinary(parent) &amp;&amp; childName === </span><span class="s0">&quot;left&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.left, child);</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(n.UnaryExpression.check(parent) &amp;&amp;</span>
+            <span class="s1">!parent.prefix &amp;&amp;</span>
+            <span class="s1">childName === </span><span class="s0">&quot;argument&quot;</span><span class="s1">) {</span>
+            <span class="s1">assert_1.</span><span class="s2">default</span><span class="s1">.strictEqual(parent.argument, child);</span>
+            <span class="s2">continue</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s2">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return true</span><span class="s1">;</span>
+<span class="s1">};</span>
+<span class="s1">exports.</span><span class="s2">default </span><span class="s1">= FastPath;</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,196 @@
+<html>
+<head>
+<title>Transformer.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Transformer.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {TransformResult, TransformResultWithSource} from '../DeltaBundler';</span>
+<span class="s0">import type {TransformerConfig, TransformOptions} from './Worker';</span>
+<span class="s0">import type {ConfigT} from 'metro-config/src/configTypes.flow';</span>
+<span class="s0">import crypto from 'crypto';</span>
+
+<span class="s0">const getTransformCacheKey = require('./getTransformCacheKey');</span>
+<span class="s0">const WorkerFarm = require('./WorkerFarm');</span>
+<span class="s0">const assert = require('assert');</span>
+<span class="s0">const fs = require('fs');</span>
+<span class="s0">const {Cache, stableHash} = require('metro-cache');</span>
+<span class="s0">const path = require('path');</span>
+
+<span class="s0">class Transformer {</span>
+  <span class="s0">_config: ConfigT;</span>
+  <span class="s0">_cache: Cache&lt;TransformResult&lt;&gt;&gt;;</span>
+  <span class="s0">_baseHash: string;</span>
+  <span class="s0">_getSha1: string =&gt; string;</span>
+  <span class="s0">_workerFarm: WorkerFarm;</span>
+
+  <span class="s0">constructor(config: ConfigT, getSha1Fn: string =&gt; string) {</span>
+    <span class="s0">this._config = config;</span>
+
+    <span class="s0">this._config.watchFolders.forEach(verifyRootExists);</span>
+    <span class="s0">this._cache = new Cache(config.cacheStores);</span>
+    <span class="s0">this._getSha1 = getSha1Fn;</span>
+
+    <span class="s0">// Remove the transformer config params that we don't want to pass to the</span>
+    <span class="s0">// transformer. We should change the config object and move them away so we</span>
+    <span class="s0">// can treat the transformer config params as opaque.</span>
+    <span class="s0">const {</span>
+      <span class="s0">getTransformOptions: _getTransformOptions,</span>
+      <span class="s0">transformVariants: _transformVariants,</span>
+      <span class="s0">workerPath: _workerPath,</span>
+      <span class="s0">...transformerConfig</span>
+    <span class="s0">} = this._config.transformer;</span>
+
+    <span class="s0">const transformerOptions: TransformerConfig = {</span>
+      <span class="s0">transformerPath: this._config.transformerPath,</span>
+      <span class="s0">transformerConfig,</span>
+    <span class="s0">};</span>
+
+    <span class="s0">this._workerFarm = new WorkerFarm(config, transformerOptions);</span>
+
+    <span class="s0">const globalCacheKey = this._cache.isDisabled</span>
+      <span class="s0">? ''</span>
+      <span class="s0">: getTransformCacheKey({</span>
+          <span class="s0">cacheVersion: this._config.cacheVersion,</span>
+          <span class="s0">projectRoot: this._config.projectRoot,</span>
+          <span class="s0">transformerConfig: transformerOptions,</span>
+        <span class="s0">});</span>
+
+    <span class="s0">this._baseHash = stableHash([globalCacheKey]).toString('binary');</span>
+  <span class="s0">}</span>
+
+  <span class="s0">async transformFile(</span>
+    <span class="s0">filePath: string,</span>
+    <span class="s0">transformerOptions: TransformOptions,</span>
+    <span class="s0">fileBuffer?: Buffer,</span>
+  <span class="s0">): Promise&lt;TransformResultWithSource&lt;&gt;&gt; {</span>
+    <span class="s0">const cache = this._cache;</span>
+
+    <span class="s0">const {</span>
+      <span class="s0">customTransformOptions,</span>
+      <span class="s0">dev,</span>
+      <span class="s0">experimentalImportSupport,</span>
+      <span class="s0">hot,</span>
+      <span class="s0">inlinePlatform,</span>
+      <span class="s0">inlineRequires,</span>
+      <span class="s0">minify,</span>
+      <span class="s0">nonInlinedRequires,</span>
+      <span class="s0">platform,</span>
+      <span class="s0">type,</span>
+      <span class="s0">unstable_disableES6Transforms,</span>
+      <span class="s0">unstable_transformProfile,</span>
+      <span class="s0">...extra</span>
+    <span class="s0">} = transformerOptions;</span>
+
+    <span class="s0">for (const key in extra) {</span>
+      <span class="s0">// $FlowFixMe[cannot-resolve-name]</span>
+      <span class="s0">if (hasOwnProperty.call(extra, key)) {</span>
+        <span class="s0">throw new Error(</span>
+          <span class="s0">'Extra keys detected: ' + Object.keys(extra).join(', '),</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const localPath = path.relative(this._config.projectRoot, filePath);</span>
+
+    <span class="s0">const partialKey = stableHash([</span>
+      <span class="s0">// This is the hash related to the global Bundler config.</span>
+      <span class="s0">this._baseHash,</span>
+
+      <span class="s0">// Path.</span>
+      <span class="s0">localPath,</span>
+
+      <span class="s0">customTransformOptions,</span>
+      <span class="s0">dev,</span>
+      <span class="s0">experimentalImportSupport,</span>
+      <span class="s0">hot,</span>
+      <span class="s0">inlinePlatform,</span>
+      <span class="s0">inlineRequires,</span>
+      <span class="s0">minify,</span>
+      <span class="s0">nonInlinedRequires,</span>
+      <span class="s0">platform,</span>
+      <span class="s0">type,</span>
+      <span class="s0">unstable_disableES6Transforms,</span>
+      <span class="s0">unstable_transformProfile,</span>
+    <span class="s0">]);</span>
+
+    <span class="s0">let sha1: string;</span>
+    <span class="s0">if (fileBuffer) {</span>
+      <span class="s0">// Shortcut for virtual modules which provide the contents with the filename.</span>
+      <span class="s0">sha1 = crypto.createHash('sha1').update(fileBuffer).digest('hex');</span>
+    <span class="s0">} else {</span>
+      <span class="s0">sha1 = this._getSha1(filePath);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">let fullKey = Buffer.concat([partialKey, Buffer.from(sha1, 'hex')]);</span>
+    <span class="s0">const result = await cache.get(fullKey);</span>
+
+    <span class="s0">// A valid result from the cache is used directly; otherwise we call into</span>
+    <span class="s0">// the transformer to computed the corresponding result.</span>
+    <span class="s0">const data: $ReadOnly&lt;{</span>
+      <span class="s0">result: TransformResult&lt;&gt;,</span>
+      <span class="s0">sha1: string,</span>
+    <span class="s0">}&gt; = result</span>
+      <span class="s0">? {result, sha1}</span>
+      <span class="s0">: await this._workerFarm.transform(</span>
+          <span class="s0">localPath,</span>
+          <span class="s0">transformerOptions,</span>
+          <span class="s0">fileBuffer,</span>
+        <span class="s0">);</span>
+
+    <span class="s0">// Only re-compute the full key if the SHA-1 changed. This is because</span>
+    <span class="s0">// references are used by the cache implementation in a weak map to keep</span>
+    <span class="s0">// track of the cache that returned the result.</span>
+    <span class="s0">if (sha1 !== data.sha1) {</span>
+      <span class="s0">fullKey = Buffer.concat([partialKey, Buffer.from(data.sha1, 'hex')]);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">cache.set(fullKey, data.result);</span>
+
+    <span class="s0">return {</span>
+      <span class="s0">...data.result,</span>
+      <span class="s0">unstable_transformResultKey: fullKey.toString(),</span>
+      <span class="s0">getSource(): Buffer {</span>
+        <span class="s0">if (fileBuffer) {</span>
+          <span class="s0">return fileBuffer;</span>
+        <span class="s0">}</span>
+        <span class="s0">return fs.readFileSync(filePath);</span>
+      <span class="s0">},</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">end(): void {</span>
+    <span class="s0">// $FlowFixMe[unused-promise]</span>
+    <span class="s0">this._workerFarm.kill();</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function verifyRootExists(root: string): void {</span>
+  <span class="s0">// Verify that the root exists.</span>
+  <span class="s0">assert(fs.statSync(root).isDirectory(), 'Root has to be a valid directory');</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = Transformer;</span>
+</pre>
+</body>
+</html>

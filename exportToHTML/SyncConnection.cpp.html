@@ -1,0 +1,154 @@
+<html>
+<head>
+<title>SyncConnection.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+SyncConnection.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;SyncConnection.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;functional&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;stdexcept&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;folly/json.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;hermes/inspector/RuntimeAdapter.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;jsinspector/InspectorInterfaces.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">hermes {</span>
+<span class="s4">namespace </span><span class="s1">inspector {</span>
+<span class="s4">namespace </span><span class="s1">chrome {</span>
+
+<span class="s4">using namespace </span><span class="s1">std::placeholders</span><span class="s4">;</span>
+<span class="s4">using </span><span class="s1">::facebook::react::IRemoteConnection</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s1">std::string prettify(</span><span class="s4">const </span><span class="s1">std::string &amp;str) {</span>
+  <span class="s4">try </span><span class="s1">{</span>
+    <span class="s1">folly::dynamic obj = folly::parseJson(str)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">folly::toPrettyJson(obj)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">catch </span><span class="s1">(...) {</span>
+    <span class="s0">// pass</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">str</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s4">class </span><span class="s1">SyncConnection::RemoteConnection : </span><span class="s4">public </span><span class="s1">IRemoteConnection {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">RemoteConnection(SyncConnection &amp;conn) : conn_(conn) {}</span>
+
+  <span class="s4">void </span><span class="s1">onMessage(std::string message) override {</span>
+    <span class="s1">conn_.onReply(message)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">onDisconnect() override {}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">SyncConnection &amp;conn_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">SyncConnection::SyncConnection(</span>
+    <span class="s1">std::shared_ptr&lt;HermesRuntime&gt; runtime</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">waitForDebugger)</span>
+    <span class="s1">: connection_(</span>
+          <span class="s1">std::make_unique&lt;SharedRuntimeAdapter&gt;(runtime)</span><span class="s4">,</span>
+          <span class="s3">&quot;testConn&quot;</span><span class="s4">,</span>
+          <span class="s1">waitForDebugger) {</span>
+  <span class="s1">connection_.connect(std::make_unique&lt;RemoteConnection&gt;(*</span><span class="s4">this</span><span class="s1">))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SyncConnection::send(</span><span class="s4">const </span><span class="s1">std::string &amp;str) {</span>
+  <span class="s1">LOG(INFO) &lt;&lt; </span><span class="s3">&quot;SyncConnection::send sending &quot; </span><span class="s1">&lt;&lt; str</span><span class="s4">;</span>
+
+  <span class="s1">connection_.sendMessage(str)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SyncConnection::waitForResponse(</span>
+    <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::string &amp;)&gt; handler</span><span class="s4">,</span>
+    <span class="s1">std::chrono::milliseconds timeout) {</span>
+  <span class="s1">std::string reply</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+    <span class="s4">bool </span><span class="s1">success = hasReply_.wait_for(</span>
+        <span class="s1">lock</span><span class="s4">, </span><span class="s1">timeout</span><span class="s4">, </span><span class="s1">[</span><span class="s4">this</span><span class="s1">]() -&gt; </span><span class="s4">bool </span><span class="s1">{ </span><span class="s4">return </span><span class="s1">!replies_.empty()</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!success) {</span>
+      <span class="s4">throw </span><span class="s1">std::runtime_error(</span><span class="s3">&quot;timed out waiting for reply&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">reply = std::move(replies_.front())</span><span class="s4">;</span>
+    <span class="s1">replies_.pop()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">handler(reply)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SyncConnection::waitForNotification(</span>
+    <span class="s1">folly::Function&lt;</span><span class="s4">void</span><span class="s1">(</span><span class="s4">const </span><span class="s1">std::string &amp;)&gt; handler</span><span class="s4">,</span>
+    <span class="s1">std::chrono::milliseconds timeout) {</span>
+  <span class="s1">std::string notification</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+    <span class="s4">bool </span><span class="s1">success = hasNotification_.wait_for(</span>
+        <span class="s1">lock</span><span class="s4">, </span><span class="s1">timeout</span><span class="s4">, </span><span class="s1">[</span><span class="s4">this</span><span class="s1">]() -&gt; </span><span class="s4">bool </span><span class="s1">{ </span><span class="s4">return </span><span class="s1">!notifications_.empty()</span><span class="s4">; </span><span class="s1">})</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!success) {</span>
+      <span class="s4">throw </span><span class="s1">std::runtime_error(</span><span class="s3">&quot;timed out waiting for notification&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">notification = std::move(notifications_.front())</span><span class="s4">;</span>
+    <span class="s1">notifications_.pop()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">handler(notification)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SyncConnection::onReply(</span><span class="s4">const </span><span class="s1">std::string &amp;message) {</span>
+  <span class="s1">LOG(INFO) &lt;&lt; </span><span class="s3">&quot;SyncConnection::onReply got message: &quot; </span><span class="s1">&lt;&lt; prettify(message)</span><span class="s4">;</span>
+
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s1">folly::dynamic obj = folly::parseJson(message)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(obj.count(</span><span class="s3">&quot;id&quot;</span><span class="s1">)) {</span>
+    <span class="s1">replies_.push(message)</span><span class="s4">;</span>
+    <span class="s1">hasReply_.notify_one()</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">notifications_.push(message)</span><span class="s4">;</span>
+    <span class="s1">hasNotification_.notify_one()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace chrome</span>
+<span class="s1">} </span><span class="s0">// namespace inspector</span>
+<span class="s1">} </span><span class="s0">// namespace hermes</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

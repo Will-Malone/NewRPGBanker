@@ -1,0 +1,337 @@
+<html>
+<head>
+<title>MethodInvoker.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+MethodInvoker.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;MethodInvoker.h&quot;</span>
+
+<span class="s2">#ifdef </span><span class="s1">WITH_FBSYSTRACE</span>
+<span class="s2">#include </span><span class="s3">&lt;fbsystrace.h&gt;</span>
+<span class="s2">#endif</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/CxxNativeModule.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fbjni/fbjni.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;JCallback.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;ReadableNativeArray.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;ReadableNativeMap.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;WritableNativeArray.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;WritableNativeMap.h&quot;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::jni</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">using </span><span class="s1">dynamic_iterator = folly::dynamic::const_iterator</span><span class="s4">;</span>
+
+<span class="s4">struct </span><span class="s1">JPromiseImpl : </span><span class="s4">public </span><span class="s1">JavaClass&lt;JPromiseImpl&gt; {</span>
+  <span class="s4">constexpr static auto </span><span class="s1">kJavaDescriptor =</span>
+      <span class="s3">&quot;Lcom/facebook/react/bridge/PromiseImpl;&quot;</span><span class="s4">;</span>
+
+  <span class="s4">static </span><span class="s1">local_ref&lt;javaobject&gt; create(</span>
+      <span class="s1">local_ref&lt;JCallback::javaobject&gt; resolve</span><span class="s4">,</span>
+      <span class="s1">local_ref&lt;JCallback::javaobject&gt; reject) {</span>
+    <span class="s4">return </span><span class="s1">newInstance(resolve</span><span class="s4">, </span><span class="s1">reject)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s0">// HACK: Exposes constructor</span>
+<span class="s4">struct </span><span class="s1">ExposedReadableNativeArray : </span><span class="s4">public </span><span class="s1">ReadableNativeArray {</span>
+  <span class="s4">explicit </span><span class="s1">ExposedReadableNativeArray(folly::dynamic array)</span>
+      <span class="s1">: ReadableNativeArray(std::move(array)) {}</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">jdouble extractDouble(</span><span class="s4">const </span><span class="s1">folly::dynamic &amp;value) {</span>
+  <span class="s4">if </span><span class="s1">(value.isInt()) {</span>
+    <span class="s4">return static_cast</span><span class="s1">&lt;jdouble&gt;(value.getInt())</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return static_cast</span><span class="s1">&lt;jdouble&gt;(value.getDouble())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">jint extractInteger(</span><span class="s4">const </span><span class="s1">folly::dynamic &amp;value) {</span>
+  <span class="s0">// The logic here is taken from convertDynamicIfIntegral, but the</span>
+  <span class="s0">// return type and exception are different.</span>
+  <span class="s4">if </span><span class="s1">(value.isInt()) {</span>
+    <span class="s4">return </span><span class="s1">value.getInt()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">double </span><span class="s1">dbl = value.getDouble()</span><span class="s4">;</span>
+  <span class="s1">jint result = </span><span class="s4">static_cast</span><span class="s1">&lt;jint&gt;(dbl)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(dbl != result) {</span>
+    <span class="s4">throw </span><span class="s1">std::invalid_argument(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;Tried to convert jint argument, but got a non-integral double: &quot;</span><span class="s4">,</span>
+        <span class="s1">dbl))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">result</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">local_ref&lt;JCxxCallbackImpl::jhybridobject&gt; extractCallback(</span>
+    <span class="s1">std::weak_ptr&lt;Instance&gt; &amp;instance</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;value) {</span>
+  <span class="s4">if </span><span class="s1">(value.isNull()) {</span>
+    <span class="s4">return </span><span class="s1">local_ref&lt;JCxxCallbackImpl::jhybridobject&gt;(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">JCxxCallbackImpl::newObjectCxxArgs(makeCallback(instance</span><span class="s4">, </span><span class="s1">value))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">local_ref&lt;JPromiseImpl::javaobject&gt; extractPromise(</span>
+    <span class="s1">std::weak_ptr&lt;Instance&gt; &amp;instance</span><span class="s4">,</span>
+    <span class="s1">dynamic_iterator &amp;it</span><span class="s4">,</span>
+    <span class="s1">dynamic_iterator &amp;end) {</span>
+  <span class="s4">auto </span><span class="s1">resolve = extractCallback(instance</span><span class="s4">, </span><span class="s1">*it++)</span><span class="s4">;</span>
+  <span class="s1">CHECK(it != end)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">reject = extractCallback(instance</span><span class="s4">, </span><span class="s1">*it++)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">JPromiseImpl::create(resolve</span><span class="s4">, </span><span class="s1">reject)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">bool </span><span class="s1">isNullable(</span><span class="s4">char </span><span class="s1">type) {</span>
+  <span class="s4">switch </span><span class="s1">(type) {</span>
+    <span class="s4">case </span><span class="s3">'Z'</span><span class="s1">:</span>
+    <span class="s4">case </span><span class="s3">'I'</span><span class="s1">:</span>
+    <span class="s4">case </span><span class="s3">'F'</span><span class="s1">:</span>
+    <span class="s4">case </span><span class="s3">'S'</span><span class="s1">:</span>
+    <span class="s4">case </span><span class="s3">'A'</span><span class="s1">:</span>
+    <span class="s4">case </span><span class="s3">'M'</span><span class="s1">:</span>
+    <span class="s4">case </span><span class="s3">'X'</span><span class="s1">:</span>
+      <span class="s4">return true;</span>
+    <span class="s4">default</span><span class="s1">:</span>
+      <span class="s4">return false;</span>
+      <span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">jvalue extract(</span>
+    <span class="s1">std::weak_ptr&lt;Instance&gt; &amp;instance</span><span class="s4">,</span>
+    <span class="s4">char </span><span class="s1">type</span><span class="s4">,</span>
+    <span class="s1">dynamic_iterator &amp;it</span><span class="s4">,</span>
+    <span class="s1">dynamic_iterator &amp;end) {</span>
+  <span class="s1">CHECK(it != end)</span><span class="s4">;</span>
+  <span class="s1">jvalue value</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(type == </span><span class="s3">'P'</span><span class="s1">) {</span>
+    <span class="s1">value.l = extractPromise(instance</span><span class="s4">, </span><span class="s1">it</span><span class="s4">, </span><span class="s1">end).release()</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">value</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">const auto </span><span class="s1">&amp;arg = *it++</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(isNullable(type) &amp;&amp; arg.isNull()) {</span>
+    <span class="s1">value.l = </span><span class="s4">nullptr;</span>
+    <span class="s4">return </span><span class="s1">value</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">switch </span><span class="s1">(type) {</span>
+    <span class="s4">case </span><span class="s3">'z'</span><span class="s1">:</span>
+      <span class="s1">value.z = </span><span class="s4">static_cast</span><span class="s1">&lt;jboolean&gt;(arg.getBool())</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'Z'</span><span class="s1">:</span>
+      <span class="s1">value.l =</span>
+          <span class="s1">JBoolean::valueOf(</span><span class="s4">static_cast</span><span class="s1">&lt;jboolean&gt;(arg.getBool())).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'i'</span><span class="s1">:</span>
+      <span class="s1">value.i = extractInteger(arg)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'I'</span><span class="s1">:</span>
+      <span class="s1">value.l = JInteger::valueOf(extractInteger(arg)).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'f'</span><span class="s1">:</span>
+      <span class="s1">value.f = </span><span class="s4">static_cast</span><span class="s1">&lt;jfloat&gt;(extractDouble(arg))</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'F'</span><span class="s1">:</span>
+      <span class="s1">value.l =</span>
+          <span class="s1">JFloat::valueOf(</span><span class="s4">static_cast</span><span class="s1">&lt;jfloat&gt;(extractDouble(arg))).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'d'</span><span class="s1">:</span>
+      <span class="s1">value.d = extractDouble(arg)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'D'</span><span class="s1">:</span>
+      <span class="s1">value.l = JDouble::valueOf(extractDouble(arg)).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'S'</span><span class="s1">:</span>
+      <span class="s1">value.l = make_jstring(arg.getString().c_str()).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'A'</span><span class="s1">:</span>
+      <span class="s1">value.l = ReadableNativeArray::newObjectCxxArgs(arg).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'M'</span><span class="s1">:</span>
+      <span class="s1">value.l = ReadableNativeMap::newObjectCxxArgs(arg).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s3">'X'</span><span class="s1">:</span>
+      <span class="s1">value.l = extractCallback(instance</span><span class="s4">, </span><span class="s1">arg).release()</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">default</span><span class="s1">:</span>
+      <span class="s1">LOG(FATAL) &lt;&lt; </span><span class="s3">&quot;Unknown param type: &quot; </span><span class="s1">&lt;&lt; type</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">value</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::size_t countJsArgs(</span><span class="s4">const </span><span class="s1">std::string &amp;signature) {</span>
+  <span class="s1">std::size_t count = </span><span class="s5">0</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">char </span><span class="s1">c : signature) {</span>
+    <span class="s4">switch </span><span class="s1">(c) {</span>
+      <span class="s4">case </span><span class="s3">'P'</span><span class="s1">:</span>
+        <span class="s1">count += </span><span class="s5">2</span><span class="s4">;</span>
+        <span class="s4">break;</span>
+      <span class="s4">default</span><span class="s1">:</span>
+        <span class="s1">count += </span><span class="s5">1</span><span class="s4">;</span>
+        <span class="s4">break;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">count</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">MethodInvoker::MethodInvoker(</span>
+    <span class="s1">alias_ref&lt;JReflectMethod::javaobject&gt; method</span><span class="s4">,</span>
+    <span class="s1">std::string methodName</span><span class="s4">,</span>
+    <span class="s1">std::string signature</span><span class="s4">,</span>
+    <span class="s1">std::string traceName</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">isSync)</span>
+    <span class="s1">: method_(method-&gt;getMethodID())</span><span class="s4">,</span>
+      <span class="s1">methodName_(methodName)</span><span class="s4">,</span>
+      <span class="s1">signature_(signature)</span><span class="s4">,</span>
+      <span class="s1">jsArgCount_(countJsArgs(signature) - </span><span class="s5">2</span><span class="s1">)</span><span class="s4">,</span>
+      <span class="s1">traceName_(std::move(traceName))</span><span class="s4">,</span>
+      <span class="s1">isSync_(isSync) {</span>
+  <span class="s1">CHECK(signature_.at(</span><span class="s5">1</span><span class="s1">) == </span><span class="s3">'.'</span><span class="s1">) &lt;&lt; </span><span class="s3">&quot;Improper module method signature&quot;</span><span class="s4">;</span>
+  <span class="s1">CHECK(isSync_ || signature_.at(</span><span class="s5">0</span><span class="s1">) == </span><span class="s3">'v'</span><span class="s1">)</span>
+      <span class="s1">&lt;&lt; </span><span class="s3">&quot;Non-sync hooks cannot have a non-void return type&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string MethodInvoker::getMethodName() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">methodName_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">MethodCallResult MethodInvoker::invoke(</span>
+    <span class="s1">std::weak_ptr&lt;Instance&gt; &amp;instance</span><span class="s4">,</span>
+    <span class="s1">alias_ref&lt;JBaseJavaModule::javaobject&gt; module</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;params) {</span>
+<span class="s2">#ifdef </span><span class="s1">WITH_FBSYSTRACE</span>
+  <span class="s1">fbsystrace::FbSystraceSection s(</span>
+      <span class="s1">TRACE_TAG_REACT_CXX_BRIDGE</span><span class="s4">,</span>
+      <span class="s1">isSync_ ? </span><span class="s3">&quot;callJavaSyncHook&quot; </span><span class="s1">: </span><span class="s3">&quot;callJavaModuleMethod&quot;</span><span class="s4">,</span>
+      <span class="s3">&quot;method&quot;</span><span class="s4">,</span>
+      <span class="s1">traceName_)</span><span class="s4">;</span>
+<span class="s2">#endif</span>
+
+  <span class="s4">if </span><span class="s1">(params.size() != jsArgCount_) {</span>
+    <span class="s4">throw </span><span class="s1">std::invalid_argument(folly::to&lt;std::string&gt;(</span>
+        <span class="s3">&quot;expected &quot;</span><span class="s4">, </span><span class="s1">jsArgCount_</span><span class="s4">, </span><span class="s3">&quot; arguments, got &quot;</span><span class="s4">, </span><span class="s1">params.size()))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">env = Environment::current()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">argCount = signature_.size() - </span><span class="s5">2</span><span class="s4">;</span>
+  <span class="s1">JniLocalScope scope(env</span><span class="s4">, </span><span class="s1">argCount)</span><span class="s4">;</span>
+  <span class="s1">jvalue args[argCount]</span><span class="s4">;</span>
+  <span class="s1">std::transform(</span>
+      <span class="s1">signature_.begin() + </span><span class="s5">2</span><span class="s4">,</span>
+      <span class="s1">signature_.end()</span><span class="s4">,</span>
+      <span class="s1">args</span><span class="s4">,</span>
+      <span class="s1">[&amp;instance</span><span class="s4">, </span><span class="s1">it = params.begin()</span><span class="s4">, </span><span class="s1">end = params.end()](</span><span class="s4">char </span><span class="s1">type) </span><span class="s4">mutable </span><span class="s1">{</span>
+        <span class="s4">return </span><span class="s1">extract(instance</span><span class="s4">, </span><span class="s1">type</span><span class="s4">, </span><span class="s1">it</span><span class="s4">, </span><span class="s1">end)</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+
+<span class="s2">#define </span><span class="s1">PRIMITIVE_CASE(METHOD)                                             \ 
+  {                                                                        \ 
+    </span><span class="s4">auto </span><span class="s1">result = env-&gt;Call##METHOD##MethodA(module.get()</span><span class="s4">, </span><span class="s1">method_</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">; </span><span class="s1">\ 
+    throwPendingJniExceptionAsCppException()</span><span class="s4">;                              </span><span class="s1">\ 
+    </span><span class="s4">return </span><span class="s1">folly::dynamic(result)</span><span class="s4">;                                         </span><span class="s1">\ 
+  }</span>
+
+<span class="s2">#define </span><span class="s1">PRIMITIVE_CASE_CASTING(METHOD</span><span class="s4">, </span><span class="s1">RESULT_TYPE)                        \ 
+  {                                                                        \ 
+    </span><span class="s4">auto </span><span class="s1">result = env-&gt;Call##METHOD##MethodA(module.get()</span><span class="s4">, </span><span class="s1">method_</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">; </span><span class="s1">\ 
+    throwPendingJniExceptionAsCppException()</span><span class="s4">;                              </span><span class="s1">\ 
+    </span><span class="s4">return </span><span class="s1">folly::dynamic(</span><span class="s4">static_cast</span><span class="s1">&lt;RESULT_TYPE&gt;(result))</span><span class="s4">;               </span><span class="s1">\ 
+  }</span>
+
+<span class="s2">#define </span><span class="s1">OBJECT_CASE(JNI_CLASS</span><span class="s4">, </span><span class="s1">ACTIONS)                                     \ 
+  {                                                                         \ 
+    </span><span class="s4">auto </span><span class="s1">jobject = env-&gt;CallObjectMethodA(module.get()</span><span class="s4">, </span><span class="s1">method_</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">;     </span><span class="s1">\ 
+    throwPendingJniExceptionAsCppException()</span><span class="s4">;                               </span><span class="s1">\ 
+    </span><span class="s4">if </span><span class="s1">(!jobject) {                                                         \ 
+      </span><span class="s4">return </span><span class="s1">folly::dynamic(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;                                       </span><span class="s1">\ 
+    }                                                                       \ 
+    </span><span class="s4">auto </span><span class="s1">result = adopt_local(</span><span class="s4">static_cast</span><span class="s1">&lt;JNI_CLASS::javaobject&gt;(jobject))</span><span class="s4">; </span><span class="s1">\ 
+    </span><span class="s4">return </span><span class="s1">folly::dynamic(result-&gt;ACTIONS())</span><span class="s4">;                               </span><span class="s1">\ 
+  }</span>
+
+<span class="s2">#define </span><span class="s1">OBJECT_CASE_CASTING(JNI_CLASS</span><span class="s4">, </span><span class="s1">ACTIONS</span><span class="s4">, </span><span class="s1">RESULT_TYPE)                \ 
+  {                                                                         \ 
+    </span><span class="s4">auto </span><span class="s1">jobject = env-&gt;CallObjectMethodA(module.get()</span><span class="s4">, </span><span class="s1">method_</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">;     </span><span class="s1">\ 
+    throwPendingJniExceptionAsCppException()</span><span class="s4">;                               </span><span class="s1">\ 
+    </span><span class="s4">if </span><span class="s1">(!jobject) {                                                         \ 
+      </span><span class="s4">return </span><span class="s1">folly::dynamic(</span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;                                       </span><span class="s1">\ 
+    }                                                                       \ 
+    </span><span class="s4">auto </span><span class="s1">result = adopt_local(</span><span class="s4">static_cast</span><span class="s1">&lt;JNI_CLASS::javaobject&gt;(jobject))</span><span class="s4">; </span><span class="s1">\ 
+    </span><span class="s4">return </span><span class="s1">folly::dynamic(</span><span class="s4">static_cast</span><span class="s1">&lt;RESULT_TYPE&gt;(result-&gt;ACTIONS()))</span><span class="s4">;     </span><span class="s1">\ 
+  }</span>
+
+  <span class="s4">char </span><span class="s1">returnType = signature_.at(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">switch </span><span class="s1">(returnType) {</span>
+    <span class="s4">case </span><span class="s3">'v'</span><span class="s1">:</span>
+      <span class="s1">env-&gt;CallVoidMethodA(module.get()</span><span class="s4">, </span><span class="s1">method_</span><span class="s4">, </span><span class="s1">args)</span><span class="s4">;</span>
+      <span class="s1">throwPendingJniExceptionAsCppException()</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">std::nullopt</span><span class="s4">;</span>
+
+    <span class="s4">case </span><span class="s3">'z'</span><span class="s1">:</span>
+      <span class="s1">PRIMITIVE_CASE_CASTING(Boolean</span><span class="s4">, bool</span><span class="s1">)</span>
+    <span class="s4">case </span><span class="s3">'Z'</span><span class="s1">:</span>
+      <span class="s1">OBJECT_CASE_CASTING(JBoolean</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, bool</span><span class="s1">)</span>
+    <span class="s4">case </span><span class="s3">'i'</span><span class="s1">:</span>
+      <span class="s1">PRIMITIVE_CASE(Int)</span>
+    <span class="s4">case </span><span class="s3">'I'</span><span class="s1">:</span>
+      <span class="s1">OBJECT_CASE(JInteger</span><span class="s4">, </span><span class="s1">value)</span>
+    <span class="s4">case </span><span class="s3">'d'</span><span class="s1">:</span>
+      <span class="s1">PRIMITIVE_CASE(Double)</span>
+    <span class="s4">case </span><span class="s3">'D'</span><span class="s1">:</span>
+      <span class="s1">OBJECT_CASE(JDouble</span><span class="s4">, </span><span class="s1">value)</span>
+    <span class="s4">case </span><span class="s3">'f'</span><span class="s1">:</span>
+      <span class="s1">PRIMITIVE_CASE(Float)</span>
+    <span class="s4">case </span><span class="s3">'F'</span><span class="s1">:</span>
+      <span class="s1">OBJECT_CASE(JFloat</span><span class="s4">, </span><span class="s1">value)</span>
+
+    <span class="s4">case </span><span class="s3">'S'</span><span class="s1">:</span>
+      <span class="s1">OBJECT_CASE(JString</span><span class="s4">, </span><span class="s1">toStdString)</span>
+    <span class="s4">case </span><span class="s3">'M'</span><span class="s1">:</span>
+      <span class="s1">OBJECT_CASE(WritableNativeMap</span><span class="s4">, </span><span class="s1">cthis()-&gt;consume)</span>
+    <span class="s4">case </span><span class="s3">'A'</span><span class="s1">:</span>
+      <span class="s1">OBJECT_CASE(WritableNativeArray</span><span class="s4">, </span><span class="s1">cthis()-&gt;consume)</span>
+
+    <span class="s4">default</span><span class="s1">:</span>
+      <span class="s1">LOG(FATAL) &lt;&lt; </span><span class="s3">&quot;Unknown return type: &quot; </span><span class="s1">&lt;&lt; returnType</span><span class="s4">;</span>
+      <span class="s4">return </span><span class="s1">std::nullopt</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

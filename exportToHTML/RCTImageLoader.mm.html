@@ -1,0 +1,1321 @@
+<html>
+<head>
+<title>RCTImageLoader.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTImageLoader.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&lt;mach/mach_time.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;objc/runtime.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;atomic&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;ImageIO/ImageIO.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;FBReactNativeSpec/FBReactNativeSpec.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConvert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTDefines.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTImageCache.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTImageLoader.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTImageLoaderWithAttributionProtocol.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTImageUtils.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTLog.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTNetworking.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTImagePlugins.h&quot;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::react</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">BOOL imagePerfInstrumentationEnabled = NO</span><span class="s4">;</span>
+
+<span class="s1">BOOL RCTImageLoadingPerfInstrumentationEnabled(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">imagePerfInstrumentationEnabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">RCTEnableImageLoadingPerfInstrumentation(BOOL enabled)</span>
+<span class="s1">{</span>
+  <span class="s1">imagePerfInstrumentationEnabled = enabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSInteger RCTImageBytesForImage(UIImage *image)</span>
+<span class="s1">{</span>
+  <span class="s1">NSInteger singleImageBytes = (NSInteger)(image.size.width * image.size.height * image.scale * image.scale * </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">image.images ? image.images.count * singleImageBytes : singleImageBytes</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">uint64_t monotonicTimeGetCurrentNanoseconds(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">static struct </span><span class="s1">mach_timebase_info tb_info = {</span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">__unused </span><span class="s4">int </span><span class="s1">ret = mach_timebase_info(&amp;tb_info)</span><span class="s4">;</span>
+    <span class="s1">assert(</span><span class="s5">0 </span><span class="s1">== ret)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">(mach_absolute_time() * tb_info.numer) / tb_info.denom</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">NSError *addResponseHeadersToError(NSError *originalError</span><span class="s4">, </span><span class="s1">NSHTTPURLResponse *response)</span>
+<span class="s1">{</span>
+  <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *_userInfo =</span>
+      <span class="s1">(NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)originalError.userInfo.mutableCopy</span><span class="s4">;</span>
+  <span class="s1">_userInfo[</span><span class="s4">@</span><span class="s3">&quot;httpStatusCode&quot;</span><span class="s1">] = [NSNumber numberWithInt:response.statusCode]</span><span class="s4">;</span>
+  <span class="s1">_userInfo[</span><span class="s4">@</span><span class="s3">&quot;httpResponseHeaders&quot;</span><span class="s1">] = response.allHeaderFields</span><span class="s4">;</span>
+  <span class="s1">NSError *error = [NSError errorWithDomain:originalError.domain code:originalError.code userInfo:_userInfo]</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">error</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@interface </span><span class="s1">RCTImageLoader () &lt;NativeImageLoaderIOSSpec</span><span class="s4">, </span><span class="s1">RCTImageLoaderWithAttributionProtocol&gt;</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">UIImage (React)</span>
+
+<span class="s1">- (NSInteger)reactDecodedImageBytes</span>
+<span class="s1">{</span>
+  <span class="s1">NSNumber *imageBytes = objc_getAssociatedObject(self</span><span class="s4">, </span><span class="s1">_cmd)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!imageBytes) {</span>
+    <span class="s1">imageBytes = </span><span class="s4">@</span><span class="s1">(RCTImageBytesForImage(self))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">[imageBytes integerValue]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setReactDecodedImageBytes:(NSInteger)bytes</span>
+<span class="s1">{</span>
+  <span class="s1">objc_setAssociatedObject(self</span><span class="s4">, @selector</span><span class="s1">(reactDecodedImageBytes)</span><span class="s4">, @</span><span class="s1">(bytes)</span><span class="s4">, </span><span class="s1">OBJC_ASSOCIATION_RETAIN_NONATOMIC)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTImageLoader {</span>
+  <span class="s1">NSArray&lt;id&lt;RCTImageURLLoader&gt;&gt; * (^_loadersProvider)(RCTModuleRegistry *)</span><span class="s4">;</span>
+  <span class="s1">NSArray&lt;id&lt;RCTImageDataDecoder&gt;&gt; * (^_decodersProvider)(RCTModuleRegistry *)</span><span class="s4">;</span>
+  <span class="s1">NSArray&lt;id&lt;RCTImageURLLoader&gt;&gt; *_loaders</span><span class="s4">;</span>
+  <span class="s1">NSArray&lt;id&lt;RCTImageDataDecoder&gt;&gt; *_decoders</span><span class="s4">;</span>
+  <span class="s1">NSOperationQueue *_imageDecodeQueue</span><span class="s4">;</span>
+  <span class="s1">dispatch_queue_t _URLRequestQueue</span><span class="s4">;</span>
+  <span class="s1">id&lt;RCTImageCache&gt; _imageCache</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray *_pendingTasks</span><span class="s4">;</span>
+  <span class="s1">NSInteger _activeTasks</span><span class="s4">;</span>
+  <span class="s1">NSMutableArray *_pendingDecodes</span><span class="s4">;</span>
+  <span class="s1">NSInteger _scheduledDecodes</span><span class="s4">;</span>
+  <span class="s1">NSUInteger _activeBytes</span><span class="s4">;</span>
+  <span class="s1">std::mutex _loadersMutex</span><span class="s4">;</span>
+  <span class="s4">__weak </span><span class="s1">id&lt;RCTImageRedirectProtocol&gt; _redirectDelegate</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@synthesize </span><span class="s1">bridge = _bridge</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">moduleRegistry = _moduleRegistry</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">maxConcurrentLoadingTasks = _maxConcurrentLoadingTasks</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">maxConcurrentDecodingTasks = _maxConcurrentDecodingTasks</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">maxConcurrentDecodingBytes = _maxConcurrentDecodingBytes</span><span class="s4">;</span>
+
+<span class="s1">RCT_EXPORT_MODULE()</span>
+
+<span class="s1">- (instancetype)init</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self initWithRedirectDelegate:nil]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">+ (BOOL)requiresMainQueueSetup</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithRedirectDelegate:(id&lt;RCTImageRedirectProtocol&gt;)redirectDelegate</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_redirectDelegate = redirectDelegate</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithRedirectDelegate:(id&lt;RCTImageRedirectProtocol&gt;)redirectDelegate</span>
+                         <span class="s1">loadersProvider:(NSArray&lt;id&lt;RCTImageURLLoader&gt;&gt; * (^)(RCTModuleRegistry *))getLoaders</span>
+                        <span class="s1">decodersProvider:(NSArray&lt;id&lt;RCTImageDataDecoder&gt;&gt; * (^)(RCTModuleRegistry *))getHandlers</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [self initWithRedirectDelegate:redirectDelegate]) {</span>
+    <span class="s1">_loadersProvider = getLoaders</span><span class="s4">;</span>
+    <span class="s1">_decodersProvider = getHandlers</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setUp</span>
+<span class="s1">{</span>
+  <span class="s0">// Set defaults</span>
+  <span class="s1">_maxConcurrentLoadingTasks = _maxConcurrentLoadingTasks ?: </span><span class="s5">4</span><span class="s4">;</span>
+  <span class="s1">_maxConcurrentDecodingTasks = _maxConcurrentDecodingTasks ?: </span><span class="s5">2</span><span class="s4">;</span>
+  <span class="s1">_maxConcurrentDecodingBytes = _maxConcurrentDecodingBytes ?: </span><span class="s5">30 </span><span class="s1">* </span><span class="s5">1024 </span><span class="s1">* </span><span class="s5">1024</span><span class="s4">; </span><span class="s0">// 30MB</span>
+
+  <span class="s1">_URLRequestQueue = dispatch_queue_create(</span><span class="s3">&quot;com.facebook.react.ImageLoaderURLRequestQueue&quot;</span><span class="s4">, </span><span class="s1">DISPATCH_QUEUE_SERIAL)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">float</span><span class="s1">)handlerPriority</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s5">2</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s2">#pragma </span><span class="s1">mark - RCTImageLoaderProtocol </span><span class="s5">1</span><span class="s1">/</span><span class="s5">3</span>
+
+<span class="s1">- (id&lt;RCTImageCache&gt;)imageCache</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_imageCache) {</span>
+    <span class="s0">// set up with default cache</span>
+    <span class="s1">_imageCache = [RCTImageCache </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">_imageCache</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setImageCache:(id&lt;RCTImageCache&gt;)cache</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_imageCache) {</span>
+    <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;RCTImageCache was already set and has now been overridden.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">_imageCache = cache</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id&lt;RCTImageURLLoader&gt;)imageURLLoaderForURL:(NSURL *)URL</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_maxConcurrentLoadingTasks) {</span>
+    <span class="s1">[self setUp]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!_loaders) {</span>
+    <span class="s1">std::unique_lock&lt;std::mutex&gt; guard(_loadersMutex)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!_loaders) {</span>
+      <span class="s0">// Get loaders, sorted in reverse priority order (highest priority first)</span>
+      <span class="s4">if </span><span class="s1">(_loadersProvider) {</span>
+        <span class="s1">_loaders = _loadersProvider(self.moduleRegistry)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">RCTAssert(_bridge</span><span class="s4">, @</span><span class="s3">&quot;Trying to find RCTImageURLLoaders and bridge not set.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">_loaders = [_bridge modulesConformingToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTImageURLLoader)]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">_loaders =</span>
+          <span class="s1">[_loaders sortedArrayUsingComparator:^NSComparisonResult(id&lt;RCTImageURLLoader&gt; a</span><span class="s4">, </span><span class="s1">id&lt;RCTImageURLLoader&gt; b) {</span>
+            <span class="s4">float </span><span class="s1">priorityA = [a respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(loaderPriority)] ? [a loaderPriority] : </span><span class="s5">0</span><span class="s4">;</span>
+            <span class="s4">float </span><span class="s1">priorityB = [b respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(loaderPriority)] ? [b loaderPriority] : </span><span class="s5">0</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">(priorityA &gt; priorityB) {</span>
+              <span class="s4">return </span><span class="s1">NSOrderedAscending</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">else if </span><span class="s1">(priorityA &lt; priorityB) {</span>
+              <span class="s4">return </span><span class="s1">NSOrderedDescending</span><span class="s4">;</span>
+            <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+              <span class="s4">return </span><span class="s1">NSOrderedSame</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(RCT_DEBUG) {</span>
+    <span class="s0">// Check for handler conflicts</span>
+    <span class="s4">float </span><span class="s1">previousPriority = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">id&lt;RCTImageURLLoader&gt; previousLoader = nil</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(id&lt;RCTImageURLLoader&gt; loader in _loaders) {</span>
+      <span class="s4">float </span><span class="s1">priority = [loader respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(loaderPriority)] ? [loader loaderPriority] : </span><span class="s5">0</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(previousLoader &amp;&amp; priority &lt; previousPriority) {</span>
+        <span class="s4">return </span><span class="s1">previousLoader</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">([loader canLoadImageURL:URL]) {</span>
+        <span class="s4">if </span><span class="s1">(previousLoader) {</span>
+          <span class="s4">if </span><span class="s1">(priority == previousPriority) {</span>
+            <span class="s1">RCTLogError(</span>
+                <span class="s4">@</span><span class="s3">&quot;The RCTImageURLLoaders %@ and %@ both reported that&quot;</span>
+                 <span class="s3">&quot; they can load the URL %@, and have equal priority&quot;</span>
+                 <span class="s3">&quot; (%g). This could result in non-deterministic behavior.&quot;</span><span class="s4">,</span>
+                <span class="s1">loader</span><span class="s4">,</span>
+                <span class="s1">previousLoader</span><span class="s4">,</span>
+                <span class="s1">URL</span><span class="s4">,</span>
+                <span class="s1">priority)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">previousLoader = loader</span><span class="s4">;</span>
+          <span class="s1">previousPriority = priority</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">previousLoader</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Normal code path</span>
+  <span class="s4">for </span><span class="s1">(id&lt;RCTImageURLLoader&gt; loader in _loaders) {</span>
+    <span class="s4">if </span><span class="s1">([loader canLoadImageURL:URL]) {</span>
+      <span class="s4">return </span><span class="s1">loader</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private Image Decoding &amp; Resizing</span>
+
+<span class="s1">- (id&lt;RCTImageDataDecoder&gt;)imageDataDecoderForData:(NSData *)data</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_maxConcurrentLoadingTasks) {</span>
+    <span class="s1">[self setUp]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!_decoders) {</span>
+    <span class="s0">// Get decoders, sorted in reverse priority order (highest priority first)</span>
+
+    <span class="s4">if </span><span class="s1">(_decodersProvider) {</span>
+      <span class="s1">_decoders = _decodersProvider(self.moduleRegistry)</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">RCTAssert(_bridge</span><span class="s4">, @</span><span class="s3">&quot;Trying to find RCTImageDataDecoders and bridge not set.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">_decoders = [_bridge modulesConformingToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTImageDataDecoder)]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_decoders = [_decoders</span>
+        <span class="s1">sortedArrayUsingComparator:^NSComparisonResult(id&lt;RCTImageDataDecoder&gt; a</span><span class="s4">, </span><span class="s1">id&lt;RCTImageDataDecoder&gt; b) {</span>
+          <span class="s4">float </span><span class="s1">priorityA = [a respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(decoderPriority)] ? [a decoderPriority] : </span><span class="s5">0</span><span class="s4">;</span>
+          <span class="s4">float </span><span class="s1">priorityB = [b respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(decoderPriority)] ? [b decoderPriority] : </span><span class="s5">0</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">(priorityA &gt; priorityB) {</span>
+            <span class="s4">return </span><span class="s1">NSOrderedAscending</span><span class="s4">;</span>
+          <span class="s1">} </span><span class="s4">else if </span><span class="s1">(priorityA &lt; priorityB) {</span>
+            <span class="s4">return </span><span class="s1">NSOrderedDescending</span><span class="s4">;</span>
+          <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+            <span class="s4">return </span><span class="s1">NSOrderedSame</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(RCT_DEBUG) {</span>
+    <span class="s0">// Check for handler conflicts</span>
+    <span class="s4">float </span><span class="s1">previousPriority = </span><span class="s5">0</span><span class="s4">;</span>
+    <span class="s1">id&lt;RCTImageDataDecoder&gt; previousDecoder = nil</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(id&lt;RCTImageDataDecoder&gt; decoder in _decoders) {</span>
+      <span class="s4">float </span><span class="s1">priority = [decoder respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(decoderPriority)] ? [decoder decoderPriority] : </span><span class="s5">0</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(previousDecoder &amp;&amp; priority &lt; previousPriority) {</span>
+        <span class="s4">return </span><span class="s1">previousDecoder</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">([decoder canDecodeImageData:data]) {</span>
+        <span class="s4">if </span><span class="s1">(previousDecoder) {</span>
+          <span class="s4">if </span><span class="s1">(priority == previousPriority) {</span>
+            <span class="s1">RCTLogError(</span>
+                <span class="s4">@</span><span class="s3">&quot;The RCTImageDataDecoders %@ and %@ both reported that&quot;</span>
+                 <span class="s3">&quot; they can decode the data &lt;NSData %p; %tu bytes&gt;, and&quot;</span>
+                 <span class="s3">&quot; have equal priority (%g). This could result in&quot;</span>
+                 <span class="s3">&quot; non-deterministic behavior.&quot;</span><span class="s4">,</span>
+                <span class="s1">decoder</span><span class="s4">,</span>
+                <span class="s1">previousDecoder</span><span class="s4">,</span>
+                <span class="s1">data</span><span class="s4">,</span>
+                <span class="s1">data.length</span><span class="s4">,</span>
+                <span class="s1">priority)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">previousDecoder = decoder</span><span class="s4">;</span>
+          <span class="s1">previousPriority = priority</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s4">return </span><span class="s1">previousDecoder</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Normal code path</span>
+  <span class="s4">for </span><span class="s1">(id&lt;RCTImageDataDecoder&gt; decoder in _decoders) {</span>
+    <span class="s4">if </span><span class="s1">([decoder canDecodeImageData:data]) {</span>
+      <span class="s4">return </span><span class="s1">decoder</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">UIImage *RCTResizeImageIfNeeded(UIImage *image</span><span class="s4">, </span><span class="s1">CGSize size</span><span class="s4">, </span><span class="s1">CGFloat scale</span><span class="s4">, </span><span class="s1">RCTResizeMode resizeMode)</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(CGSizeEqualToSize(size</span><span class="s4">, </span><span class="s1">CGSizeZero) || CGSizeEqualToSize(image.size</span><span class="s4">, </span><span class="s1">CGSizeZero) ||</span>
+      <span class="s1">CGSizeEqualToSize(image.size</span><span class="s4">, </span><span class="s1">size)) {</span>
+    <span class="s4">return </span><span class="s1">image</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">CGRect targetSize = RCTTargetRect(image.size</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">scale</span><span class="s4">, </span><span class="s1">resizeMode)</span><span class="s4">;</span>
+  <span class="s1">CGAffineTransform transform = RCTTransformFromTargetRect(image.size</span><span class="s4">, </span><span class="s1">targetSize)</span><span class="s4">;</span>
+  <span class="s1">image = RCTTransformImage(image</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">scale</span><span class="s4">, </span><span class="s1">transform)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">image</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTImageLoaderProtocol </span><span class="s5">2</span><span class="s1">/</span><span class="s5">3</span>
+
+<span class="s1">- (nullable RCTImageLoaderCancellationBlock)loadImageWithURLRequest:(NSURLRequest *)imageURLRequest</span>
+                                                           <span class="s1">callback:(RCTImageLoaderCompletionBlock)callback</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self loadImageWithURLRequest:imageURLRequest priority:RCTImageLoaderPriorityImmediate callback:callback]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (nullable RCTImageLoaderCancellationBlock)loadImageWithURLRequest:(NSURLRequest *)imageURLRequest</span>
+                                                           <span class="s1">priority:(RCTImageLoaderPriority)priority</span>
+                                                           <span class="s1">callback:(RCTImageLoaderCompletionBlock)callback</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self loadImageWithURLRequest:imageURLRequest</span>
+                                  <span class="s1">size:CGSizeZero</span>
+                                 <span class="s1">scale:</span><span class="s5">1</span>
+                               <span class="s1">clipped:YES</span>
+                            <span class="s1">resizeMode:RCTResizeModeStretch</span>
+                              <span class="s1">priority:priority</span>
+                         <span class="s1">progressBlock:nil</span>
+                      <span class="s1">partialLoadBlock:nil</span>
+                       <span class="s1">completionBlock:callback]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (nullable RCTImageLoaderCancellationBlock)loadImageWithURLRequest:(NSURLRequest *)imageURLRequest</span>
+                                                               <span class="s1">size:(CGSize)size</span>
+                                                              <span class="s1">scale:(CGFloat)scale</span>
+                                                            <span class="s1">clipped:(BOOL)clipped</span>
+                                                         <span class="s1">resizeMode:(RCTResizeMode)resizeMode</span>
+                                                      <span class="s1">progressBlock:(RCTImageLoaderProgressBlock)progressBlock</span>
+                                                   <span class="s1">partialLoadBlock:(RCTImageLoaderPartialLoadBlock)partialLoadBlock</span>
+                                                    <span class="s1">completionBlock:(RCTImageLoaderCompletionBlock)completionBlock</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self loadImageWithURLRequest:imageURLRequest</span>
+                                  <span class="s1">size:size</span>
+                                 <span class="s1">scale:scale</span>
+                               <span class="s1">clipped:clipped</span>
+                            <span class="s1">resizeMode:resizeMode</span>
+                              <span class="s1">priority:RCTImageLoaderPriorityImmediate</span>
+                         <span class="s1">progressBlock:progressBlock</span>
+                      <span class="s1">partialLoadBlock:partialLoadBlock</span>
+                       <span class="s1">completionBlock:completionBlock]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (nullable RCTImageLoaderCancellationBlock)loadImageWithURLRequest:(NSURLRequest *)imageURLRequest</span>
+                                                               <span class="s1">size:(CGSize)size</span>
+                                                              <span class="s1">scale:(CGFloat)scale</span>
+                                                            <span class="s1">clipped:(BOOL)clipped</span>
+                                                         <span class="s1">resizeMode:(RCTResizeMode)resizeMode</span>
+                                                           <span class="s1">priority:(RCTImageLoaderPriority)priority</span>
+                                                      <span class="s1">progressBlock:(RCTImageLoaderProgressBlock)progressBlock</span>
+                                                   <span class="s1">partialLoadBlock:(RCTImageLoaderPartialLoadBlock)partialLoadBlock</span>
+                                                    <span class="s1">completionBlock:(RCTImageLoaderCompletionBlock)completionBlock</span>
+<span class="s1">{</span>
+  <span class="s1">RCTImageURLLoaderRequest *request = [self loadImageWithURLRequest:imageURLRequest</span>
+      <span class="s1">size:size</span>
+      <span class="s1">scale:scale</span>
+      <span class="s1">clipped:clipped</span>
+      <span class="s1">resizeMode:resizeMode</span>
+      <span class="s1">priority:priority</span>
+      <span class="s1">attribution:{}</span>
+      <span class="s1">progressBlock:progressBlock</span>
+      <span class="s1">partialLoadBlock:partialLoadBlock</span>
+      <span class="s1">completionBlock:^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image</span><span class="s4">, </span><span class="s1">id metadata) {</span>
+        <span class="s1">completionBlock(error</span><span class="s4">, </span><span class="s1">image)</span><span class="s4">;</span>
+      <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">^{</span>
+    <span class="s1">[request cancel]</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private Downloader Methods</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)dequeueTasks</span>
+<span class="s1">{</span>
+  <span class="s1">dispatch_async(_URLRequestQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s0">// Remove completed tasks</span>
+    <span class="s1">NSMutableArray *tasksToRemove = nil</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(RCTNetworkTask *task in self-&gt;_pendingTasks.reverseObjectEnumerator) {</span>
+      <span class="s4">switch </span><span class="s1">(task.status) {</span>
+        <span class="s4">case </span><span class="s1">RCTNetworkTaskFinished:</span>
+          <span class="s4">if </span><span class="s1">(!tasksToRemove) {</span>
+            <span class="s1">tasksToRemove = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s1">[tasksToRemove addObject:task]</span><span class="s4">;</span>
+          <span class="s1">self-&gt;_activeTasks--</span><span class="s4">;</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s1">RCTNetworkTaskPending:</span>
+          <span class="s4">break;</span>
+        <span class="s4">case </span><span class="s1">RCTNetworkTaskInProgress:</span>
+          <span class="s0">// Check task isn't &quot;stuck&quot;</span>
+          <span class="s4">if </span><span class="s1">(task.requestToken == nil) {</span>
+            <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Task orphaned for request %@&quot;</span><span class="s4">, </span><span class="s1">task.request)</span><span class="s4">;</span>
+            <span class="s4">if </span><span class="s1">(!tasksToRemove) {</span>
+              <span class="s1">tasksToRemove = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+            <span class="s1">}</span>
+            <span class="s1">[tasksToRemove addObject:task]</span><span class="s4">;</span>
+            <span class="s1">self-&gt;_activeTasks--</span><span class="s4">;</span>
+            <span class="s1">[task cancel]</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(tasksToRemove) {</span>
+      <span class="s1">[self-&gt;_pendingTasks removeObjectsInArray:tasksToRemove]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Start queued decode</span>
+    <span class="s1">NSInteger activeDecodes = self-&gt;_scheduledDecodes - self-&gt;_pendingDecodes.count</span><span class="s4">;</span>
+    <span class="s4">while </span><span class="s1">(activeDecodes == </span><span class="s5">0 </span><span class="s1">||</span>
+           <span class="s1">(self-&gt;_activeBytes &lt;= self-&gt;_maxConcurrentDecodingBytes &amp;&amp;</span>
+            <span class="s1">activeDecodes &lt;= self-&gt;_maxConcurrentDecodingTasks)) {</span>
+      <span class="s1">dispatch_block_t decodeBlock = self-&gt;_pendingDecodes.firstObject</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(decodeBlock) {</span>
+        <span class="s1">[self-&gt;_pendingDecodes removeObjectAtIndex:</span><span class="s5">0</span><span class="s1">]</span><span class="s4">;</span>
+        <span class="s1">decodeBlock()</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Start queued tasks</span>
+    <span class="s4">for </span><span class="s1">(RCTNetworkTask *task in self-&gt;_pendingTasks) {</span>
+      <span class="s4">if </span><span class="s1">(MAX(self-&gt;_activeTasks</span><span class="s4">, </span><span class="s1">self-&gt;_scheduledDecodes) &gt;= self-&gt;_maxConcurrentLoadingTasks) {</span>
+        <span class="s4">break;</span>
+      <span class="s1">}</span>
+      <span class="s4">if </span><span class="s1">(task.status == RCTNetworkTaskPending) {</span>
+        <span class="s1">[task start]</span><span class="s4">;</span>
+        <span class="s1">self-&gt;_activeTasks++</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * This returns either an image, or raw image data, depending on the loading 
+ * path taken. This is useful if you want to skip decoding, e.g. when preloading 
+ * the image, or retrieving metadata. 
+ */</span>
+<span class="s1">- (RCTImageURLLoaderRequest *)_loadImageOrDataWithURLRequest:(NSURLRequest *)request</span>
+                                                        <span class="s1">size:(CGSize)size</span>
+                                                       <span class="s1">scale:(CGFloat)scale</span>
+                                                  <span class="s1">resizeMode:(RCTResizeMode)resizeMode</span>
+                                                    <span class="s1">priority:(RCTImageLoaderPriority)priority</span>
+                                                 <span class="s1">attribution:(</span><span class="s4">const </span><span class="s1">ImageURLLoaderAttribution &amp;)attribution</span>
+                                               <span class="s1">progressBlock:(RCTImageLoaderProgressBlock)progressHandler</span>
+                                            <span class="s1">partialLoadBlock:(RCTImageLoaderPartialLoadBlock)partialLoadHandler</span>
+                                             <span class="s1">completionBlock:(</span><span class="s4">void </span><span class="s1">(^)(</span>
+                                                                 <span class="s1">NSError *error</span><span class="s4">,</span>
+                                                                 <span class="s1">id imageOrData</span><span class="s4">,</span>
+                                                                 <span class="s1">id imageMetadata</span><span class="s4">,</span>
+                                                                 <span class="s1">BOOL cacheResult</span><span class="s4">,</span>
+                                                                 <span class="s1">NSURLResponse *response))completionBlock</span>
+<span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">NSMutableURLRequest *mutableRequest = [request mutableCopy]</span><span class="s4">;</span>
+    <span class="s1">[NSURLProtocol setProperty:</span><span class="s4">@</span><span class="s3">&quot;RCTImageLoader&quot; </span><span class="s1">forKey:</span><span class="s4">@</span><span class="s3">&quot;trackingName&quot; </span><span class="s1">inRequest:mutableRequest]</span><span class="s4">;</span>
+
+    <span class="s0">// Add missing png extension</span>
+    <span class="s4">if </span><span class="s1">(request.URL.fileURL &amp;&amp; request.URL.pathExtension.length == </span><span class="s5">0</span><span class="s1">) {</span>
+      <span class="s1">mutableRequest.URL = [request.URL URLByAppendingPathExtension:</span><span class="s4">@</span><span class="s3">&quot;png&quot;</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(_redirectDelegate != nil) {</span>
+      <span class="s1">mutableRequest.URL = [_redirectDelegate redirectAssetsURL:mutableRequest.URL]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">request = mutableRequest</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Create a copy here so the value is retained when accessed in the blocks below.</span>
+  <span class="s1">ImageURLLoaderAttribution attributionCopy(attribution)</span><span class="s4">;</span>
+
+  <span class="s0">// Find suitable image URL loader</span>
+  <span class="s1">id&lt;RCTImageURLLoader&gt; loadHandler = [self imageURLLoaderForURL:request.URL]</span><span class="s4">;</span>
+  <span class="s1">BOOL requiresScheduling =</span>
+      <span class="s1">[loadHandler respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(requiresScheduling)] ? [loadHandler requiresScheduling] : YES</span><span class="s4">;</span>
+
+  <span class="s1">BOOL cacheResult =</span>
+      <span class="s1">[loadHandler respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(shouldCacheLoadedImages)] ? [loadHandler shouldCacheLoadedImages] : YES</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(request.cachePolicy == NSURLRequestReloadIgnoringLocalCacheData) {</span>
+    <span class="s1">cacheResult = NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(cacheResult &amp;&amp; partialLoadHandler) {</span>
+    <span class="s1">UIImage *image = [[self imageCache] imageForUrl:request.URL.absoluteString</span>
+                                               <span class="s1">size:size</span>
+                                              <span class="s1">scale:scale</span>
+                                         <span class="s1">resizeMode:resizeMode]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(image) {</span>
+      <span class="s1">partialLoadHandler(image)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">cancelled = std::make_shared&lt;std::atomic&lt;</span><span class="s4">int</span><span class="s1">&gt;&gt;(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">__block dispatch_block_t cancelLoad = nil</span><span class="s4">;</span>
+  <span class="s1">__block NSLock *cancelLoadLock = [NSLock </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSString *requestId =</span>
+      <span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;%@-%llu&quot;</span><span class="s4">, </span><span class="s1">[[NSUUID UUID] UUIDString]</span><span class="s4">, </span><span class="s1">monotonicTimeGetCurrentNanoseconds()]</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">(^completionHandler)(NSError *</span><span class="s4">, </span><span class="s1">id</span><span class="s4">, </span><span class="s1">id</span><span class="s4">, </span><span class="s1">NSURLResponse *) =</span>
+      <span class="s1">^(NSError *error</span><span class="s4">, </span><span class="s1">id imageOrData</span><span class="s4">, </span><span class="s1">id imageMetadata</span><span class="s4">, </span><span class="s1">NSURLResponse *response) {</span>
+        <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+        <span class="s1">cancelLoad = nil</span><span class="s4">;</span>
+        <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+
+        <span class="s0">// If we've received an image, we should try to set it synchronously,</span>
+        <span class="s0">// if it's data, do decoding on a background thread.</span>
+        <span class="s4">if </span><span class="s1">(RCTIsMainQueue() &amp;&amp; ![imageOrData isKindOfClass:[UIImage </span><span class="s4">class</span><span class="s1">]]) {</span>
+          <span class="s0">// Most loaders do not return on the main thread, so caller is probably not</span>
+          <span class="s0">// expecting it, and may do expensive post-processing in the callback</span>
+          <span class="s1">dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">, </span><span class="s1">^{</span>
+            <span class="s4">if </span><span class="s1">(!std::atomic_load(cancelled.get())) {</span>
+              <span class="s1">completionBlock(error</span><span class="s4">, </span><span class="s1">imageOrData</span><span class="s4">, </span><span class="s1">imageMetadata</span><span class="s4">, </span><span class="s1">cacheResult</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+            <span class="s1">}</span>
+          <span class="s1">})</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!std::atomic_load(cancelled.get())) {</span>
+          <span class="s4">if </span><span class="s1">(response &amp;&amp; error &amp;&amp; [response isKindOfClass:[NSHTTPURLResponse </span><span class="s4">class</span><span class="s1">]]) {</span>
+            <span class="s1">NSHTTPURLResponse *_httpResp = (NSHTTPURLResponse *)response</span><span class="s4">;</span>
+            <span class="s1">error = addResponseHeadersToError(error</span><span class="s4">, </span><span class="s1">_httpResp)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s1">completionBlock(error</span><span class="s4">, </span><span class="s1">imageOrData</span><span class="s4">, </span><span class="s1">imageMetadata</span><span class="s4">, </span><span class="s1">cacheResult</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s0">// If the loader doesn't require scheduling we call it directly on</span>
+  <span class="s0">// the main queue.</span>
+  <span class="s4">if </span><span class="s1">(loadHandler &amp;&amp; !requiresScheduling) {</span>
+    <span class="s4">if </span><span class="s1">([loadHandler conformsToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTImageURLLoaderWithAttribution)]) {</span>
+      <span class="s4">return </span><span class="s1">[(id&lt;RCTImageURLLoaderWithAttribution&gt;)loadHandler</span>
+             <span class="s1">loadImageForURL:request.URL</span>
+                        <span class="s1">size:size</span>
+                       <span class="s1">scale:scale</span>
+                  <span class="s1">resizeMode:resizeMode</span>
+                   <span class="s1">requestId:requestId</span>
+                    <span class="s1">priority:priority</span>
+                 <span class="s1">attribution:attributionCopy</span>
+             <span class="s1">progressHandler:progressHandler</span>
+          <span class="s1">partialLoadHandler:partialLoadHandler</span>
+           <span class="s1">completionHandler:^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image</span><span class="s4">, </span><span class="s1">id metadata) {</span>
+             <span class="s1">completionHandler(error</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+           <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">RCTImageLoaderCancellationBlock cb = [loadHandler loadImageForURL:request.URL</span>
+                                                                 <span class="s1">size:size</span>
+                                                                <span class="s1">scale:scale</span>
+                                                           <span class="s1">resizeMode:resizeMode</span>
+                                                      <span class="s1">progressHandler:progressHandler</span>
+                                                   <span class="s1">partialLoadHandler:partialLoadHandler</span>
+                                                    <span class="s1">completionHandler:^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image) {</span>
+                                                      <span class="s1">completionHandler(error</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+                                                    <span class="s1">}]</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">[[RCTImageURLLoaderRequest alloc] initWithRequestId:nil imageURL:request.URL cancellationBlock:cb]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// All access to URL cache must be serialized</span>
+  <span class="s4">if </span><span class="s1">(!_URLRequestQueue) {</span>
+    <span class="s1">[self setUp]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">__weak </span><span class="s1">RCTImageLoader *weakSelf = self</span><span class="s4">;</span>
+  <span class="s1">dispatch_async(_URLRequestQueue</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s4">__typeof</span><span class="s1">(self) strongSelf = weakSelf</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(atomic_load(cancelled.get()) || !strongSelf) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(loadHandler) {</span>
+      <span class="s1">dispatch_block_t cancelLoadLocal</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">([loadHandler conformsToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTImageURLLoaderWithAttribution)]) {</span>
+        <span class="s1">RCTImageURLLoaderRequest *loaderRequest = [(id&lt;RCTImageURLLoaderWithAttribution&gt;)loadHandler</span>
+               <span class="s1">loadImageForURL:request.URL</span>
+                          <span class="s1">size:size</span>
+                         <span class="s1">scale:scale</span>
+                    <span class="s1">resizeMode:resizeMode</span>
+                     <span class="s1">requestId:requestId</span>
+                      <span class="s1">priority:priority</span>
+                   <span class="s1">attribution:attributionCopy</span>
+               <span class="s1">progressHandler:progressHandler</span>
+            <span class="s1">partialLoadHandler:partialLoadHandler</span>
+             <span class="s1">completionHandler:^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image</span><span class="s4">, </span><span class="s1">id metadata) {</span>
+               <span class="s1">completionHandler(error</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+             <span class="s1">}]</span><span class="s4">;</span>
+        <span class="s1">cancelLoadLocal = loaderRequest.cancellationBlock</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">cancelLoadLocal = [loadHandler loadImageForURL:request.URL</span>
+                                                  <span class="s1">size:size</span>
+                                                 <span class="s1">scale:scale</span>
+                                            <span class="s1">resizeMode:resizeMode</span>
+                                       <span class="s1">progressHandler:progressHandler</span>
+                                    <span class="s1">partialLoadHandler:partialLoadHandler</span>
+                                     <span class="s1">completionHandler:^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image) {</span>
+                                       <span class="s1">completionHandler(error</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+                                     <span class="s1">}]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+      <span class="s1">cancelLoad = cancelLoadLocal</span><span class="s4">;</span>
+      <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">UIImage *image</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(cacheResult) {</span>
+        <span class="s1">image = [[strongSelf imageCache] imageForUrl:request.URL.absoluteString</span>
+                                                <span class="s1">size:size</span>
+                                               <span class="s1">scale:scale</span>
+                                          <span class="s1">resizeMode:resizeMode]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s4">if </span><span class="s1">(image) {</span>
+        <span class="s1">completionHandler(nil</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s0">// Use networking module to load image</span>
+        <span class="s1">dispatch_block_t cancelLoadLocal =</span>
+            <span class="s1">[strongSelf _loadURLRequest:request</span>
+                          <span class="s1">progressBlock:progressHandler</span>
+                        <span class="s1">completionBlock:^(NSError *error</span><span class="s4">, </span><span class="s1">id imageOrData</span><span class="s4">, </span><span class="s1">NSURLResponse *response) {</span>
+                          <span class="s1">completionHandler(error</span><span class="s4">, </span><span class="s1">imageOrData</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+                        <span class="s1">}]</span><span class="s4">;</span>
+        <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+        <span class="s1">cancelLoad = cancelLoadLocal</span><span class="s4">;</span>
+        <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">[[RCTImageURLLoaderRequest alloc] initWithRequestId:requestId</span>
+                                                    <span class="s1">imageURL:request.URL</span>
+                                           <span class="s1">cancellationBlock:^{</span>
+                                             <span class="s1">BOOL alreadyCancelled = atomic_fetch_or(cancelled.get()</span><span class="s4">, </span><span class="s5">1</span><span class="s1">) ? YES : NO</span><span class="s4">;</span>
+                                             <span class="s4">if </span><span class="s1">(alreadyCancelled) {</span>
+                                               <span class="s4">return;</span>
+                                             <span class="s1">}</span>
+                                             <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+                                             <span class="s1">dispatch_block_t cancelLoadLocal = cancelLoad</span><span class="s4">;</span>
+                                             <span class="s1">cancelLoad = nil</span><span class="s4">;</span>
+                                             <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+                                             <span class="s4">if </span><span class="s1">(cancelLoadLocal) {</span>
+                                               <span class="s1">cancelLoadLocal()</span><span class="s4">;</span>
+                                             <span class="s1">}</span>
+                                           <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTImageLoaderCancellationBlock)_loadURLRequest:(NSURLRequest *)request</span>
+                                     <span class="s1">progressBlock:(RCTImageLoaderProgressBlock)progressHandler</span>
+                                   <span class="s1">completionBlock:(</span><span class="s4">void </span><span class="s1">(^)(NSError *error</span><span class="s4">, </span><span class="s1">id imageOrData</span><span class="s4">, </span><span class="s1">NSURLResponse *response))</span>
+                                                       <span class="s1">completionHandler</span>
+<span class="s1">{</span>
+  <span class="s1">RCTNetworking *networking = [_moduleRegistry moduleForName:</span><span class="s3">&quot;Networking&quot;</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(RCT_DEBUG &amp;&amp; !networking) {</span>
+    <span class="s1">RCTLogError(</span>
+        <span class="s4">@</span><span class="s3">&quot;No suitable image URL loader found for %@. You may need to &quot;</span>
+         <span class="s3">&quot; import the RCTNetwork library in order to load images.&quot;</span><span class="s4">,</span>
+        <span class="s1">request.URL.absoluteString)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">NULL</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Check if networking module can load image</span>
+  <span class="s4">if </span><span class="s1">(RCT_DEBUG &amp;&amp; ![networking canHandleRequest:request]) {</span>
+    <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;No suitable image URL loader found for %@&quot;</span><span class="s4">, </span><span class="s1">request.URL.absoluteString)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">NULL</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Use networking module to load image</span>
+  <span class="s1">RCTURLRequestCompletionBlock processResponse = ^(NSURLResponse *response</span><span class="s4">, </span><span class="s1">NSData *data</span><span class="s4">, </span><span class="s1">NSError *error) {</span>
+    <span class="s0">// Check for system errors</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">completionHandler(error</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!response) {</span>
+      <span class="s1">completionHandler(RCTErrorWithMessage(</span><span class="s4">@</span><span class="s3">&quot;Response metadata error&quot;</span><span class="s1">)</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!data) {</span>
+      <span class="s1">completionHandler(RCTErrorWithMessage(</span><span class="s4">@</span><span class="s3">&quot;Unknown image download error&quot;</span><span class="s1">)</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Check for http errors</span>
+    <span class="s4">if </span><span class="s1">([response isKindOfClass:[NSHTTPURLResponse </span><span class="s4">class</span><span class="s1">]]) {</span>
+      <span class="s1">NSInteger statusCode = ((NSHTTPURLResponse *)response).statusCode</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(statusCode != </span><span class="s5">200</span><span class="s1">) {</span>
+        <span class="s1">NSString *errorMessage = [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Failed to load %@&quot;</span><span class="s4">, </span><span class="s1">response.URL]</span><span class="s4">;</span>
+        <span class="s1">NSDictionary *userInfo = </span><span class="s4">@</span><span class="s1">{NSLocalizedDescriptionKey : errorMessage}</span><span class="s4">;</span>
+        <span class="s1">completionHandler(</span>
+            <span class="s1">[[NSError alloc] initWithDomain:NSURLErrorDomain code:statusCode userInfo:userInfo]</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+        <span class="s4">return;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Call handler</span>
+    <span class="s1">completionHandler(nil</span><span class="s4">, </span><span class="s1">data</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s0">// Download image</span>
+  <span class="s4">__weak __typeof</span><span class="s1">(self) weakSelf = self</span><span class="s4">;</span>
+  <span class="s1">__block RCTNetworkTask *task =</span>
+      <span class="s1">[networking networkTaskWithRequest:request</span>
+                         <span class="s1">completionBlock:^(NSURLResponse *response</span><span class="s4">, </span><span class="s1">NSData *data</span><span class="s4">, </span><span class="s1">NSError *error) {</span>
+                           <span class="s4">__typeof</span><span class="s1">(self) strongSelf = weakSelf</span><span class="s4">;</span>
+                           <span class="s4">if </span><span class="s1">(!strongSelf) {</span>
+                             <span class="s4">return;</span>
+                           <span class="s1">}</span>
+
+                           <span class="s4">if </span><span class="s1">(error || !response || !data) {</span>
+                             <span class="s1">NSError *someError = nil</span><span class="s4">;</span>
+                             <span class="s4">if </span><span class="s1">(error) {</span>
+                               <span class="s1">someError = error</span><span class="s4">;</span>
+                             <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!response) {</span>
+                               <span class="s1">someError = RCTErrorWithMessage(</span><span class="s4">@</span><span class="s3">&quot;Response metadata error&quot;</span><span class="s1">)</span><span class="s4">;</span>
+                             <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+                               <span class="s1">someError = RCTErrorWithMessage(</span><span class="s4">@</span><span class="s3">&quot;Unknown image download error&quot;</span><span class="s1">)</span><span class="s4">;</span>
+                             <span class="s1">}</span>
+                             <span class="s1">completionHandler(someError</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">response)</span><span class="s4">;</span>
+                             <span class="s1">[strongSelf dequeueTasks]</span><span class="s4">;</span>
+                             <span class="s4">return;</span>
+                           <span class="s1">}</span>
+
+                           <span class="s1">dispatch_async(strongSelf-&gt;_URLRequestQueue</span><span class="s4">, </span><span class="s1">^{</span>
+                             <span class="s0">// Process image data</span>
+                             <span class="s1">processResponse(response</span><span class="s4">, </span><span class="s1">data</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+
+                             <span class="s0">// Prepare for next task</span>
+                             <span class="s1">[strongSelf dequeueTasks]</span><span class="s4">;</span>
+                           <span class="s1">})</span><span class="s4">;</span>
+                         <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s1">task.downloadProgressBlock = ^(int64_t progress</span><span class="s4">, </span><span class="s1">int64_t total) {</span>
+    <span class="s4">if </span><span class="s1">(progressHandler) {</span>
+      <span class="s1">progressHandler(progress</span><span class="s4">, </span><span class="s1">total)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(task) {</span>
+    <span class="s4">if </span><span class="s1">(!_pendingTasks) {</span>
+      <span class="s1">_pendingTasks = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">[_pendingTasks addObject:task]</span><span class="s4">;</span>
+    <span class="s1">[self dequeueTasks]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">^{</span>
+    <span class="s4">__typeof</span><span class="s1">(self) strongSelf = weakSelf</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!strongSelf || !task) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">dispatch_async(strongSelf-&gt;_URLRequestQueue</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">[task cancel]</span><span class="s4">;</span>
+      <span class="s1">task = nil</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">[strongSelf dequeueTasks]</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTImageLoaderWithAttributionProtocol</span>
+
+<span class="s1">- (RCTImageURLLoaderRequest *)loadImageWithURLRequest:(NSURLRequest *)imageURLRequest</span>
+                                                 <span class="s1">size:(CGSize)size</span>
+                                                <span class="s1">scale:(CGFloat)scale</span>
+                                              <span class="s1">clipped:(BOOL)clipped</span>
+                                           <span class="s1">resizeMode:(RCTResizeMode)resizeMode</span>
+                                             <span class="s1">priority:(RCTImageLoaderPriority)priority</span>
+                                          <span class="s1">attribution:(</span><span class="s4">const </span><span class="s1">ImageURLLoaderAttribution &amp;)attribution</span>
+                                        <span class="s1">progressBlock:(RCTImageLoaderProgressBlock)progressBlock</span>
+                                     <span class="s1">partialLoadBlock:(RCTImageLoaderPartialLoadBlock)partialLoadBlock</span>
+                                      <span class="s1">completionBlock:(RCTImageLoaderCompletionBlockWithMetadata)completionBlock</span>
+<span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">cancelled = std::make_shared&lt;std::atomic&lt;</span><span class="s4">int</span><span class="s1">&gt;&gt;(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">__block dispatch_block_t cancelLoad = nil</span><span class="s4">;</span>
+  <span class="s1">__block NSLock *cancelLoadLock = [NSLock </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">dispatch_block_t cancellationBlock = ^{</span>
+    <span class="s1">BOOL alreadyCancelled = atomic_fetch_or(cancelled.get()</span><span class="s4">, </span><span class="s5">1</span><span class="s1">) ? YES : NO</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(alreadyCancelled) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+    <span class="s1">dispatch_block_t cancelLoadLocal = cancelLoad</span><span class="s4">;</span>
+    <span class="s1">cancelLoad = nil</span><span class="s4">;</span>
+    <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(cancelLoadLocal) {</span>
+      <span class="s1">cancelLoadLocal()</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">__weak </span><span class="s1">RCTImageLoader *weakSelf = self</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">(^completionHandler)(NSError *</span><span class="s4">, </span><span class="s1">id</span><span class="s4">, </span><span class="s1">id</span><span class="s4">, </span><span class="s1">BOOL</span><span class="s4">, </span><span class="s1">NSURLResponse *) =</span>
+      <span class="s1">^(NSError *error</span><span class="s4">, </span><span class="s1">id imageOrData</span><span class="s4">, </span><span class="s1">id imageMetadata</span><span class="s4">, </span><span class="s1">BOOL cacheResult</span><span class="s4">, </span><span class="s1">NSURLResponse *response) {</span>
+        <span class="s4">__typeof</span><span class="s1">(self) strongSelf = weakSelf</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(std::atomic_load(cancelled.get()) || !strongSelf) {</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s4">if </span><span class="s1">(!imageOrData || [imageOrData isKindOfClass:[UIImage </span><span class="s4">class</span><span class="s1">]]) {</span>
+          <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+          <span class="s1">cancelLoad = nil</span><span class="s4">;</span>
+          <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+          <span class="s1">completionBlock(error</span><span class="s4">, </span><span class="s1">imageOrData</span><span class="s4">, </span><span class="s1">imageMetadata)</span><span class="s4">;</span>
+          <span class="s4">return;</span>
+        <span class="s1">}</span>
+
+        <span class="s1">RCTImageLoaderCompletionBlock decodeCompletionHandler = ^(NSError *error_</span><span class="s4">, </span><span class="s1">UIImage *image) {</span>
+          <span class="s4">if </span><span class="s1">(cacheResult &amp;&amp; image) {</span>
+            <span class="s0">// Store decoded image in cache</span>
+            <span class="s1">[[strongSelf imageCache] addImageToCache:image</span>
+                                                 <span class="s1">URL:imageURLRequest.URL.absoluteString</span>
+                                                <span class="s1">size:size</span>
+                                               <span class="s1">scale:scale</span>
+                                          <span class="s1">resizeMode:resizeMode</span>
+                                            <span class="s1">response:response]</span><span class="s4">;</span>
+          <span class="s1">}</span>
+          <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+          <span class="s1">cancelLoad = nil</span><span class="s4">;</span>
+          <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+          <span class="s1">completionBlock(error_</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+        <span class="s1">}</span><span class="s4">;</span>
+        <span class="s1">dispatch_block_t cancelLoadLocal = [strongSelf decodeImageData:imageOrData</span>
+                                                                  <span class="s1">size:size</span>
+                                                                 <span class="s1">scale:scale</span>
+                                                               <span class="s1">clipped:clipped</span>
+                                                            <span class="s1">resizeMode:resizeMode</span>
+                                                       <span class="s1">completionBlock:decodeCompletionHandler]</span><span class="s4">;</span>
+        <span class="s1">[cancelLoadLock lock]</span><span class="s4">;</span>
+        <span class="s1">cancelLoad = cancelLoadLocal</span><span class="s4">;</span>
+        <span class="s1">[cancelLoadLock unlock]</span><span class="s4">;</span>
+      <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">RCTImageURLLoaderRequest *loaderRequest = [self _loadImageOrDataWithURLRequest:imageURLRequest</span>
+                                                                            <span class="s1">size:size</span>
+                                                                           <span class="s1">scale:scale</span>
+                                                                      <span class="s1">resizeMode:resizeMode</span>
+                                                                        <span class="s1">priority:priority</span>
+                                                                     <span class="s1">attribution:attribution</span>
+                                                                   <span class="s1">progressBlock:progressBlock</span>
+                                                                <span class="s1">partialLoadBlock:partialLoadBlock</span>
+                                                                 <span class="s1">completionBlock:completionHandler]</span><span class="s4">;</span>
+  <span class="s1">cancelLoad = loaderRequest.cancellationBlock</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[[RCTImageURLLoaderRequest alloc] initWithRequestId:loaderRequest.requestId</span>
+                                                    <span class="s1">imageURL:imageURLRequest.URL</span>
+                                           <span class="s1">cancellationBlock:cancellationBlock]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)shouldEnablePerfLoggingForRequestUrl:(NSURL *)url</span>
+<span class="s1">{</span>
+  <span class="s1">id&lt;RCTImageURLLoader&gt; loadHandler = [self imageURLLoaderForURL:url]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([loadHandler respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(shouldEnablePerfLogging)]) {</span>
+    <span class="s4">return </span><span class="s1">[(id&lt;RCTImageURLLoaderWithAttribution&gt;)loadHandler shouldEnablePerfLogging]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)trackURLImageVisibilityForRequest:(RCTImageURLLoaderRequest *)loaderRequest imageView:(UIView *)imageView</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!loaderRequest || !imageView) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">id&lt;RCTImageURLLoader&gt; loadHandler = [self imageURLLoaderForURL:loaderRequest.imageURL]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([loadHandler respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(trackURLImageVisibilityForRequest:imageView:)]) {</span>
+    <span class="s1">[(id&lt;RCTImageURLLoaderWithAttribution&gt;)loadHandler trackURLImageVisibilityForRequest:loaderRequest</span>
+                                                                               <span class="s1">imageView:imageView]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)trackURLImageRequestDidDestroy:(RCTImageURLLoaderRequest *)loaderRequest</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!loaderRequest) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">id&lt;RCTImageURLLoader&gt; loadHandler = [self imageURLLoaderForURL:loaderRequest.imageURL]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([loadHandler respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(trackURLImageRequestDidDestroy:)]) {</span>
+    <span class="s1">[(id&lt;RCTImageURLLoaderWithAttribution&gt;)loadHandler trackURLImageRequestDidDestroy:loaderRequest]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)trackURLImageDidDestroy:(RCTImageURLLoaderRequest *)loaderRequest</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!loaderRequest) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">id&lt;RCTImageURLLoader&gt; loadHandler = [self imageURLLoaderForURL:loaderRequest.imageURL]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([loadHandler respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(trackURLImageDidDestroy:)]) {</span>
+    <span class="s1">[(id&lt;RCTImageURLLoaderWithAttribution&gt;)loadHandler trackURLImageDidDestroy:loaderRequest]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTImageLoaderProtocol </span><span class="s5">3</span><span class="s1">/</span><span class="s5">3</span>
+
+<span class="s1">- (RCTImageLoaderCancellationBlock)decodeImageData:(NSData *)data</span>
+                                              <span class="s1">size:(CGSize)size</span>
+                                             <span class="s1">scale:(CGFloat)scale</span>
+                                           <span class="s1">clipped:(BOOL)clipped</span>
+                                        <span class="s1">resizeMode:(RCTResizeMode)resizeMode</span>
+                                   <span class="s1">completionBlock:(RCTImageLoaderCompletionBlock)completionBlock</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(data.length == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s1">completionBlock(RCTErrorWithMessage(</span><span class="s4">@</span><span class="s3">&quot;No image data&quot;</span><span class="s1">)</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">^{</span>
+    <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">cancelled = std::make_shared&lt;std::atomic&lt;</span><span class="s4">int</span><span class="s1">&gt;&gt;(</span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">(^completionHandler)(NSError *</span><span class="s4">, </span><span class="s1">UIImage *) = ^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image) {</span>
+    <span class="s4">if </span><span class="s1">(RCTIsMainQueue()) {</span>
+      <span class="s0">// Most loaders do not return on the main thread, so caller is probably not</span>
+      <span class="s0">// expecting it, and may do expensive post-processing in the callback</span>
+      <span class="s1">dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">, </span><span class="s1">^{</span>
+        <span class="s4">if </span><span class="s1">(!std::atomic_load(cancelled.get())) {</span>
+          <span class="s1">completionBlock(error</span><span class="s4">, </span><span class="s1">clipped ? RCTResizeImageIfNeeded(image</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">scale</span><span class="s4">, </span><span class="s1">resizeMode) : image)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else if </span><span class="s1">(!std::atomic_load(cancelled.get())) {</span>
+      <span class="s1">completionBlock(error</span><span class="s4">, </span><span class="s1">clipped ? RCTResizeImageIfNeeded(image</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">scale</span><span class="s4">, </span><span class="s1">resizeMode) : image)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">id&lt;RCTImageDataDecoder&gt; imageDecoder = [self imageDataDecoderForData:data]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(imageDecoder) {</span>
+    <span class="s4">return </span><span class="s1">[imageDecoder decodeImageData:data</span>
+                                    <span class="s1">size:size</span>
+                                   <span class="s1">scale:scale</span>
+                              <span class="s1">resizeMode:resizeMode</span>
+                       <span class="s1">completionHandler:completionHandler]</span>
+        <span class="s1">?: ^{</span>
+          <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">dispatch_block_t decodeBlock = ^{</span>
+      <span class="s0">// Calculate the size, in bytes, that the decompressed image will require</span>
+      <span class="s1">NSInteger decodedImageBytes = (NSInteger)((size.width * scale) * (size.height * scale) * </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+
+      <span class="s0">// Mark these bytes as in-use</span>
+      <span class="s1">self-&gt;_activeBytes += decodedImageBytes</span><span class="s4">;</span>
+
+      <span class="s0">// Do actual decompression on a concurrent background queue</span>
+      <span class="s1">dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">, </span><span class="s1">^{</span>
+        <span class="s4">if </span><span class="s1">(!std::atomic_load(cancelled.get())) {</span>
+          <span class="s0">// Decompress the image data (this may be CPU and memory intensive)</span>
+          <span class="s1">UIImage *image = RCTDecodeImageWithData(data</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">scale</span><span class="s4">, </span><span class="s1">resizeMode)</span><span class="s4">;</span>
+
+<span class="s2">#if </span><span class="s1">RCT_DEV</span>
+          <span class="s1">CGSize imagePixelSize = RCTSizeInPixels(image.size</span><span class="s4">, </span><span class="s1">image.scale)</span><span class="s4">;</span>
+          <span class="s1">CGSize screenPixelSize = RCTSizeInPixels(RCTScreenSize()</span><span class="s4">, </span><span class="s1">RCTScreenScale())</span><span class="s4">;</span>
+          <span class="s4">if </span><span class="s1">(imagePixelSize.width * imagePixelSize.height &gt; screenPixelSize.width * screenPixelSize.height) {</span>
+            <span class="s1">RCTLogInfo(</span>
+                <span class="s4">@</span><span class="s3">&quot;[PERF ASSETS] Loading image at size %@, which is larger &quot;</span>
+                 <span class="s3">&quot;than the screen size %@&quot;</span><span class="s4">,</span>
+                <span class="s1">NSStringFromCGSize(imagePixelSize)</span><span class="s4">,</span>
+                <span class="s1">NSStringFromCGSize(screenPixelSize))</span><span class="s4">;</span>
+          <span class="s1">}</span>
+<span class="s2">#endif</span>
+
+          <span class="s4">if </span><span class="s1">(image) {</span>
+            <span class="s1">completionHandler(nil</span><span class="s4">, </span><span class="s1">image)</span><span class="s4">;</span>
+          <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+            <span class="s1">NSString *errorMessage =</span>
+                <span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Error decoding image data &lt;NSData %p; %tu bytes&gt;&quot;</span><span class="s4">, </span><span class="s1">data</span><span class="s4">, </span><span class="s1">data.length]</span><span class="s4">;</span>
+            <span class="s1">NSError *finalError = RCTErrorWithMessage(errorMessage)</span><span class="s4">;</span>
+            <span class="s1">completionHandler(finalError</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// We're no longer retaining the uncompressed data, so now we'll mark</span>
+        <span class="s0">// the decoding as complete so that the loading task queue can resume.</span>
+        <span class="s1">dispatch_async(self-&gt;_URLRequestQueue</span><span class="s4">, </span><span class="s1">^{</span>
+          <span class="s1">self-&gt;_scheduledDecodes--</span><span class="s4">;</span>
+          <span class="s1">self-&gt;_activeBytes -= decodedImageBytes</span><span class="s4">;</span>
+          <span class="s1">[self dequeueTasks]</span><span class="s4">;</span>
+        <span class="s1">})</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">}</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!_URLRequestQueue) {</span>
+      <span class="s1">[self setUp]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">dispatch_async(_URLRequestQueue</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s0">// The decode operation retains the compressed image data until it's</span>
+      <span class="s0">// complete, so we'll mark it as having started, in order to block</span>
+      <span class="s0">// further image loads from happening until we're done with the data.</span>
+      <span class="s1">self-&gt;_scheduledDecodes++</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(!self-&gt;_pendingDecodes) {</span>
+        <span class="s1">self-&gt;_pendingDecodes = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">NSInteger activeDecodes = self-&gt;_scheduledDecodes - self-&gt;_pendingDecodes.count - </span><span class="s5">1</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(activeDecodes == </span><span class="s5">0 </span><span class="s1">||</span>
+          <span class="s1">(self-&gt;_activeBytes &lt;= self-&gt;_maxConcurrentDecodingBytes &amp;&amp;</span>
+           <span class="s1">activeDecodes &lt;= self-&gt;_maxConcurrentDecodingTasks)) {</span>
+        <span class="s1">decodeBlock()</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">[self-&gt;_pendingDecodes addObject:decodeBlock]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">})</span><span class="s4">;</span>
+
+    <span class="s4">return </span><span class="s1">^{</span>
+      <span class="s1">std::atomic_store(cancelled.get()</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTImageLoaderCancellationBlock)getImageSizeForURLRequest:(NSURLRequest *)imageURLRequest</span>
+                                                       <span class="s1">block:(</span><span class="s4">void </span><span class="s1">(^)(NSError *error</span><span class="s4">, </span><span class="s1">CGSize size))callback</span>
+<span class="s1">{</span>
+  <span class="s4">void </span><span class="s1">(^completion)(NSError *</span><span class="s4">, </span><span class="s1">id</span><span class="s4">, </span><span class="s1">id</span><span class="s4">, </span><span class="s1">BOOL</span><span class="s4">, </span><span class="s1">NSURLResponse *) =</span>
+      <span class="s1">^(NSError *error</span><span class="s4">, </span><span class="s1">id imageOrData</span><span class="s4">, </span><span class="s1">id imageMetadata</span><span class="s4">, </span><span class="s1">BOOL cacheResult</span><span class="s4">, </span><span class="s1">NSURLResponse *response) {</span>
+        <span class="s1">CGSize size</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">([imageOrData isKindOfClass:[NSData </span><span class="s4">class</span><span class="s1">]]) {</span>
+          <span class="s1">NSDictionary *meta = RCTGetImageMetadata(imageOrData)</span><span class="s4">;</span>
+
+          <span class="s1">NSInteger imageOrientation = [meta[(id)kCGImagePropertyOrientation] integerValue]</span><span class="s4">;</span>
+          <span class="s4">switch </span><span class="s1">(imageOrientation) {</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationLeft:</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationRight:</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationLeftMirrored:</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationRightMirrored:</span>
+              <span class="s0">// swap width and height</span>
+              <span class="s1">size = (CGSize){</span>
+                  <span class="s1">[meta[(id)kCGImagePropertyPixelHeight] floatValue]</span><span class="s4">,</span>
+                  <span class="s1">[meta[(id)kCGImagePropertyPixelWidth] floatValue]</span><span class="s4">,</span>
+              <span class="s1">}</span><span class="s4">;</span>
+              <span class="s4">break;</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationUp:</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationDown:</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationUpMirrored:</span>
+            <span class="s4">case </span><span class="s1">kCGImagePropertyOrientationDownMirrored:</span>
+            <span class="s4">default</span><span class="s1">:</span>
+              <span class="s1">size = (CGSize){</span>
+                  <span class="s1">[meta[(id)kCGImagePropertyPixelWidth] floatValue]</span><span class="s4">,</span>
+                  <span class="s1">[meta[(id)kCGImagePropertyPixelHeight] floatValue]</span><span class="s4">,</span>
+              <span class="s1">}</span><span class="s4">;</span>
+              <span class="s4">break;</span>
+          <span class="s1">}</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">UIImage *image = imageOrData</span><span class="s4">;</span>
+          <span class="s1">size = (CGSize){</span>
+              <span class="s1">image.size.width * image.scale</span><span class="s4">,</span>
+              <span class="s1">image.size.height * image.scale</span><span class="s4">,</span>
+          <span class="s1">}</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s1">callback(error</span><span class="s4">, </span><span class="s1">size)</span><span class="s4">;</span>
+      <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">RCTImageURLLoaderRequest *loaderRequest = [self _loadImageOrDataWithURLRequest:imageURLRequest</span>
+                                                                            <span class="s1">size:CGSizeZero</span>
+                                                                           <span class="s1">scale:</span><span class="s5">1</span>
+                                                                      <span class="s1">resizeMode:RCTResizeModeStretch</span>
+                                                                        <span class="s1">priority:RCTImageLoaderPriorityImmediate</span>
+                                                                     <span class="s1">attribution:{}</span>
+                                                                   <span class="s1">progressBlock:NULL</span>
+                                                                <span class="s1">partialLoadBlock:NULL</span>
+                                                                 <span class="s1">completionBlock:completion]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">loaderRequest.cancellationBlock</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSDictionary *)getImageCacheStatus:(NSArray *)requests</span>
+<span class="s1">{</span>
+  <span class="s1">NSMutableDictionary *results = [NSMutableDictionary dictionary]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(id request in requests) {</span>
+    <span class="s1">NSURLRequest *urlRequest = [RCTConvert NSURLRequest:request]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(urlRequest) {</span>
+      <span class="s1">NSCachedURLResponse *cachedResponse = [NSURLCache.sharedURLCache cachedResponseForRequest:urlRequest]</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(cachedResponse) {</span>
+        <span class="s4">if </span><span class="s1">(cachedResponse.storagePolicy == NSURLCacheStorageAllowedInMemoryOnly) {</span>
+          <span class="s1">results[urlRequest.URL.absoluteString] = </span><span class="s4">@</span><span class="s3">&quot;memory&quot;</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">else if </span><span class="s1">(NSURLCache.sharedURLCache.currentMemoryUsage == </span><span class="s5">0</span><span class="s1">) {</span>
+          <span class="s0">// We can't check whether the file is cached on disk or memory.</span>
+          <span class="s0">// However, if currentMemoryUsage is disabled, it must be read from disk.</span>
+          <span class="s1">results[urlRequest.URL.absoluteString] = </span><span class="s4">@</span><span class="s3">&quot;disk&quot;</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s1">results[urlRequest.URL.absoluteString] = </span><span class="s4">@</span><span class="s3">&quot;disk/memory&quot;</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">results</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTURLRequestHandler</span>
+
+<span class="s1">- (BOOL)canHandleRequest:(NSURLRequest *)request</span>
+<span class="s1">{</span>
+  <span class="s1">NSURL *requestURL = request.URL</span><span class="s4">;</span>
+
+  <span class="s0">// If the data being loaded is a video, return NO</span>
+  <span class="s0">// Even better may be to implement this on the RCTImageURLLoader that would try to load it,</span>
+  <span class="s0">// but we'd have to run the logic both in RCTPhotoLibraryImageLoader and</span>
+  <span class="s0">// RCTAssetsLibraryRequestHandler. Once we drop iOS7 though, we'd drop</span>
+  <span class="s0">// RCTAssetsLibraryRequestHandler and can move it there.</span>
+  <span class="s4">static </span><span class="s1">NSRegularExpression *videoRegex</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">NSError *error = nil</span><span class="s4">;</span>
+    <span class="s1">videoRegex = [NSRegularExpression regularExpressionWithPattern:</span><span class="s4">@</span><span class="s3">&quot;(?:&amp;|^)ext=MOV(?:&amp;|$)&quot;</span>
+                                                           <span class="s1">options:NSRegularExpressionCaseInsensitive</span>
+                                                             <span class="s1">error:&amp;error]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(error) {</span>
+      <span class="s1">RCTLogError(</span><span class="s4">@</span><span class="s3">&quot;%@&quot;</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s1">NSString *query = requestURL.query</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(query != nil &amp;&amp; [videoRegex firstMatchInString:query options:</span><span class="s5">0 </span><span class="s1">range:NSMakeRange(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">query.length)]) {</span>
+    <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(id&lt;RCTImageURLLoader&gt; loader in _loaders) {</span>
+    <span class="s0">// Don't use RCTImageURLLoader protocol for modules that already conform to</span>
+    <span class="s0">// RCTURLRequestHandler as it's inefficient to decode an image and then</span>
+    <span class="s0">// convert it back into data</span>
+    <span class="s4">if </span><span class="s1">(![loader conformsToProtocol:</span><span class="s4">@protocol</span><span class="s1">(RCTURLRequestHandler)] &amp;&amp; [loader canLoadImageURL:requestURL]) {</span>
+      <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id)sendRequest:(NSURLRequest *)request withDelegate:(id&lt;RCTURLRequestDelegate&gt;)delegate</span>
+<span class="s1">{</span>
+  <span class="s1">__block RCTImageLoaderCancellationBlock requestToken</span><span class="s4">;</span>
+  <span class="s1">requestToken = [self loadImageWithURLRequest:request</span>
+                                      <span class="s1">callback:^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image) {</span>
+                                        <span class="s4">if </span><span class="s1">(error) {</span>
+                                          <span class="s1">[delegate URLRequest:requestToken didCompleteWithError:error]</span><span class="s4">;</span>
+                                          <span class="s4">return;</span>
+                                        <span class="s1">}</span>
+
+                                        <span class="s1">NSString *mimeType = nil</span><span class="s4">;</span>
+                                        <span class="s1">NSData *imageData = nil</span><span class="s4">;</span>
+                                        <span class="s4">if </span><span class="s1">(RCTImageHasAlpha(image.CGImage)) {</span>
+                                          <span class="s1">mimeType = </span><span class="s4">@</span><span class="s3">&quot;image/png&quot;</span><span class="s4">;</span>
+                                          <span class="s1">imageData = UIImagePNGRepresentation(image)</span><span class="s4">;</span>
+                                        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+                                          <span class="s1">mimeType = </span><span class="s4">@</span><span class="s3">&quot;image/jpeg&quot;</span><span class="s4">;</span>
+                                          <span class="s1">imageData = UIImageJPEGRepresentation(image</span><span class="s4">, </span><span class="s5">1.0</span><span class="s1">)</span><span class="s4">;</span>
+                                        <span class="s1">}</span>
+
+                                        <span class="s1">NSURLResponse *response = [[NSURLResponse alloc] initWithURL:request.URL</span>
+                                                                                            <span class="s1">MIMEType:mimeType</span>
+                                                                               <span class="s1">expectedContentLength:imageData.length</span>
+                                                                                    <span class="s1">textEncodingName:nil]</span><span class="s4">;</span>
+
+                                        <span class="s1">[delegate URLRequest:requestToken didReceiveResponse:response]</span><span class="s4">;</span>
+                                        <span class="s1">[delegate URLRequest:requestToken didReceiveData:imageData]</span><span class="s4">;</span>
+                                        <span class="s1">[delegate URLRequest:requestToken didCompleteWithError:nil]</span><span class="s4">;</span>
+                                      <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">requestToken</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)cancelRequest:(id)requestToken</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(requestToken) {</span>
+    <span class="s1">((RCTImageLoaderCancellationBlock)requestToken)()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (std::shared_ptr&lt;facebook::react::TurboModule&gt;)getTurboModule:</span>
+    <span class="s1">(</span><span class="s4">const </span><span class="s1">facebook::react::ObjCTurboModule::InitParams &amp;)params</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">std::make_shared&lt;facebook::react::NativeImageLoaderIOSSpecJSI&gt;(params)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(getSize</span>
+                  <span class="s1">: (NSString *)uri resolve</span>
+                  <span class="s1">: (RCTPromiseResolveBlock)resolve reject</span>
+                  <span class="s1">: (RCTPromiseRejectBlock)reject)</span>
+<span class="s1">{</span>
+  <span class="s1">NSURLRequest *request = [RCTConvert NSURLRequest:uri]</span><span class="s4">;</span>
+  <span class="s1">[self getImageSizeForURLRequest:request</span>
+                            <span class="s1">block:^(NSError *error</span><span class="s4">, </span><span class="s1">CGSize size) {</span>
+                              <span class="s4">if </span><span class="s1">(error) {</span>
+                                <span class="s1">reject(</span>
+                                    <span class="s4">@</span><span class="s3">&quot;E_GET_SIZE_FAILURE&quot;</span><span class="s4">,</span>
+                                    <span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;Failed to getSize of %@&quot;</span><span class="s4">, </span><span class="s1">uri]</span><span class="s4">,</span>
+                                    <span class="s1">error)</span><span class="s4">;</span>
+                              <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+                                <span class="s1">resolve(</span><span class="s4">@</span><span class="s1">[ </span><span class="s4">@</span><span class="s1">(size.width)</span><span class="s4">, @</span><span class="s1">(size.height) ])</span><span class="s4">;</span>
+                              <span class="s1">}</span>
+                            <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(getSizeWithHeaders</span>
+                  <span class="s1">: (NSString *)uri headers</span>
+                  <span class="s1">: (NSDictionary *)headers resolve</span>
+                  <span class="s1">: (RCTPromiseResolveBlock)resolve reject</span>
+                  <span class="s1">: (RCTPromiseRejectBlock)reject)</span>
+<span class="s1">{</span>
+  <span class="s1">NSURL *URL = [RCTConvert NSURL:uri]</span><span class="s4">;</span>
+  <span class="s1">NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:URL]</span><span class="s4">;</span>
+  <span class="s1">[headers enumerateKeysAndObjectsUsingBlock:^(NSString *key</span><span class="s4">, </span><span class="s1">id value</span><span class="s4">, </span><span class="s1">BOOL *stop) {</span>
+    <span class="s1">[request addValue:[RCTConvert NSString:value] forHTTPHeaderField:key]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">[self getImageSizeForURLRequest:request</span>
+                            <span class="s1">block:^(NSError *error</span><span class="s4">, </span><span class="s1">CGSize size) {</span>
+                              <span class="s4">if </span><span class="s1">(error) {</span>
+                                <span class="s1">reject(</span><span class="s4">@</span><span class="s3">&quot;E_GET_SIZE_FAILURE&quot;</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+                                <span class="s4">return;</span>
+                              <span class="s1">}</span>
+                              <span class="s1">resolve(</span><span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;width&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(size.width)</span><span class="s4">, @</span><span class="s3">&quot;height&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(size.height)})</span><span class="s4">;</span>
+                            <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(prefetchImage</span>
+                  <span class="s1">: (NSString *)uri resolve</span>
+                  <span class="s1">: (RCTPromiseResolveBlock)resolve reject</span>
+                  <span class="s1">: (RCTPromiseRejectBlock)reject)</span>
+<span class="s1">{</span>
+  <span class="s1">[self prefetchImageWithMetadata:uri queryRootName:nil rootTag:</span><span class="s5">0 </span><span class="s1">resolve:resolve reject:reject]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(prefetchImageWithMetadata</span>
+                  <span class="s1">: (NSString *)uri queryRootName</span>
+                  <span class="s1">: (NSString *)queryRootName rootTag</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)rootTag resolve</span>
+                  <span class="s1">: (RCTPromiseResolveBlock)resolve reject</span>
+                  <span class="s1">: (RCTPromiseRejectBlock)reject)</span>
+<span class="s1">{</span>
+  <span class="s1">NSURLRequest *request = [RCTConvert NSURLRequest:uri]</span><span class="s4">;</span>
+  <span class="s1">[self loadImageWithURLRequest:request</span>
+                           <span class="s1">size:CGSizeZero</span>
+                          <span class="s1">scale:</span><span class="s5">1</span>
+                        <span class="s1">clipped:YES</span>
+                     <span class="s1">resizeMode:RCTResizeModeStretch</span>
+                       <span class="s1">priority:RCTImageLoaderPriorityPrefetch</span>
+                    <span class="s1">attribution:{</span>
+                                    <span class="s1">.queryRootName = queryRootName ? [queryRootName UTF8String] : </span><span class="s3">&quot;&quot;</span><span class="s4">,</span>
+                                    <span class="s1">.surfaceId = (</span><span class="s4">int</span><span class="s1">)rootTag</span><span class="s4">,</span>
+                                <span class="s1">}</span>
+                  <span class="s1">progressBlock:nil</span>
+               <span class="s1">partialLoadBlock:nil</span>
+                <span class="s1">completionBlock:^(NSError *error</span><span class="s4">, </span><span class="s1">UIImage *image</span><span class="s4">, </span><span class="s1">id completionMetadata) {</span>
+                  <span class="s4">if </span><span class="s1">(error) {</span>
+                    <span class="s1">reject(</span><span class="s4">@</span><span class="s3">&quot;E_PREFETCH_FAILURE&quot;</span><span class="s4">, </span><span class="s1">nil</span><span class="s4">, </span><span class="s1">error)</span><span class="s4">;</span>
+                    <span class="s4">return;</span>
+                  <span class="s1">}</span>
+                  <span class="s1">resolve(</span><span class="s4">@</span><span class="s1">YES)</span><span class="s4">;</span>
+                <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(queryCache</span>
+                  <span class="s1">: (NSArray *)uris resolve</span>
+                  <span class="s1">: (RCTPromiseResolveBlock)resolve reject</span>
+                  <span class="s1">: (RCTPromiseRejectBlock)reject)</span>
+<span class="s1">{</span>
+  <span class="s1">resolve([self getImageCacheStatus:uris])</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s4">@end</span>
+
+<span class="s0">/** 
+ * DEPRECATED!! DO NOT USE 
+ * Instead use `[_bridge moduleForClass:[RCTImageLoader class]]` 
+ */</span>
+<span class="s4">@implementation </span><span class="s1">RCTBridge (RCTImageLoader)</span>
+
+<span class="s1">- (RCTImageLoader *)imageLoader</span>
+<span class="s1">{</span>
+  <span class="s1">RCTLogWarn(</span>
+      <span class="s4">@</span><span class="s3">&quot;Calling bridge.imageLoader is deprecated and will not work in newer versions of RN. Please update to the &quot;</span>
+       <span class="s3">&quot;moduleForClass API or turboModuleRegistry API.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">[self moduleForClass:[RCTImageLoader </span><span class="s4">class</span><span class="s1">]]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s1">Class RCTImageLoaderCls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTImageLoader.</span><span class="s4">class;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

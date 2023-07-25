@@ -1,0 +1,214 @@
+<html>
+<head>
+<title>PackageResolve.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+PackageResolve.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">import type {PackageInfo, PackageJson, ResolutionContext} from './types';</span>
+
+<span class="s0">import path from 'path';</span>
+<span class="s0">import toPosixPath from './utils/toPosixPath';</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Resolve the main entry point subpath for a package.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Implements legacy (non-exports) package resolution behaviour based on the</span>
+ <span class="s0">* [&quot;browser&quot; field spec](https://github.com/defunctzombie/package-browser-field-spec).</span>
+ <span class="s0">*/</span>
+<span class="s0">export function getPackageEntryPoint(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">packageInfo: PackageInfo,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const {mainFields} = context;</span>
+  <span class="s0">const pkg = packageInfo.packageJson;</span>
+
+  <span class="s0">let main = 'index';</span>
+
+  <span class="s0">for (const name of mainFields) {</span>
+    <span class="s0">if (typeof pkg[name] === 'string' &amp;&amp; pkg[name].length) {</span>
+      <span class="s0">main = pkg[name];</span>
+      <span class="s0">break;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// NOTE: Additional variants are used when checking for subpath replacements</span>
+  <span class="s0">// against the main entry point. This inconsistent with those matched by</span>
+  <span class="s0">// `redirectModulePath`, but we are preserving this long-standing behaviour.</span>
+  <span class="s0">const variants = [</span>
+    <span class="s0">main,</span>
+    <span class="s0">main.slice(0, 2) === './' ? main.slice(2) : './' + main,</span>
+  <span class="s0">].flatMap(variant =&gt; [</span>
+    <span class="s0">variant,</span>
+    <span class="s0">variant + '.js',</span>
+    <span class="s0">variant + '.json',</span>
+    <span class="s0">variant.replace(/(\.js|\.json)$/, ''),</span>
+  <span class="s0">]);</span>
+
+  <span class="s0">const replacement = matchSubpathFromMainFields(variants, pkg, mainFields);</span>
+
+  <span class="s0">if (typeof replacement === 'string') {</span>
+    <span class="s0">return replacement;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return main;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Get the resolved file path for the given import specifier based on any</span>
+ <span class="s0">* `package.json` rules. Returns `false` if the module should be</span>
+ <span class="s0">* [ignored](https://github.com/defunctzombie/package-browser-field-spec#ignore-a-module),</span>
+ <span class="s0">* and returns the original path if no `package.json` mapping is matched. Does</span>
+ <span class="s0">* not test file existence.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Implements legacy (non-exports) package resolution behaviour based on the</span>
+ <span class="s0">* [&quot;browser&quot; field spec](https://github.com/defunctzombie/package-browser-field-spec).</span>
+ <span class="s0">*</span>
+ <span class="s0">* This is the default implementation of `context.redirectModulePath`.</span>
+ <span class="s0">*/</span>
+<span class="s0">export function redirectModulePath(</span>
+  <span class="s0">context: $ReadOnly&lt;{</span>
+    <span class="s0">getPackageForModule: ResolutionContext['getPackageForModule'],</span>
+    <span class="s0">mainFields: ResolutionContext['mainFields'],</span>
+    <span class="s0">originModulePath: ResolutionContext['originModulePath'],</span>
+    <span class="s0">...</span>
+  <span class="s0">}&gt;,</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* The module path being imported. This may be:</span>
+   <span class="s0">*</span>
+   <span class="s0">* - A relative specifier (beginning with '.'), which may be redirected by a</span>
+   <span class="s0">*   `package.json` file local to `context.originModulePath`.</span>
+   <span class="s0">*     - Note: A path begining with '/' is treated as an absolute specifier</span>
+   <span class="s0">*       (non-standard).</span>
+   <span class="s0">* - A bare specifier (e.g. 'some-pkg', 'some-pkg/foo'), which may be</span>
+   <span class="s0">*   redirected by `package.json` rules in the containing package.</span>
+   <span class="s0">* - An absolute specifier, which may be redirected by `package.json` rules</span>
+   <span class="s0">*   in the containing package (non-standard, &quot;browser&quot; spec only).</span>
+   <span class="s0">*</span>
+   <span class="s0">* See https://nodejs.org/docs/latest-v19.x/api/esm.html#import-specifiers</span>
+   <span class="s0">*/</span>
+  <span class="s0">modulePath: string,</span>
+<span class="s0">): string | false {</span>
+  <span class="s0">const {getPackageForModule, mainFields, originModulePath} = context;</span>
+
+  <span class="s0">const containingPackage = getPackageForModule(</span>
+    <span class="s0">path.isAbsolute(modulePath) ? modulePath : originModulePath,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">if (containingPackage == null) {</span>
+    <span class="s0">// No package.json rules apply</span>
+    <span class="s0">return modulePath;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">let redirectedPath;</span>
+
+  <span class="s0">if (modulePath.startsWith('.') || path.isAbsolute(modulePath)) {</span>
+    <span class="s0">const packageRelativeModulePath = path.relative(</span>
+      <span class="s0">containingPackage.rootPath,</span>
+      <span class="s0">path.resolve(path.dirname(originModulePath), modulePath),</span>
+    <span class="s0">);</span>
+    <span class="s0">redirectedPath = matchSubpathFromMainFields(</span>
+      <span class="s0">// Use prefixed POSIX path for lookup in package.json</span>
+      <span class="s0">'./' + toPosixPath(packageRelativeModulePath),</span>
+      <span class="s0">containingPackage.packageJson,</span>
+      <span class="s0">mainFields,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">if (typeof redirectedPath === 'string') {</span>
+      <span class="s0">// BRITTLE ASSUMPTION: This is always treated as a package-relative path</span>
+      <span class="s0">// and is converted back, even if the redirected path is a specifier</span>
+      <span class="s0">// referring to another package.</span>
+      <span class="s0">redirectedPath = path.resolve(containingPackage.rootPath, redirectedPath);</span>
+    <span class="s0">}</span>
+  <span class="s0">} else {</span>
+    <span class="s0">// Otherwise, `modulePath` may be an unprefixed relative path or a bare</span>
+    <span class="s0">// specifier (can also be an absolute specifier prefixed with a URL scheme).</span>
+    <span class="s0">// This is used only by the &quot;browser&quot; spec.</span>
+    <span class="s0">redirectedPath = matchSubpathFromMainFields(</span>
+      <span class="s0">modulePath,</span>
+      <span class="s0">containingPackage.packageJson,</span>
+      <span class="s0">mainFields,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (redirectedPath != null) {</span>
+    <span class="s0">return redirectedPath;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return modulePath;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Get the mapped replacement for the given subpath defined by matching</span>
+ <span class="s0">* `mainFields` entries in the passed `package.json`</span>
+ <span class="s0">* (https://github.com/defunctzombie/package-browser-field-spec#replace-specific-files---advanced).</span>
+ <span class="s0">*</span>
+ <span class="s0">* Returns either:</span>
+ <span class="s0">* - A `string` with the matched replacement subpath.</span>
+ <span class="s0">* - `false`, indicating the module should be ignored.</span>
+ <span class="s0">* - `null` when there is no entry for the subpath.</span>
+ <span class="s0">*/</span>
+<span class="s0">function matchSubpathFromMainFields(</span>
+  <span class="s0">/**</span>
+   <span class="s0">* The subpath, or set of subpath variants, to match. Can be either a</span>
+   <span class="s0">* package-relative subpath (beginning with '.') or a bare import specifier</span>
+   <span class="s0">* which may replace a module in another package.</span>
+   <span class="s0">*/</span>
+  <span class="s0">subpath: string | $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">pkg: PackageJson,</span>
+  <span class="s0">mainFields: $ReadOnlyArray&lt;string&gt;,</span>
+<span class="s0">): string | false | null {</span>
+  <span class="s0">const fieldValues = mainFields</span>
+    <span class="s0">.map(name =&gt; pkg[name])</span>
+    <span class="s0">.filter(value =&gt; value != null &amp;&amp; typeof value !== 'string');</span>
+
+  <span class="s0">if (!fieldValues.length) {</span>
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const replacements = Object.assign({}, ...fieldValues.reverse());</span>
+  <span class="s0">const variants = Array.isArray(subpath)</span>
+    <span class="s0">? subpath</span>
+    <span class="s0">: expandSubpathVariants(subpath);</span>
+
+  <span class="s0">for (const variant of variants) {</span>
+    <span class="s0">const replacement = replacements[variant];</span>
+
+    <span class="s0">if (replacement != null) {</span>
+      <span class="s0">return replacement;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return null;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Get the expanded variants for a given subpath to try against mappings in</span>
+ <span class="s0">* `package.json`. This is unique to &quot;main&quot; and the &quot;browser&quot; spec.</span>
+ <span class="s0">*/</span>
+<span class="s0">function expandSubpathVariants(subpath: string): Array&lt;string&gt; {</span>
+  <span class="s0">return [subpath, subpath + '.js', subpath + '.json'];</span>
+<span class="s0">}</span>
+</pre>
+</body>
+</html>

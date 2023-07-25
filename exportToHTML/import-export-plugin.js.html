@@ -1,0 +1,521 @@
+<html>
+<head>
+<title>import-export-plugin.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+import-export-plugin.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">// Type only dependency. This is not a runtime dependency</span>
+<span class="s0">// eslint-disable-next-line import/no-extraneous-dependencies</span>
+
+<span class="s1">const template = require(</span><span class="s2">&quot;@babel/template&quot;</span><span class="s1">).</span><span class="s3">default</span><span class="s1">;</span>
+<span class="s1">const nullthrows = require(</span><span class="s2">&quot;nullthrows&quot;</span><span class="s1">);</span>
+<span class="s0">/** 
+ * Produces a Babel template that transforms an &quot;import * as x from ...&quot; or an 
+ * &quot;import x from ...&quot; call into a &quot;const x = importAll(...)&quot; call with the 
+ * corresponding id in it. 
+ */</span>
+<span class="s1">const importTemplate = template.statement(`</span>
+  <span class="s3">var </span><span class="s1">LOCAL = IMPORT(FILE);</span>
+<span class="s1">`);</span>
+
+<span class="s0">/** 
+ * Produces a Babel template that transforms an &quot;import {x as y} from ...&quot; into 
+ * &quot;const y = require(...).x&quot; call with the corresponding id in it. 
+ */</span>
+<span class="s1">const importNamedTemplate = template.statement(`</span>
+  <span class="s3">var </span><span class="s1">LOCAL = require(FILE).REMOTE;</span>
+<span class="s1">`);</span>
+
+<span class="s0">/** 
+ * Produces a Babel template that transforms an &quot;import ...&quot; into 
+ * &quot;require(...)&quot;, which is considered a side-effect call. 
+ */</span>
+<span class="s1">const importSideEffectTemplate = template.statement(`</span>
+  <span class="s1">require(FILE);</span>
+<span class="s1">`);</span>
+
+<span class="s0">/** 
+ * Produces an &quot;export all&quot; template that traverses all exported symbols and 
+ * re-exposes them. 
+ */</span>
+<span class="s1">const exportAllTemplate = template.statements(`</span>
+  <span class="s3">var </span><span class="s1">REQUIRED = require(FILE);</span>
+
+  <span class="s3">for </span><span class="s1">(</span><span class="s3">var </span><span class="s1">KEY </span><span class="s3">in </span><span class="s1">REQUIRED) {</span>
+    <span class="s1">exports[KEY] = REQUIRED[KEY];</span>
+  <span class="s1">}</span>
+<span class="s1">`);</span>
+
+<span class="s0">/** 
+ * Produces a &quot;named export&quot; or &quot;default export&quot; template to export a single 
+ * symbol. 
+ */</span>
+<span class="s1">const exportTemplate = template.statement(`</span>
+  <span class="s1">exports.REMOTE = LOCAL;</span>
+<span class="s1">`);</span>
+
+<span class="s0">/** 
+ * Flags the exported module as a transpiled ES module. Needs to be kept in 1:1 
+ * compatibility with Babel. 
+ */</span>
+<span class="s1">const esModuleExportTemplate = template.statement(`</span>
+  <span class="s1">Object.defineProperty(exports, </span><span class="s2">'__esModule'</span><span class="s1">, {value: </span><span class="s3">true</span><span class="s1">});</span>
+<span class="s1">`);</span>
+
+<span class="s0">/** 
+ * Resolution template in case it is requested. 
+ */</span>
+<span class="s1">const resolveTemplate = template.expression(`</span>
+  <span class="s1">require.resolve(NODE)</span>
+<span class="s1">`);</span>
+
+<span class="s0">/** 
+ * Enforces the resolution of a path to a fully-qualified one, if set. 
+ */</span>
+<span class="s3">function </span><span class="s1">resolvePath(node, resolve) {</span>
+  <span class="s3">if </span><span class="s1">(!resolve) {</span>
+    <span class="s3">return </span><span class="s1">node;</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">resolveTemplate({</span>
+    <span class="s1">NODE: node,</span>
+  <span class="s1">});</span>
+<span class="s1">}</span>
+<span class="s0">// eslint-disable-next-line no-redeclare</span>
+<span class="s0">/* $FlowFixMe[missing-local-annot] The type annotation(s) required by Flow's 
+ * LTI update could not be added via codemod */</span>
+<span class="s3">function </span><span class="s1">withLocation(node, loc) {</span>
+  <span class="s3">if </span><span class="s1">(Array.isArray(node)) {</span>
+    <span class="s3">return </span><span class="s1">node.map((n) =&gt; withLocation(n, loc));</span>
+  <span class="s1">}</span>
+  <span class="s3">if </span><span class="s1">(!node.loc) {</span>
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s1">...node,</span>
+      <span class="s1">loc,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+  <span class="s3">return </span><span class="s1">node;</span>
+<span class="s1">}</span>
+<span class="s3">function </span><span class="s1">importExportPlugin({ types: t }) {</span>
+  <span class="s1">const { isDeclaration, isVariableDeclaration } = t;</span>
+  <span class="s3">return </span><span class="s1">{</span>
+    <span class="s1">visitor: {</span>
+      <span class="s1">ExportAllDeclaration(path, state) {</span>
+        <span class="s1">state.exportAll.push({</span>
+          <span class="s1">file: path.node.source.value,</span>
+          <span class="s1">loc: path.node.loc,</span>
+        <span class="s1">});</span>
+        <span class="s1">path.remove();</span>
+      <span class="s1">},</span>
+      <span class="s1">ExportDefaultDeclaration(path, state) {</span>
+        <span class="s1">const declaration = path.node.declaration;</span>
+        <span class="s1">const id =</span>
+          <span class="s1">declaration.id || path.scope.generateUidIdentifier(</span><span class="s2">&quot;default&quot;</span><span class="s1">);</span>
+
+        <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+        <span class="s1">declaration.id = id;</span>
+        <span class="s1">const loc = path.node.loc;</span>
+        <span class="s1">state.exportDefault.push({</span>
+          <span class="s1">local: id.name,</span>
+          <span class="s1">loc,</span>
+        <span class="s1">});</span>
+        <span class="s3">if </span><span class="s1">(isDeclaration(declaration)) {</span>
+          <span class="s1">path.insertBefore(withLocation(declaration, loc));</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s1">path.insertBefore(</span>
+            <span class="s1">withLocation(</span>
+              <span class="s1">t.variableDeclaration(</span><span class="s2">&quot;var&quot;</span><span class="s1">, [</span>
+                <span class="s1">t.variableDeclarator(id, declaration),</span>
+              <span class="s1">]),</span>
+              <span class="s1">loc</span>
+            <span class="s1">)</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+        <span class="s1">path.remove();</span>
+      <span class="s1">},</span>
+      <span class="s1">ExportNamedDeclaration(path, state) {</span>
+        <span class="s3">if </span><span class="s1">(path.node.exportKind &amp;&amp; path.node.exportKind !== </span><span class="s2">&quot;value&quot;</span><span class="s1">) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">const declaration = path.node.declaration;</span>
+        <span class="s1">const loc = path.node.loc;</span>
+        <span class="s3">if </span><span class="s1">(declaration) {</span>
+          <span class="s3">if </span><span class="s1">(isVariableDeclaration(declaration)) {</span>
+            <span class="s1">declaration.declarations.forEach((d) =&gt; {</span>
+              <span class="s3">switch </span><span class="s1">(d.id.type) {</span>
+                <span class="s3">case </span><span class="s2">&quot;ObjectPattern&quot;</span><span class="s1">:</span>
+                  <span class="s1">{</span>
+                    <span class="s1">const properties = d.id.properties;</span>
+                    <span class="s1">properties.forEach((p) =&gt; {</span>
+                      <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+                      <span class="s1">const name = p.key.name;</span>
+                      <span class="s0">// $FlowFixMe[incompatible-call]</span>
+                      <span class="s1">state.exportNamed.push({</span>
+                        <span class="s1">local: name,</span>
+                        <span class="s1">remote: name,</span>
+                        <span class="s1">loc,</span>
+                      <span class="s1">});</span>
+                    <span class="s1">});</span>
+                  <span class="s1">}</span>
+                  <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">case </span><span class="s2">&quot;ArrayPattern&quot;</span><span class="s1">:</span>
+                  <span class="s1">{</span>
+                    <span class="s1">const elements = d.id.elements;</span>
+                    <span class="s1">elements.forEach((e) =&gt; {</span>
+                      <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+                      <span class="s1">const name = e.name;</span>
+                      <span class="s0">// $FlowFixMe[incompatible-call]</span>
+                      <span class="s1">state.exportNamed.push({</span>
+                        <span class="s1">local: name,</span>
+                        <span class="s1">remote: name,</span>
+                        <span class="s1">loc,</span>
+                      <span class="s1">});</span>
+                    <span class="s1">});</span>
+                  <span class="s1">}</span>
+                  <span class="s3">break</span><span class="s1">;</span>
+                <span class="s3">default</span><span class="s1">:</span>
+                  <span class="s1">{</span>
+                    <span class="s1">const name = d.id.name;</span>
+                    <span class="s0">// $FlowFixMe[incompatible-call]</span>
+                    <span class="s1">state.exportNamed.push({</span>
+                      <span class="s1">local: name,</span>
+                      <span class="s1">remote: name,</span>
+                      <span class="s1">loc,</span>
+                    <span class="s1">});</span>
+                  <span class="s1">}</span>
+                  <span class="s3">break</span><span class="s1">;</span>
+              <span class="s1">}</span>
+            <span class="s1">});</span>
+          <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+            <span class="s1">const id = declaration.id || path.scope.generateUidIdentifier();</span>
+            <span class="s1">const name = id.name;</span>
+
+            <span class="s0">// $FlowFixMe Flow error uncovered by typing Babel more strictly</span>
+            <span class="s1">declaration.id = id;</span>
+            <span class="s0">// $FlowFixMe[incompatible-call]</span>
+            <span class="s1">state.exportNamed.push({</span>
+              <span class="s1">local: name,</span>
+              <span class="s1">remote: name,</span>
+              <span class="s1">loc,</span>
+            <span class="s1">});</span>
+          <span class="s1">}</span>
+          <span class="s1">path.insertBefore(declaration);</span>
+        <span class="s1">}</span>
+        <span class="s1">const specifiers = path.node.specifiers;</span>
+        <span class="s3">if </span><span class="s1">(specifiers) {</span>
+          <span class="s1">specifiers.forEach((s) =&gt; {</span>
+            <span class="s1">const local = s.local;</span>
+            <span class="s1">const remote = s.exported;</span>
+            <span class="s3">if </span><span class="s1">(remote.type === </span><span class="s2">&quot;StringLiteral&quot;</span><span class="s1">) {</span>
+              <span class="s0">// https://babeljs.io/docs/en/babel-plugin-syntax-module-string-names</span>
+              <span class="s3">throw </span><span class="s1">path.buildCodeFrameError(</span>
+                <span class="s2">&quot;Module string names are not supported&quot;</span>
+              <span class="s1">);</span>
+            <span class="s1">}</span>
+            <span class="s3">if </span><span class="s1">(path.node.source) {</span>
+              <span class="s0">// $FlowFixMe[incompatible-use]</span>
+              <span class="s1">const temp = path.scope.generateUidIdentifier(local.name);</span>
+
+              <span class="s0">// $FlowFixMe[incompatible-type]</span>
+              <span class="s3">if </span><span class="s1">(local.name === </span><span class="s2">&quot;default&quot;</span><span class="s1">) {</span>
+                <span class="s1">path.insertBefore(</span>
+                  <span class="s1">withLocation(</span>
+                    <span class="s1">importTemplate({</span>
+                      <span class="s1">IMPORT: t.cloneNode(state.importDefault),</span>
+                      <span class="s1">FILE: resolvePath(</span>
+                        <span class="s1">t.cloneNode(nullthrows(path.node.source)),</span>
+                        <span class="s1">state.opts.resolve</span>
+                      <span class="s1">),</span>
+                      <span class="s1">LOCAL: temp,</span>
+                    <span class="s1">}),</span>
+                    <span class="s1">loc</span>
+                  <span class="s1">)</span>
+                <span class="s1">);</span>
+                <span class="s1">state.exportNamed.push({</span>
+                  <span class="s1">local: temp.name,</span>
+                  <span class="s1">remote: remote.name,</span>
+                  <span class="s1">loc,</span>
+                <span class="s1">});</span>
+              <span class="s1">} </span><span class="s3">else if </span><span class="s1">(remote.name === </span><span class="s2">&quot;default&quot;</span><span class="s1">) {</span>
+                <span class="s1">path.insertBefore(</span>
+                  <span class="s1">withLocation(</span>
+                    <span class="s1">importNamedTemplate({</span>
+                      <span class="s1">FILE: resolvePath(</span>
+                        <span class="s1">t.cloneNode(nullthrows(path.node.source)),</span>
+                        <span class="s1">state.opts.resolve</span>
+                      <span class="s1">),</span>
+                      <span class="s1">LOCAL: temp,</span>
+                      <span class="s1">REMOTE: local,</span>
+                    <span class="s1">}),</span>
+                    <span class="s1">loc</span>
+                  <span class="s1">)</span>
+                <span class="s1">);</span>
+                <span class="s1">state.exportDefault.push({</span>
+                  <span class="s1">local: temp.name,</span>
+                  <span class="s1">loc,</span>
+                <span class="s1">});</span>
+              <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s1">path.insertBefore(</span>
+                  <span class="s1">withLocation(</span>
+                    <span class="s1">importNamedTemplate({</span>
+                      <span class="s1">FILE: resolvePath(</span>
+                        <span class="s1">t.cloneNode(nullthrows(path.node.source)),</span>
+                        <span class="s1">state.opts.resolve</span>
+                      <span class="s1">),</span>
+                      <span class="s1">LOCAL: temp,</span>
+                      <span class="s1">REMOTE: local,</span>
+                    <span class="s1">}),</span>
+                    <span class="s1">loc</span>
+                  <span class="s1">)</span>
+                <span class="s1">);</span>
+                <span class="s1">state.exportNamed.push({</span>
+                  <span class="s1">local: temp.name,</span>
+                  <span class="s1">remote: remote.name,</span>
+                  <span class="s1">loc,</span>
+                <span class="s1">});</span>
+              <span class="s1">}</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+              <span class="s3">if </span><span class="s1">(remote.name === </span><span class="s2">&quot;default&quot;</span><span class="s1">) {</span>
+                <span class="s0">// $FlowFixMe[incompatible-use]</span>
+                <span class="s1">state.exportDefault.push({</span>
+                  <span class="s1">local: local.name,</span>
+                  <span class="s1">loc,</span>
+                <span class="s1">});</span>
+              <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                <span class="s1">state.exportNamed.push({</span>
+                  <span class="s0">// $FlowFixMe[incompatible-use]</span>
+                  <span class="s1">local: local.name,</span>
+                  <span class="s1">remote: remote.name,</span>
+                  <span class="s1">loc,</span>
+                <span class="s1">});</span>
+              <span class="s1">}</span>
+            <span class="s1">}</span>
+          <span class="s1">});</span>
+        <span class="s1">}</span>
+        <span class="s1">path.remove();</span>
+      <span class="s1">},</span>
+      <span class="s1">ImportDeclaration(path, state) {</span>
+        <span class="s3">if </span><span class="s1">(path.node.importKind &amp;&amp; path.node.importKind !== </span><span class="s2">&quot;value&quot;</span><span class="s1">) {</span>
+          <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">const file = path.node.source;</span>
+        <span class="s1">const specifiers = path.node.specifiers;</span>
+        <span class="s1">const loc = path.node.loc;</span>
+        <span class="s3">if </span><span class="s1">(!specifiers.length) {</span>
+          <span class="s1">state.imports.push({</span>
+            <span class="s1">node: withLocation(</span>
+              <span class="s1">importSideEffectTemplate({</span>
+                <span class="s1">FILE: resolvePath(t.cloneNode(file), state.opts.resolve),</span>
+              <span class="s1">}),</span>
+              <span class="s1">loc</span>
+            <span class="s1">),</span>
+          <span class="s1">});</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s1">let sharedModuleImport;</span>
+          <span class="s1">let sharedModuleVariableDeclaration = </span><span class="s3">null</span><span class="s1">;</span>
+          <span class="s3">if </span><span class="s1">(</span>
+            <span class="s1">specifiers.filter(</span>
+              <span class="s1">(s) =&gt;</span>
+                <span class="s1">s.type === </span><span class="s2">&quot;ImportSpecifier&quot; </span><span class="s1">&amp;&amp;</span>
+                <span class="s1">(s.imported.type === </span><span class="s2">&quot;StringLiteral&quot; </span><span class="s1">||</span>
+                  <span class="s1">s.imported.name !== </span><span class="s2">&quot;default&quot;</span><span class="s1">)</span>
+            <span class="s1">).length &gt; </span><span class="s4">1</span>
+          <span class="s1">) {</span>
+            <span class="s1">sharedModuleImport =</span>
+              <span class="s1">path.scope.generateUidIdentifierBasedOnNode(file);</span>
+            <span class="s1">sharedModuleVariableDeclaration = withLocation(</span>
+              <span class="s1">t.variableDeclaration(</span><span class="s2">&quot;var&quot;</span><span class="s1">, [</span>
+                <span class="s1">t.variableDeclarator(</span>
+                  <span class="s1">t.cloneNode(sharedModuleImport),</span>
+                  <span class="s1">t.callExpression(t.identifier(</span><span class="s2">&quot;require&quot;</span><span class="s1">), [</span>
+                    <span class="s1">resolvePath(t.cloneNode(file), state.opts.resolve),</span>
+                  <span class="s1">])</span>
+                <span class="s1">),</span>
+              <span class="s1">]),</span>
+              <span class="s1">loc</span>
+            <span class="s1">);</span>
+            <span class="s1">state.imports.push({</span>
+              <span class="s1">node: sharedModuleVariableDeclaration,</span>
+            <span class="s1">});</span>
+          <span class="s1">}</span>
+          <span class="s1">specifiers.forEach((s) =&gt; {</span>
+            <span class="s1">const imported = s.imported;</span>
+            <span class="s1">const local = s.local;</span>
+            <span class="s3">switch </span><span class="s1">(s.type) {</span>
+              <span class="s3">case </span><span class="s2">&quot;ImportNamespaceSpecifier&quot;</span><span class="s1">:</span>
+                <span class="s1">state.imports.push({</span>
+                  <span class="s1">node: withLocation(</span>
+                    <span class="s1">importTemplate({</span>
+                      <span class="s1">IMPORT: t.cloneNode(state.importAll),</span>
+                      <span class="s1">FILE: resolvePath(t.cloneNode(file), state.opts.resolve),</span>
+                      <span class="s1">LOCAL: t.cloneNode(local),</span>
+                    <span class="s1">}),</span>
+                    <span class="s1">loc</span>
+                  <span class="s1">),</span>
+                <span class="s1">});</span>
+                <span class="s3">break</span><span class="s1">;</span>
+              <span class="s3">case </span><span class="s2">&quot;ImportDefaultSpecifier&quot;</span><span class="s1">:</span>
+                <span class="s1">state.imports.push({</span>
+                  <span class="s1">node: withLocation(</span>
+                    <span class="s1">importTemplate({</span>
+                      <span class="s1">IMPORT: t.cloneNode(state.importDefault),</span>
+                      <span class="s1">FILE: resolvePath(t.cloneNode(file), state.opts.resolve),</span>
+                      <span class="s1">LOCAL: t.cloneNode(local),</span>
+                    <span class="s1">}),</span>
+                    <span class="s1">loc</span>
+                  <span class="s1">),</span>
+                <span class="s1">});</span>
+                <span class="s3">break</span><span class="s1">;</span>
+              <span class="s3">case </span><span class="s2">&quot;ImportSpecifier&quot;</span><span class="s1">:</span>
+                <span class="s0">// $FlowFixMe[incompatible-type]</span>
+                <span class="s3">if </span><span class="s1">(imported.name === </span><span class="s2">&quot;default&quot;</span><span class="s1">) {</span>
+                  <span class="s1">state.imports.push({</span>
+                    <span class="s1">node: withLocation(</span>
+                      <span class="s1">importTemplate({</span>
+                        <span class="s1">IMPORT: t.cloneNode(state.importDefault),</span>
+                        <span class="s1">FILE: resolvePath(</span>
+                          <span class="s1">t.cloneNode(file),</span>
+                          <span class="s1">state.opts.resolve</span>
+                        <span class="s1">),</span>
+                        <span class="s1">LOCAL: t.cloneNode(local),</span>
+                      <span class="s1">}),</span>
+                      <span class="s1">loc</span>
+                    <span class="s1">),</span>
+                  <span class="s1">});</span>
+                <span class="s1">} </span><span class="s3">else if </span><span class="s1">(sharedModuleVariableDeclaration != </span><span class="s3">null</span><span class="s1">) {</span>
+                  <span class="s1">sharedModuleVariableDeclaration.declarations.push(</span>
+                    <span class="s1">withLocation(</span>
+                      <span class="s1">t.variableDeclarator(</span>
+                        <span class="s1">t.cloneNode(local),</span>
+                        <span class="s1">t.memberExpression(</span>
+                          <span class="s1">t.cloneNode(sharedModuleImport),</span>
+                          <span class="s0">// $FlowFixMe[incompatible-call]</span>
+                          <span class="s1">t.cloneNode(imported)</span>
+                        <span class="s1">)</span>
+                      <span class="s1">),</span>
+                      <span class="s1">loc</span>
+                    <span class="s1">)</span>
+                  <span class="s1">);</span>
+                <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+                  <span class="s1">state.imports.push({</span>
+                    <span class="s1">node: withLocation(</span>
+                      <span class="s1">importNamedTemplate({</span>
+                        <span class="s1">FILE: resolvePath(</span>
+                          <span class="s1">t.cloneNode(file),</span>
+                          <span class="s1">state.opts.resolve</span>
+                        <span class="s1">),</span>
+                        <span class="s1">LOCAL: t.cloneNode(local),</span>
+                        <span class="s1">REMOTE: t.cloneNode(imported),</span>
+                      <span class="s1">}),</span>
+                      <span class="s1">loc</span>
+                    <span class="s1">),</span>
+                  <span class="s1">});</span>
+                <span class="s1">}</span>
+                <span class="s3">break</span><span class="s1">;</span>
+              <span class="s3">default</span><span class="s1">:</span>
+                <span class="s3">throw new </span><span class="s1">TypeError(</span><span class="s2">&quot;Unknown import type: &quot; </span><span class="s1">+ s.type);</span>
+            <span class="s1">}</span>
+          <span class="s1">});</span>
+        <span class="s1">}</span>
+        <span class="s1">path.remove();</span>
+      <span class="s1">},</span>
+      <span class="s1">Program: {</span>
+        <span class="s1">enter(path, state) {</span>
+          <span class="s1">state.exportAll = [];</span>
+          <span class="s1">state.exportDefault = [];</span>
+          <span class="s1">state.exportNamed = [];</span>
+          <span class="s1">state.imports = [];</span>
+          <span class="s1">state.importAll = t.identifier(state.opts.importAll);</span>
+          <span class="s1">state.importDefault = t.identifier(state.opts.importDefault);</span>
+        <span class="s1">},</span>
+        <span class="s1">exit(path, state) {</span>
+          <span class="s1">const body = path.node.body;</span>
+
+          <span class="s0">// state.imports = [node1, node2, node3, ...nodeN]</span>
+          <span class="s1">state.imports.reverse().forEach((e) =&gt; {</span>
+            <span class="s0">// import nodes are added to the top of the program body</span>
+            <span class="s1">body.unshift(e.node);</span>
+          <span class="s1">});</span>
+          <span class="s1">state.exportDefault.forEach((e) =&gt; {</span>
+            <span class="s1">body.push(</span>
+              <span class="s1">withLocation(</span>
+                <span class="s1">exportTemplate({</span>
+                  <span class="s1">LOCAL: t.identifier(e.local),</span>
+                  <span class="s1">REMOTE: t.identifier(</span><span class="s2">&quot;default&quot;</span><span class="s1">),</span>
+                <span class="s1">}),</span>
+                <span class="s1">e.loc</span>
+              <span class="s1">)</span>
+            <span class="s1">);</span>
+          <span class="s1">});</span>
+          <span class="s1">state.exportAll.forEach((e) =&gt; {</span>
+            <span class="s1">body.push(</span>
+              <span class="s0">// $FlowFixMe[incompatible-call]</span>
+              <span class="s1">...withLocation(</span>
+                <span class="s1">exportAllTemplate({</span>
+                  <span class="s1">FILE: resolvePath(</span>
+                    <span class="s1">t.stringLiteral(e.file),</span>
+                    <span class="s1">state.opts.resolve</span>
+                  <span class="s1">),</span>
+                  <span class="s1">REQUIRED: path.scope.generateUidIdentifier(e.file),</span>
+                  <span class="s1">KEY: path.scope.generateUidIdentifier(</span><span class="s2">&quot;key&quot;</span><span class="s1">),</span>
+                <span class="s1">}),</span>
+                <span class="s1">e.loc</span>
+              <span class="s1">)</span>
+            <span class="s1">);</span>
+          <span class="s1">});</span>
+          <span class="s1">state.exportNamed.forEach((e) =&gt; {</span>
+            <span class="s1">body.push(</span>
+              <span class="s1">withLocation(</span>
+                <span class="s1">exportTemplate({</span>
+                  <span class="s1">LOCAL: t.identifier(e.local),</span>
+                  <span class="s1">REMOTE: t.identifier(e.remote),</span>
+                <span class="s1">}),</span>
+                <span class="s1">e.loc</span>
+              <span class="s1">)</span>
+            <span class="s1">);</span>
+          <span class="s1">});</span>
+          <span class="s3">if </span><span class="s1">(</span>
+            <span class="s1">state.exportDefault.length ||</span>
+            <span class="s1">state.exportAll.length ||</span>
+            <span class="s1">state.exportNamed.length</span>
+          <span class="s1">) {</span>
+            <span class="s1">body.unshift(esModuleExportTemplate());</span>
+            <span class="s3">if </span><span class="s1">(state.opts.out) {</span>
+              <span class="s1">state.opts.out.isESModule = </span><span class="s3">true</span><span class="s1">;</span>
+            <span class="s1">}</span>
+          <span class="s1">} </span><span class="s3">else if </span><span class="s1">(state.opts.out) {</span>
+            <span class="s1">state.opts.out.isESModule = </span><span class="s3">false</span><span class="s1">;</span>
+          <span class="s1">}</span>
+        <span class="s1">},</span>
+      <span class="s1">},</span>
+    <span class="s1">},</span>
+  <span class="s1">};</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = importExportPlugin;</span>
+</pre>
+</body>
+</html>

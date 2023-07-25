@@ -1,0 +1,206 @@
+<html>
+<head>
+<title>consistent-return.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+consistent-return.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Rule to flag consistent return values 
+ * @author Nicholas C. Zakas 
+ */</span>
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s1">const astUtils = require(</span><span class="s2">&quot;./utils/ast-utils&quot;</span><span class="s1">);</span>
+<span class="s1">const { upperCaseFirst } = require(</span><span class="s2">&quot;../shared/string-utils&quot;</span><span class="s1">);</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Checks whether or not a given code path segment is unreachable. 
+ * @param {CodePathSegment} segment A CodePathSegment to check. 
+ * @returns {boolean} `true` if the segment is unreachable. 
+ */</span>
+<span class="s3">function </span><span class="s1">isUnreachable(segment) {</span>
+    <span class="s3">return </span><span class="s1">!segment.reachable;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Checks whether a given node is a `constructor` method in an ES6 class 
+ * @param {ASTNode} node A node to check 
+ * @returns {boolean} `true` if the node is a `constructor` method 
+ */</span>
+<span class="s3">function </span><span class="s1">isClassConstructor(node) {</span>
+    <span class="s3">return </span><span class="s1">node.type === </span><span class="s2">&quot;FunctionExpression&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">node.parent &amp;&amp;</span>
+        <span class="s1">node.parent.type === </span><span class="s2">&quot;MethodDefinition&quot; </span><span class="s1">&amp;&amp;</span>
+        <span class="s1">node.parent.kind === </span><span class="s2">&quot;constructor&quot;</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">//------------------------------------------------------------------------------</span>
+<span class="s0">// Rule Definition</span>
+<span class="s0">//------------------------------------------------------------------------------</span>
+
+<span class="s0">/** @type {import('../shared/types').Rule} */</span>
+<span class="s1">module.exports = {</span>
+    <span class="s1">meta: {</span>
+        <span class="s1">type: </span><span class="s2">&quot;suggestion&quot;</span><span class="s1">,</span>
+
+        <span class="s1">docs: {</span>
+            <span class="s1">description: </span><span class="s2">&quot;Require `return` statements to either always or never specify values&quot;</span><span class="s1">,</span>
+            <span class="s1">recommended: </span><span class="s3">false</span><span class="s1">,</span>
+            <span class="s1">url: </span><span class="s2">&quot;https://eslint.org/docs/latest/rules/consistent-return&quot;</span>
+        <span class="s1">},</span>
+
+        <span class="s1">schema: [{</span>
+            <span class="s1">type: </span><span class="s2">&quot;object&quot;</span><span class="s1">,</span>
+            <span class="s1">properties: {</span>
+                <span class="s1">treatUndefinedAsUnspecified: {</span>
+                    <span class="s1">type: </span><span class="s2">&quot;boolean&quot;</span><span class="s1">,</span>
+                    <span class="s3">default</span><span class="s1">: </span><span class="s3">false</span>
+                <span class="s1">}</span>
+            <span class="s1">},</span>
+            <span class="s1">additionalProperties: </span><span class="s3">false</span>
+        <span class="s1">}],</span>
+
+        <span class="s1">messages: {</span>
+            <span class="s1">missingReturn: </span><span class="s2">&quot;Expected to return a value at the end of {{name}}.&quot;</span><span class="s1">,</span>
+            <span class="s1">missingReturnValue: </span><span class="s2">&quot;{{name}} expected a return value.&quot;</span><span class="s1">,</span>
+            <span class="s1">unexpectedReturnValue: </span><span class="s2">&quot;{{name}} expected no return value.&quot;</span>
+        <span class="s1">}</span>
+    <span class="s1">},</span>
+
+    <span class="s1">create(context) {</span>
+        <span class="s1">const options = context.options[</span><span class="s4">0</span><span class="s1">] || {};</span>
+        <span class="s1">const treatUndefinedAsUnspecified = options.treatUndefinedAsUnspecified === </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s1">let funcInfo = </span><span class="s3">null</span><span class="s1">;</span>
+
+        <span class="s0">/** 
+         * Checks whether of not the implicit returning is consistent if the last 
+         * code path segment is reachable. 
+         * @param {ASTNode} node A program/function node to check. 
+         * @returns {void} 
+         */</span>
+        <span class="s3">function </span><span class="s1">checkLastSegment(node) {</span>
+            <span class="s1">let loc, name;</span>
+
+            <span class="s0">/* 
+             * Skip if it expected no return value or unreachable. 
+             * When unreachable, all paths are returned or thrown. 
+             */</span>
+            <span class="s3">if </span><span class="s1">(!funcInfo.hasReturnValue ||</span>
+                <span class="s1">funcInfo.codePath.currentSegments.every(isUnreachable) ||</span>
+                <span class="s1">astUtils.isES5Constructor(node) ||</span>
+                <span class="s1">isClassConstructor(node)</span>
+            <span class="s1">) {</span>
+                <span class="s3">return</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Adjust a location and a message.</span>
+            <span class="s3">if </span><span class="s1">(node.type === </span><span class="s2">&quot;Program&quot;</span><span class="s1">) {</span>
+
+                <span class="s0">// The head of program.</span>
+                <span class="s1">loc = { line: </span><span class="s4">1</span><span class="s1">, column: </span><span class="s4">0 </span><span class="s1">};</span>
+                <span class="s1">name = </span><span class="s2">&quot;program&quot;</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(node.type === </span><span class="s2">&quot;ArrowFunctionExpression&quot;</span><span class="s1">) {</span>
+
+                <span class="s0">// `=&gt;` token</span>
+                <span class="s1">loc = context.sourceCode.getTokenBefore(node.body, astUtils.isArrowToken).loc;</span>
+            <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span>
+                <span class="s1">node.parent.type === </span><span class="s2">&quot;MethodDefinition&quot; </span><span class="s1">||</span>
+                <span class="s1">(node.parent.type === </span><span class="s2">&quot;Property&quot; </span><span class="s1">&amp;&amp; node.parent.method)</span>
+            <span class="s1">) {</span>
+
+                <span class="s0">// Method name.</span>
+                <span class="s1">loc = node.parent.key.loc;</span>
+            <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+
+                <span class="s0">// Function name or `function` keyword.</span>
+                <span class="s1">loc = (node.id || context.sourceCode.getFirstToken(node)).loc;</span>
+            <span class="s1">}</span>
+
+            <span class="s3">if </span><span class="s1">(!name) {</span>
+                <span class="s1">name = astUtils.getFunctionNameWithKind(node);</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Reports.</span>
+            <span class="s1">context.report({</span>
+                <span class="s1">node,</span>
+                <span class="s1">loc,</span>
+                <span class="s1">messageId: </span><span class="s2">&quot;missingReturn&quot;</span><span class="s1">,</span>
+                <span class="s1">data: { name }</span>
+            <span class="s1">});</span>
+        <span class="s1">}</span>
+
+        <span class="s3">return </span><span class="s1">{</span>
+
+            <span class="s0">// Initializes/Disposes state of each code path.</span>
+            <span class="s1">onCodePathStart(codePath, node) {</span>
+                <span class="s1">funcInfo = {</span>
+                    <span class="s1">upper: funcInfo,</span>
+                    <span class="s1">codePath,</span>
+                    <span class="s1">hasReturn: </span><span class="s3">false</span><span class="s1">,</span>
+                    <span class="s1">hasReturnValue: </span><span class="s3">false</span><span class="s1">,</span>
+                    <span class="s1">messageId: </span><span class="s2">&quot;&quot;</span><span class="s1">,</span>
+                    <span class="s1">node</span>
+                <span class="s1">};</span>
+            <span class="s1">},</span>
+            <span class="s1">onCodePathEnd() {</span>
+                <span class="s1">funcInfo = funcInfo.upper;</span>
+            <span class="s1">},</span>
+
+            <span class="s0">// Reports a given return statement if it's inconsistent.</span>
+            <span class="s1">ReturnStatement(node) {</span>
+                <span class="s1">const argument = node.argument;</span>
+                <span class="s1">let hasReturnValue = Boolean(argument);</span>
+
+                <span class="s3">if </span><span class="s1">(treatUndefinedAsUnspecified &amp;&amp; hasReturnValue) {</span>
+                    <span class="s1">hasReturnValue = !astUtils.isSpecificId(argument, </span><span class="s2">&quot;undefined&quot;</span><span class="s1">) &amp;&amp; argument.operator !== </span><span class="s2">&quot;void&quot;</span><span class="s1">;</span>
+                <span class="s1">}</span>
+
+                <span class="s3">if </span><span class="s1">(!funcInfo.hasReturn) {</span>
+                    <span class="s1">funcInfo.hasReturn = </span><span class="s3">true</span><span class="s1">;</span>
+                    <span class="s1">funcInfo.hasReturnValue = hasReturnValue;</span>
+                    <span class="s1">funcInfo.messageId = hasReturnValue ? </span><span class="s2">&quot;missingReturnValue&quot; </span><span class="s1">: </span><span class="s2">&quot;unexpectedReturnValue&quot;</span><span class="s1">;</span>
+                    <span class="s1">funcInfo.data = {</span>
+                        <span class="s1">name: funcInfo.node.type === </span><span class="s2">&quot;Program&quot;</span>
+                            <span class="s1">? </span><span class="s2">&quot;Program&quot;</span>
+                            <span class="s1">: upperCaseFirst(astUtils.getFunctionNameWithKind(funcInfo.node))</span>
+                    <span class="s1">};</span>
+                <span class="s1">} </span><span class="s3">else if </span><span class="s1">(funcInfo.hasReturnValue !== hasReturnValue) {</span>
+                    <span class="s1">context.report({</span>
+                        <span class="s1">node,</span>
+                        <span class="s1">messageId: funcInfo.messageId,</span>
+                        <span class="s1">data: funcInfo.data</span>
+                    <span class="s1">});</span>
+                <span class="s1">}</span>
+            <span class="s1">},</span>
+
+            <span class="s0">// Reports a given program/function if the implicit returning is not consistent.</span>
+            <span class="s2">&quot;Program:exit&quot;</span><span class="s1">: checkLastSegment,</span>
+            <span class="s2">&quot;FunctionDeclaration:exit&quot;</span><span class="s1">: checkLastSegment,</span>
+            <span class="s2">&quot;FunctionExpression:exit&quot;</span><span class="s1">: checkLastSegment,</span>
+            <span class="s2">&quot;ArrowFunctionExpression:exit&quot;</span><span class="s1">: checkLastSegment</span>
+        <span class="s1">};</span>
+    <span class="s1">}</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

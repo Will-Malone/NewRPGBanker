@@ -1,0 +1,338 @@
+<html>
+<head>
+<title>SurfaceHandler.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+SurfaceHandler.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;SurfaceHandler.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/uimanager/UIManager.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s4">using </span><span class="s1">Status = SurfaceHandler::Status</span><span class="s4">;</span>
+
+<span class="s1">SurfaceHandler::SurfaceHandler(</span>
+    <span class="s1">std::string </span><span class="s4">const </span><span class="s1">&amp;moduleName</span><span class="s4">,</span>
+    <span class="s1">SurfaceId surfaceId) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s1">parameters_.moduleName = moduleName</span><span class="s4">;</span>
+  <span class="s1">parameters_.surfaceId = surfaceId</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SurfaceHandler::SurfaceHandler(SurfaceHandler &amp;&amp;other) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s4">operator</span><span class="s1">=(std::move(other))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SurfaceHandler &amp;SurfaceHandler::</span><span class="s4">operator</span><span class="s1">=(SurfaceHandler &amp;&amp;other) </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s1">std::unique_lock lock1(linkMutex_</span><span class="s4">, </span><span class="s1">std::defer_lock)</span><span class="s4">;</span>
+  <span class="s1">std::unique_lock lock2(parametersMutex_</span><span class="s4">, </span><span class="s1">std::defer_lock)</span><span class="s4">;</span>
+  <span class="s1">std::unique_lock lock3(other.linkMutex_</span><span class="s4">, </span><span class="s1">std::defer_lock)</span><span class="s4">;</span>
+  <span class="s1">std::unique_lock lock4(other.parametersMutex_</span><span class="s4">, </span><span class="s1">std::defer_lock)</span><span class="s4">;</span>
+  <span class="s1">std::lock(lock1</span><span class="s4">, </span><span class="s1">lock2</span><span class="s4">, </span><span class="s1">lock3</span><span class="s4">, </span><span class="s1">lock4)</span><span class="s4">;</span>
+
+  <span class="s1">link_ = other.link_</span><span class="s4">;</span>
+  <span class="s1">parameters_ = other.parameters_</span><span class="s4">;</span>
+
+  <span class="s1">other.link_ = Link{}</span><span class="s4">;</span>
+  <span class="s1">other.parameters_ = Parameters{}</span><span class="s4">;</span>
+  <span class="s1">other.parameters_.contextContainer = parameters_.contextContainer</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">*</span><span class="s4">this;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Surface Life-Cycle Management</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::setContextContainer(</span>
+    <span class="s1">ContextContainer::Shared contextContainer) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">parameters_.contextContainer = std::move(contextContainer)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">Status SurfaceHandler::getStatus() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(linkMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">link_.status</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::start() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;SurfaceHandler::start&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">std::unique_lock lock(linkMutex_)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">link_.status == Status::Registered &amp;&amp; </span><span class="s3">&quot;Surface must be registered.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">getLayoutConstraints().layoutDirection != LayoutDirection::Undefined &amp;&amp;</span>
+      <span class="s3">&quot;layoutDirection must be set.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">parameters_.contextContainer &amp;&amp; </span><span class="s3">&quot;ContextContainer must be set.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">parameters = Parameters{}</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">SystraceSection s2(</span><span class="s3">&quot;SurfaceHandler::start::paramsLock&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">std::shared_lock parametersLock(parametersMutex_)</span><span class="s4">;</span>
+    <span class="s1">parameters = parameters_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">shadowTree = std::make_unique&lt;ShadowTree&gt;(</span>
+      <span class="s1">parameters.surfaceId</span><span class="s4">,</span>
+      <span class="s1">parameters.layoutConstraints</span><span class="s4">,</span>
+      <span class="s1">parameters.layoutContext</span><span class="s4">,</span>
+      <span class="s1">*link_.uiManager</span><span class="s4">,</span>
+      <span class="s1">*parameters.contextContainer)</span><span class="s4">;</span>
+
+  <span class="s1">link_.shadowTree = shadowTree.get()</span><span class="s4">;</span>
+
+  <span class="s1">link_.uiManager-&gt;startSurface(</span>
+      <span class="s1">std::move(shadowTree)</span><span class="s4">,</span>
+      <span class="s1">parameters.moduleName</span><span class="s4">,</span>
+      <span class="s1">parameters.props</span><span class="s4">,</span>
+      <span class="s1">parameters_.displayMode)</span><span class="s4">;</span>
+
+  <span class="s1">link_.status = Status::Running</span><span class="s4">;</span>
+
+  <span class="s1">applyDisplayMode(parameters.displayMode)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::stop() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">shadowTree = ShadowTree::Unique{}</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock lock(linkMutex_)</span><span class="s4">;</span>
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">link_.status == Status::Running &amp;&amp; </span><span class="s3">&quot;Surface must be running.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">link_.status = Status::Registered</span><span class="s4">;</span>
+    <span class="s1">link_.shadowTree = </span><span class="s4">nullptr;</span>
+    <span class="s1">shadowTree = link_.uiManager-&gt;stopSurface(parameters_.surfaceId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// As part of stopping a Surface, we need to properly destroy all</span>
+  <span class="s0">// mounted views, so we need to commit an empty tree to trigger all</span>
+  <span class="s0">// side-effects (including destroying and removing mounted views).</span>
+  <span class="s1">react_native_assert(shadowTree &amp;&amp; </span><span class="s3">&quot;`shadowTree` must not be null.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">shadowTree-&gt;commitEmptyTree()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::setDisplayMode(DisplayMode displayMode) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock lock(parametersMutex_)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(parameters_.displayMode == displayMode) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">parameters_.displayMode = displayMode</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::shared_lock lock(linkMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(link_.status != Status::Running) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">link_.uiManager-&gt;setSurfaceProps(</span>
+        <span class="s1">parameters_.surfaceId</span><span class="s4">,</span>
+        <span class="s1">parameters_.moduleName</span><span class="s4">,</span>
+        <span class="s1">parameters_.props</span><span class="s4">,</span>
+        <span class="s1">parameters_.displayMode)</span><span class="s4">;</span>
+
+    <span class="s1">applyDisplayMode(displayMode)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">DisplayMode SurfaceHandler::getDisplayMode() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">parameters_.displayMode</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Accessors</span>
+
+<span class="s1">SurfaceId SurfaceHandler::getSurfaceId() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">parameters_.surfaceId</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::setSurfaceId(SurfaceId surfaceId) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::unique_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s1">parameters_.surfaceId = surfaceId</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string SurfaceHandler::getModuleName() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">parameters_.moduleName</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::setProps(folly::dynamic </span><span class="s4">const </span><span class="s1">&amp;props) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;SurfaceHandler::setProps&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">std::unique_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s1">parameters_.props = props</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">folly::dynamic SurfaceHandler::getProps() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">parameters_.props</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::shared_ptr&lt;MountingCoordinator </span><span class="s4">const</span><span class="s1">&gt;</span>
+<span class="s1">SurfaceHandler::getMountingCoordinator() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(linkMutex_)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">link_.status != Status::Unregistered &amp;&amp; </span><span class="s3">&quot;Surface must be registered.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">link_.shadowTree &amp;&amp; </span><span class="s3">&quot;`link_.shadowTree` must not be null.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">link_.shadowTree-&gt;getMountingCoordinator()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Layout</span>
+
+<span class="s1">Size SurfaceHandler::measure(</span>
+    <span class="s1">LayoutConstraints </span><span class="s4">const </span><span class="s1">&amp;layoutConstraints</span><span class="s4">,</span>
+    <span class="s1">LayoutContext </span><span class="s4">const </span><span class="s1">&amp;layoutContext) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(linkMutex_)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(link_.status != Status::Running) {</span>
+    <span class="s4">return </span><span class="s1">layoutConstraints.clamp({</span><span class="s5">0</span><span class="s4">, </span><span class="s5">0</span><span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">link_.shadowTree &amp;&amp; </span><span class="s3">&quot;`link_.shadowTree` must not be null.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">currentRootShadowNode =</span>
+      <span class="s1">link_.shadowTree-&gt;getCurrentRevision().rootShadowNode</span><span class="s4">;</span>
+
+  <span class="s1">PropsParserContext propsParserContext{</span>
+      <span class="s1">parameters_.surfaceId</span><span class="s4">, </span><span class="s1">*parameters_.contextContainer.get()}</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">rootShadowNode = currentRootShadowNode-&gt;clone(</span>
+      <span class="s1">propsParserContext</span><span class="s4">, </span><span class="s1">layoutConstraints</span><span class="s4">, </span><span class="s1">layoutContext)</span><span class="s4">;</span>
+  <span class="s1">rootShadowNode-&gt;layoutIfNeeded()</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">rootShadowNode-&gt;getLayoutMetrics().frame.size</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::constraintLayout(</span>
+    <span class="s1">LayoutConstraints </span><span class="s4">const </span><span class="s1">&amp;layoutConstraints</span><span class="s4">,</span>
+    <span class="s1">LayoutContext </span><span class="s4">const </span><span class="s1">&amp;layoutContext) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;SurfaceHandler::constraintLayout&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock lock(parametersMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(parameters_.layoutConstraints == layoutConstraints &amp;&amp;</span>
+        <span class="s1">parameters_.layoutContext == layoutContext) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">parameters_.layoutConstraints = layoutConstraints</span><span class="s4">;</span>
+    <span class="s1">parameters_.layoutContext = layoutContext</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::shared_lock lock(linkMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(link_.status != Status::Running) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">PropsParserContext propsParserContext{</span>
+        <span class="s1">parameters_.surfaceId</span><span class="s4">, </span><span class="s1">*parameters_.contextContainer.get()}</span><span class="s4">;</span>
+
+    <span class="s1">react_native_assert(</span>
+        <span class="s1">link_.shadowTree &amp;&amp; </span><span class="s3">&quot;`link_.shadowTree` must not be null.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">link_.shadowTree-&gt;commit(</span>
+        <span class="s1">[&amp;](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode) {</span>
+          <span class="s4">return </span><span class="s1">oldRootShadowNode.clone(</span>
+              <span class="s1">propsParserContext</span><span class="s4">, </span><span class="s1">layoutConstraints</span><span class="s4">, </span><span class="s1">layoutContext)</span><span class="s4">;</span>
+        <span class="s1">}</span><span class="s4">,</span>
+        <span class="s1">{</span><span class="s0">/* default commit options */</span><span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">LayoutConstraints SurfaceHandler::getLayoutConstraints() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">parameters_.layoutConstraints</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">LayoutContext SurfaceHandler::getLayoutContext() </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(parametersMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">parameters_.layoutContext</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::applyDisplayMode(DisplayMode displayMode) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;SurfaceHandler::applyDisplayMode&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">link_.status == Status::Running &amp;&amp; </span><span class="s3">&quot;Surface must be running.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">link_.shadowTree &amp;&amp; </span><span class="s3">&quot;`link_.shadowTree` must not be null.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">switch </span><span class="s1">(displayMode) {</span>
+    <span class="s4">case </span><span class="s1">DisplayMode::Visible:</span>
+      <span class="s1">link_.shadowTree-&gt;setCommitMode(ShadowTree::CommitMode::Normal)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">DisplayMode::Suspended:</span>
+      <span class="s1">link_.shadowTree-&gt;setCommitMode(ShadowTree::CommitMode::Suspended)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">DisplayMode::Hidden:</span>
+      <span class="s1">link_.shadowTree-&gt;setCommitMode(ShadowTree::CommitMode::Normal)</span><span class="s4">;</span>
+      <span class="s0">// Getting a current revision.</span>
+      <span class="s4">auto </span><span class="s1">revision = link_.shadowTree-&gt;getCurrentRevision()</span><span class="s4">;</span>
+      <span class="s0">// Committing an empty tree to force mounting to disassemble view</span>
+      <span class="s0">// hierarchy.</span>
+      <span class="s1">link_.shadowTree-&gt;commitEmptyTree()</span><span class="s4">;</span>
+      <span class="s1">link_.shadowTree-&gt;setCommitMode(ShadowTree::CommitMode::Suspended)</span><span class="s4">;</span>
+      <span class="s0">// Committing the current revision back. It will be mounted only when</span>
+      <span class="s0">// `DisplayMode` is changed back to `Normal`.</span>
+      <span class="s1">link_.shadowTree-&gt;commit(</span>
+          <span class="s1">[&amp;](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp; </span><span class="s0">/*oldRootShadowNode*/</span><span class="s1">) {</span>
+            <span class="s4">return </span><span class="s1">std::static_pointer_cast&lt;RootShadowNode&gt;(</span>
+                <span class="s1">revision.rootShadowNode-&gt;ShadowNode::clone({}))</span><span class="s4">;</span>
+          <span class="s1">}</span><span class="s4">,</span>
+          <span class="s1">{</span><span class="s0">/* default commit options */</span><span class="s1">})</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">SurfaceHandler::setUIManager(UIManager </span><span class="s4">const </span><span class="s1">*uiManager) </span><span class="s4">const noexcept </span><span class="s1">{</span>
+  <span class="s1">std::unique_lock lock(linkMutex_)</span><span class="s4">;</span>
+
+  <span class="s1">react_native_assert(</span>
+      <span class="s1">link_.status != Status::Running &amp;&amp; </span><span class="s3">&quot;Surface must not be running.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(link_.uiManager == uiManager) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">link_.uiManager = uiManager</span><span class="s4">;</span>
+  <span class="s1">link_.status =</span>
+      <span class="s1">uiManager != </span><span class="s4">nullptr </span><span class="s1">? Status::Registered : Status::Unregistered</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">SurfaceHandler::~SurfaceHandler() </span><span class="s4">noexcept </span><span class="s1">{</span>
+  <span class="s0">// TODO(T88046056): Fix Android memory leak before uncommenting changes</span>
+  <span class="s0">//  react_native_assert(</span>
+  <span class="s0">//      link_.status == Status::Unregistered &amp;&amp;</span>
+  <span class="s0">//      &quot;`SurfaceHandler` must be unregistered (or moved-from) before</span>
+  <span class="s0">//      deallocation.&quot;);</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,535 @@
+<html>
+<head>
+<title>RCTModuleData.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTModuleData.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTModuleData.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;objc/runtime.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;atomic&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;mutex&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;reactperflogger/BridgeNativeModulePerfLogger.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge+Private.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridge.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTBridgeModuleDecorator.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTConstants.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTInitializing.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTLog.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTModuleMethod.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTProfile.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTUtils.h&quot;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::react</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+<span class="s1">int32_t getUniqueId()</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">std::atomic&lt;int32_t&gt; counter{</span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">counter++</span><span class="s4">;</span>
+<span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s4">static </span><span class="s1">BOOL isMainQueueExecutionOfConstantToExportDisabled = NO</span><span class="s4">;</span>
+
+<span class="s4">void </span><span class="s1">RCTSetIsMainQueueExecutionOfConstantsToExportDisabled(BOOL val)</span>
+<span class="s1">{</span>
+  <span class="s1">isMainQueueExecutionOfConstantToExportDisabled = val</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">BOOL RCTIsMainQueueExecutionOfConstantsToExportDisabled()</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">isMainQueueExecutionOfConstantToExportDisabled</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTModuleData {</span>
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *_constantsToExport</span><span class="s4">;</span>
+  <span class="s1">NSString *_queueName</span><span class="s4">;</span>
+  <span class="s4">__weak </span><span class="s1">RCTBridge *_bridge</span><span class="s4">;</span>
+  <span class="s1">RCTBridgeModuleProvider _moduleProvider</span><span class="s4">;</span>
+  <span class="s1">std::mutex _instanceLock</span><span class="s4">;</span>
+  <span class="s1">BOOL _setupComplete</span><span class="s4">;</span>
+  <span class="s1">RCTModuleRegistry *_moduleRegistry</span><span class="s4">;</span>
+  <span class="s1">RCTViewRegistry *_viewRegistry_DEPRECATED</span><span class="s4">;</span>
+  <span class="s1">RCTBundleManager *_bundleManager</span><span class="s4">;</span>
+  <span class="s1">RCTCallableJSModules *_callableJSModules</span><span class="s4">;</span>
+  <span class="s1">BOOL _isInitialized</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@synthesize </span><span class="s1">methods = _methods</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">methodsByName = _methodsByName</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">instance = _instance</span><span class="s4">;</span>
+<span class="s4">@synthesize </span><span class="s1">methodQueue = _methodQueue</span><span class="s4">;</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setUp</span>
+<span class="s1">{</span>
+  <span class="s1">_implementsBatchDidComplete = [_moduleClass instancesRespondToSelector:</span><span class="s4">@selector</span><span class="s1">(batchDidComplete)]</span><span class="s4">;</span>
+  <span class="s1">_implementsPartialBatchDidFlush = [_moduleClass instancesRespondToSelector:</span><span class="s4">@selector</span><span class="s1">(partialBatchDidFlush)]</span><span class="s4">;</span>
+
+  <span class="s0">// If a module overrides `constantsToExport` and doesn't implement `requiresMainQueueSetup`, then we must assume</span>
+  <span class="s0">// that it must be called on the main thread, because it may need to access UIKit.</span>
+  <span class="s1">_hasConstantsToExport = [_moduleClass instancesRespondToSelector:</span><span class="s4">@selector</span><span class="s1">(constantsToExport)]</span><span class="s4">;</span>
+
+  <span class="s4">const </span><span class="s1">BOOL implementsRequireMainQueueSetup = [_moduleClass respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(requiresMainQueueSetup)]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(implementsRequireMainQueueSetup) {</span>
+    <span class="s1">_requiresMainQueueSetup = [_moduleClass requiresMainQueueSetup]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">static </span><span class="s1">IMP objectInitMethod</span><span class="s4">;</span>
+    <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+    <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">objectInitMethod = [NSObject instanceMethodForSelector:</span><span class="s4">@selector</span><span class="s1">(init)]</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+
+    <span class="s0">// If a module overrides `init` then we must assume that it expects to be</span>
+    <span class="s0">// initialized on the main thread, because it may need to access UIKit.</span>
+    <span class="s4">const </span><span class="s1">BOOL hasCustomInit =</span>
+        <span class="s1">!_instance &amp;&amp; [_moduleClass instanceMethodForSelector:</span><span class="s4">@selector</span><span class="s1">(init)] != objectInitMethod</span><span class="s4">;</span>
+
+    <span class="s1">_requiresMainQueueSetup = _hasConstantsToExport || hasCustomInit</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(_requiresMainQueueSetup) {</span>
+      <span class="s4">const char </span><span class="s1">*methodName = </span><span class="s3">&quot;&quot;</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(_hasConstantsToExport) {</span>
+        <span class="s1">methodName = </span><span class="s3">&quot;constantsToExport&quot;</span><span class="s4">;</span>
+      <span class="s1">} </span><span class="s4">else if </span><span class="s1">(hasCustomInit) {</span>
+        <span class="s1">methodName = </span><span class="s3">&quot;init&quot;</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">RCTLogWarn(</span>
+          <span class="s4">@</span><span class="s3">&quot;Module %@ requires main queue setup since it overrides `%s` but doesn't implement &quot;</span>
+           <span class="s3">&quot;`requiresMainQueueSetup`. In a future release React Native will default to initializing all native modules &quot;</span>
+           <span class="s3">&quot;on a background thread unless explicitly opted-out of.&quot;</span><span class="s4">,</span>
+          <span class="s1">_moduleClass</span><span class="s4">,</span>
+          <span class="s1">methodName)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithModuleClass:(Class)moduleClass</span>
+                             <span class="s1">bridge:(RCTBridge *)bridge</span>
+                     <span class="s1">moduleRegistry:(RCTModuleRegistry *)moduleRegistry</span>
+            <span class="s1">viewRegistry_DEPRECATED:(RCTViewRegistry *)viewRegistry_DEPRECATED</span>
+                      <span class="s1">bundleManager:(RCTBundleManager *)bundleManager</span>
+                  <span class="s1">callableJSModules:(RCTCallableJSModules *)callableJSModules</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self initWithModuleClass:moduleClass</span>
+                    <span class="s1">moduleProvider:^id&lt;RCTBridgeModule&gt; {</span>
+                      <span class="s4">return </span><span class="s1">[moduleClass </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+                    <span class="s1">}</span>
+                            <span class="s1">bridge:bridge</span>
+                    <span class="s1">moduleRegistry:moduleRegistry</span>
+           <span class="s1">viewRegistry_DEPRECATED:viewRegistry_DEPRECATED</span>
+                     <span class="s1">bundleManager:bundleManager</span>
+                 <span class="s1">callableJSModules:callableJSModules]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithModuleClass:(Class)moduleClass</span>
+                     <span class="s1">moduleProvider:(RCTBridgeModuleProvider)moduleProvider</span>
+                             <span class="s1">bridge:(RCTBridge *)bridge</span>
+                     <span class="s1">moduleRegistry:(RCTModuleRegistry *)moduleRegistry</span>
+            <span class="s1">viewRegistry_DEPRECATED:(RCTViewRegistry *)viewRegistry_DEPRECATED</span>
+                      <span class="s1">bundleManager:(RCTBundleManager *)bundleManager</span>
+                  <span class="s1">callableJSModules:(RCTCallableJSModules *)callableJSModules</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_bridge = bridge</span><span class="s4">;</span>
+    <span class="s1">_moduleClass = moduleClass</span><span class="s4">;</span>
+    <span class="s1">_moduleProvider = [moduleProvider copy]</span><span class="s4">;</span>
+    <span class="s1">_moduleRegistry = moduleRegistry</span><span class="s4">;</span>
+    <span class="s1">_viewRegistry_DEPRECATED = viewRegistry_DEPRECATED</span><span class="s4">;</span>
+    <span class="s1">_bundleManager = bundleManager</span><span class="s4">;</span>
+    <span class="s1">_callableJSModules = callableJSModules</span><span class="s4">;</span>
+    <span class="s1">[self setUp]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithModuleInstance:(id&lt;RCTBridgeModule&gt;)instance</span>
+                                <span class="s1">bridge:(RCTBridge *)bridge</span>
+                        <span class="s1">moduleRegistry:(RCTModuleRegistry *)moduleRegistry</span>
+               <span class="s1">viewRegistry_DEPRECATED:(RCTViewRegistry *)viewRegistry_DEPRECATED</span>
+                         <span class="s1">bundleManager:(RCTBundleManager *)bundleManager</span>
+                     <span class="s1">callableJSModules:(RCTCallableJSModules *)callableJSModules</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_bridge = bridge</span><span class="s4">;</span>
+    <span class="s1">_instance = instance</span><span class="s4">;</span>
+    <span class="s1">_moduleClass = [instance </span><span class="s4">class</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">_moduleRegistry = moduleRegistry</span><span class="s4">;</span>
+    <span class="s1">_viewRegistry_DEPRECATED = viewRegistry_DEPRECATED</span><span class="s4">;</span>
+    <span class="s1">_bundleManager = bundleManager</span><span class="s4">;</span>
+    <span class="s1">_callableJSModules = callableJSModules</span><span class="s4">;</span>
+    <span class="s1">[self setUp]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_NOT_IMPLEMENTED(-(instancetype)init)</span><span class="s4">;</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - </span><span class="s4">private </span><span class="s1">setup methods</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setUpInstanceAndBridge:(int32_t)requestId</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *moduleName = [self name]</span><span class="s4">;</span>
+
+  <span class="s1">RCT_PROFILE_BEGIN_EVENT(</span>
+      <span class="s1">RCTProfileTagAlways</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s3">&quot;[RCTModuleData setUpInstanceAndBridge]&quot;</span><span class="s4">,</span>
+      <span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;moduleClass&quot; </span><span class="s1">: NSStringFromClass(_moduleClass)})</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(_instanceLock)</span><span class="s4">;</span>
+    <span class="s1">BOOL shouldSetup = !_setupComplete &amp;&amp; _bridge.valid</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(shouldSetup) {</span>
+      <span class="s4">if </span><span class="s1">(!_instance) {</span>
+        <span class="s4">if </span><span class="s1">(RCT_DEBUG &amp;&amp; _requiresMainQueueSetup) {</span>
+          <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s1">RCT_PROFILE_BEGIN_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;[RCTModuleData setUpInstanceAndBridge] Create module&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+
+        <span class="s1">BridgeNativeModulePerfLogger::moduleCreateConstructStart([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+        <span class="s1">_instance = _moduleProvider ? _moduleProvider() : nil</span><span class="s4">;</span>
+        <span class="s1">BridgeNativeModulePerfLogger::moduleCreateConstructEnd([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+
+        <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s4">if </span><span class="s1">(!_instance) {</span>
+          <span class="s0">// Module init returned nil, probably because automatic instantiation</span>
+          <span class="s0">// of the module is not supported, and it is supposed to be passed in to</span>
+          <span class="s0">// the bridge constructor. Mark setup complete to avoid doing more work.</span>
+          <span class="s1">_setupComplete = YES</span><span class="s4">;</span>
+          <span class="s1">RCTLogWarn(</span>
+              <span class="s4">@</span><span class="s3">&quot;The module %@ is returning nil from its constructor. You &quot;</span>
+               <span class="s3">&quot;may need to instantiate it yourself and pass it into the &quot;</span>
+               <span class="s3">&quot;bridge.&quot;</span><span class="s4">,</span>
+              <span class="s1">_moduleClass)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+
+      <span class="s4">if </span><span class="s1">(_instance &amp;&amp; RCTProfileIsProfiling()) {</span>
+        <span class="s1">RCTProfileHookInstance(_instance)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(_instance) {</span>
+      <span class="s1">BridgeNativeModulePerfLogger::moduleCreateSetUpStart([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(shouldSetup) {</span>
+      <span class="s0">// Bridge must be set before methodQueue is set up, as methodQueue</span>
+      <span class="s0">// initialization requires it (View Managers get their queue by calling</span>
+      <span class="s0">// self.bridge.uiManager.methodQueue)</span>
+      <span class="s1">[self setBridgeForInstance]</span><span class="s4">;</span>
+
+      <span class="s1">RCTBridgeModuleDecorator *moduleDecorator =</span>
+          <span class="s1">[[RCTBridgeModuleDecorator alloc] initWithViewRegistry:_viewRegistry_DEPRECATED</span>
+                                                  <span class="s1">moduleRegistry:_moduleRegistry</span>
+                                                   <span class="s1">bundleManager:_bundleManager</span>
+                                               <span class="s1">callableJSModules:_callableJSModules]</span><span class="s4">;</span>
+      <span class="s1">[moduleDecorator attachInteropAPIsToModule:_instance]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">[self setUpMethodQueue]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(shouldSetup) {</span>
+      <span class="s1">[self _initializeModule]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// This is called outside of the lock in order to prevent deadlock issues</span>
+  <span class="s0">// because the logic in `finishSetupForInstance` can cause</span>
+  <span class="s0">// `moduleData.instance` to be accessed re-entrantly.</span>
+  <span class="s4">if </span><span class="s1">(_bridge.moduleSetupComplete) {</span>
+    <span class="s1">[self finishSetupForInstance]</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s0">// If we're here, then the module is completely initialized,</span>
+    <span class="s0">// except for what finishSetupForInstance does.  When the instance</span>
+    <span class="s0">// method is called after moduleSetupComplete,</span>
+    <span class="s0">// finishSetupForInstance will run.  If _requiresMainQueueSetup</span>
+    <span class="s0">// is true, getting the instance will block waiting for the main</span>
+    <span class="s0">// thread, which could take a while if the main thread is busy</span>
+    <span class="s0">// (I've seen 50ms in testing).  So we clear that flag, since</span>
+    <span class="s0">// nothing in finishSetupForInstance needs to be run on the main</span>
+    <span class="s0">// thread.</span>
+    <span class="s1">_requiresMainQueueSetup = NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(_instance) {</span>
+    <span class="s1">BridgeNativeModulePerfLogger::moduleCreateSetUpEnd([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setBridgeForInstance</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">([_instance respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(bridge)] &amp;&amp; _instance.bridge != _bridge) {</span>
+    <span class="s1">RCT_PROFILE_BEGIN_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;[RCTModuleData setBridgeForInstance]&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s4">@try </span><span class="s1">{</span>
+      <span class="s1">[(id)_instance setValue:_bridge forKey:</span><span class="s4">@</span><span class="s3">&quot;bridge&quot;</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">@catch </span><span class="s1">(NSException *exception) {</span>
+      <span class="s1">RCTLogError(</span>
+          <span class="s4">@</span><span class="s3">&quot;%@ has no setter or ivar for its bridge, which is not &quot;</span>
+           <span class="s3">&quot;permitted. You must either @synthesize the bridge property, &quot;</span>
+           <span class="s3">&quot;or provide your own setter method.&quot;</span><span class="s4">,</span>
+          <span class="s1">self.name)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_initializeModule</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_isInitialized &amp;&amp; [_instance respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(initialize)]) {</span>
+    <span class="s1">_isInitialized = YES</span><span class="s4">;</span>
+    <span class="s1">[(id&lt;RCTInitializing&gt;)_instance initialize]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)finishSetupForInstance</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(!_setupComplete &amp;&amp; _instance) {</span>
+    <span class="s1">RCT_PROFILE_BEGIN_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;[RCTModuleData finishSetupForInstance]&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s1">_setupComplete = YES</span><span class="s4">;</span>
+    <span class="s1">[_bridge registerModuleForFrameUpdates:_instance withModuleData:self]</span><span class="s4">;</span>
+    <span class="s1">[[NSNotificationCenter defaultCenter]</span>
+        <span class="s1">postNotificationName:RCTDidInitializeModuleNotification</span>
+                      <span class="s1">object:_bridge</span>
+                    <span class="s1">userInfo:</span><span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;module&quot; </span><span class="s1">: _instance</span><span class="s4">, @</span><span class="s3">&quot;bridge&quot; </span><span class="s1">: RCTNullIfNil(_bridge.parentBridge)}]</span><span class="s4">;</span>
+    <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setUpMethodQueue</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_instance &amp;&amp; !_methodQueue &amp;&amp; _bridge.valid) {</span>
+    <span class="s1">RCT_PROFILE_BEGIN_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;[RCTModuleData setUpMethodQueue]&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s1">BOOL implementsMethodQueue = [_instance respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(methodQueue)]</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(implementsMethodQueue &amp;&amp; _bridge.valid) {</span>
+      <span class="s1">_methodQueue = _instance.methodQueue</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(!_methodQueue &amp;&amp; _bridge.valid) {</span>
+      <span class="s0">// Create new queue (store queueName, as it isn't retained by dispatch_queue)</span>
+      <span class="s1">_queueName = [NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;com.facebook.react.%@Queue&quot;</span><span class="s4">, </span><span class="s1">self.name]</span><span class="s4">;</span>
+      <span class="s1">_methodQueue = dispatch_queue_create(_queueName.UTF8String</span><span class="s4">, </span><span class="s1">DISPATCH_QUEUE_SERIAL)</span><span class="s4">;</span>
+
+      <span class="s0">// assign it to the module</span>
+      <span class="s4">if </span><span class="s1">(implementsMethodQueue) {</span>
+        <span class="s4">@try </span><span class="s1">{</span>
+          <span class="s1">[(id)_instance setValue:_methodQueue forKey:</span><span class="s4">@</span><span class="s3">&quot;methodQueue&quot;</span><span class="s1">]</span><span class="s4">;</span>
+        <span class="s1">} </span><span class="s4">@catch </span><span class="s1">(NSException *exception) {</span>
+          <span class="s1">RCTLogError(</span>
+              <span class="s4">@</span><span class="s3">&quot;%@ is returning nil for its methodQueue, which is not &quot;</span>
+               <span class="s3">&quot;permitted. You must either return a pre-initialized &quot;</span>
+               <span class="s3">&quot;queue, or @synthesize the methodQueue to let the bridge &quot;</span>
+               <span class="s3">&quot;create a queue for you.&quot;</span><span class="s4">,</span>
+              <span class="s1">self.name)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)calculateMethods</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_methods &amp;&amp; _methodsByName) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSMutableArray&lt;id&lt;RCTBridgeMethod&gt;&gt; *moduleMethods = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">NSMutableDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&lt;RCTBridgeMethod&gt;&gt; *moduleMethodsByName = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">([_moduleClass instancesRespondToSelector:</span><span class="s4">@selector</span><span class="s1">(methodsToExport)]) {</span>
+    <span class="s1">[moduleMethods addObjectsFromArray:[self.instance methodsToExport]]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">unsigned int </span><span class="s1">methodCount</span><span class="s4">;</span>
+  <span class="s1">Class cls = _moduleClass</span><span class="s4">;</span>
+  <span class="s4">while </span><span class="s1">(cls &amp;&amp; cls != [NSObject </span><span class="s4">class</span><span class="s1">] &amp;&amp; cls != [NSProxy </span><span class="s4">class</span><span class="s1">]) {</span>
+    <span class="s1">Method *methods = class_copyMethodList(object_getClass(cls)</span><span class="s4">, </span><span class="s1">&amp;methodCount)</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">unsigned int </span><span class="s1">i = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">i &lt; methodCount</span><span class="s4">; </span><span class="s1">i++) {</span>
+      <span class="s1">Method method = methods[i]</span><span class="s4">;</span>
+      <span class="s1">SEL </span><span class="s4">selector </span><span class="s1">= method_getName(method)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">([NSStringFromSelector(</span><span class="s4">selector</span><span class="s1">) hasPrefix:</span><span class="s4">@</span><span class="s3">&quot;__rct_export__&quot;</span><span class="s1">]) {</span>
+        <span class="s1">IMP imp = method_getImplementation(method)</span><span class="s4">;</span>
+        <span class="s4">auto </span><span class="s1">exportedMethod = ((</span><span class="s4">const </span><span class="s1">RCTMethodInfo *(*)(id</span><span class="s4">, </span><span class="s1">SEL))imp)(_moduleClass</span><span class="s4">, selector</span><span class="s1">)</span><span class="s4">;</span>
+        <span class="s1">id&lt;RCTBridgeMethod&gt; moduleMethod = [[RCTModuleMethod alloc] initWithExportedMethod:exportedMethod</span>
+                                                                               <span class="s1">moduleClass:_moduleClass]</span><span class="s4">;</span>
+
+        <span class="s1">NSString *str = [NSString stringWithUTF8String:moduleMethod.JSMethodName]</span><span class="s4">;</span>
+        <span class="s1">[moduleMethodsByName setValue:moduleMethod forKey:str]</span><span class="s4">;</span>
+        <span class="s1">[moduleMethods addObject:moduleMethod]</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">free(methods)</span><span class="s4">;</span>
+    <span class="s1">cls = class_getSuperclass(cls)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_methods = [moduleMethods copy]</span><span class="s4">;</span>
+  <span class="s1">_methodsByName = [moduleMethodsByName copy]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - </span><span class="s4">public </span><span class="s1">getters</span>
+
+<span class="s1">- (BOOL)hasInstance</span>
+<span class="s1">{</span>
+  <span class="s1">std::unique_lock&lt;std::mutex&gt; lock(_instanceLock)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_instance != nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id&lt;RCTBridgeModule&gt;)instance</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *moduleName = [self name]</span><span class="s4">;</span>
+  <span class="s1">int32_t requestId = getUniqueId()</span><span class="s4">;</span>
+  <span class="s1">BridgeNativeModulePerfLogger::moduleCreateStart([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!_setupComplete) {</span>
+    <span class="s1">RCT_PROFILE_BEGIN_EVENT(</span>
+        <span class="s1">RCTProfileTagAlways</span><span class="s4">, </span><span class="s1">([NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;[RCTModuleData instanceForClass:%@]&quot;</span><span class="s4">, </span><span class="s1">_moduleClass])</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(_requiresMainQueueSetup) {</span>
+      <span class="s0">// The chances of deadlock here are low, because module init very rarely</span>
+      <span class="s0">// calls out to other threads, however we can't control when a module might</span>
+      <span class="s0">// get accessed by client code during bridge setup, and a very low risk of</span>
+      <span class="s0">// deadlock is better than a fairly high risk of an assertion being thrown.</span>
+      <span class="s1">RCT_PROFILE_BEGIN_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;[RCTModuleData instance] main thread setup&quot;</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+
+      <span class="s4">if </span><span class="s1">(!RCTIsMainQueue()) {</span>
+        <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;RCTBridge required dispatch_sync to load %@. This may lead to deadlocks&quot;</span><span class="s4">, </span><span class="s1">_moduleClass)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">RCTUnsafeExecuteOnMainQueueSync(^{</span>
+        <span class="s1">[self setUpInstanceAndBridge:requestId]</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+      <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">[self setUpInstanceAndBridge:requestId]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">BridgeNativeModulePerfLogger::moduleCreateCacheHit([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(_instance) {</span>
+    <span class="s1">BridgeNativeModulePerfLogger::moduleCreateEnd([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">BridgeNativeModulePerfLogger::moduleCreateFail([moduleName UTF8String]</span><span class="s4">, </span><span class="s1">requestId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">_instance</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSString *)name</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTBridgeModuleNameForClass(_moduleClass)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSArray&lt;id&lt;RCTBridgeMethod&gt;&gt; *)methods</span>
+<span class="s1">{</span>
+  <span class="s1">[self calculateMethods]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_methods</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&lt;RCTBridgeMethod&gt;&gt; *)methodsByName</span>
+<span class="s1">{</span>
+  <span class="s1">[self calculateMethods]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_methodsByName</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)gatherConstants</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[self gatherConstantsAndSignalJSRequireEnding:NO]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)gatherConstantsAndSignalJSRequireEnding:(BOOL)startMarkers</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *moduleName = [self name]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(_hasConstantsToExport &amp;&amp; !_constantsToExport) {</span>
+    <span class="s1">RCT_PROFILE_BEGIN_EVENT(</span>
+        <span class="s1">RCTProfileTagAlways</span><span class="s4">, </span><span class="s1">([NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;[RCTModuleData gatherConstants] %@&quot;</span><span class="s4">, </span><span class="s1">_moduleClass])</span><span class="s4">, </span><span class="s1">nil)</span><span class="s4">;</span>
+    <span class="s1">(</span><span class="s4">void</span><span class="s1">)[self instance]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(startMarkers) {</span>
+      <span class="s0">/** 
+       * Why do we instrument moduleJSRequireEndingStart here? 
+       *  - NativeModule requires from JS go through ModuleRegistry::getConfig(). 
+       *  - ModuleRegistry::getConfig() calls NativeModule::getConstants() first. 
+       *  - This delegates to RCTNativeModule::getConstants(), which calls RCTModuleData gatherConstants(). 
+       *  - Therefore, this is the first statement that executes after the NativeModule is created/initialized in a JS 
+       *    require. 
+       */</span>
+      <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireEndingStart([moduleName UTF8String])</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(!RCTIsMainQueueExecutionOfConstantsToExportDisabled() &amp;&amp; _requiresMainQueueSetup) {</span>
+      <span class="s4">if </span><span class="s1">(!RCTIsMainQueue()) {</span>
+        <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;Required dispatch_sync to load constants for %@. This may lead to deadlocks&quot;</span><span class="s4">, </span><span class="s1">_moduleClass)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">RCTUnsafeExecuteOnMainQueueSync(^{</span>
+        <span class="s1">self-&gt;_constantsToExport = [self-&gt;_instance constantsToExport] ?: </span><span class="s4">@</span><span class="s1">{}</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s1">_constantsToExport = [_instance constantsToExport] ?: </span><span class="s4">@</span><span class="s1">{}</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">RCT_PROFILE_END_EVENT(RCTProfileTagAlways</span><span class="s4">, @</span><span class="s3">&quot;&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(startMarkers) {</span>
+    <span class="s0">/** 
+     * If a NativeModule doesn't have constants, it isn't eagerly loaded until its methods are first invoked. 
+     * Therefore, we should immediately start JSRequireEnding 
+     */</span>
+    <span class="s1">BridgeNativeModulePerfLogger::moduleJSRequireEndingStart([moduleName UTF8String])</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)exportedConstants</span>
+<span class="s1">{</span>
+  <span class="s1">[self gatherConstantsAndSignalJSRequireEnding:YES]</span><span class="s4">;</span>
+  <span class="s1">NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *constants = _constantsToExport</span><span class="s4">;</span>
+  <span class="s1">_constantsToExport = nil</span><span class="s4">; </span><span class="s0">// Not needed anymore</span>
+  <span class="s4">return </span><span class="s1">constants</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (dispatch_queue_t)methodQueue</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_bridge.valid) {</span>
+    <span class="s1">id instance = self.instance</span><span class="s4">;</span>
+    <span class="s1">RCTAssert(_methodQueue != </span><span class="s4">nullptr, @</span><span class="s3">&quot;Module %@ has no methodQueue (instance: %@)&quot;</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">instance)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">_methodQueue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)invalidate</span>
+<span class="s1">{</span>
+  <span class="s1">_methodQueue = nil</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSString *)description</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[NSString stringWithFormat:</span><span class="s4">@</span><span class="s3">&quot;&lt;%@: %p; name=</span><span class="s4">\&quot;</span><span class="s3">%@</span><span class="s4">\&quot;</span><span class="s3">&gt;&quot;</span><span class="s4">, </span><span class="s1">[self </span><span class="s4">class</span><span class="s1">]</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">self.name]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

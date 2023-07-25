@@ -1,0 +1,496 @@
+<html>
+<head>
+<title>NativeViewHierarchyOptimizer.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #629755; font-weight: bold; font-style: italic;}
+.s5 { color: #77b767; font-style: italic;}
+.s6 { color: #6a8759;}
+.s7 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+NativeViewHierarchyOptimizer.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.uimanager</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.util.SparseBooleanArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">androidx.annotation.Nullable</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReadableMapKeySetIterator</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* Class responsible for optimizing the native view hierarchy while still respecting the final UI</span>
+ <span class="s3">* product specified by JS. Basically, JS sends us a hierarchy of nodes that, while easy to reason</span>
+ <span class="s3">* about in JS, are very inefficient to translate directly to native views. This class sits in</span>
+ <span class="s3">* between {</span><span class="s4">@link </span><span class="s3">UIManagerModule}, which directly receives view commands from JS, and {</span><span class="s4">@link</span>
+ <span class="s3">* UIViewOperationQueue}, which enqueues actual operations on the native view hierarchy. It is able</span>
+ <span class="s3">* to take instructions from UIManagerModule and output instructions to the native view hierarchy</span>
+ <span class="s3">* that achieve the same displayed UI but with fewer views.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">Currently this class is only used to remove layout-only views, that is to say views that only</span>
+ <span class="s3">* affect the positions of their children but do not draw anything themselves. These views are</span>
+ <span class="s3">* fairly common because 1) containers are used to do layouting via flexbox and 2) the return of</span>
+ <span class="s3">* each Component#render() call in JS must be exactly one view, which means views are often wrapped</span>
+ <span class="s3">* in a unnecessary layer of hierarchy.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">This optimization is implemented by keeping track of both the unoptimized JS hierarchy and the</span>
+ <span class="s3">* optimized native hierarchy in {</span><span class="s4">@link </span><span class="s3">ReactShadowNode}.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">This optimization is important for view hierarchy depth (which can cause stack overflows</span>
+ <span class="s3">* during view traversal for complex apps), memory usage, amount of time spent during GCs, and</span>
+ <span class="s3">* time-to-display.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">Some examples of the optimizations this class will do based on commands from JS: - Create a</span>
+ <span class="s3">* view with only layout props: a description of that view is created as a {</span><span class="s4">@link </span><span class="s3">ReactShadowNode}</span>
+ <span class="s3">* in UIManagerModule, but this class will not output any commands to create the view in the native</span>
+ <span class="s3">* view hierarchy. - Update a layout-only view to have non-layout props: before issuing the</span>
+ <span class="s3">* updateShadowNode call to the native view hierarchy, issue commands to create the view we</span>
+ <span class="s3">* optimized away move it into the view hierarchy - Manage the children of a view: multiple</span>
+ <span class="s3">* manageChildren calls for various parent views may be issued to the native view hierarchy</span>
+ <span class="s3">* depending on where the views being added/removed are attached in the optimized hierarchy</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">NativeViewHierarchyOptimizer {</span>
+
+  <span class="s2">private static final </span><span class="s1">String TAG = </span><span class="s6">&quot;NativeViewHierarchyOptimizer&quot;</span><span class="s2">;</span>
+
+  <span class="s2">private static class </span><span class="s1">NodeIndexPair {</span>
+    <span class="s2">public final </span><span class="s1">ReactShadowNode node</span><span class="s2">;</span>
+    <span class="s2">public final int </span><span class="s1">index</span><span class="s2">;</span>
+
+    <span class="s1">NodeIndexPair(ReactShadowNode node</span><span class="s2">, int </span><span class="s1">index) {</span>
+      <span class="s2">this</span><span class="s1">.node = node</span><span class="s2">;</span>
+      <span class="s2">this</span><span class="s1">.index = index</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static final boolean </span><span class="s1">ENABLED = </span><span class="s2">true;</span>
+
+  <span class="s2">private final </span><span class="s1">UIViewOperationQueue mUIViewOperationQueue</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ShadowNodeRegistry mShadowNodeRegistry</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">SparseBooleanArray mTagsWithLayoutVisited = </span><span class="s2">new </span><span class="s1">SparseBooleanArray()</span><span class="s2">;</span>
+
+  <span class="s2">public static void </span><span class="s1">assertNodeSupportedWithoutOptimizer(ReactShadowNode node) {</span>
+    <span class="s0">// NativeKind.LEAF nodes require the optimizer. They are not ViewGroups so they cannot host</span>
+    <span class="s0">// their native children themselves. Their native children need to be hoisted by the optimizer</span>
+    <span class="s0">// to an ancestor which is a ViewGroup.</span>
+    <span class="s1">Assertions.assertCondition(</span>
+        <span class="s1">node.getNativeKind() != NativeKind.LEAF</span><span class="s2">,</span>
+        <span class="s6">&quot;Nodes with NativeKind.LEAF are not supported when the optimizer is disabled&quot;</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public </span><span class="s1">NativeViewHierarchyOptimizer(</span>
+      <span class="s1">UIViewOperationQueue uiViewOperationQueue</span><span class="s2">, </span><span class="s1">ShadowNodeRegistry shadowNodeRegistry) {</span>
+    <span class="s1">mUIViewOperationQueue = uiViewOperationQueue</span><span class="s2">;</span>
+    <span class="s1">mShadowNodeRegistry = shadowNodeRegistry</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Handles a createView call. May or may not actually create a native view. */</span>
+  <span class="s2">public void </span><span class="s1">handleCreateView(</span>
+      <span class="s1">ReactShadowNode node</span><span class="s2">,</span>
+      <span class="s1">ThemedReactContext themedContext</span><span class="s2">,</span>
+      <span class="s1">@Nullable ReactStylesDiffMap initialProps) {</span>
+    <span class="s2">if </span><span class="s1">(!ENABLED) {</span>
+      <span class="s1">assertNodeSupportedWithoutOptimizer(node)</span><span class="s2">;</span>
+      <span class="s2">int </span><span class="s1">tag = node.getReactTag()</span><span class="s2">;</span>
+      <span class="s1">mUIViewOperationQueue.enqueueCreateView(</span>
+          <span class="s1">themedContext</span><span class="s2">, </span><span class="s1">tag</span><span class="s2">, </span><span class="s1">node.getViewClass()</span><span class="s2">, </span><span class="s1">initialProps)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">boolean </span><span class="s1">isLayoutOnly =</span>
+        <span class="s1">node.getViewClass().equals(ViewProps.VIEW_CLASS_NAME)</span>
+            <span class="s1">&amp;&amp; isLayoutOnlyAndCollapsable(initialProps)</span><span class="s2">;</span>
+    <span class="s1">node.setIsLayoutOnly(isLayoutOnly)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(node.getNativeKind() != NativeKind.NONE) {</span>
+      <span class="s1">mUIViewOperationQueue.enqueueCreateView(</span>
+          <span class="s1">themedContext</span><span class="s2">, </span><span class="s1">node.getReactTag()</span><span class="s2">, </span><span class="s1">node.getViewClass()</span><span class="s2">, </span><span class="s1">initialProps)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Handles native children cleanup when css node is removed from hierarchy */</span>
+  <span class="s2">public static void </span><span class="s1">handleRemoveNode(ReactShadowNode node) {</span>
+    <span class="s1">node.removeAllNativeChildren()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Handles an updateView call. If a view transitions from being layout-only to not (or vice-versa)</span>
+   <span class="s3">* this could result in some number of additional createView and manageChildren calls. If the view</span>
+   <span class="s3">* is layout only, no updateView call will be dispatched to the native hierarchy.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">handleUpdateView(ReactShadowNode node</span><span class="s2">, </span><span class="s1">String className</span><span class="s2">, </span><span class="s1">ReactStylesDiffMap props) {</span>
+    <span class="s2">if </span><span class="s1">(!ENABLED) {</span>
+      <span class="s1">assertNodeSupportedWithoutOptimizer(node)</span><span class="s2">;</span>
+      <span class="s1">mUIViewOperationQueue.enqueueUpdateProperties(node.getReactTag()</span><span class="s2">, </span><span class="s1">className</span><span class="s2">, </span><span class="s1">props)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">boolean </span><span class="s1">needsToLeaveLayoutOnly = node.isLayoutOnly() &amp;&amp; !isLayoutOnlyAndCollapsable(props)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(needsToLeaveLayoutOnly) {</span>
+      <span class="s1">transitionLayoutOnlyViewToNativeView(node</span><span class="s2">, </span><span class="s1">props)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(!node.isLayoutOnly()) {</span>
+      <span class="s1">mUIViewOperationQueue.enqueueUpdateProperties(node.getReactTag()</span><span class="s2">, </span><span class="s1">className</span><span class="s2">, </span><span class="s1">props)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Handles a manageChildren call. This may translate into multiple manageChildren calls for</span>
+   <span class="s3">* multiple other views.</span>
+   <span class="s3">*</span>
+   <span class="s3">* </span><span class="s5">&lt;p&gt;</span><span class="s3">NB: the assumption for calling this method is that all corresponding ReactShadowNodes have</span>
+   <span class="s3">* been updated **but tagsToDelete have NOT been deleted yet**. This is because we need to use the</span>
+   <span class="s3">* metadata from those nodes to figure out the correct commands to dispatch. This is unlike all</span>
+   <span class="s3">* other calls on this class where we assume all operations on the shadow hierarchy have already</span>
+   <span class="s3">* completed by the time a corresponding method here is called.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">handleManageChildren(</span>
+      <span class="s1">ReactShadowNode nodeToManage</span><span class="s2">,</span>
+      <span class="s2">int</span><span class="s1">[] indicesToRemove</span><span class="s2">,</span>
+      <span class="s2">int</span><span class="s1">[] tagsToRemove</span><span class="s2">,</span>
+      <span class="s1">ViewAtIndex[] viewsToAdd</span><span class="s2">,</span>
+      <span class="s2">int</span><span class="s1">[] tagsToDelete) {</span>
+    <span class="s2">if </span><span class="s1">(!ENABLED) {</span>
+      <span class="s1">assertNodeSupportedWithoutOptimizer(nodeToManage)</span><span class="s2">;</span>
+      <span class="s1">mUIViewOperationQueue.enqueueManageChildren(</span>
+          <span class="s1">nodeToManage.getReactTag()</span><span class="s2">, </span><span class="s1">indicesToRemove</span><span class="s2">, </span><span class="s1">viewsToAdd</span><span class="s2">, </span><span class="s1">tagsToDelete)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// We operate on tagsToRemove instead of indicesToRemove because by the time this method is</span>
+    <span class="s0">// called, these views have already been removed from the shadow hierarchy and the indices are</span>
+    <span class="s0">// no longer useful to operate on</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i &lt; tagsToRemove.length</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s2">int </span><span class="s1">tagToRemove = tagsToRemove[i]</span><span class="s2">;</span>
+      <span class="s2">boolean </span><span class="s1">delete = </span><span class="s2">false;</span>
+      <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">j = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">j &lt; tagsToDelete.length</span><span class="s2">; </span><span class="s1">j++) {</span>
+        <span class="s2">if </span><span class="s1">(tagsToDelete[j] == tagToRemove) {</span>
+          <span class="s1">delete = </span><span class="s2">true;</span>
+          <span class="s2">break;</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">ReactShadowNode nodeToRemove = mShadowNodeRegistry.getNode(tagToRemove)</span><span class="s2">;</span>
+      <span class="s1">removeNodeFromParent(nodeToRemove</span><span class="s2">, </span><span class="s1">delete)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i &lt; viewsToAdd.length</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">ViewAtIndex toAdd = viewsToAdd[i]</span><span class="s2">;</span>
+      <span class="s1">ReactShadowNode nodeToAdd = mShadowNodeRegistry.getNode(toAdd.mTag)</span><span class="s2">;</span>
+      <span class="s1">addNodeToNode(nodeToManage</span><span class="s2">, </span><span class="s1">nodeToAdd</span><span class="s2">, </span><span class="s1">toAdd.mIndex)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Handles a setChildren call. This is a simplification of handleManagerChildren that only adds</span>
+   <span class="s3">* children in index order of the childrenTags array</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">handleSetChildren(ReactShadowNode nodeToManage</span><span class="s2">, </span><span class="s1">ReadableArray childrenTags) {</span>
+    <span class="s2">if </span><span class="s1">(!ENABLED) {</span>
+      <span class="s1">assertNodeSupportedWithoutOptimizer(nodeToManage)</span><span class="s2">;</span>
+      <span class="s1">mUIViewOperationQueue.enqueueSetChildren(nodeToManage.getReactTag()</span><span class="s2">, </span><span class="s1">childrenTags)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i &lt; childrenTags.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">ReactShadowNode nodeToAdd = mShadowNodeRegistry.getNode(childrenTags.getInt(i))</span><span class="s2">;</span>
+      <span class="s1">addNodeToNode(nodeToManage</span><span class="s2">, </span><span class="s1">nodeToAdd</span><span class="s2">, </span><span class="s1">i)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Handles an updateLayout call. All updateLayout calls are collected and dispatched at the end of</span>
+   <span class="s3">* a batch because updateLayout calls to layout-only nodes can necessitate multiple updateLayout</span>
+   <span class="s3">* calls for all its children.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">handleUpdateLayout(ReactShadowNode node) {</span>
+    <span class="s2">if </span><span class="s1">(!ENABLED) {</span>
+      <span class="s1">assertNodeSupportedWithoutOptimizer(node)</span><span class="s2">;</span>
+      <span class="s1">mUIViewOperationQueue.enqueueUpdateLayout(</span>
+          <span class="s1">Assertions.assertNotNull(node.getLayoutParent()).getReactTag()</span><span class="s2">,</span>
+          <span class="s1">node.getReactTag()</span><span class="s2">,</span>
+          <span class="s1">node.getScreenX()</span><span class="s2">,</span>
+          <span class="s1">node.getScreenY()</span><span class="s2">,</span>
+          <span class="s1">node.getScreenWidth()</span><span class="s2">,</span>
+          <span class="s1">node.getScreenHeight())</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">applyLayoutBase(node)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">handleForceViewToBeNonLayoutOnly(ReactShadowNode node) {</span>
+    <span class="s2">if </span><span class="s1">(node.isLayoutOnly()) {</span>
+      <span class="s1">transitionLayoutOnlyViewToNativeView(node</span><span class="s2">, null</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Processes the shadow hierarchy to dispatch all necessary updateLayout calls to the native</span>
+   <span class="s3">* hierarchy. Should be called after all updateLayout calls for a batch have been handled.</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">onBatchComplete() {</span>
+    <span class="s1">mTagsWithLayoutVisited.clear()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private </span><span class="s1">NodeIndexPair walkUpUntilNativeKindIsParent(</span>
+      <span class="s1">ReactShadowNode node</span><span class="s2">, int </span><span class="s1">indexInNativeChildren) {</span>
+    <span class="s2">while </span><span class="s1">(node.getNativeKind() != NativeKind.PARENT) {</span>
+      <span class="s1">ReactShadowNode parent = node.getParent()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(parent == </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s2">return null;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">indexInNativeChildren =</span>
+          <span class="s1">indexInNativeChildren</span>
+              <span class="s1">+ (node.getNativeKind() == NativeKind.LEAF ? </span><span class="s7">1 </span><span class="s1">: </span><span class="s7">0</span><span class="s1">)</span>
+              <span class="s1">+ parent.getNativeOffsetForChild(node)</span><span class="s2">;</span>
+      <span class="s1">node = parent</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">return new </span><span class="s1">NodeIndexPair(node</span><span class="s2">, </span><span class="s1">indexInNativeChildren)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">addNodeToNode(ReactShadowNode parent</span><span class="s2">, </span><span class="s1">ReactShadowNode child</span><span class="s2">, int </span><span class="s1">index) {</span>
+    <span class="s2">int </span><span class="s1">indexInNativeChildren = parent.getNativeOffsetForChild(parent.getChildAt(index))</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(parent.getNativeKind() != NativeKind.PARENT) {</span>
+      <span class="s1">NodeIndexPair result = walkUpUntilNativeKindIsParent(parent</span><span class="s2">, </span><span class="s1">indexInNativeChildren)</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(result == </span><span class="s2">null</span><span class="s1">) {</span>
+        <span class="s0">// If the parent hasn't been attached to its native parent yet, don't issue commands to the</span>
+        <span class="s0">// native hierarchy. We'll do that when the parent node actually gets attached somewhere.</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+      <span class="s1">parent = result.node</span><span class="s2">;</span>
+      <span class="s1">indexInNativeChildren = result.index</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(child.getNativeKind() != NativeKind.NONE) {</span>
+      <span class="s1">addNativeChild(parent</span><span class="s2">, </span><span class="s1">child</span><span class="s2">, </span><span class="s1">indexInNativeChildren)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">addNonNativeChild(parent</span><span class="s2">, </span><span class="s1">child</span><span class="s2">, </span><span class="s1">indexInNativeChildren)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* For handling node removal from manageChildren. In the case of removing a node which isn't</span>
+   <span class="s3">* hosting its own children (e.g. layout-only or NativeKind.LEAF), we need to recursively remove</span>
+   <span class="s3">* all its children from their native parents.</span>
+   <span class="s3">*/</span>
+  <span class="s2">private void </span><span class="s1">removeNodeFromParent(ReactShadowNode nodeToRemove</span><span class="s2">, boolean </span><span class="s1">shouldDelete) {</span>
+    <span class="s2">if </span><span class="s1">(nodeToRemove.getNativeKind() != NativeKind.PARENT) {</span>
+      <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = nodeToRemove.getChildCount() - </span><span class="s7">1</span><span class="s2">; </span><span class="s1">i &gt;= </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i--) {</span>
+        <span class="s1">removeNodeFromParent(nodeToRemove.getChildAt(i)</span><span class="s2">, </span><span class="s1">shouldDelete)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ReactShadowNode nativeNodeToRemoveFrom = nodeToRemove.getNativeParent()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(nativeNodeToRemoveFrom != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">int </span><span class="s1">index = nativeNodeToRemoveFrom.indexOfNativeChild(nodeToRemove)</span><span class="s2">;</span>
+      <span class="s1">nativeNodeToRemoveFrom.removeNativeChildAt(index)</span><span class="s2">;</span>
+
+      <span class="s1">mUIViewOperationQueue.enqueueManageChildren(</span>
+          <span class="s1">nativeNodeToRemoveFrom.getReactTag()</span><span class="s2">,</span>
+          <span class="s2">new int</span><span class="s1">[] {index}</span><span class="s2">,</span>
+          <span class="s2">null,</span>
+          <span class="s1">shouldDelete ? </span><span class="s2">new int</span><span class="s1">[] {nodeToRemove.getReactTag()} : </span><span class="s2">null</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">addNonNativeChild(</span>
+      <span class="s1">ReactShadowNode nativeParent</span><span class="s2">, </span><span class="s1">ReactShadowNode nonNativeChild</span><span class="s2">, int </span><span class="s1">index) {</span>
+    <span class="s1">addGrandchildren(nativeParent</span><span class="s2">, </span><span class="s1">nonNativeChild</span><span class="s2">, </span><span class="s1">index)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">addNativeChild(ReactShadowNode parent</span><span class="s2">, </span><span class="s1">ReactShadowNode child</span><span class="s2">, int </span><span class="s1">index) {</span>
+    <span class="s1">parent.addNativeChildAt(child</span><span class="s2">, </span><span class="s1">index)</span><span class="s2">;</span>
+    <span class="s1">mUIViewOperationQueue.enqueueManageChildren(</span>
+        <span class="s1">parent.getReactTag()</span><span class="s2">,</span>
+        <span class="s2">null,</span>
+        <span class="s2">new </span><span class="s1">ViewAtIndex[] {</span><span class="s2">new </span><span class="s1">ViewAtIndex(child.getReactTag()</span><span class="s2">, </span><span class="s1">index)}</span><span class="s2">,</span>
+        <span class="s2">null</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s2">if </span><span class="s1">(child.getNativeKind() != NativeKind.PARENT) {</span>
+      <span class="s1">addGrandchildren(parent</span><span class="s2">, </span><span class="s1">child</span><span class="s2">, </span><span class="s1">index + </span><span class="s7">1</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">addGrandchildren(ReactShadowNode nativeParent</span><span class="s2">, </span><span class="s1">ReactShadowNode child</span><span class="s2">, int </span><span class="s1">index) {</span>
+    <span class="s1">Assertions.assertCondition(child.getNativeKind() != NativeKind.PARENT)</span><span class="s2">;</span>
+
+    <span class="s0">// `child` can't hold native children. Add all of `child`'s children to `parent`.</span>
+    <span class="s2">int </span><span class="s1">currentIndex = index</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i &lt; child.getChildCount()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">ReactShadowNode grandchild = child.getChildAt(i)</span><span class="s2">;</span>
+      <span class="s1">Assertions.assertCondition(grandchild.getNativeParent() == </span><span class="s2">null</span><span class="s1">)</span><span class="s2">;</span>
+
+      <span class="s0">// Adding this child could result in adding multiple native views</span>
+      <span class="s2">int </span><span class="s1">grandchildCountBefore = nativeParent.getNativeChildCount()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(grandchild.getNativeKind() == NativeKind.NONE) {</span>
+        <span class="s1">addNonNativeChild(nativeParent</span><span class="s2">, </span><span class="s1">grandchild</span><span class="s2">, </span><span class="s1">currentIndex)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">addNativeChild(nativeParent</span><span class="s2">, </span><span class="s1">grandchild</span><span class="s2">, </span><span class="s1">currentIndex)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s2">int </span><span class="s1">grandchildCountAfter = nativeParent.getNativeChildCount()</span><span class="s2">;</span>
+      <span class="s1">currentIndex += grandchildCountAfter - grandchildCountBefore</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">applyLayoutBase(ReactShadowNode node) {</span>
+    <span class="s2">int </span><span class="s1">tag = node.getReactTag()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(mTagsWithLayoutVisited.get(tag)) {</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+    <span class="s1">mTagsWithLayoutVisited.put(tag</span><span class="s2">, true</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s1">ReactShadowNode parent = node.getParent()</span><span class="s2">;</span>
+
+    <span class="s0">// We use screenX/screenY (which round to integer pixels) at each node in the hierarchy to</span>
+    <span class="s0">// emulate what the layout would look like if it were actually built with native views which</span>
+    <span class="s0">// have to have integral top/left/bottom/right values</span>
+    <span class="s2">int </span><span class="s1">x = node.getScreenX()</span><span class="s2">;</span>
+    <span class="s2">int </span><span class="s1">y = node.getScreenY()</span><span class="s2">;</span>
+
+    <span class="s2">while </span><span class="s1">(parent != </span><span class="s2">null </span><span class="s1">&amp;&amp; parent.getNativeKind() != NativeKind.PARENT) {</span>
+      <span class="s2">if </span><span class="s1">(!parent.isVirtual()) {</span>
+        <span class="s0">// Skip these additions for virtual nodes. This has the same effect as `getLayout*`</span>
+        <span class="s0">// returning `0`. Virtual nodes aren't in the Yoga tree so we can't call `getLayout*` on</span>
+        <span class="s0">// them.</span>
+
+        <span class="s0">// TODO(7854667): handle and test proper clipping</span>
+        <span class="s1">x += Math.round(parent.getLayoutX())</span><span class="s2">;</span>
+        <span class="s1">y += Math.round(parent.getLayoutY())</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">parent = parent.getParent()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">applyLayoutRecursive(node</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">y)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">applyLayoutRecursive(ReactShadowNode toUpdate</span><span class="s2">, int </span><span class="s1">x</span><span class="s2">, int </span><span class="s1">y) {</span>
+    <span class="s2">if </span><span class="s1">(toUpdate.getNativeKind() != NativeKind.NONE &amp;&amp; toUpdate.getNativeParent() != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">int </span><span class="s1">tag = toUpdate.getReactTag()</span><span class="s2">;</span>
+      <span class="s1">mUIViewOperationQueue.enqueueUpdateLayout(</span>
+          <span class="s1">toUpdate.getLayoutParent().getReactTag()</span><span class="s2">,</span>
+          <span class="s1">tag</span><span class="s2">,</span>
+          <span class="s1">x</span><span class="s2">,</span>
+          <span class="s1">y</span><span class="s2">,</span>
+          <span class="s1">toUpdate.getScreenWidth()</span><span class="s2">,</span>
+          <span class="s1">toUpdate.getScreenHeight())</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i &lt; toUpdate.getChildCount()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">ReactShadowNode child = toUpdate.getChildAt(i)</span><span class="s2">;</span>
+      <span class="s2">int </span><span class="s1">childTag = child.getReactTag()</span><span class="s2">;</span>
+      <span class="s2">if </span><span class="s1">(mTagsWithLayoutVisited.get(childTag)) {</span>
+        <span class="s2">continue;</span>
+      <span class="s1">}</span>
+      <span class="s1">mTagsWithLayoutVisited.put(childTag</span><span class="s2">, true</span><span class="s1">)</span><span class="s2">;</span>
+
+      <span class="s2">int </span><span class="s1">childX = child.getScreenX()</span><span class="s2">;</span>
+      <span class="s2">int </span><span class="s1">childY = child.getScreenY()</span><span class="s2">;</span>
+
+      <span class="s1">childX += x</span><span class="s2">;</span>
+      <span class="s1">childY += y</span><span class="s2">;</span>
+
+      <span class="s1">applyLayoutRecursive(child</span><span class="s2">, </span><span class="s1">childX</span><span class="s2">, </span><span class="s1">childY)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">transitionLayoutOnlyViewToNativeView(</span>
+      <span class="s1">ReactShadowNode node</span><span class="s2">, </span><span class="s1">@Nullable ReactStylesDiffMap props) {</span>
+    <span class="s1">ReactShadowNode parent = node.getParent()</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(parent == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">node.setIsLayoutOnly(</span><span class="s2">false</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// First, remove the node from its parent. This causes the parent to update its native children</span>
+    <span class="s0">// count. The removeNodeFromParent call will cause all the view's children to be detached from</span>
+    <span class="s0">// their native parent.</span>
+    <span class="s2">int </span><span class="s1">childIndex = parent.indexOf(node)</span><span class="s2">;</span>
+    <span class="s1">parent.removeChildAt(childIndex)</span><span class="s2">;</span>
+    <span class="s1">removeNodeFromParent(node</span><span class="s2">, false</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s1">node.setIsLayoutOnly(</span><span class="s2">false</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s0">// Create the view since it doesn't exist in the native hierarchy yet</span>
+    <span class="s1">mUIViewOperationQueue.enqueueCreateView(</span>
+        <span class="s1">node.getThemedContext()</span><span class="s2">, </span><span class="s1">node.getReactTag()</span><span class="s2">, </span><span class="s1">node.getViewClass()</span><span class="s2">, </span><span class="s1">props)</span><span class="s2">;</span>
+
+    <span class="s0">// Add the node and all its children as if we are adding a new nodes</span>
+    <span class="s1">parent.addChildAt(node</span><span class="s2">, </span><span class="s1">childIndex)</span><span class="s2">;</span>
+    <span class="s1">addNodeToNode(parent</span><span class="s2">, </span><span class="s1">node</span><span class="s2">, </span><span class="s1">childIndex)</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i &lt; node.getChildCount()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">addNodeToNode(node</span><span class="s2">, </span><span class="s1">node.getChildAt(i)</span><span class="s2">, </span><span class="s1">i)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// Update layouts since the children of the node were offset by its x/y position previously.</span>
+    <span class="s0">// Bit of a hack: we need to update the layout of this node's children now that it's no longer</span>
+    <span class="s0">// layout-only, but we may still receive more layout updates at the end of this batch that we</span>
+    <span class="s0">// don't want to ignore.</span>
+    <span class="s1">FLog.i(</span>
+        <span class="s1">TAG</span><span class="s2">,</span>
+        <span class="s6">&quot;Transitioning LayoutOnlyView - tag: &quot;</span>
+            <span class="s1">+ node.getReactTag()</span>
+            <span class="s1">+ </span><span class="s6">&quot; - rootTag: &quot;</span>
+            <span class="s1">+ node.getRootTag()</span>
+            <span class="s1">+ </span><span class="s6">&quot; - hasProps: &quot;</span>
+            <span class="s1">+ (props != </span><span class="s2">null</span><span class="s1">)</span>
+            <span class="s1">+ </span><span class="s6">&quot; - tagsWithLayout.size: &quot;</span>
+            <span class="s1">+ mTagsWithLayoutVisited.size())</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertCondition(mTagsWithLayoutVisited.size() == </span><span class="s7">0</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">applyLayoutBase(node)</span><span class="s2">;</span>
+    <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s7">0</span><span class="s2">; </span><span class="s1">i &lt; node.getChildCount()</span><span class="s2">; </span><span class="s1">i++) {</span>
+      <span class="s1">applyLayoutBase(node.getChildAt(i))</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mTagsWithLayoutVisited.clear()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static boolean </span><span class="s1">isLayoutOnlyAndCollapsable(@Nullable ReactStylesDiffMap props) {</span>
+    <span class="s2">if </span><span class="s1">(props == </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s2">return true;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(props.hasKey(ViewProps.COLLAPSABLE) &amp;&amp; !props.getBoolean(ViewProps.COLLAPSABLE</span><span class="s2">, true</span><span class="s1">)) {</span>
+      <span class="s2">return false;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">ReadableMapKeySetIterator keyIterator = props.mBackingMap.keySetIterator()</span><span class="s2">;</span>
+    <span class="s2">while </span><span class="s1">(keyIterator.hasNextKey()) {</span>
+      <span class="s2">if </span><span class="s1">(!ViewProps.isLayoutOnly(props.mBackingMap</span><span class="s2">, </span><span class="s1">keyIterator.nextKey())) {</span>
+        <span class="s2">return false;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">return true;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Called when all the view updates of {</span><span class="s4">@link </span><span class="s3">ReactShadowNode} received as a parameter were</span>
+   <span class="s3">* processed.</span>
+   <span class="s3">*/</span>
+  <span class="s2">void </span><span class="s1">onViewUpdatesCompleted(ReactShadowNode cssNode) {</span>
+    <span class="s0">// cssNode is not being used, but it is passed as a parameter in case this is required in the</span>
+    <span class="s0">// future.</span>
+    <span class="s1">mTagsWithLayoutVisited.clear()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

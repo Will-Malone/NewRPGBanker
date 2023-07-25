@@ -1,0 +1,490 @@
+<html>
+<head>
+<title>RCTSurfacePresenter.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTSurfacePresenter.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTSurfacePresenter.h&quot;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;mutex&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;shared_mutex&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;React/RCTAssert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTBridge+Private.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTComponentViewFactory.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTComponentViewRegistry.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTConstants.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTFabricSurface.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTFollyConvert.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTI18nUtil.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTMountingManager.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTMountingManagerDelegate.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTScheduler.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceRegistry.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceView+Internal.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTSurfaceView.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTUtils.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;react/config/ReactNativeConfig.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/componentregistry/ComponentDescriptorFactory.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/components/text/BaseTextProps.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/core/CoreFeatures.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/runtimescheduler/RuntimeScheduler.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/scheduler/AsynchronousEventBeat.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/scheduler/SchedulerToolbox.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/renderer/scheduler/SynchronousEventBeat.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/utils/ContextContainer.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;react/utils/ManagedObjectWrapper.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;PlatformRunLoopObserver.h&quot;</span>
+<span class="s2">#import </span><span class="s3">&quot;RCTConversions.h&quot;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook</span><span class="s4">;</span>
+<span class="s4">using namespace </span><span class="s1">facebook::react</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">dispatch_queue_t RCTGetBackgroundQueue()</span>
+<span class="s1">{</span>
+  <span class="s4">static </span><span class="s1">dispatch_queue_t queue</span><span class="s4">;</span>
+  <span class="s4">static </span><span class="s1">dispatch_once_t onceToken</span><span class="s4">;</span>
+  <span class="s1">dispatch_once(&amp;onceToken</span><span class="s4">, </span><span class="s1">^{</span>
+    <span class="s1">dispatch_queue_attr_t attr =</span>
+        <span class="s1">dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL</span><span class="s4">, </span><span class="s1">QOS_CLASS_USER_INTERACTIVE</span><span class="s4">, </span><span class="s5">0</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">queue = dispatch_queue_create(</span><span class="s3">&quot;com.facebook.react.background&quot;</span><span class="s4">, </span><span class="s1">attr)</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">queue</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">BackgroundExecutor RCTGetBackgroundExecutor()</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[](std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;callback) {</span>
+    <span class="s4">if </span><span class="s1">(RCTIsMainQueue()) {</span>
+      <span class="s1">callback()</span><span class="s4">;</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">copyableCallback = callback</span><span class="s4">;</span>
+    <span class="s1">dispatch_async(RCTGetBackgroundQueue()</span><span class="s4">, </span><span class="s1">^{</span>
+      <span class="s1">copyableCallback()</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@interface </span><span class="s1">RCTSurfacePresenter () &lt;RCTSchedulerDelegate</span><span class="s4">, </span><span class="s1">RCTMountingManagerDelegate&gt;</span>
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTSurfacePresenter {</span>
+  <span class="s1">RCTMountingManager *_mountingManager</span><span class="s4">; </span><span class="s0">// Thread-safe.</span>
+  <span class="s1">RCTSurfaceRegistry *_surfaceRegistry</span><span class="s4">; </span><span class="s0">// Thread-safe.</span>
+
+  <span class="s1">std::mutex _schedulerAccessMutex</span><span class="s4">;</span>
+  <span class="s1">std::mutex _schedulerLifeCycleMutex</span><span class="s4">;</span>
+  <span class="s1">RCTScheduler *</span><span class="s4">_Nullable </span><span class="s1">_scheduler</span><span class="s4">; </span><span class="s0">// Thread-safe. Pointer is protected by `_schedulerAccessMutex`.</span>
+  <span class="s1">ContextContainer::Shared _contextContainer</span><span class="s4">; </span><span class="s0">// Protected by `_schedulerLifeCycleMutex`.</span>
+  <span class="s1">RuntimeExecutor _runtimeExecutor</span><span class="s4">; </span><span class="s0">// Protected by `_schedulerLifeCycleMutex`.</span>
+  <span class="s1">std::</span><span class="s4">optional</span><span class="s1">&lt;RuntimeExecutor&gt; _bridgelessBindingsExecutor</span><span class="s4">; </span><span class="s0">// Only used for installing bindings.</span>
+
+  <span class="s1">std::shared_mutex _observerListMutex</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;</span><span class="s4">__weak </span><span class="s1">id&lt;RCTSurfacePresenterObserver&gt;&gt; _observers</span><span class="s4">; </span><span class="s0">// Protected by `_observerListMutex`.</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)initWithContextContainer:(ContextContainer::Shared)contextContainer</span>
+                         <span class="s1">runtimeExecutor:(RuntimeExecutor)runtimeExecutor</span>
+              <span class="s1">bridgelessBindingsExecutor:(std::</span><span class="s4">optional</span><span class="s1">&lt;RuntimeExecutor&gt;)bridgelessBindingsExecutor</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">assert(contextContainer &amp;&amp; </span><span class="s3">&quot;RuntimeExecutor must be not null.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">_runtimeExecutor = runtimeExecutor</span><span class="s4">;</span>
+    <span class="s1">_bridgelessBindingsExecutor = bridgelessBindingsExecutor</span><span class="s4">;</span>
+    <span class="s1">_contextContainer = contextContainer</span><span class="s4">;</span>
+
+    <span class="s1">_surfaceRegistry = [RCTSurfaceRegistry </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">_mountingManager = [RCTMountingManager </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">_mountingManager.contextContainer = contextContainer</span><span class="s4">;</span>
+    <span class="s1">_mountingManager.delegate = self</span><span class="s4">;</span>
+
+    <span class="s1">_scheduler = [self _createScheduler]</span><span class="s4">;</span>
+
+    <span class="s1">[[NSNotificationCenter defaultCenter] addObserver:self</span>
+                                             <span class="s4">selector</span><span class="s1">:</span><span class="s4">@selector</span><span class="s1">(_applicationWillTerminate)</span>
+                                                 <span class="s1">name:UIApplicationWillTerminateNotification</span>
+                                               <span class="s1">object:nil]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTMountingManager *)mountingManager</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">_mountingManager</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTScheduler *</span><span class="s4">_Nullable</span><span class="s1">)scheduler</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_schedulerAccessMutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_scheduler</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (ContextContainer::Shared)contextContainer</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_schedulerLifeCycleMutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_contextContainer</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setContextContainer:(ContextContainer::Shared)contextContainer</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_schedulerLifeCycleMutex)</span><span class="s4">;</span>
+  <span class="s1">_contextContainer = contextContainer</span><span class="s4">;</span>
+  <span class="s1">_mountingManager.contextContainer = contextContainer</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RuntimeExecutor)runtimeExecutor</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_schedulerLifeCycleMutex)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">_runtimeExecutor</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setRuntimeExecutor:(RuntimeExecutor)runtimeExecutor</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_schedulerLifeCycleMutex)</span><span class="s4">;</span>
+  <span class="s1">_runtimeExecutor = runtimeExecutor</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Internal Surface-dedicated Interface</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)registerSurface:(RCTFabricSurface *)surface</span>
+<span class="s1">{</span>
+  <span class="s1">[_surfaceRegistry registerSurface:surface]</span><span class="s4">;</span>
+  <span class="s1">RCTScheduler *scheduler = [self scheduler]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(scheduler) {</span>
+    <span class="s1">[scheduler registerSurface:surface.surfaceHandler]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)unregisterSurface:(RCTFabricSurface *)surface</span>
+<span class="s1">{</span>
+  <span class="s1">RCTScheduler *scheduler = [self scheduler]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(scheduler) {</span>
+    <span class="s1">[scheduler unregisterSurface:surface.surfaceHandler]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s1">[_surfaceRegistry unregisterSurface:surface]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (RCTFabricSurface *)surfaceForRootTag:(ReactTag)rootTag</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[_surfaceRegistry surfaceForRootTag:rootTag]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (id&lt;RCTSurfaceProtocol&gt;)createFabricSurfaceForModuleName:(NSString *)moduleName</span>
+                                         <span class="s1">initialProperties:(NSDictionary *)initialProperties</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">[[RCTFabricSurface alloc] initWithSurfacePresenter:self</span>
+                                                 <span class="s1">moduleName:moduleName</span>
+                                          <span class="s1">initialProperties:initialProperties]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (UIView *)findComponentViewWithTag_DO_NOT_USE_DEPRECATED:(NSInteger)tag</span>
+<span class="s1">{</span>
+  <span class="s1">UIView&lt;RCTComponentViewProtocol&gt; *componentView =</span>
+      <span class="s1">[_mountingManager.componentViewRegistry findComponentViewWithTag:tag]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">componentView</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)synchronouslyUpdateViewOnUIThread:(NSNumber *)reactTag props:(NSDictionary *)props</span>
+<span class="s1">{</span>
+  <span class="s1">RCTScheduler *scheduler = [self scheduler]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!scheduler) {</span>
+    <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">ReactTag tag = [reactTag integerValue]</span><span class="s4">;</span>
+  <span class="s1">UIView&lt;RCTComponentViewProtocol&gt; *componentView =</span>
+      <span class="s1">[_mountingManager.componentViewRegistry findComponentViewWithTag:tag]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(componentView == nil) {</span>
+    <span class="s4">return </span><span class="s1">NO</span><span class="s4">; </span><span class="s0">// This view probably isn't managed by Fabric</span>
+  <span class="s1">}</span>
+  <span class="s1">ComponentHandle handle = [[componentView </span><span class="s4">class</span><span class="s1">] componentDescriptorProvider].handle</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">*componentDescriptor = [scheduler findComponentDescriptorByHandle_DO_NOT_USE_THIS_IS_BROKEN:handle]</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!componentDescriptor) {</span>
+    <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[_mountingManager synchronouslyUpdateViewOnUIThread:tag changedProps:props componentDescriptor:*componentDescriptor]</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setupAnimationDriverWithSurfaceHandler:(facebook::react::SurfaceHandler </span><span class="s4">const </span><span class="s1">&amp;)surfaceHandler</span>
+<span class="s1">{</span>
+  <span class="s1">[[self scheduler] setupAnimationDriver:surfaceHandler]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)suspend</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_schedulerLifeCycleMutex)</span><span class="s4">;</span>
+
+  <span class="s1">RCTScheduler *scheduler</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; accessLock(_schedulerAccessMutex)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!_scheduler) {</span>
+      <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">scheduler = _scheduler</span><span class="s4">;</span>
+    <span class="s1">_scheduler = nil</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _stopAllSurfacesWithScheduler:scheduler]</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (BOOL)resume</span>
+<span class="s1">{</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(_schedulerLifeCycleMutex)</span><span class="s4">;</span>
+
+  <span class="s1">RCTScheduler *scheduler</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; accessLock(_schedulerAccessMutex)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(_scheduler) {</span>
+      <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">scheduler = [self _createScheduler]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self _startAllSurfacesWithScheduler:scheduler]</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; accessLock(_schedulerAccessMutex)</span><span class="s4">;</span>
+    <span class="s1">_scheduler = scheduler</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">YES</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - Private</span>
+
+<span class="s1">- (RCTScheduler *)_createScheduler</span>
+<span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">reactNativeConfig = _contextContainer-&gt;at&lt;std::shared_ptr&lt;ReactNativeConfig </span><span class="s4">const</span><span class="s1">&gt;&gt;(</span><span class="s3">&quot;ReactNativeConfig&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(reactNativeConfig &amp;&amp; reactNativeConfig-&gt;getBool(</span><span class="s3">&quot;rn_convergence:dispatch_pointer_events&quot;</span><span class="s1">)) {</span>
+    <span class="s1">RCTSetDispatchW3CPointerEvents(YES)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(reactNativeConfig &amp;&amp; reactNativeConfig-&gt;getBool(</span><span class="s3">&quot;react_fabric:enable_cpp_props_iterator_setter_ios&quot;</span><span class="s1">)) {</span>
+    <span class="s1">CoreFeatures::enablePropIteratorSetter = </span><span class="s4">true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(reactNativeConfig &amp;&amp; reactNativeConfig-&gt;getBool(</span><span class="s3">&quot;react_fabric:use_native_state&quot;</span><span class="s1">)) {</span>
+    <span class="s1">CoreFeatures::useNativeState = </span><span class="s4">true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(reactNativeConfig &amp;&amp; reactNativeConfig-&gt;getBool(</span><span class="s3">&quot;react_fabric:enable_nstextstorage_caching&quot;</span><span class="s1">)) {</span>
+    <span class="s1">CoreFeatures::cacheNSTextStorage = </span><span class="s4">true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(reactNativeConfig &amp;&amp; reactNativeConfig-&gt;getBool(</span><span class="s3">&quot;react_fabric:cancel_image_downloads_on_recycle&quot;</span><span class="s1">)) {</span>
+    <span class="s1">CoreFeatures::cancelImageDownloadsOnRecycle = </span><span class="s4">true;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">componentRegistryFactory =</span>
+      <span class="s1">[factory = wrapManagedObject(_mountingManager.componentViewRegistry.componentViewFactory)](</span>
+          <span class="s1">EventDispatcher::Weak </span><span class="s4">const </span><span class="s1">&amp;eventDispatcher</span><span class="s4">, </span><span class="s1">ContextContainer::Shared </span><span class="s4">const </span><span class="s1">&amp;contextContainer) {</span>
+        <span class="s4">return </span><span class="s1">[(RCTComponentViewFactory *)unwrapManagedObject(factory)</span>
+            <span class="s1">createComponentDescriptorRegistryWithParameters:{eventDispatcher</span><span class="s4">, </span><span class="s1">contextContainer}]</span><span class="s4">;</span>
+      <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">runtimeExecutor = _runtimeExecutor</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">toolbox = SchedulerToolbox{}</span><span class="s4">;</span>
+  <span class="s1">toolbox.contextContainer = _contextContainer</span><span class="s4">;</span>
+  <span class="s1">toolbox.componentRegistryFactory = componentRegistryFactory</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">weakRuntimeScheduler = _contextContainer-&gt;find&lt;std::weak_ptr&lt;RuntimeScheduler&gt;&gt;(</span><span class="s3">&quot;RuntimeScheduler&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">runtimeScheduler = weakRuntimeScheduler.has_value() ? weakRuntimeScheduler.value().lock() : </span><span class="s4">nullptr;</span>
+  <span class="s4">if </span><span class="s1">(runtimeScheduler) {</span>
+    <span class="s1">runtimeExecutor = [runtimeScheduler](std::function&lt;</span><span class="s4">void</span><span class="s1">(jsi::Runtime &amp; runtime)&gt; &amp;&amp;callback) {</span>
+      <span class="s1">runtimeScheduler-&gt;scheduleWork(std::move(callback))</span><span class="s4">;</span>
+    <span class="s1">}</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">toolbox.runtimeExecutor = runtimeExecutor</span><span class="s4">;</span>
+  <span class="s1">toolbox.bridgelessBindingsExecutor = _bridgelessBindingsExecutor</span><span class="s4">;</span>
+
+  <span class="s1">toolbox.mainRunLoopObserverFactory = [](RunLoopObserver::Activity activities</span><span class="s4">,</span>
+                                          <span class="s1">RunLoopObserver::WeakOwner </span><span class="s4">const </span><span class="s1">&amp;owner) {</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;MainRunLoopObserver&gt;(activities</span><span class="s4">, </span><span class="s1">owner)</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(reactNativeConfig &amp;&amp; reactNativeConfig-&gt;getBool(</span><span class="s3">&quot;react_fabric:enable_background_executor_ios&quot;</span><span class="s1">)) {</span>
+    <span class="s1">toolbox.backgroundExecutor = RCTGetBackgroundExecutor()</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">toolbox.synchronousEventBeatFactory =</span>
+      <span class="s1">[runtimeExecutor</span><span class="s4">, </span><span class="s1">runtimeScheduler = runtimeScheduler](EventBeat::SharedOwnerBox </span><span class="s4">const </span><span class="s1">&amp;ownerBox) {</span>
+        <span class="s4">auto </span><span class="s1">runLoopObserver =</span>
+            <span class="s1">std::make_unique&lt;MainRunLoopObserver </span><span class="s4">const</span><span class="s1">&gt;(RunLoopObserver::Activity::BeforeWaiting</span><span class="s4">, </span><span class="s1">ownerBox-&gt;owner)</span><span class="s4">;</span>
+        <span class="s4">return </span><span class="s1">std::make_unique&lt;SynchronousEventBeat&gt;(std::move(runLoopObserver)</span><span class="s4">, </span><span class="s1">runtimeExecutor</span><span class="s4">, </span><span class="s1">runtimeScheduler)</span><span class="s4">;</span>
+      <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">toolbox.asynchronousEventBeatFactory =</span>
+      <span class="s1">[runtimeExecutor](EventBeat::SharedOwnerBox </span><span class="s4">const </span><span class="s1">&amp;ownerBox) -&gt; std::unique_ptr&lt;EventBeat&gt; {</span>
+    <span class="s4">auto </span><span class="s1">runLoopObserver =</span>
+        <span class="s1">std::make_unique&lt;MainRunLoopObserver </span><span class="s4">const</span><span class="s1">&gt;(RunLoopObserver::Activity::BeforeWaiting</span><span class="s4">, </span><span class="s1">ownerBox-&gt;owner)</span><span class="s4">;</span>
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;AsynchronousEventBeat&gt;(std::move(runLoopObserver)</span><span class="s4">, </span><span class="s1">runtimeExecutor)</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s1">RCTScheduler *scheduler = [[RCTScheduler alloc] initWithToolbox:toolbox]</span><span class="s4">;</span>
+  <span class="s1">scheduler.delegate = self</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">scheduler</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_startAllSurfacesWithScheduler:(RCTScheduler *)scheduler</span>
+<span class="s1">{</span>
+  <span class="s1">[_surfaceRegistry enumerateWithBlock:^(NSEnumerator&lt;RCTFabricSurface *&gt; *enumerator) {</span>
+    <span class="s4">for </span><span class="s1">(RCTFabricSurface *surface in enumerator) {</span>
+      <span class="s1">[scheduler registerSurface:surface.surfaceHandler]</span><span class="s4">;</span>
+      <span class="s1">[surface start]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_stopAllSurfacesWithScheduler:(RCTScheduler *)scheduler</span>
+<span class="s1">{</span>
+  <span class="s1">[_surfaceRegistry enumerateWithBlock:^(NSEnumerator&lt;RCTFabricSurface *&gt; *enumerator) {</span>
+    <span class="s4">for </span><span class="s1">(RCTFabricSurface *surface in enumerator) {</span>
+      <span class="s1">[surface stop]</span><span class="s4">;</span>
+      <span class="s1">[scheduler unregisterSurface:surface.surfaceHandler]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)_applicationWillTerminate</span>
+<span class="s1">{</span>
+  <span class="s1">[self suspend]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTSchedulerDelegate</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)schedulerDidFinishTransaction:(MountingCoordinator::Shared)mountingCoordinator</span>
+<span class="s1">{</span>
+  <span class="s1">[_mountingManager scheduleTransaction:mountingCoordinator]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)schedulerDidDispatchCommand:(ShadowView </span><span class="s4">const </span><span class="s1">&amp;)shadowView</span>
+                        <span class="s1">commandName:(std::string </span><span class="s4">const </span><span class="s1">&amp;)commandName</span>
+                               <span class="s1">args:(folly::</span><span class="s4">dynamic const </span><span class="s1">&amp;)args</span>
+<span class="s1">{</span>
+  <span class="s1">ReactTag tag = shadowView.tag</span><span class="s4">;</span>
+  <span class="s1">NSString *commandStr = [[NSString alloc] initWithUTF8String:commandName.c_str()]</span><span class="s4">;</span>
+  <span class="s1">NSArray *argsArray = convertFollyDynamicToId(args)</span><span class="s4">;</span>
+
+  <span class="s1">[_mountingManager dispatchCommand:tag commandName:commandStr args:argsArray]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)schedulerDidSendAccessibilityEvent:(</span><span class="s4">const </span><span class="s1">facebook::react::ShadowView &amp;)shadowView</span>
+                                 <span class="s1">eventType:(</span><span class="s4">const </span><span class="s1">std::string &amp;)eventType</span>
+<span class="s1">{</span>
+  <span class="s1">ReactTag tag = shadowView.tag</span><span class="s4">;</span>
+  <span class="s1">NSString *eventTypeStr = [[NSString alloc] initWithUTF8String:eventType.c_str()]</span><span class="s4">;</span>
+
+  <span class="s1">[_mountingManager sendAccessibilityEvent:tag eventType:eventTypeStr]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)schedulerDidSetIsJSResponder:(BOOL)isJSResponder</span>
+                <span class="s1">blockNativeResponder:(BOOL)blockNativeResponder</span>
+                       <span class="s1">forShadowView:(facebook::react::ShadowView </span><span class="s4">const </span><span class="s1">&amp;)shadowView</span><span class="s4">;</span>
+<span class="s1">{</span>
+  <span class="s1">[_mountingManager setIsJSResponder:isJSResponder blockNativeResponder:blockNativeResponder forShadowView:shadowView]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)addObserver:(id&lt;RCTSurfacePresenterObserver&gt;)observer</span>
+<span class="s1">{</span>
+  <span class="s1">std::unique_lock lock(_observerListMutex)</span><span class="s4">;</span>
+  <span class="s1">_observers.push_back(observer)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)removeObserver:(id&lt;RCTSurfacePresenterObserver&gt;)observer</span>
+<span class="s1">{</span>
+  <span class="s1">std::unique_lock lock(_observerListMutex)</span><span class="s4">;</span>
+  <span class="s1">std::vector&lt;</span><span class="s4">__weak </span><span class="s1">id&lt;RCTSurfacePresenterObserver&gt;&gt;::const_iterator it =</span>
+      <span class="s1">std::find(_observers.begin()</span><span class="s4">, </span><span class="s1">_observers.</span><span class="s4">end</span><span class="s1">()</span><span class="s4">, </span><span class="s1">observer)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(it != _observers.</span><span class="s4">end</span><span class="s1">()) {</span>
+    <span class="s1">_observers.erase(it)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTMountingManagerDelegate</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)mountingManager:(RCTMountingManager *)mountingManager willMountComponentsWithRootTag:(ReactTag)rootTag</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+
+  <span class="s1">NSArray&lt;id&lt;RCTSurfacePresenterObserver&gt;&gt; *observersCopy</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::shared_lock lock(_observerListMutex)</span><span class="s4">;</span>
+    <span class="s1">observersCopy = [self _getObservers]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(id&lt;RCTSurfacePresenterObserver&gt; observer in observersCopy) {</span>
+    <span class="s4">if </span><span class="s1">([observer respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(willMountComponentsWithRootTag:)]) {</span>
+      <span class="s1">[observer willMountComponentsWithRootTag:rootTag]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)mountingManager:(RCTMountingManager *)mountingManager didMountComponentsWithRootTag:(ReactTag)rootTag</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+
+  <span class="s1">NSArray&lt;id&lt;RCTSurfacePresenterObserver&gt;&gt; *observersCopy</span><span class="s4">;</span>
+  <span class="s1">{</span>
+    <span class="s1">std::shared_lock lock(_observerListMutex)</span><span class="s4">;</span>
+    <span class="s1">observersCopy = [self _getObservers]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(id&lt;RCTSurfacePresenterObserver&gt; observer in observersCopy) {</span>
+    <span class="s4">if </span><span class="s1">([observer respondsToSelector:</span><span class="s4">@selector</span><span class="s1">(didMountComponentsWithRootTag:)]) {</span>
+      <span class="s1">[observer didMountComponentsWithRootTag:rootTag]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">- (NSArray&lt;id&lt;RCTSurfacePresenterObserver&gt;&gt; *)_getObservers</span>
+<span class="s1">{</span>
+  <span class="s1">NSMutableArray&lt;id&lt;RCTSurfacePresenterObserver&gt;&gt; *observersCopy = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(id&lt;RCTSurfacePresenterObserver&gt; observer : _observers) {</span>
+    <span class="s4">if </span><span class="s1">(observer) {</span>
+      <span class="s1">[observersCopy addObject:observer]</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">observersCopy</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+</pre>
+</body>
+</html>

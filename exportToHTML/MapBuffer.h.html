@@ -1,0 +1,177 @@
+<html>
+<head>
+<title>MapBuffer.h</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+MapBuffer.h</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#pragma </span><span class="s1">once</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cstdint&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cstdlib&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;limits&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;string&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;vector&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">class </span><span class="s1">JReadableMapBuffer</span><span class="s4">;</span>
+
+<span class="s0">// clang-format off</span>
+
+<span class="s0">/** 
+ * MapBuffer is an optimized sparse array format for transferring props-like 
+ * objects between C++ and other VMs. The implementation of this map is optimized to: 
+ * - be compact to optimize space when sparse (sparse is the common case). 
+ * - be accessible through JNI with zero/minimal copying via ByteBuffer. 
+ * - have excellent C++ single-write and many-read performance by maximizing 
+ *   CPU cache performance through compactness, data locality, and fixed offsets 
+ *   where possible. 
+ * - be optimized for iteration and intersection against other maps, but with 
+ *   reasonably good random access as well. 
+ * - work recursively for nested maps/arrays. 
+ * - support dynamic types that map to JSON. 
+ * - don't require mutability/copy - single-write on creation and move semantics. 
+ * - have minimal APK size and build time impact. 
+ * 
+ * MapBuffer data is stored in a continuous chunk of memory (bytes_ field below) with the following layout: 
+ * 
+ * ┌─────────────────────Header──────────────────────┐ 
+ * │                    10 bytes                     │ 
+ * ├─Alignment─┬─Item count─┬──────Buffer size───────┤ 
+ * │  2 bytes  │  2 bytes   │        4 bytes         │ 
+ * └───────────┴────────────┴────────────────────────┘ 
+ * ┌────────────────────────────────────────────────────────────────────────────────────────┐ 
+ * │                           Buckets (one per item in the map)                            │ 
+ * │                                                                                        │ 
+ * ├───────────────────────────Bucket───────────────────────────┬───Bucket────┬─────────────┤ 
+ * │                          12 bytes                          │  12 bytes   │             │ 
+ * ├───Key───┬──Type───┬──────Value (primitive or offset)───────┤     ...     │     ...     │ 
+ * │ 2 bytes │ 2 bytes │                8 bytes                 │             │             │ 
+ * └─────────┴─────────┴────────────────────────────────────────┴─────────────┴─────────────┘ 
+ * ┌────────────────────────────────────────────────────────────────────────────────────────┐ 
+ * │  Dynamic data                                                                          │ 
+ * │                                                                                        │ 
+ * │  Free-form data for complex objects (e.g. strings or nested MapBuffers).               │ 
+ * │  When dynamic data is serialized with some object, bucket value contains an offset of  │ 
+ * │  associated byte in the array. The format of the data is not restricted, but common    │ 
+ * │  practice is to use [length | bytes].                                                  │ 
+ * └────────────────────────────────────────────────────────────────────────────────────────┘ 
+ */</span>
+
+<span class="s0">// clang-format on</span>
+
+<span class="s4">class </span><span class="s1">MapBuffer {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">using </span><span class="s1">Key = uint16_t</span><span class="s4">;</span>
+
+  <span class="s0">// The first value in the buffer, used to check correct encoding/endianness on</span>
+  <span class="s0">// JVM side.</span>
+  <span class="s4">constexpr static </span><span class="s1">uint16_t HEADER_ALIGNMENT = </span><span class="s5">0xFE</span><span class="s4">;</span>
+
+  <span class="s4">struct </span><span class="s1">Header {</span>
+    <span class="s1">uint16_t alignment = HEADER_ALIGNMENT</span><span class="s4">; </span><span class="s0">// alignment of serialization</span>
+    <span class="s1">uint16_t count</span><span class="s4">; </span><span class="s0">// amount of items in the map</span>
+    <span class="s1">uint32_t bufferSize</span><span class="s4">; </span><span class="s0">// Amount of bytes used to store the map in memory</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+<span class="s2">#pragma </span><span class="s1">pack(push</span><span class="s4">, </span><span class="s5">1</span><span class="s1">)</span>
+  <span class="s4">struct </span><span class="s1">Bucket {</span>
+    <span class="s1">Key key</span><span class="s4">;</span>
+    <span class="s1">uint16_t type</span><span class="s4">;</span>
+    <span class="s1">uint64_t data</span><span class="s4">;</span>
+
+    <span class="s1">Bucket(Key key</span><span class="s4">, </span><span class="s1">uint16_t type</span><span class="s4">, </span><span class="s1">uint64_t data)</span>
+        <span class="s1">: key(key)</span><span class="s4">, </span><span class="s1">type(type)</span><span class="s4">, </span><span class="s1">data(data) {}</span>
+  <span class="s1">}</span><span class="s4">;</span>
+<span class="s2">#pragma </span><span class="s1">pack(pop)</span>
+
+  <span class="s4">static_assert</span><span class="s1">(</span><span class="s4">sizeof</span><span class="s1">(Header) == </span><span class="s5">8</span><span class="s4">, </span><span class="s3">&quot;MapBuffer header size is incorrect.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s4">static_assert</span><span class="s1">(</span><span class="s4">sizeof</span><span class="s1">(Bucket) == </span><span class="s5">12</span><span class="s4">, </span><span class="s3">&quot;MapBuffer bucket size is incorrect.&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">/** 
+   * Data types available for serialization in MapBuffer 
+   * Keep in sync with `DataType` enum in `JReadableMapBuffer.java`, which 
+   * expects the same values after reading them through JNI. 
+   */</span>
+  <span class="s4">enum </span><span class="s1">DataType : uint16_t {</span>
+    <span class="s1">Boolean = </span><span class="s5">0</span><span class="s4">,</span>
+    <span class="s1">Int = </span><span class="s5">1</span><span class="s4">,</span>
+    <span class="s1">Double = </span><span class="s5">2</span><span class="s4">,</span>
+    <span class="s1">String = </span><span class="s5">3</span><span class="s4">,</span>
+    <span class="s1">Map = </span><span class="s5">4</span><span class="s4">,</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">explicit </span><span class="s1">MapBuffer(std::vector&lt;uint8_t&gt; data)</span><span class="s4">;</span>
+
+  <span class="s1">MapBuffer(MapBuffer </span><span class="s4">const </span><span class="s1">&amp;buffer) = </span><span class="s4">delete;</span>
+
+  <span class="s1">MapBuffer &amp;</span><span class="s4">operator</span><span class="s1">=(</span><span class="s4">const </span><span class="s1">MapBuffer &amp;other) = </span><span class="s4">delete;</span>
+
+  <span class="s1">MapBuffer(MapBuffer &amp;&amp;buffer) = </span><span class="s4">default;</span>
+
+  <span class="s1">MapBuffer &amp;</span><span class="s4">operator</span><span class="s1">=(MapBuffer &amp;&amp;other) = </span><span class="s4">default;</span>
+
+  <span class="s1">int32_t getInt(MapBuffer::Key key) </span><span class="s4">const;</span>
+
+  <span class="s4">bool </span><span class="s1">getBool(MapBuffer::Key key) </span><span class="s4">const;</span>
+
+  <span class="s4">double </span><span class="s1">getDouble(MapBuffer::Key key) </span><span class="s4">const;</span>
+
+  <span class="s1">std::string getString(MapBuffer::Key key) </span><span class="s4">const;</span>
+
+  <span class="s0">// TODO T83483191: review this declaration</span>
+  <span class="s1">MapBuffer getMapBuffer(MapBuffer::Key key) </span><span class="s4">const;</span>
+
+  <span class="s1">std::vector&lt;MapBuffer&gt; getMapBufferList(MapBuffer::Key key) </span><span class="s4">const;</span>
+
+  <span class="s1">size_t size() </span><span class="s4">const;</span>
+
+  <span class="s1">uint8_t </span><span class="s4">const </span><span class="s1">*data() </span><span class="s4">const;</span>
+
+  <span class="s1">uint16_t count() </span><span class="s4">const;</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s0">// Buffer and its size</span>
+  <span class="s1">std::vector&lt;uint8_t&gt; bytes_</span><span class="s4">;</span>
+
+  <span class="s0">// amount of items in the MapBuffer</span>
+  <span class="s1">uint16_t count_ = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s0">// returns the relative offset of the first byte of dynamic data</span>
+  <span class="s1">int32_t getDynamicDataOffset() </span><span class="s4">const;</span>
+
+  <span class="s1">int32_t getKeyBucket(MapBuffer::Key key) </span><span class="s4">const;</span>
+
+  <span class="s4">friend </span><span class="s1">JReadableMapBuffer</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,204 @@
+<html>
+<head>
+<title>TaskQueue.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+TaskQueue.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * @format 
+ * @flow strict 
+ */</span>
+
+<span class="s2">'use strict'</span><span class="s1">;</span>
+
+<span class="s1">const infoLog = require(</span><span class="s2">'../Utilities/infoLog'</span><span class="s1">);</span>
+<span class="s1">const invariant = require(</span><span class="s2">'invariant'</span><span class="s1">);</span>
+
+<span class="s1">type SimpleTask = {</span>
+  <span class="s1">name: string,</span>
+  <span class="s1">run: () =&gt; </span><span class="s3">void</span><span class="s1">,</span>
+<span class="s1">};</span>
+<span class="s1">type PromiseTask = {</span>
+  <span class="s1">name: string,</span>
+  <span class="s1">gen: () =&gt; Promise&lt;</span><span class="s3">void</span><span class="s1">&gt;,</span>
+<span class="s1">};</span>
+<span class="s1">export type Task = SimpleTask | PromiseTask | (() =&gt; </span><span class="s3">void</span><span class="s1">);</span>
+
+<span class="s1">const DEBUG: </span><span class="s3">false </span><span class="s1">= </span><span class="s3">false</span><span class="s1">;</span>
+
+<span class="s0">/** 
+ * TaskQueue - A system for queueing and executing a mix of simple callbacks and 
+ * trees of dependent tasks based on Promises. No tasks are executed unless 
+ * `processNext` is called. 
+ * 
+ * `enqueue` takes a Task object with either a simple `run` callback, or a 
+ * `gen` function that returns a `Promise` and puts it in the queue.  If a gen 
+ * function is supplied, then the promise it returns will block execution of 
+ * tasks already in the queue until it resolves. This can be used to make sure 
+ * the first task is fully resolved (including asynchronous dependencies that 
+ * also schedule more tasks via `enqueue`) before starting on the next task. 
+ * The `onMoreTasks` constructor argument is used to inform the owner that an 
+ * async task has resolved and that the queue should be processed again. 
+ * 
+ * Note: Tasks are only actually executed with explicit calls to `processNext`. 
+ */</span>
+<span class="s1">class TaskQueue {</span>
+  <span class="s0">/** 
+   * TaskQueue instances are self contained and independent, so multiple tasks 
+   * of varying semantics and priority can operate together. 
+   * 
+   * `onMoreTasks` is invoked when `PromiseTask`s resolve if there are more 
+   * tasks to process. 
+   */</span>
+  <span class="s1">constructor({onMoreTasks}: {onMoreTasks: () =&gt; </span><span class="s3">void</span><span class="s1">, ...}) {</span>
+    <span class="s3">this</span><span class="s1">._onMoreTasks = onMoreTasks;</span>
+    <span class="s3">this</span><span class="s1">._queueStack = [{tasks: [], popable: </span><span class="s3">false</span><span class="s1">}];</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Add a task to the queue.  It is recommended to name your tasks for easier 
+   * async debugging. Tasks will not be executed until `processNext` is called 
+   * explicitly. 
+   */</span>
+  <span class="s1">enqueue(task: Task): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s3">this</span><span class="s1">._getCurrentQueue().push(task);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">enqueueTasks(tasks: Array&lt;Task&gt;): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">tasks.forEach(task =&gt; </span><span class="s3">this</span><span class="s1">.enqueue(task));</span>
+  <span class="s1">}</span>
+
+  <span class="s1">cancelTasks(tasksToCancel: Array&lt;Task&gt;): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s0">// search through all tasks and remove them.</span>
+    <span class="s3">this</span><span class="s1">._queueStack = </span><span class="s3">this</span><span class="s1">._queueStack</span>
+      <span class="s1">.map(queue =&gt; ({</span>
+        <span class="s1">...queue,</span>
+        <span class="s1">tasks: queue.tasks.filter(task =&gt; tasksToCancel.indexOf(task) === -</span><span class="s4">1</span><span class="s1">),</span>
+      <span class="s1">}))</span>
+      <span class="s1">.filter((queue, idx) =&gt; queue.tasks.length &gt; </span><span class="s4">0 </span><span class="s1">|| idx === </span><span class="s4">0</span><span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Check to see if `processNext` should be called. 
+   * 
+   * @returns {boolean} Returns true if there are tasks that are ready to be 
+   * processed with `processNext`, or returns false if there are no more tasks 
+   * to be processed right now, although there may be tasks in the queue that 
+   * are blocked by earlier `PromiseTask`s that haven't resolved yet. 
+   * `onMoreTasks` will be called after each `PromiseTask` resolves if there are 
+   * tasks ready to run at that point. 
+   */</span>
+  <span class="s1">hasTasksToProcess(): boolean {</span>
+    <span class="s3">return this</span><span class="s1">._getCurrentQueue().length &gt; </span><span class="s4">0</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Executes the next task in the queue. 
+   */</span>
+  <span class="s1">processNext(): </span><span class="s3">void </span><span class="s1">{</span>
+    <span class="s1">const queue = </span><span class="s3">this</span><span class="s1">._getCurrentQueue();</span>
+    <span class="s3">if </span><span class="s1">(queue.length) {</span>
+      <span class="s1">const task = queue.shift();</span>
+      <span class="s3">try </span><span class="s1">{</span>
+        <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">task === </span><span class="s2">'object' </span><span class="s1">&amp;&amp; task.gen) {</span>
+          <span class="s1">DEBUG &amp;&amp; infoLog(</span><span class="s2">'TaskQueue: genPromise for task ' </span><span class="s1">+ task.name);</span>
+          <span class="s3">this</span><span class="s1">._genPromise(task);</span>
+        <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">task === </span><span class="s2">'object' </span><span class="s1">&amp;&amp; task.run) {</span>
+          <span class="s1">DEBUG &amp;&amp; infoLog(</span><span class="s2">'TaskQueue: run task ' </span><span class="s1">+ task.name);</span>
+          <span class="s1">task.run();</span>
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+          <span class="s1">invariant(</span>
+            <span class="s3">typeof </span><span class="s1">task === </span><span class="s2">'function'</span><span class="s1">,</span>
+            <span class="s2">'Expected Function, SimpleTask, or PromiseTask, but got:</span><span class="s5">\n</span><span class="s2">' </span><span class="s1">+</span>
+              <span class="s1">JSON.stringify(task, </span><span class="s3">null</span><span class="s1">, </span><span class="s4">2</span><span class="s1">),</span>
+          <span class="s1">);</span>
+          <span class="s1">DEBUG &amp;&amp; infoLog(</span><span class="s2">'TaskQueue: run anonymous task'</span><span class="s1">);</span>
+          <span class="s1">task();</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s3">catch </span><span class="s1">(e) {</span>
+        <span class="s1">e.message =</span>
+          <span class="s2">'TaskQueue: Error with task ' </span><span class="s1">+ (task.name || </span><span class="s2">''</span><span class="s1">) + </span><span class="s2">': ' </span><span class="s1">+ e.message;</span>
+        <span class="s3">throw </span><span class="s1">e;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_queueStack: Array&lt;{</span>
+    <span class="s1">tasks: Array&lt;Task&gt;,</span>
+    <span class="s1">popable: boolean,</span>
+    <span class="s1">...</span>
+  <span class="s1">}&gt;;</span>
+  <span class="s1">_onMoreTasks: () =&gt; </span><span class="s3">void</span><span class="s1">;</span>
+
+  <span class="s1">_getCurrentQueue(): Array&lt;Task&gt; {</span>
+    <span class="s1">const stackIdx = </span><span class="s3">this</span><span class="s1">._queueStack.length - </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">const queue = </span><span class="s3">this</span><span class="s1">._queueStack[stackIdx];</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">queue.popable &amp;&amp;</span>
+      <span class="s1">queue.tasks.length === </span><span class="s4">0 </span><span class="s1">&amp;&amp;</span>
+      <span class="s3">this</span><span class="s1">._queueStack.length &gt; </span><span class="s4">1</span>
+    <span class="s1">) {</span>
+      <span class="s3">this</span><span class="s1">._queueStack.pop();</span>
+      <span class="s1">DEBUG &amp;&amp;</span>
+        <span class="s1">infoLog(</span><span class="s2">'TaskQueue: popped queue: '</span><span class="s1">, {</span>
+          <span class="s1">stackIdx,</span>
+          <span class="s1">queueStackSize: </span><span class="s3">this</span><span class="s1">._queueStack.length,</span>
+        <span class="s1">});</span>
+      <span class="s3">return this</span><span class="s1">._getCurrentQueue();</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s3">return </span><span class="s1">queue.tasks;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">_genPromise(task: PromiseTask) {</span>
+    <span class="s0">// Each async task pushes it's own queue onto the queue stack. This</span>
+    <span class="s0">// effectively defers execution of previously queued tasks until the promise</span>
+    <span class="s0">// resolves, at which point we allow the new queue to be popped, which</span>
+    <span class="s0">// happens once it is fully processed.</span>
+    <span class="s3">this</span><span class="s1">._queueStack.push({tasks: [], popable: </span><span class="s3">false</span><span class="s1">});</span>
+    <span class="s1">const stackIdx = </span><span class="s3">this</span><span class="s1">._queueStack.length - </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s1">const stackItem = </span><span class="s3">this</span><span class="s1">._queueStack[stackIdx];</span>
+    <span class="s1">DEBUG &amp;&amp; infoLog(</span><span class="s2">'TaskQueue: push new queue: '</span><span class="s1">, {stackIdx});</span>
+    <span class="s1">DEBUG &amp;&amp; infoLog(</span><span class="s2">'TaskQueue: exec gen task ' </span><span class="s1">+ task.name);</span>
+    <span class="s1">task</span>
+      <span class="s1">.gen()</span>
+      <span class="s1">.then(() =&gt; {</span>
+        <span class="s1">DEBUG &amp;&amp;</span>
+          <span class="s1">infoLog(</span><span class="s2">'TaskQueue: onThen for gen task ' </span><span class="s1">+ task.name, {</span>
+            <span class="s1">stackIdx,</span>
+            <span class="s1">queueStackSize: </span><span class="s3">this</span><span class="s1">._queueStack.length,</span>
+          <span class="s1">});</span>
+        <span class="s1">stackItem.popable = </span><span class="s3">true</span><span class="s1">;</span>
+        <span class="s3">this</span><span class="s1">.hasTasksToProcess() &amp;&amp; </span><span class="s3">this</span><span class="s1">._onMoreTasks();</span>
+      <span class="s1">})</span>
+      <span class="s1">.</span><span class="s3">catch</span><span class="s1">(ex =&gt; {</span>
+        <span class="s1">setTimeout(() =&gt; {</span>
+          <span class="s1">ex.message = `TaskQueue: Error resolving Promise </span><span class="s3">in </span><span class="s1">task ${task.name}: ${ex.message}`;</span>
+          <span class="s3">throw </span><span class="s1">ex;</span>
+        <span class="s1">}, </span><span class="s4">0</span><span class="s1">);</span>
+      <span class="s1">});</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">module.exports = TaskQueue;</span>
+</pre>
+</body>
+</html>

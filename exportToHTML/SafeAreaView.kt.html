@@ -1,0 +1,175 @@
+<html>
+<head>
+<title>SafeAreaView.kt</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6897bb;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+SafeAreaView.kt</font>
+</center></td></tr></table>
+<pre><span class="s0">package </span><span class="s1">com.th3rdwave.safeareacontext</span>
+
+<span class="s1">import android.content.Context</span>
+<span class="s1">import android.util.Log</span>
+<span class="s1">import android.view.View</span>
+<span class="s1">import android.view.ViewTreeObserver</span>
+<span class="s1">import com.facebook.react.bridge.Arguments</span>
+<span class="s1">import com.facebook.react.uimanager.FabricViewStateManager</span>
+<span class="s1">import com.facebook.react.uimanager.FabricViewStateManager.HasFabricViewStateManager</span>
+<span class="s1">import com.facebook.react.uimanager.UIManagerModule</span>
+<span class="s1">import com.facebook.react.views.view.ReactViewGroup</span>
+<span class="s1">import java.util.*</span>
+<span class="s1">import java.util.concurrent.locks.ReentrantLock</span>
+<span class="s1">import kotlin.concurrent.withLock</span>
+
+<span class="s1">private const </span><span class="s0">val </span><span class="s1">MAX_WAIT_TIME_NANO = </span><span class="s2">500000000L </span><span class="s3">// 500ms</span>
+
+<span class="s0">class </span><span class="s1">SafeAreaView(context: Context?) :</span>
+    <span class="s1">ReactViewGroup(context)</span><span class="s0">, </span><span class="s1">ViewTreeObserver.OnPreDrawListener</span><span class="s0">, </span><span class="s1">HasFabricViewStateManager {</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">mMode = SafeAreaViewMode.PADDING</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">mInsets: EdgeInsets? = </span><span class="s0">null</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">mEdges: SafeAreaViewEdges? = </span><span class="s0">null</span>
+  <span class="s1">private </span><span class="s0">var </span><span class="s1">mProviderView: View? = </span><span class="s0">null</span>
+  <span class="s1">private </span><span class="s0">val </span><span class="s1">mFabricViewStateManager = FabricViewStateManager()</span>
+
+  <span class="s1">override </span><span class="s0">fun </span><span class="s1">getFabricViewStateManager(): FabricViewStateManager {</span>
+    <span class="s0">return </span><span class="s1">mFabricViewStateManager</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">updateInsets() {</span>
+    <span class="s0">val </span><span class="s1">insets = mInsets</span>
+    <span class="s0">if </span><span class="s1">(insets != </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s0">val </span><span class="s1">edges =</span>
+          <span class="s1">mEdges</span>
+              <span class="s1">?: SafeAreaViewEdges(</span>
+                  <span class="s1">SafeAreaViewEdgeModes.ADDITIVE</span><span class="s0">,</span>
+                  <span class="s1">SafeAreaViewEdgeModes.ADDITIVE</span><span class="s0">,</span>
+                  <span class="s1">SafeAreaViewEdgeModes.ADDITIVE</span><span class="s0">,</span>
+                  <span class="s1">SafeAreaViewEdgeModes.ADDITIVE)</span>
+      <span class="s0">if </span><span class="s1">(mFabricViewStateManager.hasStateWrapper()) {</span>
+        <span class="s1">mFabricViewStateManager.setState {</span>
+          <span class="s0">val </span><span class="s1">map = Arguments.createMap()</span>
+          <span class="s1">map.putMap(</span><span class="s4">&quot;insets&quot;</span><span class="s0">, </span><span class="s1">edgeInsetsToJsMap(insets))</span>
+          <span class="s1">map</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s0">else </span><span class="s1">{</span>
+        <span class="s0">val </span><span class="s1">localData = SafeAreaViewLocalData(insets = insets</span><span class="s0">, </span><span class="s1">mode = mMode</span><span class="s0">, </span><span class="s1">edges = edges)</span>
+        <span class="s0">val </span><span class="s1">reactContext = getReactContext(</span><span class="s0">this</span><span class="s1">)</span>
+        <span class="s0">val </span><span class="s1">uiManager = reactContext.getNativeModule(UIManagerModule::</span><span class="s0">class</span><span class="s1">.java)</span>
+        <span class="s0">if </span><span class="s1">(uiManager != </span><span class="s0">null</span><span class="s1">) {</span>
+          <span class="s1">uiManager.setViewLocalData(id</span><span class="s0">, </span><span class="s1">localData)</span>
+          <span class="s3">// Sadly there doesn't seem to be a way to properly dirty a yoga node from java, so if we</span>
+          <span class="s3">// are in</span>
+          <span class="s3">// the middle of a layout, we need to recompute it. There is also no way to know whether</span>
+          <span class="s3">// we</span>
+          <span class="s3">// are in the middle of a layout so always do it.</span>
+          <span class="s1">reactContext.runOnNativeModulesQueueThread {</span>
+            <span class="s1">uiManager.uiImplementation.dispatchViewUpdates(-</span><span class="s2">1</span><span class="s1">)</span>
+          <span class="s1">}</span>
+          <span class="s1">waitForReactLayout()</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">waitForReactLayout() {</span>
+    <span class="s3">// Block the main thread until the native module thread is finished with</span>
+    <span class="s3">// its current tasks. To do this we use the done boolean as a lock and enqueue</span>
+    <span class="s3">// a task on the native modules thread. When the task runs we can unblock the</span>
+    <span class="s3">// main thread. This should be safe as long as the native modules thread</span>
+    <span class="s3">// does not block waiting on the main thread.</span>
+    <span class="s0">var </span><span class="s1">done = </span><span class="s0">false</span>
+    <span class="s0">val </span><span class="s1">lock = ReentrantLock()</span>
+    <span class="s0">val </span><span class="s1">condition = lock.newCondition()</span>
+    <span class="s0">val </span><span class="s1">startTime = System.nanoTime()</span>
+    <span class="s0">var </span><span class="s1">waitTime = </span><span class="s2">0L</span>
+    <span class="s1">getReactContext(</span><span class="s0">this</span><span class="s1">).runOnNativeModulesQueueThread {</span>
+      <span class="s1">lock.withLock {</span>
+        <span class="s0">if </span><span class="s1">(!done) {</span>
+          <span class="s1">done = </span><span class="s0">true</span>
+          <span class="s1">condition.signal()</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s1">lock.withLock {</span>
+      <span class="s0">while </span><span class="s1">(!done &amp;&amp; waitTime &lt; MAX_WAIT_TIME_NANO) {</span>
+        <span class="s0">try </span><span class="s1">{</span>
+          <span class="s1">condition.awaitNanos(MAX_WAIT_TIME_NANO)</span>
+        <span class="s1">} catch (ex: InterruptedException) {</span>
+          <span class="s3">// In case of an interrupt just give up waiting.</span>
+          <span class="s1">done = </span><span class="s0">true</span>
+        <span class="s1">}</span>
+        <span class="s1">waitTime += System.nanoTime() - startTime</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">// Timed out waiting.</span>
+    <span class="s0">if </span><span class="s1">(waitTime &gt;= MAX_WAIT_TIME_NANO) {</span>
+      <span class="s1">Log.w(</span><span class="s4">&quot;SafeAreaView&quot;</span><span class="s0">, </span><span class="s4">&quot;Timed out waiting for layout.&quot;</span><span class="s1">)</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">fun </span><span class="s1">setMode(mode: SafeAreaViewMode) {</span>
+    <span class="s1">mMode = mode</span>
+    <span class="s1">updateInsets()</span>
+  <span class="s1">}</span>
+
+  <span class="s0">fun </span><span class="s1">setEdges(edges: SafeAreaViewEdges) {</span>
+    <span class="s1">mEdges = edges</span>
+    <span class="s1">updateInsets()</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">maybeUpdateInsets(): Boolean {</span>
+    <span class="s0">val </span><span class="s1">providerView = mProviderView ?: </span><span class="s0">return false</span>
+    <span class="s0">val </span><span class="s1">edgeInsets = getSafeAreaInsets(providerView) ?: </span><span class="s0">return false</span>
+    <span class="s0">if </span><span class="s1">(mInsets != edgeInsets) {</span>
+      <span class="s1">mInsets = edgeInsets</span>
+      <span class="s1">updateInsets()</span>
+      <span class="s0">return true</span>
+    <span class="s1">}</span>
+    <span class="s0">return false</span>
+  <span class="s1">}</span>
+
+  <span class="s1">private </span><span class="s0">fun </span><span class="s1">findProvider(): View {</span>
+    <span class="s0">var </span><span class="s1">current = parent</span>
+    <span class="s0">while </span><span class="s1">(current != </span><span class="s0">null</span><span class="s1">) {</span>
+      <span class="s0">if </span><span class="s1">(current </span><span class="s0">is </span><span class="s1">SafeAreaProvider) {</span>
+        <span class="s0">return </span><span class="s1">current</span>
+      <span class="s1">}</span>
+      <span class="s1">current = current.parent</span>
+    <span class="s1">}</span>
+    <span class="s0">return this</span>
+  <span class="s1">}</span>
+
+  <span class="s1">override </span><span class="s0">fun </span><span class="s1">onAttachedToWindow() {</span>
+    <span class="s0">super</span><span class="s1">.onAttachedToWindow()</span>
+    <span class="s1">mProviderView = findProvider()</span>
+    <span class="s1">mProviderView?.viewTreeObserver?.addOnPreDrawListener(</span><span class="s0">this</span><span class="s1">)</span>
+    <span class="s1">maybeUpdateInsets()</span>
+  <span class="s1">}</span>
+
+  <span class="s1">override </span><span class="s0">fun </span><span class="s1">onDetachedFromWindow() {</span>
+    <span class="s0">super</span><span class="s1">.onDetachedFromWindow()</span>
+    <span class="s1">mProviderView?.viewTreeObserver?.removeOnPreDrawListener(</span><span class="s0">this</span><span class="s1">)</span>
+    <span class="s1">mProviderView = </span><span class="s0">null</span>
+  <span class="s1">}</span>
+
+  <span class="s1">override </span><span class="s0">fun </span><span class="s1">onPreDraw(): Boolean {</span>
+    <span class="s0">val </span><span class="s1">didUpdate = maybeUpdateInsets()</span>
+    <span class="s0">if </span><span class="s1">(didUpdate) {</span>
+      <span class="s1">requestLayout()</span>
+    <span class="s1">}</span>
+    <span class="s0">return </span><span class="s1">!didUpdate</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

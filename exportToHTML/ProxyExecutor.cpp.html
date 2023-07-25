@@ -1,0 +1,165 @@
+<html>
+<head>
+<title>ProxyExecutor.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ProxyExecutor.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ProxyExecutor.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSBigString.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/ModuleRegistry.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fb/assert.h&gt;</span>
+<span class="s0">// #include &lt;fb/Environment.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/json.h&gt;</span>
+<span class="s0">// #include &lt;jni/LocalReference.h&gt;</span>
+<span class="s0">// #include &lt;jni/LocalString.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">const auto </span><span class="s1">EXECUTOR_BASECLASS = </span><span class="s3">&quot;com/facebook/react/bridge/JavaJSExecutor&quot;</span><span class="s4">;</span>
+
+<span class="s4">static </span><span class="s1">std::string executeJSCallWithProxy(</span>
+    <span class="s1">jobject executor</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;methodName</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;arguments) {</span>
+  <span class="s4">static auto </span><span class="s1">executeJSCall =</span>
+      <span class="s1">jni::findClassStatic(EXECUTOR_BASECLASS)</span>
+          <span class="s1">-&gt;getMethod&lt;jstring(jstring</span><span class="s4">, </span><span class="s1">jstring)&gt;(</span><span class="s3">&quot;executeJSCall&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">result = executeJSCall(</span>
+      <span class="s1">executor</span><span class="s4">,</span>
+      <span class="s1">jni::make_jstring(methodName).get()</span><span class="s4">,</span>
+      <span class="s1">jni::make_jstring(folly::toJson(arguments).c_str()).get())</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">result-&gt;toString()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::unique_ptr&lt;JSExecutor&gt; ProxyExecutorOneTimeFactory::createJSExecutor(</span>
+    <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; delegate</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;MessageQueueThread&gt;) {</span>
+  <span class="s4">return </span><span class="s1">std::make_unique&lt;ProxyExecutor&gt;(std::move(m_executor)</span><span class="s4">, </span><span class="s1">delegate)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ProxyExecutor::ProxyExecutor(</span>
+    <span class="s1">jni::global_ref&lt;jobject&gt; &amp;&amp;executorInstance</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;ExecutorDelegate&gt; delegate)</span>
+    <span class="s1">: m_executor(std::move(executorInstance))</span><span class="s4">, </span><span class="s1">m_delegate(delegate) {}</span>
+
+<span class="s1">ProxyExecutor::~ProxyExecutor() {</span>
+  <span class="s1">m_executor.reset()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ProxyExecutor::initializeRuntime() {</span>
+  <span class="s1">folly::dynamic nativeModuleConfig = folly::dynamic::array</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">SystraceSection s(</span><span class="s3">&quot;collectNativeModuleDescriptions&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">moduleRegistry = m_delegate-&gt;getModuleRegistry()</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;name : moduleRegistry-&gt;moduleNames()) {</span>
+      <span class="s4">auto </span><span class="s1">config = moduleRegistry-&gt;getConfig(name)</span><span class="s4">;</span>
+      <span class="s1">nativeModuleConfig.push_back(config ? config-&gt;config : </span><span class="s4">nullptr</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s1">folly::dynamic config = folly::dynamic::object(</span>
+      <span class="s3">&quot;remoteModuleConfig&quot;</span><span class="s4">, </span><span class="s1">std::move(nativeModuleConfig))</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">SystraceSection t(</span><span class="s3">&quot;setGlobalVariable&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">setGlobalVariable(</span>
+        <span class="s3">&quot;__fbBatchedBridgeConfig&quot;</span><span class="s4">,</span>
+        <span class="s1">std::make_unique&lt;JSBigStdString&gt;(folly::toJson(config)))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ProxyExecutor::loadBundle(</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt;</span><span class="s4">,</span>
+    <span class="s1">std::string sourceURL) {</span>
+  <span class="s4">static auto </span><span class="s1">loadBundle = jni::findClassStatic(EXECUTOR_BASECLASS)</span>
+                               <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">(jstring)&gt;(</span><span class="s3">&quot;loadBundle&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s0">// The proxy ignores the script data passed in.</span>
+
+  <span class="s1">loadBundle(m_executor.get()</span><span class="s4">, </span><span class="s1">jni::make_jstring(sourceURL).get())</span><span class="s4">;</span>
+  <span class="s0">// We can get pending calls here to native but the queue will be drained when</span>
+  <span class="s0">// we launch the application.</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ProxyExecutor::setBundleRegistry(std::unique_ptr&lt;RAMBundleRegistry&gt;) {</span>
+  <span class="s1">jni::throwNewJavaException(</span>
+      <span class="s3">&quot;java/lang/UnsupportedOperationException&quot;</span><span class="s4">,</span>
+      <span class="s3">&quot;Loading application RAM bundles is not supported for proxy executors&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ProxyExecutor::registerBundle(</span>
+    <span class="s1">uint32_t bundleId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;bundlePath) {</span>
+  <span class="s1">jni::throwNewJavaException(</span>
+      <span class="s3">&quot;java/lang/UnsupportedOperationException&quot;</span><span class="s4">,</span>
+      <span class="s3">&quot;Loading application RAM bundles is not supported for proxy executors&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ProxyExecutor::callFunction(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;moduleId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;methodId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;arguments) {</span>
+  <span class="s4">auto </span><span class="s1">call = folly::dynamic::array(moduleId</span><span class="s4">, </span><span class="s1">methodId</span><span class="s4">, </span><span class="s1">std::move(arguments))</span><span class="s4">;</span>
+
+  <span class="s1">std::string result = executeJSCallWithProxy(</span>
+      <span class="s1">m_executor.get()</span><span class="s4">, </span><span class="s3">&quot;callFunctionReturnFlushedQueue&quot;</span><span class="s4">, </span><span class="s1">std::move(call))</span><span class="s4">;</span>
+  <span class="s1">m_delegate-&gt;callNativeModules(*</span><span class="s4">this, </span><span class="s1">folly::parseJson(result)</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ProxyExecutor::invokeCallback(</span>
+    <span class="s4">const double </span><span class="s1">callbackId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">folly::dynamic &amp;arguments) {</span>
+  <span class="s4">auto </span><span class="s1">call = folly::dynamic::array(callbackId</span><span class="s4">, </span><span class="s1">std::move(arguments))</span><span class="s4">;</span>
+  <span class="s1">std::string result = executeJSCallWithProxy(</span>
+      <span class="s1">m_executor.get()</span><span class="s4">, </span><span class="s3">&quot;invokeCallbackAndReturnFlushedQueue&quot;</span><span class="s4">, </span><span class="s1">std::move(call))</span><span class="s4">;</span>
+  <span class="s1">m_delegate-&gt;callNativeModules(*</span><span class="s4">this, </span><span class="s1">folly::parseJson(result)</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ProxyExecutor::setGlobalVariable(</span>
+    <span class="s1">std::string propName</span><span class="s4">,</span>
+    <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; jsonValue) {</span>
+  <span class="s4">static auto </span><span class="s1">setGlobalVariable =</span>
+      <span class="s1">jni::findClassStatic(EXECUTOR_BASECLASS)</span>
+          <span class="s1">-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">(jstring</span><span class="s4">, </span><span class="s1">jstring)&gt;(</span><span class="s3">&quot;setGlobalVariable&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">setGlobalVariable(</span>
+      <span class="s1">m_executor.get()</span><span class="s4">,</span>
+      <span class="s1">jni::make_jstring(propName).get()</span><span class="s4">,</span>
+      <span class="s1">jni::make_jstring(jsonValue-&gt;c_str()).get())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">std::string ProxyExecutor::getDescription() {</span>
+  <span class="s4">return </span><span class="s3">&quot;Chrome&quot;</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

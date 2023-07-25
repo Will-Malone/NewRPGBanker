@@ -1,0 +1,178 @@
+<html>
+<head>
+<title>rule-validator.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+rule-validator.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * @fileoverview Rule Validator 
+ * @author Nicholas C. Zakas 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Requirements</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s1">const ajv = require(</span><span class="s2">&quot;../shared/ajv&quot;</span><span class="s1">)();</span>
+<span class="s1">const {</span>
+    <span class="s1">parseRuleId,</span>
+    <span class="s1">getRuleFromConfig,</span>
+    <span class="s1">getRuleOptionsSchema</span>
+<span class="s1">} = require(</span><span class="s2">&quot;./flat-config-helpers&quot;</span><span class="s1">);</span>
+<span class="s1">const ruleReplacements = require(</span><span class="s2">&quot;../../conf/replacements.json&quot;</span><span class="s1">);</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Helpers</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Throws a helpful error when a rule cannot be found. 
+ * @param {Object} ruleId The rule identifier. 
+ * @param {string} ruleId.pluginName The ID of the rule to find. 
+ * @param {string} ruleId.ruleName The ID of the rule to find. 
+ * @param {Object} config The config to search in. 
+ * @throws {TypeError} For missing plugin or rule. 
+ * @returns {void} 
+ */</span>
+<span class="s3">function </span><span class="s1">throwRuleNotFoundError({ pluginName, ruleName }, config) {</span>
+
+    <span class="s1">const ruleId = pluginName === </span><span class="s2">&quot;@&quot; </span><span class="s1">? ruleName : `${pluginName}/${ruleName}`;</span>
+
+    <span class="s1">const errorMessageHeader = `Key </span><span class="s2">&quot;rules&quot;</span><span class="s1">: Key </span><span class="s2">&quot;${ruleId}&quot;</span><span class="s1">`;</span>
+    <span class="s1">let errorMessage = `${errorMessageHeader}: Could not find plugin </span><span class="s2">&quot;${pluginName}&quot;</span><span class="s1">.`;</span>
+
+    <span class="s0">// if the plugin exists then we need to check if the rule exists</span>
+    <span class="s3">if </span><span class="s1">(config.plugins &amp;&amp; config.plugins[pluginName]) {</span>
+        <span class="s1">const replacementRuleName = ruleReplacements.rules[ruleName];</span>
+
+        <span class="s3">if </span><span class="s1">(pluginName === </span><span class="s2">&quot;@&quot; </span><span class="s1">&amp;&amp; replacementRuleName) {</span>
+
+            <span class="s1">errorMessage = `${errorMessageHeader}: Rule </span><span class="s2">&quot;${ruleName}&quot; </span><span class="s1">was removed and replaced by </span><span class="s2">&quot;${replacementRuleName}&quot;</span><span class="s1">.`;</span>
+
+        <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+
+            <span class="s1">errorMessage = `${errorMessageHeader}: Could not find </span><span class="s2">&quot;${ruleName}&quot; </span><span class="s3">in </span><span class="s1">plugin </span><span class="s2">&quot;${pluginName}&quot;</span><span class="s1">.`;</span>
+
+            <span class="s0">// otherwise, let's see if we can find the rule name elsewhere</span>
+            <span class="s3">for </span><span class="s1">(const [otherPluginName, otherPlugin] of Object.entries(config.plugins)) {</span>
+                <span class="s3">if </span><span class="s1">(otherPlugin.rules &amp;&amp; otherPlugin.rules[ruleName]) {</span>
+                    <span class="s1">errorMessage += ` Did you mean </span><span class="s2">&quot;${otherPluginName}/${ruleName}&quot;</span><span class="s1">?`;</span>
+                    <span class="s3">break</span><span class="s1">;</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+
+        <span class="s1">}</span>
+
+        <span class="s0">// falls through to throw error</span>
+    <span class="s1">}</span>
+
+    <span class="s3">throw new </span><span class="s1">TypeError(errorMessage);</span>
+<span class="s1">}</span>
+
+<span class="s0">//-----------------------------------------------------------------------------</span>
+<span class="s0">// Exports</span>
+<span class="s0">//-----------------------------------------------------------------------------</span>
+
+<span class="s0">/** 
+ * Implements validation functionality for the rules portion of a config. 
+ */</span>
+<span class="s1">class RuleValidator {</span>
+
+    <span class="s0">/** 
+     * Creates a new instance. 
+     */</span>
+    <span class="s1">constructor() {</span>
+
+        <span class="s0">/** 
+         * A collection of compiled validators for rules that have already 
+         * been validated. 
+         * @type {WeakMap} 
+         */</span>
+        <span class="s3">this</span><span class="s1">.validators = </span><span class="s3">new </span><span class="s1">WeakMap();</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/** 
+     * Validates all of the rule configurations in a config against each 
+     * rule's schema. 
+     * @param {Object} config The full config to validate. This object must 
+     *      contain both the rules section and the plugins section. 
+     * @returns {void} 
+     * @throws {Error} If a rule's configuration does not match its schema. 
+     */</span>
+    <span class="s1">validate(config) {</span>
+
+        <span class="s3">if </span><span class="s1">(!config.rules) {</span>
+            <span class="s3">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s3">for </span><span class="s1">(const [ruleId, ruleOptions] of Object.entries(config.rules)) {</span>
+
+            <span class="s0">// check for edge case</span>
+            <span class="s3">if </span><span class="s1">(ruleId === </span><span class="s2">&quot;__proto__&quot;</span><span class="s1">) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s0">/* 
+             * If a rule is disabled, we don't do any validation. This allows 
+             * users to safely set any value to 0 or &quot;off&quot; without worrying 
+             * that it will cause a validation error. 
+             * 
+             * Note: ruleOptions is always an array at this point because 
+             * this validation occurs after FlatConfigArray has merged and 
+             * normalized values. 
+             */</span>
+            <span class="s3">if </span><span class="s1">(ruleOptions[</span><span class="s4">0</span><span class="s1">] === </span><span class="s4">0</span><span class="s1">) {</span>
+                <span class="s3">continue</span><span class="s1">;</span>
+            <span class="s1">}</span>
+
+            <span class="s1">const rule = getRuleFromConfig(ruleId, config);</span>
+
+            <span class="s3">if </span><span class="s1">(!rule) {</span>
+                <span class="s1">throwRuleNotFoundError(parseRuleId(ruleId), config);</span>
+            <span class="s1">}</span>
+
+            <span class="s0">// Precompile and cache validator the first time</span>
+            <span class="s3">if </span><span class="s1">(!</span><span class="s3">this</span><span class="s1">.validators.has(rule)) {</span>
+                <span class="s1">const schema = getRuleOptionsSchema(rule);</span>
+
+                <span class="s3">if </span><span class="s1">(schema) {</span>
+                    <span class="s3">this</span><span class="s1">.validators.set(rule, ajv.compile(schema));</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+
+            <span class="s1">const validateRule = </span><span class="s3">this</span><span class="s1">.validators.get(rule);</span>
+
+            <span class="s3">if </span><span class="s1">(validateRule) {</span>
+
+                <span class="s1">validateRule(ruleOptions.slice(</span><span class="s4">1</span><span class="s1">));</span>
+
+                <span class="s3">if </span><span class="s1">(validateRule.errors) {</span>
+                    <span class="s3">throw new </span><span class="s1">Error(`Key </span><span class="s2">&quot;rules&quot;</span><span class="s1">: Key </span><span class="s2">&quot;${ruleId}&quot;</span><span class="s1">: ${</span>
+                        <span class="s1">validateRule.errors.map(</span>
+                            <span class="s1">error =&gt; `\tValue ${JSON.stringify(error.data)} ${error.message}.\n`</span>
+                        <span class="s1">).join(</span><span class="s2">&quot;&quot;</span><span class="s1">)</span>
+                    <span class="s1">}`);</span>
+                <span class="s1">}</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">exports.RuleValidator = RuleValidator;</span>
+</pre>
+</body>
+</html>

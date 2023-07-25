@@ -1,0 +1,421 @@
+<html>
+<head>
+<title>EventDispatcherImpl.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #77b767; font-style: italic;}
+.s5 { color: #629755; font-weight: bold; font-style: italic;}
+.s6 { color: #6897bb;}
+.s7 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+EventDispatcherImpl.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.uimanager.events</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.util.LongSparseArray</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.LifecycleEventListener</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.ReactApplicationContext</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.bridge.UiThreadUtil</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.MapBuilder</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.modules.core.ChoreographerCompat</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.modules.core.ReactChoreographer</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.common.UIManagerType</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.systrace.Systrace</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.ArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Arrays</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Comparator</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.Map</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.CopyOnWriteArrayList</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">java.util.concurrent.atomic.AtomicInteger</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* Class responsible for dispatching UI events to JS. The main purpose of this class is to act as an</span>
+ <span class="s3">* intermediary between UI code generating events and JS, making sure we don't send more events than</span>
+ <span class="s3">* JS can process.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">To use it, create a subclass of {</span><span class="s5">@link </span><span class="s3">Event} and call {</span><span class="s5">@link </span><span class="s3">#dispatchEvent(Event)} whenever</span>
+ <span class="s3">* there's a UI event to dispatch.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">This class works by installing a Choreographer frame callback on the main thread. This</span>
+ <span class="s3">* callback then enqueues a runnable on the JS thread (if one is not already pending) that is</span>
+ <span class="s3">* responsible for actually dispatch events to JS. This implementation depends on the properties</span>
+ <span class="s3">* that 1) FrameCallbacks run after UI events have been processed in Choreographer.java 2) when we</span>
+ <span class="s3">* enqueue a runnable on the JS queue thread, it won't be called until after any previously enqueued</span>
+ <span class="s3">* JS jobs have finished processing</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">If JS is taking a long time processing events, then the UI events generated on the UI thread</span>
+ <span class="s3">* can be coalesced into fewer events so that when the runnable runs, we don't overload JS with a</span>
+ <span class="s3">* ton of events and make it get even farther behind.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">Ideally, we don't need this and JS is fast enough to process all the events each frame, but</span>
+ <span class="s3">* bad things happen, including load on CPUs from the system, and we should handle this case well.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">== Event Cookies ==</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">An event cookie is made up of the event type id, view tag, and a custom coalescing key. Only</span>
+ <span class="s3">* Events that have the same cookie can be coalesced.</span>
+ <span class="s3">*</span>
+ <span class="s3">* </span><span class="s4">&lt;p&gt;</span><span class="s3">Event Cookie Composition: VIEW_TAG_MASK = 0x00000000ffffffff EVENT_TYPE_ID_MASK =</span>
+ <span class="s3">* 0x0000ffff00000000 COALESCING_KEY_MASK = 0xffff000000000000</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">EventDispatcherImpl </span><span class="s2">implements </span><span class="s1">EventDispatcher</span><span class="s2">, </span><span class="s1">LifecycleEventListener {</span>
+
+  <span class="s2">private static final </span><span class="s1">Comparator&lt;Event&gt; EVENT_COMPARATOR =</span>
+      <span class="s2">new </span><span class="s1">Comparator&lt;Event&gt;() {</span>
+        <span class="s1">@Override</span>
+        <span class="s2">public int </span><span class="s1">compare(Event lhs</span><span class="s2">, </span><span class="s1">Event rhs) {</span>
+          <span class="s2">if </span><span class="s1">(lhs == </span><span class="s2">null </span><span class="s1">&amp;&amp; rhs == </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s2">return </span><span class="s6">0</span><span class="s2">;</span>
+          <span class="s1">}</span>
+          <span class="s2">if </span><span class="s1">(lhs == </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s2">return </span><span class="s1">-</span><span class="s6">1</span><span class="s2">;</span>
+          <span class="s1">}</span>
+          <span class="s2">if </span><span class="s1">(rhs == </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s2">return </span><span class="s6">1</span><span class="s2">;</span>
+          <span class="s1">}</span>
+
+          <span class="s2">long </span><span class="s1">diff = lhs.getTimestampMs() - rhs.getTimestampMs()</span><span class="s2">;</span>
+          <span class="s2">if </span><span class="s1">(diff == </span><span class="s6">0</span><span class="s1">) {</span>
+            <span class="s2">return </span><span class="s6">0</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else if </span><span class="s1">(diff &lt; </span><span class="s6">0</span><span class="s1">) {</span>
+            <span class="s2">return </span><span class="s1">-</span><span class="s6">1</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s2">return </span><span class="s6">1</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span><span class="s2">;</span>
+
+  <span class="s2">private final </span><span class="s1">Object mEventsStagingLock = </span><span class="s2">new </span><span class="s1">Object()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Object mEventsToDispatchLock = </span><span class="s2">new </span><span class="s1">Object()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ReactApplicationContext mReactContext</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">LongSparseArray&lt;Integer&gt; mEventCookieToLastEventIdx = </span><span class="s2">new </span><span class="s1">LongSparseArray&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">Map&lt;String</span><span class="s2">, </span><span class="s1">Short&gt; mEventNameToEventId = MapBuilder.newHashMap()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">DispatchEventsRunnable mDispatchEventsRunnable = </span><span class="s2">new </span><span class="s1">DispatchEventsRunnable()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ArrayList&lt;Event&gt; mEventStaging = </span><span class="s2">new </span><span class="s1">ArrayList&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">CopyOnWriteArrayList&lt;EventDispatcherListener&gt; mListeners =</span>
+      <span class="s2">new </span><span class="s1">CopyOnWriteArrayList&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">CopyOnWriteArrayList&lt;BatchEventDispatchedListener&gt; mPostEventDispatchListeners =</span>
+      <span class="s2">new </span><span class="s1">CopyOnWriteArrayList&lt;&gt;()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ScheduleDispatchFrameCallback mCurrentFrameCallback =</span>
+      <span class="s2">new </span><span class="s1">ScheduleDispatchFrameCallback()</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">AtomicInteger mHasDispatchScheduledCount = </span><span class="s2">new </span><span class="s1">AtomicInteger()</span><span class="s2">;</span>
+
+  <span class="s2">private </span><span class="s1">Event[] mEventsToDispatch = </span><span class="s2">new </span><span class="s1">Event[</span><span class="s6">16</span><span class="s1">]</span><span class="s2">;</span>
+  <span class="s2">private int </span><span class="s1">mEventsToDispatchSize = </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s2">private volatile </span><span class="s1">ReactEventEmitter mReactEventEmitter</span><span class="s2">;</span>
+  <span class="s2">private short </span><span class="s1">mNextEventTypeId = </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s2">private volatile boolean </span><span class="s1">mHasDispatchScheduled = </span><span class="s2">false;</span>
+
+  <span class="s2">public </span><span class="s1">EventDispatcherImpl(ReactApplicationContext reactContext) {</span>
+    <span class="s1">mReactContext = reactContext</span><span class="s2">;</span>
+    <span class="s1">mReactContext.addLifecycleEventListener(</span><span class="s2">this</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">mReactEventEmitter = </span><span class="s2">new </span><span class="s1">ReactEventEmitter(mReactContext)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Sends the given Event to JS, coalescing eligible events if JS is backed up. */</span>
+  <span class="s2">public void </span><span class="s1">dispatchEvent(Event event) {</span>
+    <span class="s1">Assertions.assertCondition(event.isInitialized()</span><span class="s2">, </span><span class="s7">&quot;Dispatched event hasn't been initialized&quot;</span><span class="s1">)</span><span class="s2">;</span>
+
+    <span class="s2">for </span><span class="s1">(EventDispatcherListener listener : mListeners) {</span>
+      <span class="s1">listener.onEventDispatch(event)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">synchronized </span><span class="s1">(mEventsStagingLock) {</span>
+      <span class="s1">mEventStaging.add(event)</span><span class="s2">;</span>
+      <span class="s1">Systrace.startAsyncFlow(</span>
+          <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s1">event.getEventName()</span><span class="s2">, </span><span class="s1">event.getUniqueID())</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">maybePostFrameCallbackFromNonUI()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">dispatchAllEvents() {</span>
+    <span class="s1">maybePostFrameCallbackFromNonUI()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">maybePostFrameCallbackFromNonUI() {</span>
+    <span class="s2">if </span><span class="s1">(mReactEventEmitter != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s0">// If the host activity is paused, the frame callback may not be currently</span>
+      <span class="s0">// posted. Ensure that it is so that this event gets delivered promptly.</span>
+      <span class="s1">mCurrentFrameCallback.maybePostFromNonUI()</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s0">// No JS application has started yet, or resumed. This can happen when a ReactRootView is</span>
+      <span class="s0">// added to view hierarchy, but ReactContext creation has not completed yet. In this case, any</span>
+      <span class="s0">// touch event dispatch will hit this codepath, and we simply queue them so that they</span>
+      <span class="s0">// are dispatched once ReactContext creation completes and JS app is running.</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Add a listener to this EventDispatcher. */</span>
+  <span class="s2">public void </span><span class="s1">addListener(EventDispatcherListener listener) {</span>
+    <span class="s1">mListeners.add(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/** Remove a listener from this EventDispatcher. */</span>
+  <span class="s2">public void </span><span class="s1">removeListener(EventDispatcherListener listener) {</span>
+    <span class="s1">mListeners.remove(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">addBatchEventDispatchedListener(BatchEventDispatchedListener listener) {</span>
+    <span class="s1">mPostEventDispatchListeners.add(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">removeBatchEventDispatchedListener(BatchEventDispatchedListener listener) {</span>
+    <span class="s1">mPostEventDispatchListeners.remove(listener)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onHostResume() {</span>
+    <span class="s1">maybePostFrameCallbackFromNonUI()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onHostPause() {</span>
+    <span class="s1">stopFrameCallback()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">@Override</span>
+  <span class="s2">public void </span><span class="s1">onHostDestroy() {</span>
+    <span class="s1">stopFrameCallback()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onCatalystInstanceDestroyed() {</span>
+    <span class="s1">UiThreadUtil.runOnUiThread(</span>
+        <span class="s2">new </span><span class="s1">Runnable() {</span>
+          <span class="s1">@Override</span>
+          <span class="s2">public void </span><span class="s1">run() {</span>
+            <span class="s1">stopFrameCallback()</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">})</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">stopFrameCallback() {</span>
+    <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+    <span class="s1">mCurrentFrameCallback.stop()</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* We use a staging data structure so that all UI events generated in a single frame are</span>
+   <span class="s3">* dispatched at once. Otherwise, a JS runnable enqueued in a previous frame could run while the</span>
+   <span class="s3">* UI thread is in the process of adding UI events and we might incorrectly send one event this</span>
+   <span class="s3">* frame and another from this frame during the next.</span>
+   <span class="s3">*/</span>
+  <span class="s2">private void </span><span class="s1">moveStagedEventsToDispatchQueue() {</span>
+    <span class="s2">synchronized </span><span class="s1">(mEventsStagingLock) {</span>
+      <span class="s2">synchronized </span><span class="s1">(mEventsToDispatchLock) {</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">i = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">i &lt; mEventStaging.size()</span><span class="s2">; </span><span class="s1">i++) {</span>
+          <span class="s1">Event event = mEventStaging.get(i)</span><span class="s2">;</span>
+
+          <span class="s2">if </span><span class="s1">(!event.canCoalesce()) {</span>
+            <span class="s1">addEventToEventsToDispatch(event)</span><span class="s2">;</span>
+            <span class="s2">continue;</span>
+          <span class="s1">}</span>
+
+          <span class="s2">long </span><span class="s1">eventCookie =</span>
+              <span class="s1">getEventCookie(event.getViewTag()</span><span class="s2">, </span><span class="s1">event.getEventName()</span><span class="s2">, </span><span class="s1">event.getCoalescingKey())</span><span class="s2">;</span>
+
+          <span class="s1">Event eventToAdd = </span><span class="s2">null;</span>
+          <span class="s1">Event eventToDispose = </span><span class="s2">null;</span>
+          <span class="s1">Integer lastEventIdx = mEventCookieToLastEventIdx.get(eventCookie)</span><span class="s2">;</span>
+
+          <span class="s2">if </span><span class="s1">(lastEventIdx == </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s1">eventToAdd = event</span><span class="s2">;</span>
+            <span class="s1">mEventCookieToLastEventIdx.put(eventCookie</span><span class="s2">, </span><span class="s1">mEventsToDispatchSize)</span><span class="s2">;</span>
+          <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s1">Event lastEvent = mEventsToDispatch[lastEventIdx]</span><span class="s2">;</span>
+            <span class="s1">Event coalescedEvent = event.coalesce(lastEvent)</span><span class="s2">;</span>
+            <span class="s2">if </span><span class="s1">(coalescedEvent != lastEvent) {</span>
+              <span class="s1">eventToAdd = coalescedEvent</span><span class="s2">;</span>
+              <span class="s1">mEventCookieToLastEventIdx.put(eventCookie</span><span class="s2">, </span><span class="s1">mEventsToDispatchSize)</span><span class="s2">;</span>
+              <span class="s1">eventToDispose = lastEvent</span><span class="s2">;</span>
+              <span class="s1">mEventsToDispatch[lastEventIdx] = </span><span class="s2">null;</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+              <span class="s1">eventToDispose = event</span><span class="s2">;</span>
+            <span class="s1">}</span>
+          <span class="s1">}</span>
+
+          <span class="s2">if </span><span class="s1">(eventToAdd != </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s1">addEventToEventsToDispatch(eventToAdd)</span><span class="s2">;</span>
+          <span class="s1">}</span>
+          <span class="s2">if </span><span class="s1">(eventToDispose != </span><span class="s2">null</span><span class="s1">) {</span>
+            <span class="s1">eventToDispose.dispose()</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s1">mEventStaging.clear()</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private long </span><span class="s1">getEventCookie(</span><span class="s2">int </span><span class="s1">viewTag</span><span class="s2">, </span><span class="s1">String eventName</span><span class="s2">, short </span><span class="s1">coalescingKey) {</span>
+    <span class="s2">short </span><span class="s1">eventTypeId</span><span class="s2">;</span>
+    <span class="s1">Short eventIdObj = mEventNameToEventId.get(eventName)</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(eventIdObj != </span><span class="s2">null</span><span class="s1">) {</span>
+      <span class="s1">eventTypeId = eventIdObj</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">eventTypeId = mNextEventTypeId++</span><span class="s2">;</span>
+      <span class="s1">mEventNameToEventId.put(eventName</span><span class="s2">, </span><span class="s1">eventTypeId)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">getEventCookie(viewTag</span><span class="s2">, </span><span class="s1">eventTypeId</span><span class="s2">, </span><span class="s1">coalescingKey)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private static long </span><span class="s1">getEventCookie(</span><span class="s2">int </span><span class="s1">viewTag</span><span class="s2">, short </span><span class="s1">eventTypeId</span><span class="s2">, short </span><span class="s1">coalescingKey) {</span>
+    <span class="s2">return </span><span class="s1">viewTag</span>
+        <span class="s1">| (((</span><span class="s2">long</span><span class="s1">) eventTypeId) &amp; </span><span class="s6">0xffff</span><span class="s1">) &lt;&lt; </span><span class="s6">32</span>
+        <span class="s1">| (((</span><span class="s2">long</span><span class="s1">) coalescingKey) &amp; </span><span class="s6">0xffff</span><span class="s1">) &lt;&lt; </span><span class="s6">48</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">registerEventEmitter(@UIManagerType </span><span class="s2">int </span><span class="s1">uiManagerType</span><span class="s2">, </span><span class="s1">RCTEventEmitter eventEmitter) {</span>
+    <span class="s1">mReactEventEmitter.register(uiManagerType</span><span class="s2">, </span><span class="s1">eventEmitter)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">registerEventEmitter(</span>
+      <span class="s1">@UIManagerType </span><span class="s2">int </span><span class="s1">uiManagerType</span><span class="s2">, </span><span class="s1">RCTModernEventEmitter eventEmitter) {</span>
+    <span class="s1">mReactEventEmitter.register(uiManagerType</span><span class="s2">, </span><span class="s1">eventEmitter)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">unregisterEventEmitter(@UIManagerType </span><span class="s2">int </span><span class="s1">uiManagerType) {</span>
+    <span class="s1">mReactEventEmitter.unregister(uiManagerType)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">ScheduleDispatchFrameCallback </span><span class="s2">extends </span><span class="s1">ChoreographerCompat.FrameCallback {</span>
+    <span class="s2">private volatile boolean </span><span class="s1">mIsPosted = </span><span class="s2">false;</span>
+    <span class="s2">private boolean </span><span class="s1">mShouldStop = </span><span class="s2">false;</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">doFrame(</span><span class="s2">long </span><span class="s1">frameTimeNanos) {</span>
+      <span class="s1">UiThreadUtil.assertOnUiThread()</span><span class="s2">;</span>
+
+      <span class="s2">if </span><span class="s1">(mShouldStop) {</span>
+        <span class="s1">mIsPosted = </span><span class="s2">false;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">post()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s1">Systrace.beginSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;ScheduleDispatchFrameCallback&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">moveStagedEventsToDispatchQueue()</span><span class="s2">;</span>
+
+        <span class="s2">if </span><span class="s1">(!mHasDispatchScheduled) {</span>
+          <span class="s1">mHasDispatchScheduled = </span><span class="s2">true;</span>
+          <span class="s1">Systrace.startAsyncFlow(</span>
+              <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+              <span class="s7">&quot;ScheduleDispatchFrameCallback&quot;</span><span class="s2">,</span>
+              <span class="s1">mHasDispatchScheduledCount.get())</span><span class="s2">;</span>
+          <span class="s1">mReactContext.runOnJSQueueThread(mDispatchEventsRunnable)</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+        <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public void </span><span class="s1">stop() {</span>
+      <span class="s1">mShouldStop = </span><span class="s2">true;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public void </span><span class="s1">maybePost() {</span>
+      <span class="s2">if </span><span class="s1">(!mIsPosted) {</span>
+        <span class="s1">mIsPosted = </span><span class="s2">true;</span>
+        <span class="s1">post()</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s2">private void </span><span class="s1">post() {</span>
+      <span class="s1">ReactChoreographer.getInstance()</span>
+          <span class="s1">.postFrameCallback(ReactChoreographer.CallbackType.TIMERS_EVENTS</span><span class="s2">, </span><span class="s1">mCurrentFrameCallback)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+
+    <span class="s2">public void </span><span class="s1">maybePostFromNonUI() {</span>
+      <span class="s2">if </span><span class="s1">(mIsPosted) {</span>
+        <span class="s2">return;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// We should only hit this slow path when we receive events while the host activity is paused.</span>
+      <span class="s2">if </span><span class="s1">(mReactContext.isOnUiQueueThread()) {</span>
+        <span class="s1">maybePost()</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">mReactContext.runOnUiQueueThread(</span>
+            <span class="s2">new </span><span class="s1">Runnable() {</span>
+              <span class="s1">@Override</span>
+              <span class="s2">public void </span><span class="s1">run() {</span>
+                <span class="s1">maybePost()</span><span class="s2">;</span>
+              <span class="s1">}</span>
+            <span class="s1">})</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private class </span><span class="s1">DispatchEventsRunnable </span><span class="s2">implements </span><span class="s1">Runnable {</span>
+
+    <span class="s1">@Override</span>
+    <span class="s2">public void </span><span class="s1">run() {</span>
+      <span class="s1">Systrace.beginSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s7">&quot;DispatchEventsRunnable&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">try </span><span class="s1">{</span>
+        <span class="s1">Systrace.endAsyncFlow(</span>
+            <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">,</span>
+            <span class="s7">&quot;ScheduleDispatchFrameCallback&quot;</span><span class="s2">,</span>
+            <span class="s1">mHasDispatchScheduledCount.getAndIncrement())</span><span class="s2">;</span>
+        <span class="s1">mHasDispatchScheduled = </span><span class="s2">false;</span>
+        <span class="s1">Assertions.assertNotNull(mReactEventEmitter)</span><span class="s2">;</span>
+        <span class="s2">synchronized </span><span class="s1">(mEventsToDispatchLock) {</span>
+          <span class="s2">if </span><span class="s1">(mEventsToDispatchSize &gt; </span><span class="s6">0</span><span class="s1">) {</span>
+            <span class="s0">// We avoid allocating an array and iterator, and &quot;sorting&quot; if we don't need to.</span>
+            <span class="s0">// This occurs when the size of mEventsToDispatch is zero or one.</span>
+            <span class="s2">if </span><span class="s1">(mEventsToDispatchSize &gt; </span><span class="s6">1</span><span class="s1">) {</span>
+              <span class="s1">Arrays.sort(mEventsToDispatch</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s1">mEventsToDispatchSize</span><span class="s2">, </span><span class="s1">EVENT_COMPARATOR)</span><span class="s2">;</span>
+            <span class="s1">}</span>
+            <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">eventIdx = </span><span class="s6">0</span><span class="s2">; </span><span class="s1">eventIdx &lt; mEventsToDispatchSize</span><span class="s2">; </span><span class="s1">eventIdx++) {</span>
+              <span class="s1">Event event = mEventsToDispatch[eventIdx]</span><span class="s2">;</span>
+              <span class="s0">// Event can be null if it has been coalesced into another event.</span>
+              <span class="s2">if </span><span class="s1">(event == </span><span class="s2">null</span><span class="s1">) {</span>
+                <span class="s2">continue;</span>
+              <span class="s1">}</span>
+              <span class="s1">Systrace.endAsyncFlow(</span>
+                  <span class="s1">Systrace.TRACE_TAG_REACT_JAVA_BRIDGE</span><span class="s2">, </span><span class="s1">event.getEventName()</span><span class="s2">, </span><span class="s1">event.getUniqueID())</span><span class="s2">;</span>
+
+              <span class="s1">event.dispatchModern(mReactEventEmitter)</span><span class="s2">;</span>
+              <span class="s1">event.dispose()</span><span class="s2">;</span>
+            <span class="s1">}</span>
+            <span class="s1">clearEventsToDispatch()</span><span class="s2">;</span>
+            <span class="s1">mEventCookieToLastEventIdx.clear()</span><span class="s2">;</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s2">for </span><span class="s1">(BatchEventDispatchedListener listener : mPostEventDispatchListeners) {</span>
+          <span class="s1">listener.onBatchEventDispatched()</span><span class="s2">;</span>
+        <span class="s1">}</span>
+      <span class="s1">} </span><span class="s2">finally </span><span class="s1">{</span>
+        <span class="s1">Systrace.endSection(Systrace.TRACE_TAG_REACT_JAVA_BRIDGE)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">addEventToEventsToDispatch(Event event) {</span>
+    <span class="s2">if </span><span class="s1">(mEventsToDispatchSize == mEventsToDispatch.length) {</span>
+      <span class="s1">mEventsToDispatch = Arrays.copyOf(mEventsToDispatch</span><span class="s2">, </span><span class="s6">2 </span><span class="s1">* mEventsToDispatch.length)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+    <span class="s1">mEventsToDispatch[mEventsToDispatchSize++] = event</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">clearEventsToDispatch() {</span>
+    <span class="s1">Arrays.fill(mEventsToDispatch</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s1">mEventsToDispatchSize</span><span class="s2">, null</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">mEventsToDispatchSize = </span><span class="s6">0</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

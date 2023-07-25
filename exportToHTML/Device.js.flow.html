@@ -1,0 +1,665 @@
+<html>
+<head>
+<title>Device.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Device.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">DebuggerRequest,</span>
+  <span class="s0">ErrorResponse,</span>
+  <span class="s0">GetScriptSourceRequest,</span>
+  <span class="s0">GetScriptSourceResponse,</span>
+  <span class="s0">MessageFromDevice,</span>
+  <span class="s0">MessageToDevice,</span>
+  <span class="s0">Page,</span>
+  <span class="s0">SetBreakpointByUrlRequest,</span>
+<span class="s0">} from './types';</span>
+
+<span class="s0">import * as fs from 'fs';</span>
+<span class="s0">import * as path from 'path';</span>
+<span class="s0">import fetch from 'node-fetch';</span>
+<span class="s0">import WS from 'ws';</span>
+
+<span class="s0">const debug = require('debug')('Metro:InspectorProxy');</span>
+
+<span class="s0">const PAGES_POLLING_INTERVAL = 1000;</span>
+
+<span class="s0">// Android's stock emulator and other emulators such as genymotion use a standard localhost alias.</span>
+<span class="s0">const EMULATOR_LOCALHOST_ADDRESSES: Array&lt;string&gt; = ['10.0.2.2', '10.0.3.2'];</span>
+
+<span class="s0">// Prefix for script URLs that are alphanumeric IDs. See comment in _processMessageFromDevice method for</span>
+<span class="s0">// more details.</span>
+<span class="s0">const FILE_PREFIX = 'file://';</span>
+
+<span class="s0">type DebuggerInfo = {</span>
+  <span class="s0">// Debugger web socket connection</span>
+  <span class="s0">socket: typeof WS,</span>
+  <span class="s0">// If we replaced address (like '10.0.2.2') to localhost we need to store original</span>
+  <span class="s0">// address because Chrome uses URL or urlRegex params (instead of scriptId) to set breakpoints.</span>
+  <span class="s0">originalSourceURLAddress?: string,</span>
+  <span class="s0">prependedFilePrefix: boolean,</span>
+  <span class="s0">pageId: string,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+
+<span class="s0">const REACT_NATIVE_RELOADABLE_PAGE_ID = '-1';</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Device class represents single device connection to Inspector Proxy. Each device</span>
+ <span class="s0">* can have multiple inspectable pages.</span>
+ <span class="s0">*/</span>
+<span class="s0">class Device {</span>
+  <span class="s0">// ID of the device.</span>
+  <span class="s0">_id: string;</span>
+
+  <span class="s0">// Name of the device.</span>
+  <span class="s0">_name: string;</span>
+
+  <span class="s0">// Package name of the app.</span>
+  <span class="s0">_app: string;</span>
+
+  <span class="s0">// Stores socket connection between Inspector Proxy and device.</span>
+  <span class="s0">_deviceSocket: typeof WS;</span>
+
+  <span class="s0">// Stores last list of device's pages.</span>
+  <span class="s0">_pages: Array&lt;Page&gt;;</span>
+
+  <span class="s0">// Stores information about currently connected debugger (if any).</span>
+  <span class="s0">_debuggerConnection: ?DebuggerInfo = null;</span>
+
+  <span class="s0">// Last known Page ID of the React Native page.</span>
+  <span class="s0">// This is used by debugger connections that don't have PageID specified</span>
+  <span class="s0">// (and will interact with the latest React Native page).</span>
+  <span class="s0">_lastConnectedReactNativePage: ?Page = null;</span>
+
+  <span class="s0">// Whether we are in the middle of a reload in the REACT_NATIVE_RELOADABLE_PAGE.</span>
+  <span class="s0">_isReloading: boolean = false;</span>
+
+  <span class="s0">// The previous &quot;GetPages&quot; message, for deduplication in debug logs.</span>
+  <span class="s0">_lastGetPagesMessage: string = '';</span>
+
+  <span class="s0">// Mapping built from scriptParsed events and used to fetch file content in `Debugger.getScriptSource`.</span>
+  <span class="s0">_scriptIdToSourcePathMapping: Map&lt;string, string&gt; = new Map();</span>
+
+  <span class="s0">// Root of the project used for relative to absolute source path conversion.</span>
+  <span class="s0">_projectRoot: string;</span>
+
+  <span class="s0">constructor(</span>
+    <span class="s0">id: string,</span>
+    <span class="s0">name: string,</span>
+    <span class="s0">app: string,</span>
+    <span class="s0">socket: typeof WS,</span>
+    <span class="s0">projectRoot: string,</span>
+  <span class="s0">) {</span>
+    <span class="s0">this._id = id;</span>
+    <span class="s0">this._name = name;</span>
+    <span class="s0">this._app = app;</span>
+    <span class="s0">this._pages = [];</span>
+    <span class="s0">this._deviceSocket = socket;</span>
+    <span class="s0">this._projectRoot = projectRoot;</span>
+
+    <span class="s0">this._deviceSocket.on('message', (message: string) =&gt; {</span>
+      <span class="s0">const parsedMessage = JSON.parse(message);</span>
+      <span class="s0">if (parsedMessage.event === 'getPages') {</span>
+        <span class="s0">// There's a 'getPages' message every second, so only show them if they change</span>
+        <span class="s0">if (message !== this._lastGetPagesMessage) {</span>
+          <span class="s0">debug(</span>
+            <span class="s0">'(Debugger)    (Proxy) &lt;- (Device), getPages ping has changed: ' +</span>
+              <span class="s0">message,</span>
+          <span class="s0">);</span>
+          <span class="s0">this._lastGetPagesMessage = message;</span>
+        <span class="s0">}</span>
+      <span class="s0">} else {</span>
+        <span class="s0">debug('(Debugger)    (Proxy) &lt;- (Device): ' + message);</span>
+      <span class="s0">}</span>
+      <span class="s0">this._handleMessageFromDevice(parsedMessage);</span>
+    <span class="s0">});</span>
+    <span class="s0">this._deviceSocket.on('close', () =&gt; {</span>
+      <span class="s0">// Device disconnected - close debugger connection.</span>
+      <span class="s0">if (this._debuggerConnection) {</span>
+        <span class="s0">this._debuggerConnection.socket.close();</span>
+        <span class="s0">this._debuggerConnection = null;</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+
+    <span class="s0">this._setPagesPolling();</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getName(): string {</span>
+    <span class="s0">return this._name;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getApp(): string {</span>
+    <span class="s0">return this._app;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">getPagesList(): Array&lt;Page&gt; {</span>
+    <span class="s0">if (this._lastConnectedReactNativePage) {</span>
+      <span class="s0">const reactNativeReloadablePage = {</span>
+        <span class="s0">id: REACT_NATIVE_RELOADABLE_PAGE_ID,</span>
+        <span class="s0">title: 'React Native Experimental (Improved Chrome Reloads)',</span>
+        <span class="s0">vm: &quot;don't use&quot;,</span>
+        <span class="s0">app: this._app,</span>
+      <span class="s0">};</span>
+      <span class="s0">return this._pages.concat(reactNativeReloadablePage);</span>
+    <span class="s0">} else {</span>
+      <span class="s0">return this._pages;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Handles new debugger connection to this device:</span>
+  <span class="s0">// 1. Sends connect event to device</span>
+  <span class="s0">// 2. Forwards all messages from the debugger to device as wrappedEvent</span>
+  <span class="s0">// 3. Sends disconnect event to device when debugger connection socket closes.</span>
+  <span class="s0">handleDebuggerConnection(socket: typeof WS, pageId: string) {</span>
+    <span class="s0">// Disconnect current debugger if we already have debugger connected.</span>
+    <span class="s0">if (this._debuggerConnection) {</span>
+      <span class="s0">this._debuggerConnection.socket.close();</span>
+      <span class="s0">this._debuggerConnection = null;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const debuggerInfo = {</span>
+      <span class="s0">socket,</span>
+      <span class="s0">prependedFilePrefix: false,</span>
+      <span class="s0">pageId,</span>
+    <span class="s0">};</span>
+    <span class="s0">this._debuggerConnection = debuggerInfo;</span>
+
+    <span class="s0">debug(`Got new debugger connection for page ${pageId} of ${this._name}`);</span>
+
+    <span class="s0">this._sendMessageToDevice({</span>
+      <span class="s0">event: 'connect',</span>
+      <span class="s0">payload: {</span>
+        <span class="s0">pageId: this._mapToDevicePageId(pageId),</span>
+      <span class="s0">},</span>
+    <span class="s0">});</span>
+
+    <span class="s0">socket.on('message', (message: string) =&gt; {</span>
+      <span class="s0">debug('(Debugger) -&gt; (Proxy)    (Device): ' + message);</span>
+      <span class="s0">const debuggerRequest = JSON.parse(message);</span>
+      <span class="s0">const handled = this._interceptMessageFromDebugger(</span>
+        <span class="s0">debuggerRequest,</span>
+        <span class="s0">debuggerInfo,</span>
+        <span class="s0">socket,</span>
+      <span class="s0">);</span>
+
+      <span class="s0">if (!handled) {</span>
+        <span class="s0">this._sendMessageToDevice({</span>
+          <span class="s0">event: 'wrappedEvent',</span>
+          <span class="s0">payload: {</span>
+            <span class="s0">pageId: this._mapToDevicePageId(pageId),</span>
+            <span class="s0">wrappedEvent: JSON.stringify(debuggerRequest),</span>
+          <span class="s0">},</span>
+        <span class="s0">});</span>
+      <span class="s0">}</span>
+    <span class="s0">});</span>
+    <span class="s0">socket.on('close', () =&gt; {</span>
+      <span class="s0">debug(`Debugger for page ${pageId} and ${this._name} disconnected.`);</span>
+      <span class="s0">this._sendMessageToDevice({</span>
+        <span class="s0">event: 'disconnect',</span>
+        <span class="s0">payload: {</span>
+          <span class="s0">pageId: this._mapToDevicePageId(pageId),</span>
+        <span class="s0">},</span>
+      <span class="s0">});</span>
+      <span class="s0">this._debuggerConnection = null;</span>
+    <span class="s0">});</span>
+
+    <span class="s0">const sendFunc = socket.send;</span>
+    <span class="s0">socket.send = function (message: string) {</span>
+      <span class="s0">debug('(Debugger) &lt;- (Proxy)    (Device): ' + message);</span>
+      <span class="s0">return sendFunc.call(socket, message);</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* Handles cleaning up a duplicate device connection, by client-side device ID.</span>
+   <span class="s0">* 1. Checks if the same device is attempting to reconnect for the same app.</span>
+   <span class="s0">* 2. If not, close both the device and debugger socket.</span>
+   <span class="s0">* 3. If the debugger connection can be reused, close the device socket only.</span>
+   <span class="s0">*</span>
+   <span class="s0">* This allows users to reload the app, either as result of a crash, or manually</span>
+   <span class="s0">* reloading, without having to restart the debugger.</span>
+   <span class="s0">*/</span>
+  <span class="s0">handleDuplicateDeviceConnection(newDevice: Device) {</span>
+    <span class="s0">if (</span>
+      <span class="s0">this._app !== newDevice.getApp() ||</span>
+      <span class="s0">this._name !== newDevice.getName()</span>
+    <span class="s0">) {</span>
+      <span class="s0">this._deviceSocket.close();</span>
+      <span class="s0">this._debuggerConnection?.socket.close();</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const oldDebugger = this._debuggerConnection;</span>
+    <span class="s0">this._debuggerConnection = null;</span>
+
+    <span class="s0">if (oldDebugger) {</span>
+      <span class="s0">oldDebugger.socket.removeAllListeners();</span>
+      <span class="s0">this._deviceSocket.close();</span>
+      <span class="s0">newDevice.handleDebuggerConnection(</span>
+        <span class="s0">oldDebugger.socket,</span>
+        <span class="s0">oldDebugger.pageId,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Handles messages received from device:</span>
+  <span class="s0">// 1. For getPages responses updates local _pages list.</span>
+  <span class="s0">// 2. All other messages are forwarded to debugger as wrappedEvent.</span>
+  <span class="s0">//</span>
+  <span class="s0">// In the future more logic will be added to this method for modifying</span>
+  <span class="s0">// some of the messages (like updating messages with source maps and file</span>
+  <span class="s0">// locations).</span>
+  <span class="s0">_handleMessageFromDevice(message: MessageFromDevice) {</span>
+    <span class="s0">if (message.event === 'getPages') {</span>
+      <span class="s0">this._pages = message.payload;</span>
+
+      <span class="s0">// Check if device have new React Native page.</span>
+      <span class="s0">// There is usually no more than 2-3 pages per device so this operation</span>
+      <span class="s0">// is not expensive.</span>
+      <span class="s0">// TODO(hypuk): It is better for VM to send update event when new page is</span>
+      <span class="s0">// created instead of manually checking this on every getPages result.</span>
+      <span class="s0">for (let i = 0; i &lt; this._pages.length; ++i) {</span>
+        <span class="s0">if (this._pages[i].title.indexOf('React') &gt;= 0) {</span>
+          <span class="s0">if (this._pages[i].id != this._lastConnectedReactNativePage?.id) {</span>
+            <span class="s0">this._newReactNativePage(this._pages[i]);</span>
+            <span class="s0">break;</span>
+          <span class="s0">}</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">} else if (message.event === 'disconnect') {</span>
+      <span class="s0">// Device sends disconnect events only when page is reloaded or</span>
+      <span class="s0">// if debugger socket was disconnected.</span>
+      <span class="s0">const pageId = message.payload.pageId;</span>
+      <span class="s0">const debuggerSocket = this._debuggerConnection</span>
+        <span class="s0">? this._debuggerConnection.socket</span>
+        <span class="s0">: null;</span>
+      <span class="s0">if (debuggerSocket &amp;&amp; debuggerSocket.readyState === WS.OPEN) {</span>
+        <span class="s0">if (</span>
+          <span class="s0">this._debuggerConnection != null &amp;&amp;</span>
+          <span class="s0">this._debuggerConnection.pageId !== REACT_NATIVE_RELOADABLE_PAGE_ID</span>
+        <span class="s0">) {</span>
+          <span class="s0">debug(`Page ${pageId} is reloading.`);</span>
+          <span class="s0">debuggerSocket.send(JSON.stringify({method: 'reload'}));</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">} else if (message.event === 'wrappedEvent') {</span>
+      <span class="s0">if (this._debuggerConnection == null) {</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">// FIXME: Is it possible that we received message for pageID that does not</span>
+      <span class="s0">// correspond to current debugger connection?</span>
+
+      <span class="s0">const debuggerSocket = this._debuggerConnection.socket;</span>
+      <span class="s0">if (debuggerSocket == null || debuggerSocket.readyState !== WS.OPEN) {</span>
+        <span class="s0">// TODO(hypuk): Send error back to device?</span>
+        <span class="s0">return;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">const parsedPayload = JSON.parse(message.payload.wrappedEvent);</span>
+
+      <span class="s0">if (this._debuggerConnection) {</span>
+        <span class="s0">// Wrapping just to make flow happy :)</span>
+        <span class="s0">// $FlowFixMe[unused-promise]</span>
+        <span class="s0">this._processMessageFromDevice(</span>
+          <span class="s0">parsedPayload,</span>
+          <span class="s0">this._debuggerConnection,</span>
+        <span class="s0">).then(() =&gt; {</span>
+          <span class="s0">const messageToSend = JSON.stringify(parsedPayload);</span>
+          <span class="s0">debuggerSocket.send(messageToSend);</span>
+        <span class="s0">});</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Sends single message to device.</span>
+  <span class="s0">_sendMessageToDevice(message: MessageToDevice) {</span>
+    <span class="s0">try {</span>
+      <span class="s0">if (message.event !== 'getPages') {</span>
+        <span class="s0">debug('(Debugger)    (Proxy) -&gt; (Device): ' + JSON.stringify(message));</span>
+      <span class="s0">}</span>
+      <span class="s0">this._deviceSocket.send(JSON.stringify(message));</span>
+    <span class="s0">} catch (error) {}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Sends 'getPages' request to device every PAGES_POLLING_INTERVAL milliseconds.</span>
+  <span class="s0">_setPagesPolling() {</span>
+    <span class="s0">setInterval(</span>
+      <span class="s0">() =&gt; this._sendMessageToDevice({event: 'getPages'}),</span>
+      <span class="s0">PAGES_POLLING_INTERVAL,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// We received new React Native Page ID.</span>
+  <span class="s0">_newReactNativePage(page: Page) {</span>
+    <span class="s0">debug(`React Native page updated to ${page.id}`);</span>
+    <span class="s0">if (</span>
+      <span class="s0">this._debuggerConnection == null ||</span>
+      <span class="s0">this._debuggerConnection.pageId !== REACT_NATIVE_RELOADABLE_PAGE_ID</span>
+    <span class="s0">) {</span>
+      <span class="s0">// We can just remember new page ID without any further actions if no</span>
+      <span class="s0">// debugger is currently attached or attached debugger is not</span>
+      <span class="s0">// &quot;Reloadable React Native&quot; connection.</span>
+      <span class="s0">this._lastConnectedReactNativePage = page;</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+    <span class="s0">const oldPageId = this._lastConnectedReactNativePage?.id;</span>
+    <span class="s0">this._lastConnectedReactNativePage = page;</span>
+    <span class="s0">this._isReloading = true;</span>
+
+    <span class="s0">// We already had a debugger connected to React Native page and a</span>
+    <span class="s0">// new one appeared - in this case we need to emulate execution context</span>
+    <span class="s0">// detroy and resend Debugger.enable and Runtime.enable commands to new</span>
+    <span class="s0">// page.</span>
+
+    <span class="s0">if (oldPageId != null) {</span>
+      <span class="s0">this._sendMessageToDevice({</span>
+        <span class="s0">event: 'disconnect',</span>
+        <span class="s0">payload: {</span>
+          <span class="s0">pageId: oldPageId,</span>
+        <span class="s0">},</span>
+      <span class="s0">});</span>
+    <span class="s0">}</span>
+
+    <span class="s0">this._sendMessageToDevice({</span>
+      <span class="s0">event: 'connect',</span>
+      <span class="s0">payload: {</span>
+        <span class="s0">pageId: page.id,</span>
+      <span class="s0">},</span>
+    <span class="s0">});</span>
+
+    <span class="s0">const toSend = [</span>
+      <span class="s0">{method: 'Runtime.enable', id: 1e9},</span>
+      <span class="s0">{method: 'Debugger.enable', id: 1e9},</span>
+    <span class="s0">];</span>
+
+    <span class="s0">for (const message of toSend) {</span>
+      <span class="s0">this._sendMessageToDevice({</span>
+        <span class="s0">event: 'wrappedEvent',</span>
+        <span class="s0">payload: {</span>
+          <span class="s0">pageId: this._mapToDevicePageId(page.id),</span>
+          <span class="s0">wrappedEvent: JSON.stringify(message),</span>
+        <span class="s0">},</span>
+      <span class="s0">});</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Allows to make changes in incoming message from device.</span>
+  <span class="s0">async _processMessageFromDevice(</span>
+    <span class="s0">payload: {method: string, params: {sourceMapURL: string, url: string}},</span>
+    <span class="s0">debuggerInfo: DebuggerInfo,</span>
+  <span class="s0">) {</span>
+    <span class="s0">// Replace Android addresses for scriptParsed event.</span>
+    <span class="s0">if (payload.method === 'Debugger.scriptParsed') {</span>
+      <span class="s0">const params = payload.params || {};</span>
+      <span class="s0">if ('sourceMapURL' in params) {</span>
+        <span class="s0">for (let i = 0; i &lt; EMULATOR_LOCALHOST_ADDRESSES.length; ++i) {</span>
+          <span class="s0">const address = EMULATOR_LOCALHOST_ADDRESSES[i];</span>
+          <span class="s0">if (params.sourceMapURL.indexOf(address) &gt;= 0) {</span>
+            <span class="s0">payload.params.sourceMapURL = params.sourceMapURL.replace(</span>
+              <span class="s0">address,</span>
+              <span class="s0">'localhost',</span>
+            <span class="s0">);</span>
+            <span class="s0">debuggerInfo.originalSourceURLAddress = address;</span>
+          <span class="s0">}</span>
+        <span class="s0">}</span>
+
+        <span class="s0">const sourceMapURL = this._tryParseHTTPURL(params.sourceMapURL);</span>
+        <span class="s0">if (sourceMapURL) {</span>
+          <span class="s0">// Some debug clients do not support fetching HTTP URLs. If the</span>
+          <span class="s0">// message headed to the debug client identifies the source map with</span>
+          <span class="s0">// an HTTP URL, fetch the content here and convert the content to a</span>
+          <span class="s0">// Data URL (which is more widely supported) before passing the</span>
+          <span class="s0">// message to the debug client.</span>
+          <span class="s0">try {</span>
+            <span class="s0">const sourceMap = await this._fetchText(sourceMapURL);</span>
+            <span class="s0">payload.params.sourceMapURL =</span>
+              <span class="s0">'data:application/json;charset=utf-8;base64,' +</span>
+              <span class="s0">new Buffer(sourceMap).toString('base64');</span>
+          <span class="s0">} catch (exception) {</span>
+            <span class="s0">this._sendErrorToDebugger(</span>
+              <span class="s0">`Failed to fetch source map ${params.sourceMapURL}: ${exception.message}`,</span>
+            <span class="s0">);</span>
+          <span class="s0">}</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+      <span class="s0">if ('url' in params) {</span>
+        <span class="s0">for (let i = 0; i &lt; EMULATOR_LOCALHOST_ADDRESSES.length; ++i) {</span>
+          <span class="s0">const address = EMULATOR_LOCALHOST_ADDRESSES[i];</span>
+          <span class="s0">if (params.url.indexOf(address) &gt;= 0) {</span>
+            <span class="s0">payload.params.url = params.url.replace(address, 'localhost');</span>
+            <span class="s0">debuggerInfo.originalSourceURLAddress = address;</span>
+          <span class="s0">}</span>
+        <span class="s0">}</span>
+
+        <span class="s0">// Chrome doesn't download source maps if URL param is not a valid</span>
+        <span class="s0">// URL. Some frameworks pass alphanumeric script ID instead of URL which causes</span>
+        <span class="s0">// Chrome to not download source maps. In this case we want to prepend script ID</span>
+        <span class="s0">// with 'file://' prefix.</span>
+        <span class="s0">if (payload.params.url.match(/^[0-9a-z]+$/)) {</span>
+          <span class="s0">payload.params.url = FILE_PREFIX + payload.params.url;</span>
+          <span class="s0">debuggerInfo.prependedFilePrefix = true;</span>
+        <span class="s0">}</span>
+
+        <span class="s0">// $FlowFixMe[prop-missing]</span>
+        <span class="s0">if (params.scriptId != null) {</span>
+          <span class="s0">this._scriptIdToSourcePathMapping.set(params.scriptId, params.url);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (</span>
+      <span class="s0">payload.method === 'Runtime.executionContextCreated' &amp;&amp;</span>
+      <span class="s0">this._isReloading</span>
+    <span class="s0">) {</span>
+      <span class="s0">// The new context is ready. First notify Chrome that we've reloaded so</span>
+      <span class="s0">// it'll resend its breakpoints. If we do this earlier, we may not be</span>
+      <span class="s0">// ready to receive them.</span>
+      <span class="s0">debuggerInfo.socket.send(</span>
+        <span class="s0">JSON.stringify({method: 'Runtime.executionContextsCleared'}),</span>
+      <span class="s0">);</span>
+
+      <span class="s0">// The VM starts in a paused mode. Ask it to resume.</span>
+      <span class="s0">// Note that if setting breakpoints in early initialization functions,</span>
+      <span class="s0">// there's a currently race condition between these functions executing</span>
+      <span class="s0">// and Chrome re-applying the breakpoints due to the message above.</span>
+      <span class="s0">//</span>
+      <span class="s0">// This is not an issue in VSCode/Nuclide where the IDE knows to resume</span>
+      <span class="s0">// at its convenience.</span>
+      <span class="s0">this._sendMessageToDevice({</span>
+        <span class="s0">event: 'wrappedEvent',</span>
+        <span class="s0">payload: {</span>
+          <span class="s0">pageId: this._mapToDevicePageId(debuggerInfo.pageId),</span>
+          <span class="s0">wrappedEvent: JSON.stringify({method: 'Debugger.resume', id: 0}),</span>
+        <span class="s0">},</span>
+      <span class="s0">});</span>
+
+      <span class="s0">this._isReloading = false;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Allows to make changes in incoming messages from debugger. Returns a boolean</span>
+  <span class="s0">// indicating whether the message has been handled locally (i.e. does not need</span>
+  <span class="s0">// to be forwarded to the target).</span>
+  <span class="s0">_interceptMessageFromDebugger(</span>
+    <span class="s0">req: DebuggerRequest,</span>
+    <span class="s0">debuggerInfo: DebuggerInfo,</span>
+    <span class="s0">socket: typeof WS,</span>
+  <span class="s0">): boolean {</span>
+    <span class="s0">if (req.method === 'Debugger.setBreakpointByUrl') {</span>
+      <span class="s0">this._processDebuggerSetBreakpointByUrl(req, debuggerInfo);</span>
+    <span class="s0">} else if (req.method === 'Debugger.getScriptSource') {</span>
+      <span class="s0">this._processDebuggerGetScriptSource(req, socket);</span>
+      <span class="s0">return true;</span>
+    <span class="s0">}</span>
+    <span class="s0">return false;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_processDebuggerSetBreakpointByUrl(</span>
+    <span class="s0">req: SetBreakpointByUrlRequest,</span>
+    <span class="s0">debuggerInfo: DebuggerInfo,</span>
+  <span class="s0">) {</span>
+    <span class="s0">// If we replaced Android emulator's address to localhost we need to change it back.</span>
+    <span class="s0">if (debuggerInfo.originalSourceURLAddress) {</span>
+      <span class="s0">if (req.params.url) {</span>
+        <span class="s0">req.params.url = req.params.url.replace(</span>
+          <span class="s0">'localhost',</span>
+          <span class="s0">debuggerInfo.originalSourceURLAddress,</span>
+        <span class="s0">);</span>
+
+        <span class="s0">if (</span>
+          <span class="s0">req.params.url &amp;&amp;</span>
+          <span class="s0">req.params.url.startsWith(FILE_PREFIX) &amp;&amp;</span>
+          <span class="s0">debuggerInfo.prependedFilePrefix</span>
+        <span class="s0">) {</span>
+          <span class="s0">// Remove fake URL prefix if we modified URL in _processMessageFromDevice.</span>
+          <span class="s0">// $FlowFixMe[incompatible-use]</span>
+          <span class="s0">req.params.url = req.params.url.slice(FILE_PREFIX.length);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+      <span class="s0">if (req.params.urlRegex) {</span>
+        <span class="s0">req.params.urlRegex = req.params.urlRegex.replace(</span>
+          <span class="s0">/localhost/g,</span>
+          <span class="s0">// $FlowFixMe[incompatible-call]</span>
+          <span class="s0">debuggerInfo.originalSourceURLAddress,</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_processDebuggerGetScriptSource(</span>
+    <span class="s0">req: GetScriptSourceRequest,</span>
+    <span class="s0">socket: typeof WS,</span>
+  <span class="s0">) {</span>
+    <span class="s0">const sendSuccessResponse = (scriptSource: string) =&gt; {</span>
+      <span class="s0">const result: GetScriptSourceResponse = {scriptSource};</span>
+      <span class="s0">socket.send(JSON.stringify({id: req.id, result}));</span>
+    <span class="s0">};</span>
+    <span class="s0">const sendErrorResponse = (error: string) =&gt; {</span>
+      <span class="s0">// Tell the client that the request failed</span>
+      <span class="s0">const result: ErrorResponse = {error: {message: error}};</span>
+      <span class="s0">socket.send(JSON.stringify({id: req.id, result}));</span>
+
+      <span class="s0">// Send to the console as well, so the user can see it</span>
+      <span class="s0">this._sendErrorToDebugger(error);</span>
+    <span class="s0">};</span>
+
+    <span class="s0">const pathToSource = this._scriptIdToSourcePathMapping.get(</span>
+      <span class="s0">req.params.scriptId,</span>
+    <span class="s0">);</span>
+    <span class="s0">if (pathToSource) {</span>
+      <span class="s0">const httpURL = this._tryParseHTTPURL(pathToSource);</span>
+      <span class="s0">if (httpURL) {</span>
+        <span class="s0">this._fetchText(httpURL).then(</span>
+          <span class="s0">text =&gt; sendSuccessResponse(text),</span>
+          <span class="s0">err =&gt;</span>
+            <span class="s0">sendErrorResponse(</span>
+              <span class="s0">`Failed to fetch source url ${pathToSource}: ${err.message}`,</span>
+            <span class="s0">),</span>
+        <span class="s0">);</span>
+      <span class="s0">} else {</span>
+        <span class="s0">let file;</span>
+        <span class="s0">try {</span>
+          <span class="s0">file = fs.readFileSync(</span>
+            <span class="s0">path.resolve(this._projectRoot, pathToSource),</span>
+            <span class="s0">'utf8',</span>
+          <span class="s0">);</span>
+        <span class="s0">} catch (err) {</span>
+          <span class="s0">sendErrorResponse(</span>
+            <span class="s0">`Failed to fetch source file ${pathToSource}: ${err.message}`,</span>
+          <span class="s0">);</span>
+        <span class="s0">}</span>
+        <span class="s0">if (file) {</span>
+          <span class="s0">sendSuccessResponse(file);</span>
+        <span class="s0">}</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_mapToDevicePageId(pageId: string): string {</span>
+    <span class="s0">if (</span>
+      <span class="s0">pageId === REACT_NATIVE_RELOADABLE_PAGE_ID &amp;&amp;</span>
+      <span class="s0">this._lastConnectedReactNativePage != null</span>
+    <span class="s0">) {</span>
+      <span class="s0">return this._lastConnectedReactNativePage.id;</span>
+    <span class="s0">} else {</span>
+      <span class="s0">return pageId;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_tryParseHTTPURL(url: string): ?URL {</span>
+    <span class="s0">let parsedURL: ?URL;</span>
+    <span class="s0">try {</span>
+      <span class="s0">parsedURL = new URL(url);</span>
+    <span class="s0">} catch {}</span>
+
+    <span class="s0">const protocol = parsedURL?.protocol;</span>
+    <span class="s0">if (protocol !== 'http:' &amp;&amp; protocol !== 'https:') {</span>
+      <span class="s0">parsedURL = undefined;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return parsedURL;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Fetch text, raising an exception if the text could not be fetched,</span>
+  <span class="s0">// or is too large.</span>
+  <span class="s0">async _fetchText(url: URL): Promise&lt;string&gt; {</span>
+    <span class="s0">if (url.hostname !== 'localhost') {</span>
+      <span class="s0">throw new Error('remote fetches not permitted');</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const response = await fetch(url);</span>
+    <span class="s0">const text = await response.text();</span>
+    <span class="s0">// Restrict the length to well below the 500MB limit for nodejs (leaving</span>
+    <span class="s0">// room some some later manipulation, e.g. base64 or wrapping in JSON)</span>
+    <span class="s0">if (text.length &gt; 350000000) {</span>
+      <span class="s0">throw new Error('file too large to fetch via HTTP');</span>
+    <span class="s0">}</span>
+    <span class="s0">return text;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_sendErrorToDebugger(message: string) {</span>
+    <span class="s0">const debuggerSocket = this._debuggerConnection?.socket;</span>
+    <span class="s0">if (debuggerSocket &amp;&amp; debuggerSocket.readyState === WS.OPEN) {</span>
+      <span class="s0">debuggerSocket.send(</span>
+        <span class="s0">JSON.stringify({</span>
+          <span class="s0">method: 'Runtime.consoleAPICalled',</span>
+          <span class="s0">params: {</span>
+            <span class="s0">args: [</span>
+              <span class="s0">{</span>
+                <span class="s0">type: 'string',</span>
+                <span class="s0">value: message,</span>
+              <span class="s0">},</span>
+            <span class="s0">],</span>
+            <span class="s0">executionContextId: 0,</span>
+            <span class="s0">type: 'error',</span>
+          <span class="s0">},</span>
+        <span class="s0">}),</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = Device;</span>
+</pre>
+</body>
+</html>

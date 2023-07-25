@@ -1,0 +1,550 @@
+<html>
+<head>
+<title>GenerateModuleH.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+GenerateModuleH.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">Nullable,</span>
+  <span class="s0">SchemaType,</span>
+  <span class="s0">NativeModuleTypeAnnotation,</span>
+  <span class="s0">NativeModuleFunctionTypeAnnotation,</span>
+  <span class="s0">NativeModulePropertyShape,</span>
+  <span class="s0">NativeModuleAliasMap,</span>
+  <span class="s0">NativeModuleEnumMap,</span>
+  <span class="s0">NativeModuleEnumMembers,</span>
+  <span class="s0">NativeModuleEnumMemberType,</span>
+<span class="s0">} from '../../CodegenSchema';</span>
+
+<span class="s0">import type {AliasResolver} from './Utils';</span>
+
+<span class="s0">const {getEnumName, toSafeCppString} = require('../Utils');</span>
+
+<span class="s0">const {</span>
+  <span class="s0">createAliasResolver,</span>
+  <span class="s0">getModules,</span>
+  <span class="s0">getAreEnumMembersInteger,</span>
+<span class="s0">} = require('./Utils');</span>
+<span class="s0">const {indent} = require('../Utils');</span>
+<span class="s0">const {unwrapNullable} = require('../../parsers/parsers-commons');</span>
+
+<span class="s0">type FilesOutput = Map&lt;string, string&gt;;</span>
+
+<span class="s0">const ModuleClassDeclarationTemplate = ({</span>
+  <span class="s0">hasteModuleName,</span>
+  <span class="s0">moduleProperties,</span>
+  <span class="s0">structs,</span>
+  <span class="s0">enums,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">moduleProperties: string[],</span>
+  <span class="s0">structs: string,</span>
+  <span class="s0">enums: string,</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `${enums}</span>
+  <span class="s0">${structs}class JSI_EXPORT ${hasteModuleName}CxxSpecJSI : public TurboModule {</span>
+<span class="s0">protected:</span>
+  <span class="s0">${hasteModuleName}CxxSpecJSI(std::shared_ptr&lt;CallInvoker&gt; jsInvoker);</span>
+
+<span class="s0">public:</span>
+  <span class="s0">${indent(moduleProperties.join('\n'), 2)}</span>
+
+<span class="s0">};`;</span>
+<span class="s0">};</span>
+
+<span class="s0">const ModuleSpecClassDeclarationTemplate = ({</span>
+  <span class="s0">hasteModuleName,</span>
+  <span class="s0">moduleName,</span>
+  <span class="s0">moduleProperties,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">hasteModuleName: string,</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">moduleProperties: string[],</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `template &lt;typename T&gt;</span>
+<span class="s0">class JSI_EXPORT ${hasteModuleName}CxxSpec : public TurboModule {</span>
+<span class="s0">public:</span>
+  <span class="s0">jsi::Value get(jsi::Runtime &amp;rt, const jsi::PropNameID &amp;propName) override {</span>
+    <span class="s0">return delegate_.get(rt, propName);</span>
+  <span class="s0">}</span>
+
+<span class="s0">protected:</span>
+  <span class="s0">${hasteModuleName}CxxSpec(std::shared_ptr&lt;CallInvoker&gt; jsInvoker)</span>
+    <span class="s0">: TurboModule(&quot;${moduleName}&quot;, jsInvoker),</span>
+      <span class="s0">delegate_(static_cast&lt;T*&gt;(this), jsInvoker) {}</span>
+
+<span class="s0">private:</span>
+  <span class="s0">class Delegate : public ${hasteModuleName}CxxSpecJSI {</span>
+  <span class="s0">public:</span>
+    <span class="s0">Delegate(T *instance, std::shared_ptr&lt;CallInvoker&gt; jsInvoker) :</span>
+      <span class="s0">${hasteModuleName}CxxSpecJSI(std::move(jsInvoker)), instance_(instance) {}</span>
+
+    <span class="s0">${indent(moduleProperties.join('\n'), 4)}</span>
+
+  <span class="s0">private:</span>
+    <span class="s0">T *instance_;</span>
+  <span class="s0">};</span>
+
+  <span class="s0">Delegate delegate_;</span>
+<span class="s0">};`;</span>
+<span class="s0">};</span>
+
+<span class="s0">const FileTemplate = ({</span>
+  <span class="s0">modules,</span>
+<span class="s0">}: $ReadOnly&lt;{</span>
+  <span class="s0">modules: string[],</span>
+<span class="s0">}&gt;) =&gt; {</span>
+  <span class="s0">return `/**</span>
+ <span class="s0">* This code was generated by [react-native-codegen](https://www.npmjs.com/package/react-native-codegen).</span>
+ <span class="s0">*</span>
+ <span class="s0">* Do not edit this file as changes may cause incorrect behavior and will be lost</span>
+ <span class="s0">* once the code is regenerated.</span>
+ <span class="s0">*</span>
+ <span class="s0">* ${'@'}generated by codegen project: GenerateModuleH.js</span>
+ <span class="s0">*/</span>
+
+<span class="s0">#pragma once</span>
+
+<span class="s0">#include &lt;ReactCommon/TurboModule.h&gt;</span>
+<span class="s0">#include &lt;react/bridging/Bridging.h&gt;</span>
+
+<span class="s0">namespace facebook {</span>
+<span class="s0">namespace react {</span>
+
+<span class="s0">${modules.join('\n\n')}</span>
+
+<span class="s0">} // namespace react</span>
+<span class="s0">} // namespace facebook</span>
+<span class="s0">`;</span>
+<span class="s0">};</span>
+
+<span class="s0">function translatePrimitiveJSTypeToCpp(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">nullableTypeAnnotation: Nullable&lt;NativeModuleTypeAnnotation&gt;,</span>
+  <span class="s0">optional: boolean,</span>
+  <span class="s0">createErrorMessage: (typeName: string) =&gt; string,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+  <span class="s0">enumMap: NativeModuleEnumMap,</span>
+<span class="s0">) {</span>
+  <span class="s0">const [typeAnnotation, nullable] = unwrapNullable&lt;NativeModuleTypeAnnotation&gt;(</span>
+    <span class="s0">nullableTypeAnnotation,</span>
+  <span class="s0">);</span>
+  <span class="s0">const isRequired = !optional &amp;&amp; !nullable;</span>
+
+  <span class="s0">let realTypeAnnotation = typeAnnotation;</span>
+  <span class="s0">if (realTypeAnnotation.type === 'TypeAliasTypeAnnotation') {</span>
+    <span class="s0">realTypeAnnotation = resolveAlias(realTypeAnnotation.name);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">function wrap(type: string) {</span>
+    <span class="s0">return isRequired ? type : `std::optional&lt;${type}&gt;`;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">switch (realTypeAnnotation.type) {</span>
+    <span class="s0">case 'ReservedTypeAnnotation':</span>
+      <span class="s0">switch (realTypeAnnotation.name) {</span>
+        <span class="s0">case 'RootTag':</span>
+          <span class="s0">return wrap('double');</span>
+        <span class="s0">default:</span>
+          <span class="s0">(realTypeAnnotation.name: empty);</span>
+          <span class="s0">throw new Error(createErrorMessage(realTypeAnnotation.name));</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'VoidTypeAnnotation':</span>
+      <span class="s0">return 'void';</span>
+    <span class="s0">case 'StringTypeAnnotation':</span>
+      <span class="s0">return wrap('jsi::String');</span>
+    <span class="s0">case 'NumberTypeAnnotation':</span>
+      <span class="s0">return wrap('double');</span>
+    <span class="s0">case 'DoubleTypeAnnotation':</span>
+      <span class="s0">return wrap('double');</span>
+    <span class="s0">case 'FloatTypeAnnotation':</span>
+      <span class="s0">return wrap('double');</span>
+    <span class="s0">case 'Int32TypeAnnotation':</span>
+      <span class="s0">return wrap('int');</span>
+    <span class="s0">case 'BooleanTypeAnnotation':</span>
+      <span class="s0">return wrap('bool');</span>
+    <span class="s0">case 'EnumDeclaration':</span>
+      <span class="s0">switch (realTypeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return getAreEnumMembersInteger(</span>
+            <span class="s0">enumMap[realTypeAnnotation.name].members,</span>
+          <span class="s0">)</span>
+            <span class="s0">? wrap('int')</span>
+            <span class="s0">: wrap('double');</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return wrap('jsi::String');</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(createErrorMessage(realTypeAnnotation.type));</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'GenericObjectTypeAnnotation':</span>
+      <span class="s0">return wrap('jsi::Object');</span>
+    <span class="s0">case 'UnionTypeAnnotation':</span>
+      <span class="s0">switch (typeAnnotation.memberType) {</span>
+        <span class="s0">case 'NumberTypeAnnotation':</span>
+          <span class="s0">return wrap('double');</span>
+        <span class="s0">case 'ObjectTypeAnnotation':</span>
+          <span class="s0">return wrap('jsi::Object');</span>
+        <span class="s0">case 'StringTypeAnnotation':</span>
+          <span class="s0">return wrap('jsi::String');</span>
+        <span class="s0">default:</span>
+          <span class="s0">throw new Error(createErrorMessage(realTypeAnnotation.type));</span>
+      <span class="s0">}</span>
+    <span class="s0">case 'ObjectTypeAnnotation':</span>
+      <span class="s0">return wrap('jsi::Object');</span>
+    <span class="s0">case 'ArrayTypeAnnotation':</span>
+      <span class="s0">return wrap('jsi::Array');</span>
+    <span class="s0">case 'FunctionTypeAnnotation':</span>
+      <span class="s0">return wrap('jsi::Function');</span>
+    <span class="s0">case 'PromiseTypeAnnotation':</span>
+      <span class="s0">return wrap('jsi::Value');</span>
+    <span class="s0">case 'MixedTypeAnnotation':</span>
+      <span class="s0">return wrap('jsi::Value');</span>
+    <span class="s0">default:</span>
+      <span class="s0">(realTypeAnnotation.type: empty);</span>
+      <span class="s0">throw new Error(createErrorMessage(realTypeAnnotation.type));</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function createStructsString(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">aliasMap: NativeModuleAliasMap,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+  <span class="s0">enumMap: NativeModuleEnumMap,</span>
+<span class="s0">): string {</span>
+  <span class="s0">return Object.keys(aliasMap)</span>
+    <span class="s0">.map(alias =&gt; {</span>
+      <span class="s0">const value = aliasMap[alias];</span>
+      <span class="s0">if (value.properties.length === 0) {</span>
+        <span class="s0">return '';</span>
+      <span class="s0">}</span>
+      <span class="s0">const structName = `${moduleName}Base${alias}`;</span>
+      <span class="s0">const templateParameterWithTypename = value.properties</span>
+        <span class="s0">.map((v, i) =&gt; 'typename P' + i)</span>
+        <span class="s0">.join(', ');</span>
+      <span class="s0">const templateParameter = value.properties</span>
+        <span class="s0">.map((v, i) =&gt; 'P' + i)</span>
+        <span class="s0">.join(', ');</span>
+      <span class="s0">const paramemterConversion = value.properties</span>
+        <span class="s0">.map((v, i) =&gt; {</span>
+          <span class="s0">const translatedParam = translatePrimitiveJSTypeToCpp(</span>
+            <span class="s0">moduleName,</span>
+            <span class="s0">v.typeAnnotation,</span>
+            <span class="s0">false,</span>
+            <span class="s0">typeName =&gt;</span>
+              <span class="s0">`Unsupported type for param &quot;${v.name}&quot;. Found: ${typeName}`,</span>
+            <span class="s0">resolveAlias,</span>
+            <span class="s0">enumMap,</span>
+          <span class="s0">);</span>
+          <span class="s0">return `  static ${translatedParam} ${v.name}ToJs(jsi::Runtime &amp;rt, P${i} value) {</span>
+    <span class="s0">return bridging::toJs(rt, value);</span>
+  <span class="s0">}`;</span>
+        <span class="s0">})</span>
+        <span class="s0">.join('\n');</span>
+      <span class="s0">return `#pragma mark - ${structName}</span>
+
+<span class="s0">template &lt;${templateParameterWithTypename}&gt;</span>
+<span class="s0">struct ${structName} {</span>
+<span class="s0">${value.properties.map((v, i) =&gt; '  P' + i + ' ' + v.name).join(';\n')};</span>
+  <span class="s0">bool operator==(const ${structName} &amp;other) const {</span>
+    <span class="s0">return ${value.properties</span>
+      <span class="s0">.map(v =&gt; `${v.name} == other.${v.name}`)</span>
+      <span class="s0">.join(' &amp;&amp; ')};</span>
+  <span class="s0">}</span>
+<span class="s0">};</span>
+
+<span class="s0">template &lt;${templateParameterWithTypename}&gt;</span>
+<span class="s0">struct ${structName}Bridging {</span>
+  <span class="s0">static ${structName}&lt;${templateParameter}&gt; fromJs(</span>
+      <span class="s0">jsi::Runtime &amp;rt,</span>
+      <span class="s0">const jsi::Object &amp;value,</span>
+      <span class="s0">const std::shared_ptr&lt;CallInvoker&gt; &amp;jsInvoker) {</span>
+    <span class="s0">${structName}&lt;${templateParameter}&gt; result{</span>
+<span class="s0">${value.properties</span>
+  <span class="s0">.map(</span>
+    <span class="s0">(v, i) =&gt;</span>
+      <span class="s0">`      bridging::fromJs&lt;P${i}&gt;(rt, value.getProperty(rt, &quot;${v.name}&quot;), jsInvoker)`,</span>
+  <span class="s0">)</span>
+  <span class="s0">.join(',\n')}};</span>
+    <span class="s0">return result;</span>
+  <span class="s0">}</span>
+
+<span class="s0">#ifdef DEBUG</span>
+<span class="s0">${paramemterConversion}</span>
+<span class="s0">#endif</span>
+
+  <span class="s0">static jsi::Object toJs(</span>
+    <span class="s0">jsi::Runtime &amp;rt,</span>
+    <span class="s0">const ${structName}&lt;${templateParameter}&gt; &amp;value,</span>
+    <span class="s0">const std::shared_ptr&lt;CallInvoker&gt; &amp;jsInvoker) {</span>
+      <span class="s0">auto result = facebook::jsi::Object(rt);</span>
+      <span class="s0">${value.properties</span>
+        <span class="s0">.map((v, i) =&gt; {</span>
+          <span class="s0">if (v.optional) {</span>
+            <span class="s0">return `    if (value.${v.name}) {</span>
+            <span class="s0">result.setProperty(rt, &quot;${v.name}&quot;, bridging::toJs(rt, value.${v.name}.value(), jsInvoker));</span>
+          <span class="s0">}`;</span>
+          <span class="s0">} else {</span>
+            <span class="s0">return `    result.setProperty(rt, &quot;${v.name}&quot;, bridging::toJs(rt, value.${v.name}, jsInvoker));`;</span>
+          <span class="s0">}</span>
+        <span class="s0">})</span>
+        <span class="s0">.join('\n')}</span>
+          <span class="s0">return result;</span>
+        <span class="s0">}</span>
+      <span class="s0">};</span>
+
+<span class="s0">`;</span>
+    <span class="s0">})</span>
+    <span class="s0">.join('\n');</span>
+<span class="s0">}</span>
+
+<span class="s0">type NativeEnumMemberValueType = 'std::string' | 'int32_t' | 'float';</span>
+
+<span class="s0">const EnumTemplate = ({</span>
+  <span class="s0">enumName,</span>
+  <span class="s0">values,</span>
+  <span class="s0">fromCases,</span>
+  <span class="s0">toCases,</span>
+  <span class="s0">nativeEnumMemberType,</span>
+<span class="s0">}: {</span>
+  <span class="s0">enumName: string,</span>
+  <span class="s0">values: string,</span>
+  <span class="s0">fromCases: string,</span>
+  <span class="s0">toCases: string,</span>
+  <span class="s0">nativeEnumMemberType: NativeEnumMemberValueType,</span>
+<span class="s0">}) =&gt; {</span>
+  <span class="s0">const [fromValue, fromValueConversion, toValue] =</span>
+    <span class="s0">nativeEnumMemberType === 'std::string'</span>
+      <span class="s0">? [</span>
+          <span class="s0">'const jsi::String &amp;rawValue',</span>
+          <span class="s0">'std::string value = rawValue.utf8(rt);',</span>
+          <span class="s0">'jsi::String',</span>
+        <span class="s0">]</span>
+      <span class="s0">: [</span>
+          <span class="s0">'const jsi::Value &amp;rawValue',</span>
+          <span class="s0">'double value = (double)rawValue.asNumber();',</span>
+          <span class="s0">'jsi::Value',</span>
+        <span class="s0">];</span>
+
+  <span class="s0">return `</span>
+<span class="s0">#pragma mark - ${enumName}</span>
+
+<span class="s0">enum ${enumName} { ${values} };</span>
+
+<span class="s0">template &lt;&gt;</span>
+<span class="s0">struct Bridging&lt;${enumName}&gt; {</span>
+  <span class="s0">static ${enumName} fromJs(jsi::Runtime &amp;rt, ${fromValue}) {</span>
+    <span class="s0">${fromValueConversion}</span>
+    <span class="s0">${fromCases}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">static ${toValue} toJs(jsi::Runtime &amp;rt, ${enumName} value) {</span>
+    <span class="s0">${toCases}</span>
+  <span class="s0">}</span>
+<span class="s0">};`;</span>
+<span class="s0">};</span>
+
+<span class="s0">function generateEnum(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">origEnumName: string,</span>
+  <span class="s0">members: NativeModuleEnumMembers,</span>
+  <span class="s0">memberType: NativeModuleEnumMemberType,</span>
+<span class="s0">): string {</span>
+  <span class="s0">const enumName = getEnumName(moduleName, origEnumName);</span>
+
+  <span class="s0">const nativeEnumMemberType: NativeEnumMemberValueType =</span>
+    <span class="s0">memberType === 'StringTypeAnnotation'</span>
+      <span class="s0">? 'std::string'</span>
+      <span class="s0">: getAreEnumMembersInteger(members)</span>
+      <span class="s0">? 'int32_t'</span>
+      <span class="s0">: 'float';</span>
+
+  <span class="s0">const getMemberValueAppearance = (value: string) =&gt;</span>
+    <span class="s0">memberType === 'StringTypeAnnotation'</span>
+      <span class="s0">? `&quot;${value}&quot;`</span>
+      <span class="s0">: `${value}${nativeEnumMemberType === 'float' ? 'f' : ''}`;</span>
+
+  <span class="s0">const fromCases =</span>
+    <span class="s0">members</span>
+      <span class="s0">.map(</span>
+        <span class="s0">member =&gt; `if (value == ${getMemberValueAppearance(member.value)}) {</span>
+      <span class="s0">return ${enumName}::${toSafeCppString(member.name)};</span>
+    <span class="s0">}`,</span>
+      <span class="s0">)</span>
+      <span class="s0">.join(' else ') +</span>
+    <span class="s0">` else {</span>
+      <span class="s0">throw jsi::JSError(rt, &quot;No appropriate enum member found for value&quot;);</span>
+    <span class="s0">}`;</span>
+
+  <span class="s0">const toCases =</span>
+    <span class="s0">members</span>
+      <span class="s0">.map(</span>
+        <span class="s0">member =&gt; `if (value == ${enumName}::${toSafeCppString(member.name)}) {</span>
+      <span class="s0">return bridging::toJs(rt, ${getMemberValueAppearance(member.value)});</span>
+    <span class="s0">}`,</span>
+      <span class="s0">)</span>
+      <span class="s0">.join(' else ') +</span>
+    <span class="s0">` else {</span>
+      <span class="s0">throw jsi::JSError(rt, &quot;No appropriate enum member found for enum value&quot;);</span>
+    <span class="s0">}`;</span>
+
+  <span class="s0">return EnumTemplate({</span>
+    <span class="s0">enumName,</span>
+    <span class="s0">values: members.map(member =&gt; member.name).join(', '),</span>
+    <span class="s0">fromCases,</span>
+    <span class="s0">toCases,</span>
+    <span class="s0">nativeEnumMemberType,</span>
+  <span class="s0">});</span>
+<span class="s0">}</span>
+
+<span class="s0">function createEnums(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">enumMap: NativeModuleEnumMap,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+<span class="s0">): string {</span>
+  <span class="s0">return Object.entries(enumMap)</span>
+    <span class="s0">.map(([enumName, enumNode]) =&gt; {</span>
+      <span class="s0">return generateEnum(</span>
+        <span class="s0">moduleName,</span>
+        <span class="s0">enumName,</span>
+        <span class="s0">enumNode.members,</span>
+        <span class="s0">enumNode.memberType,</span>
+      <span class="s0">);</span>
+    <span class="s0">})</span>
+    <span class="s0">.filter(Boolean)</span>
+    <span class="s0">.join('\n');</span>
+<span class="s0">}</span>
+
+<span class="s0">function translatePropertyToCpp(</span>
+  <span class="s0">moduleName: string,</span>
+  <span class="s0">prop: NativeModulePropertyShape,</span>
+  <span class="s0">resolveAlias: AliasResolver,</span>
+  <span class="s0">enumMap: NativeModuleEnumMap,</span>
+  <span class="s0">abstract: boolean = false,</span>
+<span class="s0">) {</span>
+  <span class="s0">const [propTypeAnnotation] =</span>
+    <span class="s0">unwrapNullable&lt;NativeModuleFunctionTypeAnnotation&gt;(prop.typeAnnotation);</span>
+
+  <span class="s0">const params = propTypeAnnotation.params.map(</span>
+    <span class="s0">param =&gt; `std::move(${param.name})`,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const paramTypes = propTypeAnnotation.params.map(param =&gt; {</span>
+    <span class="s0">const translatedParam = translatePrimitiveJSTypeToCpp(</span>
+      <span class="s0">moduleName,</span>
+      <span class="s0">param.typeAnnotation,</span>
+      <span class="s0">param.optional,</span>
+      <span class="s0">typeName =&gt;</span>
+        <span class="s0">`Unsupported type for param &quot;${param.name}&quot; in ${prop.name}. Found: ${typeName}`,</span>
+      <span class="s0">resolveAlias,</span>
+      <span class="s0">enumMap,</span>
+    <span class="s0">);</span>
+    <span class="s0">return `${translatedParam} ${param.name}`;</span>
+  <span class="s0">});</span>
+
+  <span class="s0">const returnType = translatePrimitiveJSTypeToCpp(</span>
+    <span class="s0">moduleName,</span>
+    <span class="s0">propTypeAnnotation.returnTypeAnnotation,</span>
+    <span class="s0">false,</span>
+    <span class="s0">typeName =&gt; `Unsupported return type for ${prop.name}. Found: ${typeName}`,</span>
+    <span class="s0">resolveAlias,</span>
+    <span class="s0">enumMap,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">// The first param will always be the runtime reference.</span>
+  <span class="s0">paramTypes.unshift('jsi::Runtime &amp;rt');</span>
+
+  <span class="s0">const method = `${returnType} ${prop.name}(${paramTypes.join(', ')})`;</span>
+
+  <span class="s0">if (abstract) {</span>
+    <span class="s0">return `virtual ${method} = 0;`;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return `${method} override {</span>
+  <span class="s0">static_assert(</span>
+      <span class="s0">bridging::getParameterCount(&amp;T::${prop.name}) == ${paramTypes.length},</span>
+      <span class="s0">&quot;Expected ${prop.name}(...) to have ${paramTypes.length} parameters&quot;);</span>
+
+  <span class="s0">return bridging::callFromJs&lt;${returnType}&gt;(</span>
+      <span class="s0">rt, &amp;T::${prop.name}, jsInvoker_, ${['instance_', ...params].join(', ')});</span>
+<span class="s0">}`;</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">generate(</span>
+    <span class="s0">libraryName: string,</span>
+    <span class="s0">schema: SchemaType,</span>
+    <span class="s0">packageName?: string,</span>
+    <span class="s0">assumeNonnull: boolean = false,</span>
+  <span class="s0">): FilesOutput {</span>
+    <span class="s0">const nativeModules = getModules(schema);</span>
+
+    <span class="s0">const modules = Object.keys(nativeModules).flatMap(hasteModuleName =&gt; {</span>
+      <span class="s0">const {</span>
+        <span class="s0">aliasMap,</span>
+        <span class="s0">enumMap,</span>
+        <span class="s0">spec: {properties},</span>
+        <span class="s0">moduleName,</span>
+      <span class="s0">} = nativeModules[hasteModuleName];</span>
+      <span class="s0">const resolveAlias = createAliasResolver(aliasMap);</span>
+      <span class="s0">const structs = createStructsString(</span>
+        <span class="s0">moduleName,</span>
+        <span class="s0">aliasMap,</span>
+        <span class="s0">resolveAlias,</span>
+        <span class="s0">enumMap,</span>
+      <span class="s0">);</span>
+      <span class="s0">const enums = createEnums(moduleName, enumMap, resolveAlias);</span>
+
+      <span class="s0">return [</span>
+        <span class="s0">ModuleClassDeclarationTemplate({</span>
+          <span class="s0">hasteModuleName,</span>
+          <span class="s0">moduleProperties: properties.map(prop =&gt;</span>
+            <span class="s0">translatePropertyToCpp(</span>
+              <span class="s0">moduleName,</span>
+              <span class="s0">prop,</span>
+              <span class="s0">resolveAlias,</span>
+              <span class="s0">enumMap,</span>
+              <span class="s0">true,</span>
+            <span class="s0">),</span>
+          <span class="s0">),</span>
+          <span class="s0">structs,</span>
+          <span class="s0">enums,</span>
+        <span class="s0">}),</span>
+        <span class="s0">ModuleSpecClassDeclarationTemplate({</span>
+          <span class="s0">hasteModuleName,</span>
+          <span class="s0">moduleName,</span>
+          <span class="s0">moduleProperties: properties.map(prop =&gt;</span>
+            <span class="s0">translatePropertyToCpp(moduleName, prop, resolveAlias, enumMap),</span>
+          <span class="s0">),</span>
+        <span class="s0">}),</span>
+      <span class="s0">];</span>
+    <span class="s0">});</span>
+
+    <span class="s0">const fileName = `${libraryName}JSI.h`;</span>
+    <span class="s0">const replacedTemplate = FileTemplate({modules});</span>
+
+    <span class="s0">return new Map([[fileName, replacedTemplate]]);</span>
+  <span class="s0">},</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

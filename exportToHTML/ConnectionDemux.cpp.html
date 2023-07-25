@@ -1,0 +1,152 @@
+<html>
+<head>
+<title>ConnectionDemux.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ConnectionDemux.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ConnectionDemux.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;Connection.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;jsinspector/InspectorInterfaces.h&gt;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">hermes {</span>
+<span class="s4">namespace </span><span class="s1">inspector {</span>
+<span class="s4">namespace </span><span class="s1">chrome {</span>
+
+<span class="s4">using </span><span class="s1">::facebook::react::IInspector</span><span class="s4">;</span>
+<span class="s4">using </span><span class="s1">::facebook::react::ILocalConnection</span><span class="s4">;</span>
+<span class="s4">using </span><span class="s1">::facebook::react::IRemoteConnection</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">class </span><span class="s1">LocalConnection : </span><span class="s4">public </span><span class="s1">ILocalConnection {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s1">LocalConnection(</span>
+      <span class="s1">std::shared_ptr&lt;Connection&gt; conn</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;std::unordered_set&lt;std::string&gt;&gt; inspectedContexts)</span><span class="s4">;</span>
+  <span class="s1">~LocalConnection()</span><span class="s4">;</span>
+
+  <span class="s4">void </span><span class="s1">sendMessage(std::string message) override</span><span class="s4">;</span>
+  <span class="s4">void </span><span class="s1">disconnect() override</span><span class="s4">;</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">std::shared_ptr&lt;Connection&gt; conn_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;std::unordered_set&lt;std::string&gt;&gt; inspectedContexts_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">LocalConnection::LocalConnection(</span>
+    <span class="s1">std::shared_ptr&lt;Connection&gt; conn</span><span class="s4">,</span>
+    <span class="s1">std::shared_ptr&lt;std::unordered_set&lt;std::string&gt;&gt; inspectedContexts)</span>
+    <span class="s1">: conn_(conn)</span><span class="s4">, </span><span class="s1">inspectedContexts_(inspectedContexts) {</span>
+  <span class="s1">inspectedContexts_-&gt;insert(conn-&gt;getTitle())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">LocalConnection::~LocalConnection() = </span><span class="s4">default;</span>
+
+<span class="s4">void </span><span class="s1">LocalConnection::sendMessage(std::string str) {</span>
+  <span class="s1">conn_-&gt;sendMessage(std::move(str))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">LocalConnection::disconnect() {</span>
+  <span class="s1">inspectedContexts_-&gt;erase(conn_-&gt;getTitle())</span><span class="s4">;</span>
+  <span class="s1">conn_-&gt;disconnect()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">ConnectionDemux::ConnectionDemux(facebook::react::IInspector &amp;inspector)</span>
+    <span class="s1">: globalInspector_(inspector)</span><span class="s4">,</span>
+      <span class="s1">inspectedContexts_(std::make_shared&lt;std::unordered_set&lt;std::string&gt;&gt;()) {}</span>
+
+<span class="s1">ConnectionDemux::~ConnectionDemux() = </span><span class="s4">default;</span>
+
+<span class="s1">DebugSessionToken ConnectionDemux::enableDebugging(</span>
+    <span class="s1">std::unique_ptr&lt;RuntimeAdapter&gt; adapter</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;title) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+
+  <span class="s0">// TODO(#22976087): workaround for ComponentScript contexts never being</span>
+  <span class="s0">// destroyed.</span>
+  <span class="s0">//</span>
+  <span class="s0">// After a reload, the old ComponentScript VM instance stays alive. When we</span>
+  <span class="s0">// register the new CS VM instance, check for any previous CS VM (via strcmp</span>
+  <span class="s0">// of title) and remove them.</span>
+  <span class="s1">std::vector&lt;</span><span class="s4">int</span><span class="s1">&gt; pagesToDelete</span><span class="s4">;</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">it = conns_.begin()</span><span class="s4">; </span><span class="s1">it != conns_.end()</span><span class="s4">; </span><span class="s1">++it) {</span>
+    <span class="s4">if </span><span class="s1">(it-&gt;second-&gt;getTitle() == title) {</span>
+      <span class="s1">pagesToDelete.push_back(it-&gt;first)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto </span><span class="s1">pageId : pagesToDelete) {</span>
+    <span class="s1">removePage(pageId)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">waitForDebugger =</span>
+      <span class="s1">(inspectedContexts_-&gt;find(title) != inspectedContexts_-&gt;end())</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">addPage(</span>
+      <span class="s1">std::make_shared&lt;Connection&gt;(std::move(adapter)</span><span class="s4">, </span><span class="s1">title</span><span class="s4">, </span><span class="s1">waitForDebugger))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ConnectionDemux::disableDebugging(DebugSessionToken session) {</span>
+  <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(mutex_)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(conns_.find(session) == conns_.end()) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">removePage(session)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">int </span><span class="s1">ConnectionDemux::addPage(std::shared_ptr&lt;Connection&gt; conn) {</span>
+  <span class="s4">auto </span><span class="s1">connectFunc = [conn</span><span class="s4">, this</span><span class="s1">](std::unique_ptr&lt;IRemoteConnection&gt; remoteConn)</span>
+      <span class="s1">-&gt; std::unique_ptr&lt;ILocalConnection&gt; {</span>
+    <span class="s4">if </span><span class="s1">(!conn-&gt;connect(std::move(remoteConn))) {</span>
+      <span class="s4">return nullptr;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">return </span><span class="s1">std::make_unique&lt;LocalConnection&gt;(conn</span><span class="s4">, </span><span class="s1">inspectedContexts_)</span><span class="s4">;</span>
+  <span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s4">int </span><span class="s1">pageId = globalInspector_.addPage(</span>
+      <span class="s1">conn-&gt;getTitle()</span><span class="s4">, </span><span class="s3">&quot;Hermes&quot;</span><span class="s4">, </span><span class="s1">std::move(connectFunc))</span><span class="s4">;</span>
+  <span class="s1">conns_[pageId] = std::move(conn)</span><span class="s4">;</span>
+
+  <span class="s4">return </span><span class="s1">pageId</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ConnectionDemux::removePage(</span><span class="s4">int </span><span class="s1">pageId) {</span>
+  <span class="s1">globalInspector_.removePage(pageId)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">conn = conns_.at(pageId)</span><span class="s4">;</span>
+  <span class="s1">std::string title = conn-&gt;getTitle()</span><span class="s4">;</span>
+  <span class="s1">inspectedContexts_-&gt;erase(title)</span><span class="s4">;</span>
+  <span class="s1">conn-&gt;disconnect()</span><span class="s4">;</span>
+  <span class="s1">conns_.erase(pageId)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace chrome</span>
+<span class="s1">} </span><span class="s0">// namespace inspector</span>
+<span class="s1">} </span><span class="s0">// namespace hermes</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

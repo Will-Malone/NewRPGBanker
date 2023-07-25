@@ -1,0 +1,415 @@
+<html>
+<head>
+<title>RCTNativeAnimatedModule.mm</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+RCTNativeAnimatedModule.mm</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#import </span><span class="s3">&lt;FBReactNativeSpec/FBReactNativeSpec.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTInitializing.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTLog.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTNativeAnimatedModule.h&gt;</span>
+<span class="s2">#import </span><span class="s3">&lt;React/RCTNativeAnimatedNodesManager.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&lt;RCTTypeSafety/RCTConvertHelpers.h&gt;</span>
+
+<span class="s2">#import </span><span class="s3">&quot;RCTAnimationPlugins.h&quot;</span>
+
+<span class="s4">typedef void </span><span class="s1">(^AnimatedOperation)(RCTNativeAnimatedNodesManager *nodesManager)</span><span class="s4">;</span>
+
+<span class="s4">@interface </span><span class="s1">RCTNativeAnimatedModule () &lt;RCTInitializing&gt;</span>
+<span class="s4">@end</span>
+
+<span class="s4">@implementation </span><span class="s1">RCTNativeAnimatedModule {</span>
+  <span class="s1">RCTNativeAnimatedNodesManager *_nodesManager</span><span class="s4">;</span>
+
+  <span class="s0">// Operations called after views have been updated.</span>
+  <span class="s1">NSMutableArray&lt;AnimatedOperation&gt; *_operations</span><span class="s4">;</span>
+  <span class="s0">// Operations called before views have been updated.</span>
+  <span class="s1">NSMutableArray&lt;AnimatedOperation&gt; *_preOperations</span><span class="s4">;</span>
+  <span class="s1">NSMutableDictionary&lt;NSNumber *</span><span class="s4">, </span><span class="s1">NSNumber *&gt; *_animIdIsManagedByFabric</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_MODULE()</span><span class="s4">;</span>
+
+<span class="s1">+ (BOOL)requiresMainQueueSetup</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">NO</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (instancetype)init</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(self = [super init]) {</span>
+    <span class="s1">_operations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">_preOperations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+    <span class="s1">_animIdIsManagedByFabric = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">self</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)invalidate</span>
+<span class="s1">{</span>
+  <span class="s1">[super invalidate]</span><span class="s4">;</span>
+  <span class="s1">[_nodesManager stopAnimationLoop]</span><span class="s4">;</span>
+  <span class="s1">[[self.moduleRegistry moduleForName:</span><span class="s3">&quot;EventDispatcher&quot;</span><span class="s1">] removeDispatchObserver:self]</span><span class="s4">;</span>
+  <span class="s1">[self.bridge.uiManager.observerCoordinator removeObserver:self]</span><span class="s4">;</span>
+  <span class="s1">[self.bridge.surfacePresenter removeObserver:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (dispatch_queue_t)methodQueue</span>
+<span class="s1">{</span>
+  <span class="s0">// This module needs to be on the same queue as the UIManager to avoid</span>
+  <span class="s0">// having to lock `_operations` and `_preOperations` since `uiManagerWillPerformMounting`</span>
+  <span class="s0">// will be called from that queue.</span>
+  <span class="s4">return </span><span class="s1">RCTGetUIManagerQueue()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setBridge:(RCTBridge *)bridge</span>
+<span class="s1">{</span>
+  <span class="s1">[super setBridge:bridge]</span><span class="s4">;</span>
+  <span class="s1">_nodesManager = [[RCTNativeAnimatedNodesManager alloc] initWithBridge:self.bridge</span>
+                                                       <span class="s1">surfacePresenter:bridge.surfacePresenter]</span><span class="s4">;</span>
+  <span class="s1">[bridge.uiManager.observerCoordinator addObserver:self]</span><span class="s4">;</span>
+  <span class="s1">[bridge.surfacePresenter addObserver:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)initialize</span>
+<span class="s1">{</span>
+  <span class="s1">[[self.moduleRegistry moduleForName:</span><span class="s3">&quot;EventDispatcher&quot;</span><span class="s1">] addDispatchObserver:self]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * This selector should only be invoked in bridgeless mode, which is not compatible with this non turbo module. 
+ */</span>
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)setSurfacePresenter:(id&lt;RCTSurfacePresenterStub&gt;)surfacePresenter</span>
+<span class="s1">{</span>
+  <span class="s1">RCTLogWarn(</span><span class="s4">@</span><span class="s3">&quot;setSurfacePresenter should only be invoked in RCTNativeAnimatedTurboModule&quot;</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark-- API</span>
+
+<span class="s1">RCT_EXPORT_METHOD(createAnimatedNode : (</span><span class="s4">double</span><span class="s1">)tag config : (NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)config)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager createAnimatedNode:[NSNumber numberWithDouble:tag] config:config]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(updateAnimatedNodeConfig : (</span><span class="s4">double</span><span class="s1">)tag config : (NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)config)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager updateAnimatedNodeConfig:[NSNumber numberWithDouble:tag] config:config]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(connectAnimatedNodes : (</span><span class="s4">double</span><span class="s1">)parentTag childTag : (</span><span class="s4">double</span><span class="s1">)childTag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager connectAnimatedNodes:[NSNumber numberWithDouble:parentTag]</span>
+                              <span class="s1">childTag:[NSNumber numberWithDouble:childTag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(disconnectAnimatedNodes : (</span><span class="s4">double</span><span class="s1">)parentTag childTag : (</span><span class="s4">double</span><span class="s1">)childTag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager disconnectAnimatedNodes:[NSNumber numberWithDouble:parentTag]</span>
+                                 <span class="s1">childTag:[NSNumber numberWithDouble:childTag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(startAnimatingNode</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)animationId nodeTag</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)nodeTag config</span>
+                  <span class="s1">: (NSDictionary&lt;NSString *</span><span class="s4">, </span><span class="s1">id&gt; *)config endCallback</span>
+                  <span class="s1">: (RCTResponseSenderBlock)callBack)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager startAnimatingNode:[NSNumber numberWithDouble:animationId]</span>
+                             <span class="s1">nodeTag:[NSNumber numberWithDouble:nodeTag]</span>
+                              <span class="s1">config:config</span>
+                         <span class="s1">endCallback:callBack]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+
+  <span class="s1">RCTExecuteOnMainQueue(^{</span>
+    <span class="s4">if </span><span class="s1">(![self-&gt;_nodesManager isNodeManagedByFabric:[NSNumber numberWithDouble:nodeTag]]) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">RCTExecuteOnUIManagerQueue(^{</span>
+      <span class="s1">self-&gt;_animIdIsManagedByFabric[[NSNumber numberWithDouble:animationId]] = </span><span class="s4">@</span><span class="s1">YES</span><span class="s4">;</span>
+      <span class="s1">[self flushOperationQueues]</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(stopAnimation : (</span><span class="s4">double</span><span class="s1">)animationId)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager stopAnimation:[NSNumber numberWithDouble:animationId]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">([_animIdIsManagedByFabric[[NSNumber numberWithDouble:animationId]] boolValue]) {</span>
+    <span class="s1">[self flushOperationQueues]</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(setAnimatedNodeValue : (</span><span class="s4">double</span><span class="s1">)nodeTag value : (</span><span class="s4">double</span><span class="s1">)value)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager setAnimatedNodeValue:[NSNumber numberWithDouble:nodeTag] value:[NSNumber numberWithDouble:value]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(setAnimatedNodeOffset : (</span><span class="s4">double</span><span class="s1">)nodeTag offset : (</span><span class="s4">double</span><span class="s1">)offset)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager setAnimatedNodeOffset:[NSNumber numberWithDouble:nodeTag] offset:[NSNumber numberWithDouble:offset]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(flattenAnimatedNodeOffset : (</span><span class="s4">double</span><span class="s1">)nodeTag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager flattenAnimatedNodeOffset:[NSNumber numberWithDouble:nodeTag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(extractAnimatedNodeOffset : (</span><span class="s4">double</span><span class="s1">)nodeTag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager extractAnimatedNodeOffset:[NSNumber numberWithDouble:nodeTag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(connectAnimatedNodeToView : (</span><span class="s4">double</span><span class="s1">)nodeTag viewTag : (</span><span class="s4">double</span><span class="s1">)viewTag)</span>
+<span class="s1">{</span>
+  <span class="s1">NSString *viewName = [self.bridge.uiManager viewNameForReactTag:[NSNumber numberWithDouble:viewTag]]</span><span class="s4">;</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager connectAnimatedNodeToView:[NSNumber numberWithDouble:nodeTag]</span>
+                                    <span class="s1">viewTag:[NSNumber numberWithDouble:viewTag]</span>
+                                   <span class="s1">viewName:viewName]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(disconnectAnimatedNodeFromView : (</span><span class="s4">double</span><span class="s1">)nodeTag viewTag : (</span><span class="s4">double</span><span class="s1">)viewTag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager disconnectAnimatedNodeFromView:[NSNumber numberWithDouble:nodeTag]</span>
+                                         <span class="s1">viewTag:[NSNumber numberWithDouble:viewTag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(restoreDefaultValues : (</span><span class="s4">double</span><span class="s1">)nodeTag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addPreOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager restoreDefaultValues:[NSNumber numberWithDouble:nodeTag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(dropAnimatedNode : (</span><span class="s4">double</span><span class="s1">)tag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager dropAnimatedNode:[NSNumber numberWithDouble:tag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(startListeningToAnimatedNodeValue : (</span><span class="s4">double</span><span class="s1">)tag)</span>
+<span class="s1">{</span>
+  <span class="s4">__weak </span><span class="s1">id&lt;RCTValueAnimatedNodeObserver&gt; valueObserver = self</span><span class="s4">;</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager startListeningToAnimatedNodeValue:[NSNumber numberWithDouble:tag] valueObserver:valueObserver]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(stopListeningToAnimatedNodeValue : (</span><span class="s4">double</span><span class="s1">)tag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager stopListeningToAnimatedNodeValue:[NSNumber numberWithDouble:tag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(addAnimatedEventToView</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)viewTag eventName</span>
+                  <span class="s1">: (nonnull NSString *)eventName eventMapping</span>
+                  <span class="s1">: (JS::NativeAnimatedModule::EventMapping &amp;)eventMapping)</span>
+<span class="s1">{</span>
+  <span class="s1">NSMutableDictionary *eventMappingDict = [NSMutableDictionary </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">eventMappingDict[</span><span class="s4">@</span><span class="s3">&quot;nativeEventPath&quot;</span><span class="s1">] = RCTConvertVecToArray(eventMapping.nativeEventPath())</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(eventMapping.animatedValueTag()) {</span>
+    <span class="s1">eventMappingDict[</span><span class="s4">@</span><span class="s3">&quot;animatedValueTag&quot;</span><span class="s1">] = </span><span class="s4">@</span><span class="s1">(*eventMapping.animatedValueTag())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager addAnimatedEventToView:[NSNumber numberWithDouble:viewTag]</span>
+                               <span class="s1">eventName:eventName</span>
+                            <span class="s1">eventMapping:eventMappingDict]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(removeAnimatedEventFromView</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)viewTag eventName</span>
+                  <span class="s1">: (nonnull NSString *)eventName animatedNodeTag</span>
+                  <span class="s1">: (</span><span class="s4">double</span><span class="s1">)animatedNodeTag)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager removeAnimatedEventFromView:[NSNumber numberWithDouble:viewTag]</span>
+                                    <span class="s1">eventName:eventName</span>
+                              <span class="s1">animatedNodeTag:[NSNumber numberWithDouble:animatedNodeTag]]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(getValue : (</span><span class="s4">double</span><span class="s1">)nodeTag saveValueCallback : (RCTResponseSenderBlock)saveValueCallback)</span>
+<span class="s1">{</span>
+  <span class="s1">[self addOperationBlock:^(RCTNativeAnimatedNodesManager *nodesManager) {</span>
+    <span class="s1">[nodesManager getValue:[NSNumber numberWithDouble:nodeTag] saveCallback:saveValueCallback]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">RCT_EXPORT_METHOD(queueAndExecuteBatchedOperations : (NSArray *)operationsAndArgs)</span>
+<span class="s1">{</span>
+  <span class="s0">// TODO: implement in the future if we want the same optimization here as on Android</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark-- Batch handling</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)addOperationBlock:(AnimatedOperation)operation</span>
+<span class="s1">{</span>
+  <span class="s1">[_operations addObject:operation]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)addPreOperationBlock:(AnimatedOperation)operation</span>
+<span class="s1">{</span>
+  <span class="s1">[_preOperations addObject:operation]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)flushOperationQueues</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_preOperations.count == </span><span class="s5">0 </span><span class="s1">&amp;&amp; _operations.count == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+  <span class="s1">NSArray&lt;AnimatedOperation&gt; *preOperations = _preOperations</span><span class="s4">;</span>
+  <span class="s1">NSArray&lt;AnimatedOperation&gt; *operations = _operations</span><span class="s4">;</span>
+  <span class="s1">_preOperations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_operations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">RCTExecuteOnMainQueue(^{</span>
+    <span class="s4">for </span><span class="s1">(AnimatedOperation operation in preOperations) {</span>
+      <span class="s1">operation(self-&gt;_nodesManager)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s4">for </span><span class="s1">(AnimatedOperation operation in operations) {</span>
+      <span class="s1">operation(self-&gt;_nodesManager)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+    <span class="s1">[self-&gt;_nodesManager updateAnimations]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTSurfacePresenterObserver</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)willMountComponentsWithRootTag:(NSInteger)rootTag</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+  <span class="s1">RCTExecuteOnUIManagerQueue(^{</span>
+    <span class="s1">NSArray&lt;AnimatedOperation&gt; *preOperations = self-&gt;_preOperations</span><span class="s4">;</span>
+    <span class="s1">self-&gt;_preOperations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+
+    <span class="s1">RCTExecuteOnMainQueue(^{</span>
+      <span class="s4">for </span><span class="s1">(AnimatedOperation preOperation in preOperations) {</span>
+        <span class="s1">preOperation(self-&gt;_nodesManager)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)didMountComponentsWithRootTag:(NSInteger)rootTag</span>
+<span class="s1">{</span>
+  <span class="s1">RCTAssertMainQueue()</span><span class="s4">;</span>
+  <span class="s1">RCTExecuteOnUIManagerQueue(^{</span>
+    <span class="s1">NSArray&lt;AnimatedOperation&gt; *operations = self-&gt;_operations</span><span class="s4">;</span>
+    <span class="s1">self-&gt;_operations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+
+    <span class="s1">RCTExecuteOnMainQueue(^{</span>
+      <span class="s4">for </span><span class="s1">(AnimatedOperation operation in operations) {</span>
+        <span class="s1">operation(self-&gt;_nodesManager)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark - RCTUIManagerObserver</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)uiManagerWillPerformMounting:(RCTUIManager *)uiManager</span>
+<span class="s1">{</span>
+  <span class="s4">if </span><span class="s1">(_preOperations.count == </span><span class="s5">0 </span><span class="s1">&amp;&amp; _operations.count == </span><span class="s5">0</span><span class="s1">) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">NSArray&lt;AnimatedOperation&gt; *preOperations = _preOperations</span><span class="s4">;</span>
+  <span class="s1">NSArray&lt;AnimatedOperation&gt; *operations = _operations</span><span class="s4">;</span>
+  <span class="s1">_preOperations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+  <span class="s1">_operations = [NSMutableArray </span><span class="s4">new</span><span class="s1">]</span><span class="s4">;</span>
+
+  <span class="s1">[uiManager</span>
+      <span class="s1">prependUIBlock:^(__unused RCTUIManager *manager</span><span class="s4">, </span><span class="s1">__unused NSDictionary&lt;NSNumber *</span><span class="s4">, </span><span class="s1">UIView *&gt; *viewRegistry) {</span>
+        <span class="s4">for </span><span class="s1">(AnimatedOperation operation in preOperations) {</span>
+          <span class="s1">operation(self-&gt;_nodesManager)</span><span class="s4">;</span>
+        <span class="s1">}</span>
+      <span class="s1">}]</span><span class="s4">;</span>
+  <span class="s1">[uiManager addUIBlock:^(__unused RCTUIManager *manager</span><span class="s4">, </span><span class="s1">__unused NSDictionary&lt;NSNumber *</span><span class="s4">, </span><span class="s1">UIView *&gt; *viewRegistry) {</span>
+    <span class="s4">for </span><span class="s1">(AnimatedOperation operation in operations) {</span>
+      <span class="s1">operation(self-&gt;_nodesManager)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">[self-&gt;_nodesManager updateAnimations]</span><span class="s4">;</span>
+  <span class="s1">}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s2">#pragma </span><span class="s1">mark-- Events</span>
+
+<span class="s1">- (NSArray&lt;NSString *&gt; *)supportedEvents</span>
+<span class="s1">{</span>
+  <span class="s4">return @</span><span class="s1">[ </span><span class="s4">@</span><span class="s3">&quot;onAnimatedValueUpdate&quot; </span><span class="s1">]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)animatedNode:(RCTValueAnimatedNode *)node didUpdateValue:(CGFloat)value</span>
+<span class="s1">{</span>
+  <span class="s1">[self sendEventWithName:</span><span class="s4">@</span><span class="s3">&quot;onAnimatedValueUpdate&quot; </span><span class="s1">body:</span><span class="s4">@</span><span class="s1">{</span><span class="s4">@</span><span class="s3">&quot;tag&quot; </span><span class="s1">: node.nodeTag</span><span class="s4">, @</span><span class="s3">&quot;value&quot; </span><span class="s1">: </span><span class="s4">@</span><span class="s1">(value)}]</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">- (</span><span class="s4">void</span><span class="s1">)eventDispatcherWillDispatchEvent:(id&lt;RCTEvent&gt;)event</span>
+<span class="s1">{</span>
+  <span class="s0">// Events can be dispatched from any queue so we have to make sure handleAnimatedEvent</span>
+  <span class="s0">// is run from the main queue.</span>
+  <span class="s1">RCTExecuteOnMainQueue(^{</span>
+    <span class="s1">[self-&gt;_nodesManager handleAnimatedEvent:event]</span><span class="s4">;</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">@end</span>
+
+<span class="s1">Class RCTNativeAnimatedModuleCls(</span><span class="s4">void</span><span class="s1">)</span>
+<span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">RCTNativeAnimatedModule.</span><span class="s4">class;</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

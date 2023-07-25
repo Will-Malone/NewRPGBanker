@@ -1,0 +1,195 @@
+<html>
+<head>
+<title>Terminal.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #4646f1;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Terminal.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const throttle = require(</span><span class="s2">&quot;lodash.throttle&quot;</span><span class="s1">);</span>
+<span class="s1">const readline = require(</span><span class="s2">&quot;readline&quot;</span><span class="s1">);</span>
+<span class="s1">const tty = require(</span><span class="s2">&quot;tty&quot;</span><span class="s1">);</span>
+<span class="s1">const util = require(</span><span class="s2">&quot;util&quot;</span><span class="s1">);</span>
+<span class="s0">/** 
+ * Clear some text that was previously printed on an interactive stream, 
+ * without trailing newline character (so we have to move back to the 
+ * beginning of the line). 
+ */</span>
+<span class="s3">function </span><span class="s1">clearStringBackwards(stream, str) {</span>
+  <span class="s1">readline.moveCursor(stream, -stream.columns, </span><span class="s4">0</span><span class="s1">);</span>
+  <span class="s1">readline.clearLine(stream, </span><span class="s4">0</span><span class="s1">);</span>
+  <span class="s1">let lineCount = (str.match(/\n/g) || []).length;</span>
+  <span class="s3">while </span><span class="s1">(lineCount &gt; </span><span class="s4">0</span><span class="s1">) {</span>
+    <span class="s1">readline.moveCursor(stream, </span><span class="s4">0</span><span class="s1">, -</span><span class="s4">1</span><span class="s1">);</span>
+    <span class="s1">readline.clearLine(stream, </span><span class="s4">0</span><span class="s1">);</span>
+    <span class="s1">--lineCount;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Cut a string into an array of string of the specific maximum size. A newline 
+ * ends a chunk immediately (it's not included in the &quot;.&quot; RexExp operator), and 
+ * is not included in the result. 
+ * When counting we should ignore non-printable characters. In particular the 
+ * ANSI escape sequences (regex: /\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?m/) 
+ * (Not an exhaustive match, intended to match ANSI color escapes) 
+ * https://en.wikipedia.org/wiki/ANSI_escape_code 
+ */</span>
+<span class="s3">function </span><span class="s1">chunkString(str, size) {</span>
+  <span class="s1">const ANSI_COLOR = </span><span class="s2">&quot;</span><span class="s5">\x</span><span class="s2">1B</span><span class="s5">\\</span><span class="s2">[([0-9]{1,2}(;[0-9]{1,2})?)?m&quot;</span><span class="s1">;</span>
+  <span class="s1">const SKIP_ANSI = `(?:${ANSI_COLOR})*`;</span>
+  <span class="s3">return </span><span class="s1">str.match(</span><span class="s3">new </span><span class="s1">RegExp(`(?:${SKIP_ANSI}.){</span><span class="s4">1</span><span class="s1">,${size}}`, </span><span class="s2">&quot;g&quot;</span><span class="s1">)) || [];</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * Get the stream as a TTY if it effectively looks like a valid TTY. 
+ */</span>
+<span class="s3">function </span><span class="s1">getTTYStream(stream) {</span>
+  <span class="s3">if </span><span class="s1">(</span>
+    <span class="s1">stream </span><span class="s3">instanceof </span><span class="s1">tty.WriteStream &amp;&amp;</span>
+    <span class="s1">stream.isTTY &amp;&amp;</span>
+    <span class="s1">stream.columns &gt;= </span><span class="s4">1</span>
+  <span class="s1">) {</span>
+    <span class="s3">return </span><span class="s1">stream;</span>
+  <span class="s1">}</span>
+  <span class="s3">return null</span><span class="s1">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/** 
+ * We don't just print things to the console, sometimes we also want to show 
+ * and update progress. This utility just ensures the output stays neat: no 
+ * missing newlines, no mangled log lines. 
+ * 
+ *     const terminal = Terminal.default; 
+ *     terminal.status('Updating... 38%'); 
+ *     terminal.log('warning: Something happened.'); 
+ *     terminal.status('Updating, done.'); 
+ *     terminal.persistStatus(); 
+ * 
+ * The final output: 
+ * 
+ *     warning: Something happened. 
+ *     Updating, done. 
+ * 
+ * Without the status feature, we may get a mangled output: 
+ * 
+ *     Updating... 38%warning: Something happened. 
+ *     Updating, done. 
+ * 
+ * This is meant to be user-readable and TTY-oriented. We use stdout by default 
+ * because it's more about status information than diagnostics/errors (stderr). 
+ * 
+ * Do not add any higher-level functionality in this class such as &quot;warning&quot; and 
+ * &quot;error&quot; printers, as it is not meant for formatting/reporting. It has the 
+ * single responsibility of handling status messages. 
+ */</span>
+<span class="s1">class Terminal {</span>
+  <span class="s1">constructor(stream) {</span>
+    <span class="s3">this</span><span class="s1">._logLines = [];</span>
+    <span class="s3">this</span><span class="s1">._nextStatusStr = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+    <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+    <span class="s3">this</span><span class="s1">._scheduleUpdate = throttle(</span><span class="s3">this</span><span class="s1">._update, </span><span class="s4">33</span><span class="s1">);</span>
+    <span class="s3">this</span><span class="s1">._statusStr = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+    <span class="s3">this</span><span class="s1">._stream = stream;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Clear and write the new status, logging in bulk in-between. Doing this in a 
+   * throttled way (in a different tick than the calls to `log()` and 
+   * `status()`) prevents us from repeatedly rewriting the status in case 
+   * `terminal.log()` is called several times. 
+   */</span>
+  <span class="s1">_update() {</span>
+    <span class="s1">const { _statusStr, _stream } = </span><span class="s3">this</span><span class="s1">;</span>
+    <span class="s1">const ttyStream = getTTYStream(_stream);</span>
+    <span class="s3">if </span><span class="s1">(_statusStr === </span><span class="s3">this</span><span class="s1">._nextStatusStr &amp;&amp; </span><span class="s3">this</span><span class="s1">._logLines.length === </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s3">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(ttyStream != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s1">clearStringBackwards(ttyStream, _statusStr);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._logLines.forEach((line) =&gt; {</span>
+      <span class="s1">_stream.write(line);</span>
+      <span class="s1">_stream.write(</span><span class="s2">&quot;</span><span class="s5">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+    <span class="s1">});</span>
+    <span class="s3">this</span><span class="s1">._logLines = [];</span>
+    <span class="s3">if </span><span class="s1">(ttyStream != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">this</span><span class="s1">._nextStatusStr = chunkString(</span>
+        <span class="s3">this</span><span class="s1">._nextStatusStr,</span>
+        <span class="s1">ttyStream.columns</span>
+      <span class="s1">).join(</span><span class="s2">&quot;</span><span class="s5">\n</span><span class="s2">&quot;</span><span class="s1">);</span>
+      <span class="s1">_stream.write(</span><span class="s3">this</span><span class="s1">._nextStatusStr);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._statusStr = </span><span class="s3">this</span><span class="s1">._nextStatusStr;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Shows some text that is meant to be overriden later. Return the previous 
+   * status that was shown and is no more. Calling `status()` with no argument 
+   * removes the status altogether. The status is never shown in a 
+   * non-interactive terminal: for example, if the output is redirected to a 
+   * file, then we don't care too much about having a progress bar. 
+   */</span>
+  <span class="s1">status(format, ...args) {</span>
+    <span class="s1">const { _nextStatusStr } = </span><span class="s3">this</span><span class="s1">;</span>
+    <span class="s3">this</span><span class="s1">._nextStatusStr = util.format(format, ...args);</span>
+    <span class="s3">this</span><span class="s1">._scheduleUpdate();</span>
+    <span class="s3">return </span><span class="s1">_nextStatusStr;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Similar to `console.log`, except it moves the status/progress text out of 
+   * the way correctly. In non-interactive terminals this is the same as 
+   * `console.log`. 
+   */</span>
+  <span class="s1">log(format, ...args) {</span>
+    <span class="s3">this</span><span class="s1">._logLines.push(util.format(format, ...args));</span>
+    <span class="s3">this</span><span class="s1">._scheduleUpdate();</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Log the current status and start from scratch. This is useful if the last 
+   * status was the last one of a series of updates. 
+   */</span>
+  <span class="s1">persistStatus() {</span>
+    <span class="s3">this</span><span class="s1">.log(</span><span class="s3">this</span><span class="s1">._nextStatusStr);</span>
+    <span class="s3">this</span><span class="s1">._nextStatusStr = </span><span class="s2">&quot;&quot;</span><span class="s1">;</span>
+  <span class="s1">}</span>
+  <span class="s1">flush() {</span>
+    <span class="s0">// Useful if you're going to start calling console.log/console.error directly</span>
+    <span class="s0">// again; otherwise you could end up with mangled output when the queued</span>
+    <span class="s0">// update starts writing to stream after a delay.</span>
+    <span class="s0">/* $FlowFixMe(&gt;=0.99.0 site=react_native_fb) This comment suppresses an 
+     * error found when Flow v0.99 was deployed. To see the error, delete this 
+     * comment and run Flow. */</span>
+    <span class="s3">this</span><span class="s1">._scheduleUpdate.flush();</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = Terminal;</span>
+</pre>
+</body>
+</html>

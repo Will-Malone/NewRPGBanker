@@ -1,0 +1,472 @@
+<html>
+<head>
+<title>CatalystInstanceImpl.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+CatalystInstanceImpl.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;CatalystInstanceImpl.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;condition_variable&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fstream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;memory&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;mutex&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;sstream&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;vector&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;ReactCommon/CallInvokerHolder.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/CxxNativeModule.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/Instance.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSBigString.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSBundleType.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSIndexedRAMBundle.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/MethodCall.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/ModuleRegistry.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/RAMBundleRegistry.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/RecoverableError.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fb/log.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;fbjni/ByteBuffer.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;folly/dynamic.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;glog/logging.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/runtimescheduler/RuntimeScheduler.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/runtimescheduler/RuntimeSchedulerBinding.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/runtimescheduler/RuntimeSchedulerCallInvoker.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;logger/react_native_log.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;CxxModuleWrapper.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JReactCxxErrorHandler.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JReactSoftExceptionLogger.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JavaScriptExecutorHolder.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;JniJSModulesUnbundle.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;NativeArray.h&quot;</span>
+
+<span class="s4">using namespace </span><span class="s1">facebook::jni</span><span class="s4">;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook {</span>
+<span class="s4">namespace </span><span class="s1">react {</span>
+
+<span class="s4">namespace </span><span class="s1">{</span>
+
+<span class="s4">class </span><span class="s1">Exception : </span><span class="s4">public </span><span class="s1">jni::JavaClass&lt;Exception&gt; {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s4">class </span><span class="s1">JInstanceCallback : </span><span class="s4">public </span><span class="s1">InstanceCallback {</span>
+ <span class="s4">public</span><span class="s1">:</span>
+  <span class="s4">explicit </span><span class="s1">JInstanceCallback(</span>
+      <span class="s1">alias_ref&lt;ReactCallback::javaobject&gt; jobj</span><span class="s4">,</span>
+      <span class="s1">std::shared_ptr&lt;JMessageQueueThread&gt; messageQueueThread)</span>
+      <span class="s1">: jobj_(make_global(jobj))</span><span class="s4">,</span>
+        <span class="s1">messageQueueThread_(std::move(messageQueueThread)) {}</span>
+
+  <span class="s4">void </span><span class="s1">onBatchComplete() override {</span>
+    <span class="s1">messageQueueThread_-&gt;runOnQueue([</span><span class="s4">this</span><span class="s1">] {</span>
+      <span class="s4">static auto </span><span class="s1">method = ReactCallback::javaClassStatic()-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">()&gt;(</span>
+          <span class="s3">&quot;onBatchComplete&quot;</span><span class="s1">)</span><span class="s4">;</span>
+      <span class="s1">method(jobj_)</span><span class="s4">;</span>
+    <span class="s1">})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">incrementPendingJSCalls() override {</span>
+    <span class="s0">// For C++ modules, this can be called from an arbitrary thread</span>
+    <span class="s0">// managed by the module, via callJSCallback or callJSFunction.  So,</span>
+    <span class="s0">// we ensure that it is registered with the JVM.</span>
+    <span class="s1">jni::ThreadScope guard</span><span class="s4">;</span>
+    <span class="s4">static auto </span><span class="s1">method = ReactCallback::javaClassStatic()-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">()&gt;(</span>
+        <span class="s3">&quot;incrementPendingJSCalls&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">method(jobj_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">void </span><span class="s1">decrementPendingJSCalls() override {</span>
+    <span class="s1">jni::ThreadScope guard</span><span class="s4">;</span>
+    <span class="s4">static auto </span><span class="s1">method = ReactCallback::javaClassStatic()-&gt;getMethod&lt;</span><span class="s4">void</span><span class="s1">()&gt;(</span>
+        <span class="s3">&quot;decrementPendingJSCalls&quot;</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">method(jobj_)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+ <span class="s4">private</span><span class="s1">:</span>
+  <span class="s1">global_ref&lt;ReactCallback::javaobject&gt; jobj_</span><span class="s4">;</span>
+  <span class="s1">std::shared_ptr&lt;JMessageQueueThread&gt; messageQueueThread_</span><span class="s4">;</span>
+<span class="s1">}</span><span class="s4">;</span>
+
+<span class="s1">} </span><span class="s0">// namespace</span>
+
+<span class="s1">jni::local_ref&lt;CatalystInstanceImpl::jhybriddata&gt;</span>
+<span class="s1">CatalystInstanceImpl::initHybrid(jni::alias_ref&lt;jclass&gt;) {</span>
+  <span class="s4">return </span><span class="s1">makeCxxInstance()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CatalystInstanceImpl::CatalystInstanceImpl()</span>
+    <span class="s1">: instance_(std::make_unique&lt;Instance&gt;()) {}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::warnOnLegacyNativeModuleSystemUse() {</span>
+  <span class="s1">CxxNativeModule::setShouldWarnOnUse(</span><span class="s4">true</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::registerNatives() {</span>
+  <span class="s1">registerHybrid({</span>
+      <span class="s1">makeNativeMethod(</span><span class="s3">&quot;initHybrid&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::initHybrid)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;initializeBridge&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::initializeBridge)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniExtendNativeModules&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::extendNativeModules)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniSetSourceURL&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::jniSetSourceURL)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniRegisterSegment&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::jniRegisterSegment)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniLoadScriptFromAssets&quot;</span><span class="s4">,</span>
+          <span class="s1">CatalystInstanceImpl::jniLoadScriptFromAssets)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniLoadScriptFromFile&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::jniLoadScriptFromFile)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniCallJSFunction&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::jniCallJSFunction)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniCallJSCallback&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::jniCallJSCallback)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;setGlobalVariable&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::setGlobalVariable)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;getJavaScriptContext&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::getJavaScriptContext)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;getJSCallInvokerHolder&quot;</span><span class="s4">,</span>
+          <span class="s1">CatalystInstanceImpl::getJSCallInvokerHolder)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;getNativeCallInvokerHolder&quot;</span><span class="s4">,</span>
+          <span class="s1">CatalystInstanceImpl::getNativeCallInvokerHolder)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;jniHandleMemoryPressure&quot;</span><span class="s4">,</span>
+          <span class="s1">CatalystInstanceImpl::handleMemoryPressure)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;getRuntimeExecutor&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::getRuntimeExecutor)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;getRuntimeScheduler&quot;</span><span class="s4">, </span><span class="s1">CatalystInstanceImpl::getRuntimeScheduler)</span><span class="s4">,</span>
+      <span class="s1">makeNativeMethod(</span>
+          <span class="s3">&quot;warnOnLegacyNativeModuleSystemUse&quot;</span><span class="s4">,</span>
+          <span class="s1">CatalystInstanceImpl::warnOnLegacyNativeModuleSystemUse)</span><span class="s4">,</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">log(ReactNativeLogLevel level</span><span class="s4">, const char </span><span class="s1">*message) {</span>
+  <span class="s4">switch </span><span class="s1">(level) {</span>
+    <span class="s4">case </span><span class="s1">ReactNativeLogLevelInfo:</span>
+      <span class="s1">LOG(INFO) &lt;&lt; message</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">ReactNativeLogLevelWarning:</span>
+      <span class="s1">LOG(WARNING) &lt;&lt; message</span><span class="s4">;</span>
+      <span class="s1">JReactSoftExceptionLogger::logNoThrowSoftExceptionWithMessage(</span>
+          <span class="s3">&quot;react_native_log#warning&quot;</span><span class="s4">, </span><span class="s1">message)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">ReactNativeLogLevelError:</span>
+      <span class="s1">LOG(ERROR) &lt;&lt; message</span><span class="s4">;</span>
+      <span class="s1">JReactCxxErrorHandler::handleError(message)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">ReactNativeLogLevelFatal:</span>
+      <span class="s1">LOG(FATAL) &lt;&lt; message</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::initializeBridge(</span>
+    <span class="s1">jni::alias_ref&lt;ReactCallback::javaobject&gt; callback</span><span class="s4">,</span>
+    <span class="s0">// This executor is actually a factory holder.</span>
+    <span class="s1">JavaScriptExecutorHolder *jseh</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;JavaMessageQueueThread::javaobject&gt; jsQueue</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;JavaMessageQueueThread::javaobject&gt; nativeModulesQueue</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;jni::JCollection&lt;JavaModuleWrapper::javaobject&gt;::javaobject&gt;</span>
+        <span class="s1">javaModules</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;jni::JCollection&lt;ModuleHolder::javaobject&gt;::javaobject&gt;</span>
+        <span class="s1">cxxModules) {</span>
+  <span class="s1">set_react_native_logfunc(&amp;log)</span><span class="s4">;</span>
+
+  <span class="s0">// TODO mhorowitz: how to assert here?</span>
+  <span class="s0">// Assertions.assertCondition(mBridge == null, &quot;initializeBridge should be</span>
+  <span class="s0">// called once&quot;);</span>
+  <span class="s1">moduleMessageQueue_ =</span>
+      <span class="s1">std::make_shared&lt;JMessageQueueThread&gt;(nativeModulesQueue)</span><span class="s4">;</span>
+
+  <span class="s0">// This used to be:</span>
+  <span class="s0">//</span>
+  <span class="s0">// Java CatalystInstanceImpl -&gt; C++ CatalystInstanceImpl -&gt; Bridge -&gt;</span>
+  <span class="s0">// Bridge::Callback</span>
+  <span class="s0">// --weak--&gt; ReactCallback -&gt; Java CatalystInstanceImpl</span>
+  <span class="s0">//</span>
+  <span class="s0">// Now the weak ref is a global ref.  So breaking the loop depends on</span>
+  <span class="s0">// CatalystInstanceImpl#destroy() calling mHybridData.resetNative(), which</span>
+  <span class="s0">// should cause all the C++ pointers to be cleaned up (except C++</span>
+  <span class="s0">// CatalystInstanceImpl might be kept alive for a short time by running</span>
+  <span class="s0">// callbacks). This also means that all native calls need to be pre-checked</span>
+  <span class="s0">// to avoid NPE.</span>
+
+  <span class="s0">// See the comment in callJSFunction.  Once js calls switch to strings, we</span>
+  <span class="s0">// don't need jsModuleDescriptions any more, all the way up and down the</span>
+  <span class="s0">// stack.</span>
+
+  <span class="s1">moduleRegistry_ = std::make_shared&lt;ModuleRegistry&gt;(buildNativeModuleList(</span>
+      <span class="s1">std::weak_ptr&lt;Instance&gt;(instance_)</span><span class="s4">,</span>
+      <span class="s1">javaModules</span><span class="s4">,</span>
+      <span class="s1">cxxModules</span><span class="s4">,</span>
+      <span class="s1">moduleMessageQueue_))</span><span class="s4">;</span>
+
+  <span class="s1">instance_-&gt;initializeBridge(</span>
+      <span class="s1">std::make_unique&lt;JInstanceCallback&gt;(callback</span><span class="s4">, </span><span class="s1">moduleMessageQueue_)</span><span class="s4">,</span>
+      <span class="s1">jseh-&gt;getExecutorFactory()</span><span class="s4">,</span>
+      <span class="s1">std::make_unique&lt;JMessageQueueThread&gt;(jsQueue)</span><span class="s4">,</span>
+      <span class="s1">moduleRegistry_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::extendNativeModules(</span>
+    <span class="s1">jni::alias_ref&lt;jni::JCollection&lt;JavaModuleWrapper::javaobject&gt;::javaobject&gt;</span>
+        <span class="s1">javaModules</span><span class="s4">,</span>
+    <span class="s1">jni::alias_ref&lt;jni::JCollection&lt;ModuleHolder::javaobject&gt;::javaobject&gt;</span>
+        <span class="s1">cxxModules) {</span>
+  <span class="s1">moduleRegistry_-&gt;registerModules(buildNativeModuleList(</span>
+      <span class="s1">std::weak_ptr&lt;Instance&gt;(instance_)</span><span class="s4">,</span>
+      <span class="s1">javaModules</span><span class="s4">,</span>
+      <span class="s1">cxxModules</span><span class="s4">,</span>
+      <span class="s1">moduleMessageQueue_))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::jniSetSourceURL(</span><span class="s4">const </span><span class="s1">std::string &amp;sourceURL) {</span>
+  <span class="s1">instance_-&gt;setSourceURL(sourceURL)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::jniRegisterSegment(</span>
+    <span class="s4">int </span><span class="s1">segmentId</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;path) {</span>
+  <span class="s1">instance_-&gt;registerBundle((uint32_t)segmentId</span><span class="s4">, </span><span class="s1">path)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static </span><span class="s1">ScriptTag getScriptTagFromFile(</span><span class="s4">const char </span><span class="s1">*sourcePath) {</span>
+  <span class="s1">std::ifstream bundle_stream(sourcePath</span><span class="s4">, </span><span class="s1">std::ios_base::in)</span><span class="s4">;</span>
+  <span class="s1">BundleHeader header</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(bundle_stream &amp;&amp;</span>
+      <span class="s1">bundle_stream.read(</span><span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">char </span><span class="s1">*&gt;(&amp;header)</span><span class="s4">, sizeof</span><span class="s1">(header))) {</span>
+    <span class="s4">return </span><span class="s1">parseTypeFromHeader(header)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s4">return </span><span class="s1">ScriptTag::String</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">static bool </span><span class="s1">isIndexedRAMBundle(std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigString&gt; *script) {</span>
+  <span class="s1">BundleHeader header</span><span class="s4">;</span>
+  <span class="s1">strncpy(</span>
+      <span class="s4">reinterpret_cast</span><span class="s1">&lt;</span><span class="s4">char </span><span class="s1">*&gt;(&amp;header)</span><span class="s4">,</span>
+      <span class="s1">script-&gt;get()-&gt;c_str()</span><span class="s4">,</span>
+      <span class="s4">sizeof</span><span class="s1">(header))</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">parseTypeFromHeader(header) == ScriptTag::RAMBundle</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::jniLoadScriptFromAssets(</span>
+    <span class="s1">jni::alias_ref&lt;JAssetManager::javaobject&gt; assetManager</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;assetURL</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">loadSynchronously) {</span>
+  <span class="s4">const int </span><span class="s1">kAssetsLength = </span><span class="s5">9</span><span class="s4">; </span><span class="s0">// strlen(&quot;assets://&quot;);</span>
+  <span class="s4">auto </span><span class="s1">sourceURL = assetURL.substr(kAssetsLength)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">manager = extractAssetManager(assetManager)</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">script = loadScriptFromAssets(manager</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(JniJSModulesUnbundle::isUnbundle(manager</span><span class="s4">, </span><span class="s1">sourceURL)) {</span>
+    <span class="s4">auto </span><span class="s1">bundle = JniJSModulesUnbundle::fromEntryFile(manager</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">registry = RAMBundleRegistry::singleBundleRegistry(std::move(bundle))</span><span class="s4">;</span>
+    <span class="s1">instance_-&gt;loadRAMBundle(</span>
+        <span class="s1">std::move(registry)</span><span class="s4">, </span><span class="s1">std::move(script)</span><span class="s4">, </span><span class="s1">sourceURL</span><span class="s4">, </span><span class="s1">loadSynchronously)</span><span class="s4">;</span>
+    <span class="s4">return;</span>
+  <span class="s1">} </span><span class="s4">else if </span><span class="s1">(isIndexedRAMBundle(&amp;script)) {</span>
+    <span class="s1">instance_-&gt;loadRAMBundleFromString(std::move(script)</span><span class="s4">, </span><span class="s1">sourceURL)</span><span class="s4">;</span>
+  <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+    <span class="s1">instance_-&gt;loadScriptFromString(</span>
+        <span class="s1">std::move(script)</span><span class="s4">, </span><span class="s1">sourceURL</span><span class="s4">, </span><span class="s1">loadSynchronously)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::jniLoadScriptFromFile(</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;fileName</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">std::string &amp;sourceURL</span><span class="s4">,</span>
+    <span class="s4">bool </span><span class="s1">loadSynchronously) {</span>
+  <span class="s4">auto </span><span class="s1">reactInstance = instance_</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!reactInstance) {</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">switch </span><span class="s1">(getScriptTagFromFile(fileName.c_str())) {</span>
+    <span class="s4">case </span><span class="s1">ScriptTag::MetroHBCBundle: {</span>
+      <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigFileString&gt; script</span><span class="s4">;</span>
+      <span class="s1">RecoverableError::runRethrowingAsRecoverable&lt;std::system_error&gt;(</span>
+          <span class="s1">[&amp;fileName</span><span class="s4">, </span><span class="s1">&amp;script]() {</span>
+            <span class="s1">script = JSBigFileString::fromPath(fileName)</span><span class="s4">;</span>
+          <span class="s1">})</span><span class="s4">;</span>
+      <span class="s4">const char </span><span class="s1">*buffer = script-&gt;c_str()</span><span class="s4">;</span>
+      <span class="s1">uint32_t bufferLength = (uint32_t)script-&gt;size()</span><span class="s4">;</span>
+      <span class="s1">uint32_t offset = </span><span class="s5">8</span><span class="s4">;</span>
+      <span class="s4">while </span><span class="s1">(offset &lt; bufferLength) {</span>
+        <span class="s1">uint32_t segment = offset + </span><span class="s5">4</span><span class="s4">;</span>
+        <span class="s1">uint32_t moduleLength =</span>
+            <span class="s1">bufferLength &lt; segment ? </span><span class="s5">0 </span><span class="s1">: *(((uint32_t *)buffer) + offset / </span><span class="s5">4</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s1">reactInstance-&gt;loadScriptFromString(</span>
+            <span class="s1">std::make_unique&lt;</span><span class="s4">const </span><span class="s1">JSBigStdString&gt;(</span>
+                <span class="s1">std::string(buffer + segment</span><span class="s4">, </span><span class="s1">buffer + moduleLength + segment))</span><span class="s4">,</span>
+            <span class="s1">sourceURL</span><span class="s4">,</span>
+            <span class="s4">false</span><span class="s1">)</span><span class="s4">;</span>
+
+        <span class="s1">offset += ((moduleLength + </span><span class="s5">3</span><span class="s1">) &amp; ~</span><span class="s5">3</span><span class="s1">) + </span><span class="s5">4</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+    <span class="s4">case </span><span class="s1">ScriptTag::RAMBundle:</span>
+      <span class="s1">instance_-&gt;loadRAMBundleFromFile(fileName</span><span class="s4">, </span><span class="s1">sourceURL</span><span class="s4">, </span><span class="s1">loadSynchronously)</span><span class="s4">;</span>
+      <span class="s4">break;</span>
+    <span class="s4">case </span><span class="s1">ScriptTag::String:</span>
+    <span class="s4">default</span><span class="s1">: {</span>
+      <span class="s1">std::unique_ptr&lt;</span><span class="s4">const </span><span class="s1">JSBigFileString&gt; script</span><span class="s4">;</span>
+      <span class="s1">RecoverableError::runRethrowingAsRecoverable&lt;std::system_error&gt;(</span>
+          <span class="s1">[&amp;fileName</span><span class="s4">, </span><span class="s1">&amp;script]() {</span>
+            <span class="s1">script = JSBigFileString::fromPath(fileName)</span><span class="s4">;</span>
+          <span class="s1">})</span><span class="s4">;</span>
+      <span class="s1">instance_-&gt;loadScriptFromString(</span>
+          <span class="s1">std::move(script)</span><span class="s4">, </span><span class="s1">sourceURL</span><span class="s4">, </span><span class="s1">loadSynchronously)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::jniCallJSFunction(</span>
+    <span class="s1">std::string module</span><span class="s4">,</span>
+    <span class="s1">std::string method</span><span class="s4">,</span>
+    <span class="s1">NativeArray *arguments) {</span>
+  <span class="s0">// We want to share the C++ code, and on iOS, modules pass module/method</span>
+  <span class="s0">// names as strings all the way through to JS, and there's no way to do</span>
+  <span class="s0">// string -&gt; id mapping on the objc side.  So on Android, we convert the</span>
+  <span class="s0">// number to a string, here which gets passed as-is to JS.  There, they they</span>
+  <span class="s0">// used as ids if isFinite(), which handles this case, and looked up as</span>
+  <span class="s0">// strings otherwise.  Eventually, we'll probably want to modify the stack</span>
+  <span class="s0">// from the JS proxy through here to use strings, too.</span>
+  <span class="s1">instance_-&gt;callJSFunction(</span>
+      <span class="s1">std::move(module)</span><span class="s4">, </span><span class="s1">std::move(method)</span><span class="s4">, </span><span class="s1">arguments-&gt;consume())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::jniCallJSCallback(</span>
+    <span class="s1">jint callbackId</span><span class="s4">,</span>
+    <span class="s1">NativeArray *arguments) {</span>
+  <span class="s1">instance_-&gt;callJSCallback(callbackId</span><span class="s4">, </span><span class="s1">arguments-&gt;consume())</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::setGlobalVariable(</span>
+    <span class="s1">std::string propName</span><span class="s4">,</span>
+    <span class="s1">std::string &amp;&amp;jsonValue) {</span>
+  <span class="s0">// This is only ever called from Java with short strings, and only</span>
+  <span class="s0">// for testing, so no need to try hard for zero-copy here.</span>
+
+  <span class="s1">instance_-&gt;setGlobalVariable(</span>
+      <span class="s1">std::move(propName)</span><span class="s4">,</span>
+      <span class="s1">std::make_unique&lt;JSBigStdString&gt;(std::move(jsonValue)))</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jlong CatalystInstanceImpl::getJavaScriptContext() {</span>
+  <span class="s4">return </span><span class="s1">(jlong)(intptr_t)instance_-&gt;getJavaScriptContext()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">CatalystInstanceImpl::handleMemoryPressure(</span><span class="s4">int </span><span class="s1">pressureLevel) {</span>
+  <span class="s1">instance_-&gt;handleMemoryPressure(pressureLevel)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jni::alias_ref&lt;CallInvokerHolder::javaobject&gt;</span>
+<span class="s1">CatalystInstanceImpl::getJSCallInvokerHolder() {</span>
+  <span class="s4">if </span><span class="s1">(!jsCallInvokerHolder_) {</span>
+    <span class="s4">auto </span><span class="s1">runtimeScheduler = getRuntimeScheduler()</span><span class="s4">;</span>
+    <span class="s4">auto </span><span class="s1">runtimeSchedulerCallInvoker =</span>
+        <span class="s1">std::make_shared&lt;RuntimeSchedulerCallInvoker&gt;(</span>
+            <span class="s1">runtimeScheduler-&gt;cthis()-&gt;get())</span><span class="s4">;</span>
+    <span class="s1">jsCallInvokerHolder_ = jni::make_global(</span>
+        <span class="s1">CallInvokerHolder::newObjectCxxArgs(runtimeSchedulerCallInvoker))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">jsCallInvokerHolder_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jni::alias_ref&lt;CallInvokerHolder::javaobject&gt;</span>
+<span class="s1">CatalystInstanceImpl::getNativeCallInvokerHolder() {</span>
+  <span class="s4">if </span><span class="s1">(!nativeCallInvokerHolder_) {</span>
+    <span class="s4">class </span><span class="s1">NativeThreadCallInvoker : </span><span class="s4">public </span><span class="s1">CallInvoker {</span>
+     <span class="s4">private</span><span class="s1">:</span>
+      <span class="s1">std::shared_ptr&lt;JMessageQueueThread&gt; messageQueueThread_</span><span class="s4">;</span>
+
+     <span class="s4">public</span><span class="s1">:</span>
+      <span class="s1">NativeThreadCallInvoker(</span>
+          <span class="s1">std::shared_ptr&lt;JMessageQueueThread&gt; messageQueueThread)</span>
+          <span class="s1">: messageQueueThread_(messageQueueThread) {}</span>
+      <span class="s4">void </span><span class="s1">invokeAsync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;work) override {</span>
+        <span class="s1">messageQueueThread_-&gt;runOnQueue(std::move(work))</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s4">void </span><span class="s1">invokeSync(std::function&lt;</span><span class="s4">void</span><span class="s1">()&gt; &amp;&amp;work) override {</span>
+        <span class="s1">messageQueueThread_-&gt;runOnQueueSync(std::move(work))</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span><span class="s4">;</span>
+
+    <span class="s1">std::shared_ptr&lt;CallInvoker&gt; nativeInvoker =</span>
+        <span class="s1">std::make_shared&lt;NativeThreadCallInvoker&gt;(moduleMessageQueue_)</span><span class="s4">;</span>
+
+    <span class="s1">std::shared_ptr&lt;CallInvoker&gt; decoratedNativeInvoker =</span>
+        <span class="s1">instance_-&gt;getDecoratedNativeCallInvoker(nativeInvoker)</span><span class="s4">;</span>
+
+    <span class="s1">nativeCallInvokerHolder_ = jni::make_global(</span>
+        <span class="s1">CallInvokerHolder::newObjectCxxArgs(decoratedNativeInvoker))</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">nativeCallInvokerHolder_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jni::alias_ref&lt;JRuntimeExecutor::javaobject&gt;</span>
+<span class="s1">CatalystInstanceImpl::getRuntimeExecutor() {</span>
+  <span class="s4">if </span><span class="s1">(!runtimeExecutor_) {</span>
+    <span class="s4">auto </span><span class="s1">executor = instance_-&gt;getRuntimeExecutor()</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(executor) {</span>
+      <span class="s1">runtimeExecutor_ =</span>
+          <span class="s1">jni::make_global(JRuntimeExecutor::newObjectCxxArgs(executor))</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+  <span class="s4">return </span><span class="s1">runtimeExecutor_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">jni::alias_ref&lt;JRuntimeScheduler::javaobject&gt;</span>
+<span class="s1">CatalystInstanceImpl::getRuntimeScheduler() {</span>
+  <span class="s4">if </span><span class="s1">(!runtimeScheduler_) {</span>
+    <span class="s4">auto </span><span class="s1">runtimeExecutor = instance_-&gt;getRuntimeExecutor()</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(runtimeExecutor) {</span>
+      <span class="s4">auto </span><span class="s1">runtimeScheduler =</span>
+          <span class="s1">std::make_shared&lt;RuntimeScheduler&gt;(runtimeExecutor)</span><span class="s4">;</span>
+      <span class="s1">runtimeScheduler_ = jni::make_global(</span>
+          <span class="s1">JRuntimeScheduler::newObjectCxxArgs(runtimeScheduler))</span><span class="s4">;</span>
+      <span class="s1">runtimeExecutor([scheduler =</span>
+                           <span class="s1">std::move(runtimeScheduler)](jsi::Runtime &amp;runtime) {</span>
+        <span class="s1">RuntimeSchedulerBinding::createAndInstallIfNeeded(runtime</span><span class="s4">, </span><span class="s1">scheduler)</span><span class="s4">;</span>
+      <span class="s1">})</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">runtimeScheduler_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace react</span>
+<span class="s1">} </span><span class="s0">// namespace facebook</span>
+</pre>
+</body>
+</html>

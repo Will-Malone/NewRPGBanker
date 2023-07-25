@@ -1,0 +1,432 @@
+<html>
+<head>
+<title>PackageExportsResolve.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+PackageExportsResolve.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow strict</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">ExportMap,</span>
+  <span class="s0">ExportMapWithFallbacks,</span>
+  <span class="s0">ExportsField,</span>
+  <span class="s0">FileResolution,</span>
+  <span class="s0">ResolutionContext,</span>
+<span class="s0">} from './types';</span>
+
+<span class="s0">import path from 'path';</span>
+<span class="s0">import InvalidPackageConfigurationError from './errors/InvalidPackageConfigurationError';</span>
+<span class="s0">import PackagePathNotExportedError from './errors/PackagePathNotExportedError';</span>
+<span class="s0">import resolveAsset from './resolveAsset';</span>
+<span class="s0">import isAssetFile from './utils/isAssetFile';</span>
+<span class="s0">import toPosixPath from './utils/toPosixPath';</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Resolve a package subpath based on the entry points defined in the package's</span>
+ <span class="s0">* &quot;exports&quot; field. If there is no match for the given subpath (which may be</span>
+ <span class="s0">* augmented by resolution of conditional exports for the passed `context`),</span>
+ <span class="s0">* throws a `PackagePathNotExportedError`.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Implements modern package resolution behaviour based on the [Package Entry</span>
+ <span class="s0">* Points spec](https://nodejs.org/docs/latest-v19.x/api/packages.html#package-entry-points).</span>
+ <span class="s0">*</span>
+ <span class="s0">* @throws {InvalidPackageConfigurationError} Raised if configuration specified</span>
+ <span class="s0">*   by `exportsField` is invalid.</span>
+ <span class="s0">* @throws {InvalidModuleSpecifierError} Raised if the resolved module specifier</span>
+ <span class="s0">*   is invalid.</span>
+ <span class="s0">* @throws {PackagePathNotExportedError} Raised when the requested subpath is</span>
+ <span class="s0">*   not exported.</span>
+ <span class="s0">*/</span>
+<span class="s0">export function resolvePackageTargetFromExports(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">/**</span>
+   <span class="s0">* The path to the containing npm package directory.</span>
+   <span class="s0">*/</span>
+  <span class="s0">packagePath: string,</span>
+  <span class="s0">/**</span>
+   <span class="s0">* The unresolved absolute path to the target module. This will be converted</span>
+   <span class="s0">* to a package-relative subpath for comparison.</span>
+   <span class="s0">*/</span>
+  <span class="s0">modulePath: string,</span>
+  <span class="s0">exportsField: ExportsField,</span>
+  <span class="s0">platform: string | null,</span>
+<span class="s0">): FileResolution {</span>
+  <span class="s0">const createConfigError = (reason: string) =&gt; {</span>
+    <span class="s0">return new InvalidPackageConfigurationError({</span>
+      <span class="s0">reason,</span>
+      <span class="s0">packagePath,</span>
+    <span class="s0">});</span>
+  <span class="s0">};</span>
+
+  <span class="s0">const subpath = getExportsSubpath(packagePath, modulePath);</span>
+  <span class="s0">const exportMap = normalizeExportsField(exportsField, createConfigError);</span>
+
+  <span class="s0">if (!isSubpathDefinedInExports(exportMap, subpath)) {</span>
+    <span class="s0">throw new PackagePathNotExportedError(</span>
+      <span class="s0">`Attempted to import the module &quot;${modulePath}&quot; which is not listed ` +</span>
+        <span class="s0">`in the &quot;exports&quot; of &quot;${packagePath}&quot;.`,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const {target, patternMatch} = matchSubpathFromExports(</span>
+    <span class="s0">context,</span>
+    <span class="s0">subpath,</span>
+    <span class="s0">exportMap,</span>
+    <span class="s0">platform,</span>
+    <span class="s0">createConfigError,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">if (target != null) {</span>
+    <span class="s0">const invalidSegmentInTarget = findInvalidPathSegment(target.slice(2));</span>
+
+    <span class="s0">if (invalidSegmentInTarget != null) {</span>
+      <span class="s0">throw createConfigError(</span>
+        <span class="s0">`The target for &quot;${subpath}&quot; defined in &quot;exports&quot; is &quot;${target}&quot;, ` +</span>
+          <span class="s0">'however this value is an invalid subpath or subpath pattern ' +</span>
+          <span class="s0">`because it includes &quot;${invalidSegmentInTarget}&quot;.`,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const filePath = path.join(</span>
+      <span class="s0">packagePath,</span>
+      <span class="s0">patternMatch != null ? target.replace('*', patternMatch) : target,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">if (isAssetFile(filePath, context.assetExts)) {</span>
+      <span class="s0">const assetResult = resolveAsset(context, filePath);</span>
+
+      <span class="s0">if (assetResult != null) {</span>
+        <span class="s0">return assetResult;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">if (context.doesFileExist(filePath)) {</span>
+      <span class="s0">return {type: 'sourceFile', filePath};</span>
+    <span class="s0">}</span>
+
+    <span class="s0">throw createConfigError(</span>
+      <span class="s0">`The resolution for &quot;${modulePath}&quot; defined in &quot;exports&quot; is ${filePath}, ` +</span>
+        <span class="s0">'however this file does not exist.',</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">throw new PackagePathNotExportedError(</span>
+    <span class="s0">`Attempted to import the module &quot;${modulePath}&quot; which is listed in the ` +</span>
+      <span class="s0">`&quot;exports&quot; of &quot;${packagePath}&quot;, however no match was resolved for this ` +</span>
+      <span class="s0">`request (platform = ${platform ?? 'null'}).`,</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Convert a module path to the package-relative subpath key to attempt for</span>
+ <span class="s0">* &quot;exports&quot; field lookup.</span>
+ <span class="s0">*/</span>
+<span class="s0">function getExportsSubpath(packagePath: string, modulePath: string): string {</span>
+  <span class="s0">const packageSubpath = path.relative(packagePath, modulePath);</span>
+
+  <span class="s0">return packageSubpath === '' ? '.' : './' + toPosixPath(packageSubpath);</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Normalise an &quot;exports&quot;-like field by parsing string shorthand and conditions</span>
+ <span class="s0">* shorthand at root, and flattening any legacy Node.js &lt;13.7 array values.</span>
+ <span class="s0">*</span>
+ <span class="s0">* See https://nodejs.org/docs/latest-v19.x/api/packages.html#exports-sugar.</span>
+ <span class="s0">*/</span>
+<span class="s0">function normalizeExportsField(</span>
+  <span class="s0">exportsField: ExportsField,</span>
+  <span class="s0">createConfigError: (reason: string) =&gt; Error,</span>
+<span class="s0">): ExportMap {</span>
+  <span class="s0">let rootValue;</span>
+
+  <span class="s0">if (Array.isArray(exportsField)) {</span>
+    <span class="s0">// If an array of strings, expand as subpath mapping (legacy root shorthand)</span>
+    <span class="s0">if (exportsField.every(value =&gt; typeof value === 'string')) {</span>
+      <span class="s0">// $FlowIssue[incompatible-call] exportsField is refined to `string[]`</span>
+      <span class="s0">return exportsField.reduce(</span>
+        <span class="s0">(result: ExportMap, subpath: string) =&gt; ({</span>
+          <span class="s0">...result,</span>
+          <span class="s0">[subpath]: subpath,</span>
+        <span class="s0">}),</span>
+        <span class="s0">{},</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">// Otherwise, should be a condition map and fallback string (Node.js &lt;13.7)</span>
+    <span class="s0">rootValue = exportsField[0];</span>
+  <span class="s0">} else {</span>
+    <span class="s0">rootValue = exportsField;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (rootValue == null || Array.isArray(rootValue)) {</span>
+    <span class="s0">throw createConfigError(</span>
+      <span class="s0">'Could not parse non-standard array value at root of &quot;exports&quot; field.',</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (typeof rootValue === 'string') {</span>
+    <span class="s0">return {'.': rootValue};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const firstLevelKeys = Object.keys(rootValue);</span>
+  <span class="s0">const subpathKeys = firstLevelKeys.filter(subpathOrCondition =&gt;</span>
+    <span class="s0">subpathOrCondition.startsWith('.'),</span>
+  <span class="s0">);</span>
+
+  <span class="s0">if (subpathKeys.length === firstLevelKeys.length) {</span>
+    <span class="s0">return flattenLegacySubpathValues(rootValue, createConfigError);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (subpathKeys.length !== 0) {</span>
+    <span class="s0">throw createConfigError(</span>
+      <span class="s0">'The &quot;exports&quot; field cannot have keys which are both subpaths and ' +</span>
+        <span class="s0">'condition names at the same level.',</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return {'.': flattenLegacySubpathValues(rootValue, createConfigError)};</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Flatten legacy Node.js &lt;13.7 array subpath values in an exports mapping.</span>
+ <span class="s0">*/</span>
+<span class="s0">function flattenLegacySubpathValues(</span>
+  <span class="s0">exportMap: ExportMap | ExportMapWithFallbacks,</span>
+  <span class="s0">createConfigError: (reason: string) =&gt; Error,</span>
+<span class="s0">): ExportMap {</span>
+  <span class="s0">return Object.keys(exportMap).reduce((result: ExportMap, subpath: string) =&gt; {</span>
+    <span class="s0">const value = exportMap[subpath];</span>
+
+    <span class="s0">// We do not support empty or nested arrays (non-standard)</span>
+    <span class="s0">if (Array.isArray(value) &amp;&amp; (!value.length || Array.isArray(value[0]))) {</span>
+      <span class="s0">throw createConfigError(</span>
+        <span class="s0">'Could not parse non-standard array value in &quot;exports&quot; field.',</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return {</span>
+      <span class="s0">...result,</span>
+      <span class="s0">[subpath]: Array.isArray(value) ? value[0] : value,</span>
+    <span class="s0">};</span>
+  <span class="s0">}, {});</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Identifies whether the given subpath is defined in the given &quot;exports&quot;-like</span>
+ <span class="s0">* mapping. Does not reduce exports conditions (therefore does not identify</span>
+ <span class="s0">* whether the subpath is mapped to a value).</span>
+ <span class="s0">*/</span>
+<span class="s0">export function isSubpathDefinedInExports(</span>
+  <span class="s0">exportMap: ExportMap,</span>
+  <span class="s0">subpath: string,</span>
+<span class="s0">): boolean {</span>
+  <span class="s0">if (subpath in exportMap) {</span>
+    <span class="s0">return true;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">// Attempt to match after expanding any subpath pattern keys</span>
+  <span class="s0">for (const key in exportMap) {</span>
+    <span class="s0">if (</span>
+      <span class="s0">key.split('*').length === 2 &amp;&amp;</span>
+      <span class="s0">matchSubpathPattern(key, subpath) != null</span>
+    <span class="s0">) {</span>
+      <span class="s0">return true;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return false;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Get the mapped replacement for the given subpath.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Implements modern package resolution behaviour based on the [Package Entry</span>
+ <span class="s0">* Points spec](https://nodejs.org/docs/latest-v19.x/api/packages.html#package-entry-points).</span>
+ <span class="s0">*/</span>
+<span class="s0">function matchSubpathFromExports(</span>
+  <span class="s0">context: ResolutionContext,</span>
+  <span class="s0">/**</span>
+   <span class="s0">* The package-relative subpath (beginning with '.') to match against either</span>
+   <span class="s0">* an exact subpath key or subpath pattern key in &quot;exports&quot;.</span>
+   <span class="s0">*/</span>
+  <span class="s0">subpath: string,</span>
+  <span class="s0">exportMap: ExportMap,</span>
+  <span class="s0">platform: string | null,</span>
+  <span class="s0">createConfigError: (reason: string) =&gt; Error,</span>
+<span class="s0">): $ReadOnly&lt;{</span>
+  <span class="s0">target: string | null,</span>
+  <span class="s0">patternMatch: string | null,</span>
+<span class="s0">}&gt; {</span>
+  <span class="s0">const conditionNames = new Set([</span>
+    <span class="s0">'default',</span>
+    <span class="s0">...context.unstable_conditionNames,</span>
+    <span class="s0">...(platform != null</span>
+      <span class="s0">? context.unstable_conditionsByPlatform[platform] ?? []</span>
+      <span class="s0">: []),</span>
+  <span class="s0">]);</span>
+
+  <span class="s0">const exportMapAfterConditions = reduceExportMap(</span>
+    <span class="s0">exportMap,</span>
+    <span class="s0">conditionNames,</span>
+    <span class="s0">createConfigError,</span>
+  <span class="s0">);</span>
+
+  <span class="s0">let target = exportMapAfterConditions[subpath];</span>
+  <span class="s0">let patternMatch = null;</span>
+
+  <span class="s0">// Attempt to match after expanding any subpath pattern keys</span>
+  <span class="s0">if (target == null) {</span>
+    <span class="s0">// Gather keys which are subpath patterns in descending order of specificity</span>
+    <span class="s0">const expansionKeys = Object.keys(exportMapAfterConditions)</span>
+      <span class="s0">.filter(key =&gt; key.includes('*'))</span>
+      <span class="s0">.sort(key =&gt; key.split('*')[0].length)</span>
+      <span class="s0">.reverse();</span>
+
+    <span class="s0">for (const key of expansionKeys) {</span>
+      <span class="s0">const value = exportMapAfterConditions[key];</span>
+
+      <span class="s0">// Skip invalid values (must include a single '*' or be `null`)</span>
+      <span class="s0">if (typeof value === 'string' &amp;&amp; value.split('*').length !== 2) {</span>
+        <span class="s0">break;</span>
+      <span class="s0">}</span>
+
+      <span class="s0">patternMatch = matchSubpathPattern(key, subpath);</span>
+
+      <span class="s0">if (patternMatch != null) {</span>
+        <span class="s0">target = value;</span>
+        <span class="s0">break;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return {target, patternMatch};</span>
+<span class="s0">}</span>
+
+<span class="s0">type FlattenedExportMap = $ReadOnly&lt;{[subpath: string]: string | null}&gt;;</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Reduce an &quot;exports&quot;-like mapping to a flat subpath mapping after resolving</span>
+ <span class="s0">* conditional exports.</span>
+ <span class="s0">*/</span>
+<span class="s0">function reduceExportMap(</span>
+  <span class="s0">exportMap: ExportMap,</span>
+  <span class="s0">conditionNames: $ReadOnlySet&lt;string&gt;,</span>
+  <span class="s0">createConfigError: (reason: string) =&gt; Error,</span>
+<span class="s0">): FlattenedExportMap {</span>
+  <span class="s0">const result: {[subpath: string]: string | null} = {};</span>
+
+  <span class="s0">for (const subpath in exportMap) {</span>
+    <span class="s0">const subpathValue = reduceConditionalExport(</span>
+      <span class="s0">exportMap[subpath],</span>
+      <span class="s0">conditionNames,</span>
+    <span class="s0">);</span>
+
+    <span class="s0">// If a subpath has no resolution for the passed `conditionNames`, do not</span>
+    <span class="s0">// include it in the result. (This includes only explicit `null` values,</span>
+    <span class="s0">// which may conditionally hide higher-specificity subpath patterns.)</span>
+    <span class="s0">if (subpathValue !== 'no-match') {</span>
+      <span class="s0">result[subpath] = subpathValue;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const invalidValues = Object.values(result).filter(</span>
+    <span class="s0">value =&gt; value != null &amp;&amp; !value.startsWith('./'),</span>
+  <span class="s0">);</span>
+
+  <span class="s0">if (invalidValues.length) {</span>
+    <span class="s0">throw createConfigError(</span>
+      <span class="s0">'One or more mappings for subpaths defined in &quot;exports&quot; are invalid. ' +</span>
+        <span class="s0">'All values must begin with &quot;./&quot;.',</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return result;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Reduce an &quot;exports&quot;-like subpath value after asserting the passed</span>
+ <span class="s0">* `conditionNames` in any nested conditions.</span>
+ <span class="s0">*</span>
+ <span class="s0">* Returns `'no-match'` in the case that none of the asserted `conditionNames`</span>
+ <span class="s0">* are matched.</span>
+ <span class="s0">*</span>
+ <span class="s0">* See https://nodejs.org/docs/latest-v19.x/api/packages.html#conditional-exports.</span>
+ <span class="s0">*/</span>
+<span class="s0">function reduceConditionalExport(</span>
+  <span class="s0">subpathValue: $Values&lt;ExportMap&gt;,</span>
+  <span class="s0">conditionNames: $ReadOnlySet&lt;string&gt;,</span>
+<span class="s0">): string | null | 'no-match' {</span>
+  <span class="s0">let reducedValue = subpathValue;</span>
+
+  <span class="s0">while (reducedValue != null &amp;&amp; typeof reducedValue !== 'string') {</span>
+    <span class="s0">let match: typeof subpathValue | 'no-match' = 'no-match';</span>
+
+    <span class="s0">for (const conditionName in reducedValue) {</span>
+      <span class="s0">if (conditionNames.has(conditionName)) {</span>
+        <span class="s0">match = reducedValue[conditionName];</span>
+        <span class="s0">break;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">reducedValue = match;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return reducedValue;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* If a subpath pattern expands to the passed subpath, return the subpath match</span>
+ <span class="s0">* (value to substitute for '*'). Otherwise, return `null`.</span>
+ <span class="s0">*</span>
+ <span class="s0">* See https://nodejs.org/docs/latest-v19.x/api/packages.html#subpath-patterns.</span>
+ <span class="s0">*/</span>
+<span class="s0">function matchSubpathPattern(</span>
+  <span class="s0">subpathPattern: string,</span>
+  <span class="s0">subpath: string,</span>
+<span class="s0">): string | null {</span>
+  <span class="s0">const [patternBase, patternTrailer] = subpathPattern.split('*');</span>
+
+  <span class="s0">if (subpath.startsWith(patternBase) &amp;&amp; subpath.endsWith(patternTrailer)) {</span>
+    <span class="s0">return subpath.substring(</span>
+      <span class="s0">patternBase.length,</span>
+      <span class="s0">subpath.length - patternTrailer.length,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return null;</span>
+<span class="s0">}</span>
+
+<span class="s0">function findInvalidPathSegment(subpath: string): ?string {</span>
+  <span class="s0">for (const segment of subpath.split(/[\\/]/)) {</span>
+    <span class="s0">if (</span>
+      <span class="s0">segment === '' ||</span>
+      <span class="s0">segment === '.' ||</span>
+      <span class="s0">segment === '..' ||</span>
+      <span class="s0">segment === 'node_modules'</span>
+    <span class="s0">) {</span>
+      <span class="s0">return segment;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return null;</span>
+<span class="s0">}</span>
+</pre>
+</body>
+</html>

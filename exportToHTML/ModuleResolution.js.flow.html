@@ -1,0 +1,402 @@
+<html>
+<head>
+<title>ModuleResolution.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ModuleResolution.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {</span>
+  <span class="s0">CustomResolver,</span>
+  <span class="s0">DoesFileExist,</span>
+  <span class="s0">FileCandidates,</span>
+  <span class="s0">GetRealPath,</span>
+  <span class="s0">Resolution,</span>
+  <span class="s0">ResolveAsset,</span>
+<span class="s0">} from 'metro-resolver';</span>
+<span class="s0">import type {ResolverInputOptions} from '../../shared/types.flow';</span>
+<span class="s0">import type {PackageInfo, PackageJson} from 'metro-resolver/src/types';</span>
+
+<span class="s0">const {codeFrameColumns} = require('@babel/code-frame');</span>
+<span class="s0">const fs = require('fs');</span>
+<span class="s0">const invariant = require('invariant');</span>
+<span class="s0">const Resolver = require('metro-resolver');</span>
+<span class="s0">const createDefaultContext = require('metro-resolver/src/createDefaultContext');</span>
+<span class="s0">const path = require('path');</span>
+<span class="s0">const util = require('util');</span>
+<span class="s0">import type {BundlerResolution} from '../../DeltaBundler/types.flow';</span>
+<span class="s0">import type {Reporter} from '../../lib/reporting';</span>
+
+<span class="s0">export type DirExistsFn = (filePath: string) =&gt; boolean;</span>
+
+<span class="s0">export type Packageish = interface {</span>
+  <span class="s0">path: string,</span>
+  <span class="s0">read(): PackageJson,</span>
+<span class="s0">};</span>
+
+<span class="s0">export type Moduleish = interface {</span>
+  <span class="s0">+path: string,</span>
+  <span class="s0">getPackage(): ?Packageish,</span>
+<span class="s0">};</span>
+
+<span class="s0">export type ModuleishCache&lt;TPackage&gt; = interface {</span>
+  <span class="s0">getPackage(</span>
+    <span class="s0">name: string,</span>
+    <span class="s0">platform?: string,</span>
+    <span class="s0">supportsNativePlatform?: boolean,</span>
+  <span class="s0">): TPackage,</span>
+  <span class="s0">getPackageOf(modulePath: string): ?TPackage,</span>
+<span class="s0">};</span>
+
+<span class="s0">type Options&lt;TPackage&gt; = $ReadOnly&lt;{</span>
+  <span class="s0">assetExts: $ReadOnlySet&lt;string&gt;,</span>
+  <span class="s0">dirExists: DirExistsFn,</span>
+  <span class="s0">disableHierarchicalLookup: boolean,</span>
+  <span class="s0">doesFileExist: DoesFileExist,</span>
+  <span class="s0">emptyModulePath: string,</span>
+  <span class="s0">extraNodeModules: ?Object,</span>
+  <span class="s0">getHasteModulePath: (name: string, platform: ?string) =&gt; ?string,</span>
+  <span class="s0">getHastePackagePath: (name: string, platform: ?string) =&gt; ?string,</span>
+  <span class="s0">mainFields: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">moduleCache: ModuleishCache&lt;TPackage&gt;,</span>
+  <span class="s0">nodeModulesPaths: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">preferNativePlatform: boolean,</span>
+  <span class="s0">projectRoot: string,</span>
+  <span class="s0">reporter: Reporter,</span>
+  <span class="s0">resolveAsset: ResolveAsset,</span>
+  <span class="s0">resolveRequest: ?CustomResolver,</span>
+  <span class="s0">sourceExts: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">unstable_conditionNames: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">unstable_conditionsByPlatform: $ReadOnly&lt;{</span>
+    <span class="s0">[platform: string]: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">}&gt;,</span>
+  <span class="s0">unstable_enablePackageExports: boolean,</span>
+  <span class="s0">unstable_getRealPath: ?GetRealPath,</span>
+<span class="s0">}&gt;;</span>
+
+<span class="s0">class ModuleResolver&lt;TPackage: Packageish&gt; {</span>
+  <span class="s0">_options: Options&lt;TPackage&gt;;</span>
+  <span class="s0">// A module representing the project root, used as the origin when resolving `emptyModulePath`.</span>
+  <span class="s0">_projectRootFakeModule: Moduleish;</span>
+  <span class="s0">// An empty module, the result of resolving `emptyModulePath` from the project root.</span>
+  <span class="s0">_cachedEmptyModule: ?BundlerResolution;</span>
+
+  <span class="s0">constructor(options: Options&lt;TPackage&gt;) {</span>
+    <span class="s0">this._options = options;</span>
+    <span class="s0">const {projectRoot, moduleCache} = this._options;</span>
+    <span class="s0">this._projectRootFakeModule = {</span>
+      <span class="s0">path: path.join(projectRoot, '_'),</span>
+      <span class="s0">getPackage: () =&gt;</span>
+        <span class="s0">moduleCache.getPackageOf(this._projectRootFakeModule.path),</span>
+      <span class="s0">isHaste() {</span>
+        <span class="s0">throw new Error('not implemented');</span>
+      <span class="s0">},</span>
+      <span class="s0">getName() {</span>
+        <span class="s0">throw new Error('not implemented');</span>
+      <span class="s0">},</span>
+    <span class="s0">};</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_getEmptyModule(): BundlerResolution {</span>
+    <span class="s0">let emptyModule = this._cachedEmptyModule;</span>
+    <span class="s0">if (!emptyModule) {</span>
+      <span class="s0">emptyModule = this.resolveDependency(</span>
+        <span class="s0">this._projectRootFakeModule,</span>
+        <span class="s0">this._options.emptyModulePath,</span>
+        <span class="s0">false,</span>
+        <span class="s0">null,</span>
+        <span class="s0">/* resolverOptions */ {},</span>
+      <span class="s0">);</span>
+      <span class="s0">this._cachedEmptyModule = emptyModule;</span>
+    <span class="s0">}</span>
+    <span class="s0">return emptyModule;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">resolveDependency(</span>
+    <span class="s0">fromModule: Moduleish,</span>
+    <span class="s0">moduleName: string,</span>
+    <span class="s0">allowHaste: boolean,</span>
+    <span class="s0">platform: string | null,</span>
+    <span class="s0">resolverOptions: ResolverInputOptions,</span>
+  <span class="s0">): BundlerResolution {</span>
+    <span class="s0">const {</span>
+      <span class="s0">assetExts,</span>
+      <span class="s0">disableHierarchicalLookup,</span>
+      <span class="s0">doesFileExist,</span>
+      <span class="s0">extraNodeModules,</span>
+      <span class="s0">mainFields,</span>
+      <span class="s0">nodeModulesPaths,</span>
+      <span class="s0">preferNativePlatform,</span>
+      <span class="s0">resolveAsset,</span>
+      <span class="s0">resolveRequest,</span>
+      <span class="s0">sourceExts,</span>
+      <span class="s0">unstable_conditionNames,</span>
+      <span class="s0">unstable_conditionsByPlatform,</span>
+      <span class="s0">unstable_enablePackageExports,</span>
+      <span class="s0">unstable_getRealPath,</span>
+    <span class="s0">} = this._options;</span>
+
+    <span class="s0">try {</span>
+      <span class="s0">const result = Resolver.resolve(</span>
+        <span class="s0">createDefaultContext({</span>
+          <span class="s0">allowHaste,</span>
+          <span class="s0">assetExts,</span>
+          <span class="s0">disableHierarchicalLookup,</span>
+          <span class="s0">doesFileExist,</span>
+          <span class="s0">extraNodeModules,</span>
+          <span class="s0">mainFields,</span>
+          <span class="s0">nodeModulesPaths,</span>
+          <span class="s0">preferNativePlatform,</span>
+          <span class="s0">resolveAsset,</span>
+          <span class="s0">resolveRequest,</span>
+          <span class="s0">sourceExts,</span>
+          <span class="s0">unstable_conditionNames,</span>
+          <span class="s0">unstable_conditionsByPlatform,</span>
+          <span class="s0">unstable_enablePackageExports,</span>
+          <span class="s0">unstable_getRealPath,</span>
+          <span class="s0">unstable_logWarning: this._logWarning,</span>
+          <span class="s0">customResolverOptions: resolverOptions.customResolverOptions ?? {},</span>
+          <span class="s0">originModulePath: fromModule.path,</span>
+          <span class="s0">resolveHasteModule: (name: string) =&gt;</span>
+            <span class="s0">this._options.getHasteModulePath(name, platform),</span>
+          <span class="s0">resolveHastePackage: (name: string) =&gt;</span>
+            <span class="s0">this._options.getHastePackagePath(name, platform),</span>
+          <span class="s0">getPackage: this._getPackage,</span>
+          <span class="s0">getPackageForModule: (modulePath: string) =&gt;</span>
+            <span class="s0">this._getPackageForModule(fromModule, modulePath),</span>
+        <span class="s0">}),</span>
+        <span class="s0">moduleName,</span>
+        <span class="s0">platform,</span>
+      <span class="s0">);</span>
+      <span class="s0">return this._getFileResolvedModule(result);</span>
+    <span class="s0">} catch (error) {</span>
+      <span class="s0">if (error instanceof Resolver.FailedToResolvePathError) {</span>
+        <span class="s0">const {candidates} = error;</span>
+        <span class="s0">throw new UnableToResolveError(</span>
+          <span class="s0">fromModule.path,</span>
+          <span class="s0">moduleName,</span>
+          <span class="s0">[</span>
+            <span class="s0">'\n\nNone of these files exist:',</span>
+            <span class="s0">`  * ${Resolver.formatFileCandidates(</span>
+              <span class="s0">this._removeRoot(candidates.file),</span>
+            <span class="s0">)}`,</span>
+            <span class="s0">`  * ${Resolver.formatFileCandidates(</span>
+              <span class="s0">this._removeRoot(candidates.dir),</span>
+            <span class="s0">)}`,</span>
+          <span class="s0">].join('\n'),</span>
+          <span class="s0">{</span>
+            <span class="s0">cause: error,</span>
+          <span class="s0">},</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+      <span class="s0">if (error instanceof Resolver.FailedToResolveNameError) {</span>
+        <span class="s0">const dirPaths = error.dirPaths;</span>
+        <span class="s0">const extraPaths = error.extraPaths;</span>
+        <span class="s0">const displayDirPaths = dirPaths</span>
+          <span class="s0">.filter((dirPath: string) =&gt; this._options.dirExists(dirPath))</span>
+          <span class="s0">.map(dirPath =&gt; path.relative(this._options.projectRoot, dirPath))</span>
+          <span class="s0">.concat(extraPaths);</span>
+
+        <span class="s0">const hint = displayDirPaths.length ? ' or in these directories:' : '';</span>
+
+        <span class="s0">throw new UnableToResolveError(</span>
+          <span class="s0">fromModule.path,</span>
+          <span class="s0">moduleName,</span>
+          <span class="s0">[</span>
+            <span class="s0">`${moduleName} could not be found within the project${hint || '.'}`,</span>
+            <span class="s0">...displayDirPaths.map((dirPath: string) =&gt; `  ${dirPath}`),</span>
+          <span class="s0">].join('\n'),</span>
+          <span class="s0">{</span>
+            <span class="s0">cause: error,</span>
+          <span class="s0">},</span>
+        <span class="s0">);</span>
+      <span class="s0">}</span>
+      <span class="s0">throw error;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_getPackage = (packageJsonPath: string): ?PackageJson =&gt; {</span>
+    <span class="s0">try {</span>
+      <span class="s0">return this._options.moduleCache.getPackage(packageJsonPath).read();</span>
+    <span class="s0">} catch (e) {</span>
+      <span class="s0">// Do nothing. The standard module cache does not trigger any error, but</span>
+      <span class="s0">// the ModuleGraph one does, if the module does not exist.</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return null;</span>
+  <span class="s0">};</span>
+
+  <span class="s0">_getPackageForModule = (</span>
+    <span class="s0">fromModule: Moduleish,</span>
+    <span class="s0">modulePath: string,</span>
+  <span class="s0">): ?PackageInfo =&gt; {</span>
+    <span class="s0">let pkg;</span>
+
+    <span class="s0">try {</span>
+      <span class="s0">pkg = this._options.moduleCache.getPackageOf(modulePath);</span>
+    <span class="s0">} catch (e) {</span>
+      <span class="s0">// Do nothing. The standard module cache does not trigger any error, but</span>
+      <span class="s0">// the ModuleGraph one does, if the module does not exist.</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return pkg != null</span>
+      <span class="s0">? {</span>
+          <span class="s0">rootPath: path.dirname(pkg.path),</span>
+          <span class="s0">packageJson: pkg.read(),</span>
+        <span class="s0">}</span>
+      <span class="s0">: null;</span>
+  <span class="s0">};</span>
+
+  <span class="s0">/**</span>
+   <span class="s0">* TODO: Return Resolution instead of coercing to BundlerResolution here</span>
+   <span class="s0">*/</span>
+  <span class="s0">_getFileResolvedModule(resolution: Resolution): BundlerResolution {</span>
+    <span class="s0">switch (resolution.type) {</span>
+      <span class="s0">case 'sourceFile':</span>
+        <span class="s0">return resolution;</span>
+      <span class="s0">case 'assetFiles':</span>
+        <span class="s0">// FIXME: we should forward ALL the paths/metadata,</span>
+        <span class="s0">// not just an arbitrary item!</span>
+        <span class="s0">const arbitrary = getArrayLowestItem(resolution.filePaths);</span>
+        <span class="s0">invariant(arbitrary != null, 'invalid asset resolution');</span>
+        <span class="s0">return {type: 'sourceFile', filePath: arbitrary};</span>
+      <span class="s0">case 'empty':</span>
+        <span class="s0">return this._getEmptyModule();</span>
+      <span class="s0">default:</span>
+        <span class="s0">(resolution.type: empty);</span>
+        <span class="s0">throw new Error('invalid type');</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">_logWarning = (message: string): void =&gt; {</span>
+    <span class="s0">this._options.reporter.update({</span>
+      <span class="s0">type: 'resolver_warning',</span>
+      <span class="s0">message,</span>
+    <span class="s0">});</span>
+  <span class="s0">};</span>
+
+  <span class="s0">_removeRoot(candidates: FileCandidates): FileCandidates {</span>
+    <span class="s0">if (candidates.filePathPrefix) {</span>
+      <span class="s0">candidates.filePathPrefix = path.relative(</span>
+        <span class="s0">this._options.projectRoot,</span>
+        <span class="s0">candidates.filePathPrefix,</span>
+      <span class="s0">);</span>
+    <span class="s0">}</span>
+    <span class="s0">return candidates;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">function getArrayLowestItem(a: $ReadOnlyArray&lt;string&gt;): string | void {</span>
+  <span class="s0">if (a.length === 0) {</span>
+    <span class="s0">return undefined;</span>
+  <span class="s0">}</span>
+  <span class="s0">let lowest = a[0];</span>
+  <span class="s0">for (let i = 1; i &lt; a.length; ++i) {</span>
+    <span class="s0">if (a[i] &lt; lowest) {</span>
+      <span class="s0">lowest = a[i];</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+  <span class="s0">return lowest;</span>
+<span class="s0">}</span>
+
+<span class="s0">class UnableToResolveError extends Error {</span>
+  <span class="s0">/**</span>
+   <span class="s0">* File path of the module that tried to require a module, ex. `/js/foo.js`.</span>
+   <span class="s0">*/</span>
+  <span class="s0">originModulePath: string;</span>
+  <span class="s0">/**</span>
+   <span class="s0">* The name of the module that was required, no necessarily a path,</span>
+   <span class="s0">* ex. `./bar`, or `invariant`.</span>
+   <span class="s0">*/</span>
+  <span class="s0">targetModuleName: string;</span>
+  <span class="s0">/**</span>
+   <span class="s0">* Original error that causes this error</span>
+   <span class="s0">*/</span>
+  <span class="s0">cause: ?Error;</span>
+
+  <span class="s0">constructor(</span>
+    <span class="s0">originModulePath: string,</span>
+    <span class="s0">targetModuleName: string,</span>
+    <span class="s0">message: string,</span>
+    <span class="s0">options?: $ReadOnly&lt;{</span>
+      <span class="s0">cause?: Error,</span>
+    <span class="s0">}&gt;,</span>
+  <span class="s0">) {</span>
+    <span class="s0">super();</span>
+    <span class="s0">this.originModulePath = originModulePath;</span>
+    <span class="s0">this.targetModuleName = targetModuleName;</span>
+    <span class="s0">const codeFrameMessage = this.buildCodeFrameMessage();</span>
+    <span class="s0">this.message =</span>
+      <span class="s0">util.format(</span>
+        <span class="s0">'Unable to resolve module %s from %s: %s',</span>
+        <span class="s0">targetModuleName,</span>
+        <span class="s0">originModulePath,</span>
+        <span class="s0">message,</span>
+      <span class="s0">) + (codeFrameMessage ? '\n' + codeFrameMessage : '');</span>
+
+    <span class="s0">this.cause = options?.cause;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">buildCodeFrameMessage(): ?string {</span>
+    <span class="s0">let file;</span>
+    <span class="s0">try {</span>
+      <span class="s0">file = fs.readFileSync(this.originModulePath, 'utf8');</span>
+    <span class="s0">} catch (error) {</span>
+      <span class="s0">if (error.code === 'ENOENT' || error.code === 'EISDIR') {</span>
+        <span class="s0">// We're probably dealing with a virtualised file system where</span>
+        <span class="s0">// `this.originModulePath` doesn't actually exist on disk.</span>
+        <span class="s0">// We can't show a code frame, but there's no need to let this I/O</span>
+        <span class="s0">// error shadow the original module resolution error.</span>
+        <span class="s0">return null;</span>
+      <span class="s0">}</span>
+      <span class="s0">throw error;</span>
+    <span class="s0">}</span>
+
+    <span class="s0">const lines = file.split('\n');</span>
+    <span class="s0">let lineNumber = 0;</span>
+    <span class="s0">let column = -1;</span>
+    <span class="s0">for (let line = 0; line &lt; lines.length; line++) {</span>
+      <span class="s0">const columnLocation = lines[line].lastIndexOf(this.targetModuleName);</span>
+      <span class="s0">if (columnLocation &gt;= 0) {</span>
+        <span class="s0">lineNumber = line;</span>
+        <span class="s0">column = columnLocation;</span>
+        <span class="s0">break;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+
+    <span class="s0">return codeFrameColumns(</span>
+      <span class="s0">fs.readFileSync(this.originModulePath, 'utf8'),</span>
+      <span class="s0">{</span>
+        <span class="s0">start: {column: column + 1, line: lineNumber + 1},</span>
+      <span class="s0">},</span>
+      <span class="s0">{forceColor: process.env.NODE_ENV !== 'test'},</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">ModuleResolver,</span>
+  <span class="s0">UnableToResolveError,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

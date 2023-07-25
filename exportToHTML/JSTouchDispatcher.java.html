@@ -1,0 +1,227 @@
+<html>
+<head>
+<title>JSTouchDispatcher.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #629755; font-weight: bold; font-style: italic;}
+.s6 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+JSTouchDispatcher.java</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">package </span><span class="s1">com.facebook.react.uimanager</span><span class="s2">;</span>
+
+<span class="s2">import </span><span class="s1">android.view.MotionEvent</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">android.view.ViewGroup</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.common.logging.FLog</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.infer.annotation.Assertions</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.common.ReactConstants</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.events.EventDispatcher</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.events.TouchEvent</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.events.TouchEventCoalescingKeyHelper</span><span class="s2">;</span>
+<span class="s2">import </span><span class="s1">com.facebook.react.uimanager.events.TouchEventType</span><span class="s2">;</span>
+
+<span class="s3">/**</span>
+ <span class="s3">* JSTouchDispatcher handles dispatching touches to JS from RootViews. If you implement RootView you</span>
+ <span class="s3">* need to call handleTouchEvent from onTouchEvent and onInterceptTouchEvent. It will correctly find</span>
+ <span class="s3">* the right view to handle the touch and also dispatch the appropriate event to JS</span>
+ <span class="s3">*/</span>
+<span class="s2">public class </span><span class="s1">JSTouchDispatcher {</span>
+
+  <span class="s2">private int </span><span class="s1">mTargetTag = -</span><span class="s4">1</span><span class="s2">;</span>
+  <span class="s2">private final float</span><span class="s1">[] mTargetCoordinates = </span><span class="s2">new float</span><span class="s1">[</span><span class="s4">2</span><span class="s1">]</span><span class="s2">;</span>
+  <span class="s2">private boolean </span><span class="s1">mChildIsHandlingNativeGesture = </span><span class="s2">false;</span>
+  <span class="s2">private long </span><span class="s1">mGestureStartTime = TouchEvent.UNSET</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">ViewGroup mRootViewGroup</span><span class="s2">;</span>
+  <span class="s2">private final </span><span class="s1">TouchEventCoalescingKeyHelper mTouchEventCoalescingKeyHelper =</span>
+      <span class="s2">new </span><span class="s1">TouchEventCoalescingKeyHelper()</span><span class="s2">;</span>
+
+  <span class="s2">public </span><span class="s1">JSTouchDispatcher(ViewGroup viewGroup) {</span>
+    <span class="s1">mRootViewGroup = viewGroup</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onChildStartedNativeGesture(</span>
+      <span class="s1">MotionEvent androidEvent</span><span class="s2">, </span><span class="s1">EventDispatcher eventDispatcher) {</span>
+    <span class="s2">if </span><span class="s1">(mChildIsHandlingNativeGesture) {</span>
+      <span class="s0">// This means we previously had another child start handling this native gesture and now a</span>
+      <span class="s0">// different native parent of that child has decided to intercept the touch stream and handle</span>
+      <span class="s0">// the gesture itself. Example where this can happen: HorizontalScrollView in a ScrollView.</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">dispatchCancelEvent(androidEvent</span><span class="s2">, </span><span class="s1">eventDispatcher)</span><span class="s2">;</span>
+    <span class="s1">mChildIsHandlingNativeGesture = </span><span class="s2">true;</span>
+    <span class="s1">mTargetTag = -</span><span class="s4">1</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">public void </span><span class="s1">onChildEndedNativeGesture(MotionEvent androidEvent</span><span class="s2">, </span><span class="s1">EventDispatcher eventDispatcher) {</span>
+    <span class="s0">// There should be only one child gesture at any given time. We can safely turn off the flag.</span>
+    <span class="s1">mChildIsHandlingNativeGesture = </span><span class="s2">false;</span>
+  <span class="s1">}</span>
+
+  <span class="s3">/**</span>
+   <span class="s3">* Main catalyst view is responsible for collecting and sending touch events to JS. This method</span>
+   <span class="s3">* reacts for an incoming android native touch events ({</span><span class="s5">@link </span><span class="s3">MotionEvent}) and calls into {</span><span class="s5">@link</span>
+   <span class="s3">* com.facebook.react.uimanager.events.EventDispatcher} when appropriate. It uses {</span><span class="s5">@link</span>
+   <span class="s3">* com.facebook.react.uimanager.TouchTargetHelper#findTouchTargetView} helper method for figuring</span>
+   <span class="s3">* out a react view ID in the case of ACTION_DOWN event (when the gesture starts).</span>
+   <span class="s3">*/</span>
+  <span class="s2">public void </span><span class="s1">handleTouchEvent(MotionEvent ev</span><span class="s2">, </span><span class="s1">EventDispatcher eventDispatcher) {</span>
+    <span class="s2">int </span><span class="s1">action = ev.getAction() &amp; MotionEvent.ACTION_MASK</span><span class="s2">;</span>
+    <span class="s2">if </span><span class="s1">(action == MotionEvent.ACTION_DOWN) {</span>
+      <span class="s2">if </span><span class="s1">(mTargetTag != -</span><span class="s4">1</span><span class="s1">) {</span>
+        <span class="s1">FLog.e(</span>
+            <span class="s1">ReactConstants.TAG</span><span class="s2">, </span><span class="s6">&quot;Got DOWN touch before receiving UP or CANCEL from last gesture&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+
+      <span class="s0">// First event for this gesture. We expect tag to be set to -1, and we use helper method</span>
+      <span class="s0">// {@link #findTargetTagForTouch} to find react view ID that will be responsible for handling</span>
+      <span class="s0">// this gesture</span>
+      <span class="s1">mChildIsHandlingNativeGesture = </span><span class="s2">false;</span>
+      <span class="s1">mGestureStartTime = ev.getEventTime()</span><span class="s2">;</span>
+
+      <span class="s1">mTargetTag = findTargetTagAndSetCoordinates(ev)</span><span class="s2">;</span>
+      <span class="s1">eventDispatcher.dispatchEvent(</span>
+          <span class="s1">TouchEvent.obtain(</span>
+              <span class="s1">UIManagerHelper.getSurfaceId(mRootViewGroup)</span><span class="s2">,</span>
+              <span class="s1">mTargetTag</span><span class="s2">,</span>
+              <span class="s1">TouchEventType.START</span><span class="s2">,</span>
+              <span class="s1">ev</span><span class="s2">,</span>
+              <span class="s1">mGestureStartTime</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTouchEventCoalescingKeyHelper))</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(mChildIsHandlingNativeGesture) {</span>
+      <span class="s0">// If the touch was intercepted by a child, we've already sent a cancel event to JS for this</span>
+      <span class="s0">// gesture, so we shouldn't send any more touches related to it.</span>
+      <span class="s2">return;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(mTargetTag == -</span><span class="s4">1</span><span class="s1">) {</span>
+      <span class="s0">// All the subsequent action types are expected to be called after ACTION_DOWN thus target</span>
+      <span class="s0">// is supposed to be set for them.</span>
+      <span class="s1">FLog.e(</span>
+          <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+          <span class="s6">&quot;Unexpected state: received touch event but didn't get starting ACTION_DOWN for this &quot;</span>
+              <span class="s1">+ </span><span class="s6">&quot;gesture before&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(action == MotionEvent.ACTION_UP) {</span>
+      <span class="s0">// End of the gesture. We reset target tag to -1 and expect no further event associated with</span>
+      <span class="s0">// this gesture.</span>
+      <span class="s1">findTargetTagAndSetCoordinates(ev)</span><span class="s2">;</span>
+      <span class="s1">eventDispatcher.dispatchEvent(</span>
+          <span class="s1">TouchEvent.obtain(</span>
+              <span class="s1">UIManagerHelper.getSurfaceId(mRootViewGroup)</span><span class="s2">,</span>
+              <span class="s1">mTargetTag</span><span class="s2">,</span>
+              <span class="s1">TouchEventType.END</span><span class="s2">,</span>
+              <span class="s1">ev</span><span class="s2">,</span>
+              <span class="s1">mGestureStartTime</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTouchEventCoalescingKeyHelper))</span><span class="s2">;</span>
+      <span class="s1">mTargetTag = -</span><span class="s4">1</span><span class="s2">;</span>
+      <span class="s1">mGestureStartTime = TouchEvent.UNSET</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(action == MotionEvent.ACTION_MOVE) {</span>
+      <span class="s0">// Update pointer position for current gesture</span>
+      <span class="s1">findTargetTagAndSetCoordinates(ev)</span><span class="s2">;</span>
+      <span class="s1">eventDispatcher.dispatchEvent(</span>
+          <span class="s1">TouchEvent.obtain(</span>
+              <span class="s1">UIManagerHelper.getSurfaceId(mRootViewGroup)</span><span class="s2">,</span>
+              <span class="s1">mTargetTag</span><span class="s2">,</span>
+              <span class="s1">TouchEventType.MOVE</span><span class="s2">,</span>
+              <span class="s1">ev</span><span class="s2">,</span>
+              <span class="s1">mGestureStartTime</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTouchEventCoalescingKeyHelper))</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(action == MotionEvent.ACTION_POINTER_DOWN) {</span>
+      <span class="s0">// New pointer goes down, this can only happen after ACTION_DOWN is sent for the first pointer</span>
+      <span class="s1">eventDispatcher.dispatchEvent(</span>
+          <span class="s1">TouchEvent.obtain(</span>
+              <span class="s1">UIManagerHelper.getSurfaceId(mRootViewGroup)</span><span class="s2">,</span>
+              <span class="s1">mTargetTag</span><span class="s2">,</span>
+              <span class="s1">TouchEventType.START</span><span class="s2">,</span>
+              <span class="s1">ev</span><span class="s2">,</span>
+              <span class="s1">mGestureStartTime</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTouchEventCoalescingKeyHelper))</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(action == MotionEvent.ACTION_POINTER_UP) {</span>
+      <span class="s0">// Exactly one of the pointers goes up</span>
+      <span class="s1">eventDispatcher.dispatchEvent(</span>
+          <span class="s1">TouchEvent.obtain(</span>
+              <span class="s1">UIManagerHelper.getSurfaceId(mRootViewGroup)</span><span class="s2">,</span>
+              <span class="s1">mTargetTag</span><span class="s2">,</span>
+              <span class="s1">TouchEventType.END</span><span class="s2">,</span>
+              <span class="s1">ev</span><span class="s2">,</span>
+              <span class="s1">mGestureStartTime</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTargetCoordinates[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+              <span class="s1">mTouchEventCoalescingKeyHelper))</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else if </span><span class="s1">(action == MotionEvent.ACTION_CANCEL) {</span>
+      <span class="s2">if </span><span class="s1">(mTouchEventCoalescingKeyHelper.hasCoalescingKey(ev.getDownTime())) {</span>
+        <span class="s1">dispatchCancelEvent(ev</span><span class="s2">, </span><span class="s1">eventDispatcher)</span><span class="s2">;</span>
+      <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+        <span class="s1">FLog.e(</span>
+            <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+            <span class="s6">&quot;Received an ACTION_CANCEL touch event for which we have no corresponding ACTION_DOWN&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s1">}</span>
+      <span class="s1">mTargetTag = -</span><span class="s4">1</span><span class="s2">;</span>
+      <span class="s1">mGestureStartTime = TouchEvent.UNSET</span><span class="s2">;</span>
+    <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+      <span class="s1">FLog.w(</span>
+          <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+          <span class="s6">&quot;Warning : touch event was ignored. Action=&quot; </span><span class="s1">+ action + </span><span class="s6">&quot; Target=&quot; </span><span class="s1">+ mTargetTag)</span><span class="s2">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private int </span><span class="s1">findTargetTagAndSetCoordinates(MotionEvent ev) {</span>
+    <span class="s0">// This method updates `mTargetCoordinates` with coordinates for the motion event.</span>
+    <span class="s2">return </span><span class="s1">TouchTargetHelper.findTargetTagAndCoordinatesForTouch(</span>
+        <span class="s1">ev.getX()</span><span class="s2">, </span><span class="s1">ev.getY()</span><span class="s2">, </span><span class="s1">mRootViewGroup</span><span class="s2">, </span><span class="s1">mTargetCoordinates</span><span class="s2">, null</span><span class="s1">)</span><span class="s2">;</span>
+  <span class="s1">}</span>
+
+  <span class="s2">private void </span><span class="s1">dispatchCancelEvent(MotionEvent androidEvent</span><span class="s2">, </span><span class="s1">EventDispatcher eventDispatcher) {</span>
+    <span class="s0">// This means the gesture has already ended, via some other CANCEL or UP event. This is not</span>
+    <span class="s0">// expected to happen very often as it would mean some child View has decided to intercept the</span>
+    <span class="s0">// touch stream and start a native gesture only upon receiving the UP/CANCEL event.</span>
+    <span class="s2">if </span><span class="s1">(mTargetTag == -</span><span class="s4">1</span><span class="s1">) {</span>
+      <span class="s1">FLog.w(</span>
+          <span class="s1">ReactConstants.TAG</span><span class="s2">,</span>
+          <span class="s6">&quot;Can't cancel already finished gesture. Is a child View trying to start a gesture from &quot;</span>
+              <span class="s1">+ </span><span class="s6">&quot;an UP/CANCEL event?&quot;</span><span class="s1">)</span><span class="s2">;</span>
+      <span class="s2">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">Assertions.assertCondition(</span>
+        <span class="s1">!mChildIsHandlingNativeGesture</span><span class="s2">,</span>
+        <span class="s6">&quot;Expected to not have already sent a cancel for this gesture&quot;</span><span class="s1">)</span><span class="s2">;</span>
+    <span class="s1">Assertions.assertNotNull(eventDispatcher)</span>
+        <span class="s1">.dispatchEvent(</span>
+            <span class="s1">TouchEvent.obtain(</span>
+                <span class="s1">UIManagerHelper.getSurfaceId(mRootViewGroup)</span><span class="s2">,</span>
+                <span class="s1">mTargetTag</span><span class="s2">,</span>
+                <span class="s1">TouchEventType.CANCEL</span><span class="s2">,</span>
+                <span class="s1">androidEvent</span><span class="s2">,</span>
+                <span class="s1">mGestureStartTime</span><span class="s2">,</span>
+                <span class="s1">mTargetCoordinates[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">mTargetCoordinates[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">mTouchEventCoalescingKeyHelper))</span><span class="s2">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

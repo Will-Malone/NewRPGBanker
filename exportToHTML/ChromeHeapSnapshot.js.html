@@ -1,0 +1,573 @@
+<html>
+<head>
+<title>ChromeHeapSnapshot.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ChromeHeapSnapshot.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const invariant = require(</span><span class="s2">&quot;invariant&quot;</span><span class="s1">);</span>
+<span class="s0">// The snapshot metadata doesn't have a type describing the `children` field</span>
+<span class="s0">// of `trace_tree`, but modeling it as a type works really well. So we make up</span>
+<span class="s0">// our own name for it and use that internally.</span>
+<span class="s1">const CHILDREN_FIELD_TYPE = </span><span class="s2">&quot;__CHILDREN__&quot;</span><span class="s1">;</span>
+
+<span class="s0">// An adapter for reading and mutating a Chrome heap snapshot in-place,</span>
+<span class="s0">// including safely decoding and encoding fields that point into the global</span>
+<span class="s0">// string table and into enum types.</span>
+<span class="s0">// Care is taken to adhere to the self-describing heap snapshot schema, but</span>
+<span class="s0">// we make some additional assumptions based on what Chrome hardcodes (where</span>
+<span class="s0">// the format leaves us no other choice).</span>
+<span class="s1">class ChromeHeapSnapshotProcessor {</span>
+  <span class="s0">// The raw snapshot data provided to this processor. Mutable.</span>
+
+  <span class="s0">// An adapter for the global string table in the raw snapshot data.</span>
+  <span class="s0">// This is shared across all the iterators we will create.</span>
+
+  <span class="s1">constructor(snapshotData) {</span>
+    <span class="s3">this</span><span class="s1">._snapshotData = snapshotData;</span>
+    <span class="s3">this</span><span class="s1">._globalStringTable = </span><span class="s3">new </span><span class="s1">ChromeHeapSnapshotStringTable(</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.strings</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+  <span class="s1">traceFunctionInfos() {</span>
+    <span class="s3">return new </span><span class="s1">ChromeHeapSnapshotRecordIterator(</span>
+      <span class="s0">// Flow is being conservative here, but we'll never change a number into RawBuffer or vice versa.</span>
+      <span class="s0">// $FlowIgnore[incompatible-call]</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.trace_function_infos,</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.snapshot.meta.trace_function_info_fields,</span>
+      <span class="s1">{</span>
+        <span class="s1">name: </span><span class="s2">&quot;string&quot;</span><span class="s1">,</span>
+        <span class="s1">script_name: </span><span class="s2">&quot;string&quot;</span><span class="s1">,</span>
+      <span class="s1">},</span>
+      <span class="s3">this</span><span class="s1">._globalStringTable,</span>
+      <span class="s1">undefined </span><span class="s0">/* start position */</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">locations() {</span>
+    <span class="s3">return new </span><span class="s1">ChromeHeapSnapshotRecordIterator(</span>
+      <span class="s0">// Flow is being conservative here, but we'll never change a number into RawBuffer or vice versa.</span>
+      <span class="s0">// $FlowIgnore[incompatible-call]</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.locations,</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.snapshot.meta.location_fields,</span>
+      <span class="s3">null</span><span class="s1">,</span>
+      <span class="s3">this</span><span class="s1">._globalStringTable,</span>
+      <span class="s1">undefined </span><span class="s0">/* start position */</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">nodes() {</span>
+    <span class="s3">return new </span><span class="s1">ChromeHeapSnapshotRecordIterator(</span>
+      <span class="s0">// Flow is being conservative here, but we'll never change a number into RawBuffer or vice versa.</span>
+      <span class="s0">// $FlowIgnore[incompatible-call]</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.nodes,</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.snapshot.meta.node_fields,</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.snapshot.meta.node_types,</span>
+      <span class="s3">this</span><span class="s1">._globalStringTable,</span>
+      <span class="s1">undefined </span><span class="s0">/* start position */</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">edges() {</span>
+    <span class="s3">return new </span><span class="s1">ChromeHeapSnapshotRecordIterator(</span>
+      <span class="s0">// Flow is being conservative here, but we'll never change a number into RawBuffer or vice versa.</span>
+      <span class="s0">// $FlowIgnore[incompatible-call]</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.edges,</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.snapshot.meta.edge_fields,</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.snapshot.meta.edge_types,</span>
+      <span class="s3">this</span><span class="s1">._globalStringTable,</span>
+      <span class="s1">undefined </span><span class="s0">/* start position */</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s1">traceTree() {</span>
+    <span class="s3">return new </span><span class="s1">ChromeHeapSnapshotRecordIterator(</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.trace_tree,</span>
+      <span class="s3">this</span><span class="s1">._snapshotData.snapshot.meta.trace_node_fields,</span>
+      <span class="s1">{</span>
+        <span class="s1">children: CHILDREN_FIELD_TYPE,</span>
+      <span class="s1">},</span>
+      <span class="s3">this</span><span class="s1">._globalStringTable,</span>
+      <span class="s1">undefined </span><span class="s0">/* start position */</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// An uniquing adapter for the heap snapshot's string table that allows</span>
+<span class="s0">// retrieving and adding strings.</span>
+<span class="s0">//</span>
+<span class="s0">// Assumptions:</span>
+<span class="s0">// 1. The string table is only manipulated via this class, and only via a</span>
+<span class="s0">//    single instance of it.</span>
+<span class="s0">// 2. The string table array is always mutated in-place rather than being</span>
+<span class="s0">//    copied / replaced with a new array in its containing object.</span>
+<span class="s1">class ChromeHeapSnapshotStringTable {</span>
+  <span class="s1">constructor(strings) {</span>
+    <span class="s3">this</span><span class="s1">._strings = strings;</span>
+    <span class="s3">this</span><span class="s1">._indexCache = </span><span class="s3">new </span><span class="s1">Map();</span>
+    <span class="s0">// NOTE: _indexCache is lazily initialised in _syncIndexCache.</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Looks up a string in the string table, adds it if necessary, and returns</span>
+  <span class="s0">// its index.</span>
+  <span class="s1">add(value) {</span>
+    <span class="s3">this</span><span class="s1">._syncIndexCache();</span>
+    <span class="s1">let index = </span><span class="s3">this</span><span class="s1">._indexCache.get(value);</span>
+    <span class="s3">if </span><span class="s1">(index != </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">index;</span>
+    <span class="s1">}</span>
+    <span class="s1">index = </span><span class="s3">this</span><span class="s1">._strings.length;</span>
+    <span class="s3">this</span><span class="s1">._strings.push(value);</span>
+    <span class="s3">this</span><span class="s1">._indexCache.set(value, index);</span>
+    <span class="s3">return </span><span class="s1">index;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Retrieve the string at the given index.</span>
+  <span class="s1">get(index) {</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">index &gt;= </span><span class="s4">0 </span><span class="s1">&amp;&amp; index &lt; </span><span class="s3">this</span><span class="s1">._strings.length,</span>
+      <span class="s2">&quot;index out of string table range&quot;</span>
+    <span class="s1">);</span>
+    <span class="s3">return this</span><span class="s1">._strings[index];</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Indexes the string table for fast lookup.</span>
+  <span class="s1">_syncIndexCache() {</span>
+    <span class="s0">// Because we only grow the string table and we assume it's unique to begin</span>
+    <span class="s0">// with, we only need to scan any strings that we may have appended since</span>
+    <span class="s0">// the last time we synced the index.</span>
+    <span class="s0">// NOTE: This is not even strictly necessary other than for the very first</span>
+    <span class="s0">// add() call, but it might allow us to do more complicated string table</span>
+    <span class="s0">// manipulation down the line.</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._strings.length &gt; </span><span class="s3">this</span><span class="s1">._indexCache.size) {</span>
+      <span class="s3">for </span><span class="s1">(let i = </span><span class="s3">this</span><span class="s1">._indexCache.size; i &lt; </span><span class="s3">this</span><span class="s1">._strings.length; ++i) {</span>
+        <span class="s3">this</span><span class="s1">._indexCache.set(</span><span class="s3">this</span><span class="s1">._strings[i], i);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s0">// A cursor pointing to a record-aligned position in a 1D array of N records</span>
+<span class="s0">// each with K fields in a fixed order. Supports encoding/decoding field values</span>
+<span class="s0">// in the raw array according to a schema passed to the constructor.</span>
+<span class="s0">//</span>
+<span class="s0">// Field values are stored as either numbers (representing scalars) or arrays</span>
+<span class="s0">// (representing lists of nested records). Scalar fields may represent strings</span>
+<span class="s0">// in the string table, strings in an enum, or numbers. Nested record lists are</span>
+<span class="s0">// processed according to the same schema as their parent record.</span>
+<span class="s0">//</span>
+<span class="s0">// Setters directly mutate raw data in the buffer and in the string table.</span>
+<span class="s1">class ChromeHeapSnapshotRecordAccessor {</span>
+  <span class="s0">// Fast lookup tables from field names to their offsets (required) and types</span>
+  <span class="s0">// (optional). These are shared with any child iterators.</span>
+
+  <span class="s0">// The number of fields in every record (i.e. K).</span>
+
+  <span class="s0">// The raw buffer. Mutable.</span>
+
+  <span class="s0">// The global string table. Mutable in the ways allowed by the string table</span>
+  <span class="s0">// class.</span>
+
+  <span class="s0">// The current position in the raw buffer.</span>
+
+  <span class="s1">constructor(</span>
+    <span class="s1">buffer,</span>
+    <span class="s1">recordFields,</span>
+    <span class="s0">// recordTypes can be:</span>
+    <span class="s0">// 1. An array: Field types as described in the snapshot itself, e.g.</span>
+    <span class="s0">//    node_types, edge_types.</span>
+    <span class="s0">// 2. An object: Field types that are implicit (hardcoded in V8 / DevTools)</span>
+    <span class="s0">//    so we pass them in by field name.</span>
+    <span class="s0">// 3. null: No field types are known.</span>
+    <span class="s0">// Fields with unknown types are assumed to be numeric.</span>
+    <span class="s1">recordTypes,</span>
+    <span class="s1">globalStringTable,</span>
+    <span class="s1">position,</span>
+    <span class="s1">parent</span>
+  <span class="s1">) {</span>
+    <span class="s3">if </span><span class="s1">(parent) {</span>
+      <span class="s3">this</span><span class="s1">._recordSize = parent._recordSize;</span>
+      <span class="s3">this</span><span class="s1">._fieldToOffset = parent._fieldToOffset;</span>
+      <span class="s3">this</span><span class="s1">._fieldToType = parent._fieldToType;</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s3">this</span><span class="s1">._recordSize = recordFields.length;</span>
+      <span class="s3">this</span><span class="s1">._fieldToOffset = </span><span class="s3">new </span><span class="s1">Map(</span>
+        <span class="s0">// $FlowFixMe[not-an-object]</span>
+        <span class="s1">Object.entries(recordFields).map(([offsetStr, name]) =&gt; [</span>
+          <span class="s1">String(name),</span>
+          <span class="s1">Number(offsetStr),</span>
+        <span class="s1">])</span>
+      <span class="s1">);</span>
+      <span class="s3">if </span><span class="s1">(Array.isArray(recordTypes)) {</span>
+        <span class="s3">this</span><span class="s1">._fieldToType = </span><span class="s3">new </span><span class="s1">Map(</span>
+          <span class="s0">// $FlowFixMe[not-an-object]</span>
+          <span class="s1">Object.entries(recordTypes).map(([offsetStr, type]) =&gt; [</span>
+            <span class="s1">recordFields[Number(offsetStr)],</span>
+            <span class="s1">type,</span>
+          <span class="s1">])</span>
+        <span class="s1">);</span>
+      <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+        <span class="s0">// $FlowIssue[incompatible-type-arg] Object.entries is incompletely typed</span>
+        <span class="s3">this</span><span class="s1">._fieldToType = </span><span class="s3">new </span><span class="s1">Map(Object.entries(recordTypes || {}));</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._buffer = buffer;</span>
+    <span class="s3">this</span><span class="s1">._position = position;</span>
+    <span class="s1">invariant(</span>
+      <span class="s3">this</span><span class="s1">._position % </span><span class="s3">this</span><span class="s1">._recordSize === </span><span class="s4">0</span><span class="s1">,</span>
+      <span class="s2">&quot;Record accessor constructed at invalid offset&quot;</span>
+    <span class="s1">);</span>
+    <span class="s1">invariant(</span>
+      <span class="s3">this</span><span class="s1">._buffer.length % </span><span class="s3">this</span><span class="s1">._recordSize === </span><span class="s4">0</span><span class="s1">,</span>
+      <span class="s2">&quot;Record accessor constructed with wrong size buffer&quot;</span>
+    <span class="s1">);</span>
+    <span class="s3">this</span><span class="s1">._globalStringTable = globalStringTable;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** Public API */</span>
+
+  <span class="s0">// Reads a scalar string or enum value from the given field.</span>
+  <span class="s0">// It's an error to read a number (or other non-string) field as a string.</span>
+  <span class="s0">// NOTE: The type &quot;string_or_number&quot; is always treated as a number and cannot</span>
+  <span class="s0">// be read using this method.</span>
+  <span class="s1">getString(field) {</span>
+    <span class="s1">const dynamicValue = </span><span class="s3">this</span><span class="s1">._getScalar(field);</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">dynamicValue === </span><span class="s2">&quot;string&quot;</span><span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">dynamicValue;</span>
+    <span class="s1">}</span>
+    <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Not a string or enum field: &quot; </span><span class="s1">+ field);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Reads a scalar numeric value from the given field.</span>
+  <span class="s0">// It's an error to read a string (or other non-number) field as a number.</span>
+  <span class="s0">// NOTE: The type &quot;string_or_number&quot; is always treated as a number.</span>
+  <span class="s1">getNumber(field) {</span>
+    <span class="s1">const dynamicValue = </span><span class="s3">this</span><span class="s1">._getScalar(field);</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">dynamicValue === </span><span class="s2">&quot;number&quot;</span><span class="s1">) {</span>
+      <span class="s3">return </span><span class="s1">dynamicValue;</span>
+    <span class="s1">}</span>
+    <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Not a number field: &quot; </span><span class="s1">+ field);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Returns an iterator over the children of this record that are stored in</span>
+  <span class="s0">// the given field (typically 'children'). Children conform to the same</span>
+  <span class="s0">// schema as the current record.</span>
+  <span class="s1">getChildren(field) {</span>
+    <span class="s1">const fieldType = </span><span class="s3">this</span><span class="s1">._fieldToType.get(field);</span>
+    <span class="s3">if </span><span class="s1">(fieldType !== CHILDREN_FIELD_TYPE) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Not a children field: &quot; </span><span class="s1">+ field);</span>
+    <span class="s1">}</span>
+    <span class="s1">const childrenBuffer = </span><span class="s3">this</span><span class="s1">._getRaw(field);</span>
+    <span class="s1">invariant(</span>
+      <span class="s1">Array.isArray(childrenBuffer),</span>
+      <span class="s2">&quot;Expected array in children-typed field&quot;</span>
+    <span class="s1">);</span>
+    <span class="s3">return new </span><span class="s1">ChromeHeapSnapshotRecordIterator(</span>
+      <span class="s1">childrenBuffer,</span>
+      <span class="s1">[],</span>
+      <span class="s0">// recordFields ignored when there's a parent</span>
+      <span class="s3">null</span><span class="s1">,</span>
+      <span class="s0">// recordTypes ignored when there's a parent</span>
+      <span class="s3">this</span><span class="s1">._globalStringTable,</span>
+      <span class="s1">-</span><span class="s3">this</span><span class="s1">._fieldToOffset.size </span><span class="s0">/* start position */</span><span class="s1">,</span>
+      <span class="s3">this</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Writes a scalar string or enum value into the given field, updating the</span>
+  <span class="s0">// global string table as needed.</span>
+  <span class="s0">// It's an error to write anything other than a string into a string or enum</span>
+  <span class="s0">// field.</span>
+  <span class="s0">// It's an error to write an unknown enum value into an enum field.</span>
+  <span class="s0">// NOTE: The type &quot;string_or_number&quot; is always treated as a number and cannot</span>
+  <span class="s0">// be written using this method.</span>
+  <span class="s1">setString(field, value) {</span>
+    <span class="s3">this</span><span class="s1">._setRaw(field, </span><span class="s3">this</span><span class="s1">._encodeString(field, value));</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Writes a scalar numeric value into the given field.</span>
+  <span class="s0">// It's an error to write anything other than a number into a numeric field.</span>
+  <span class="s0">// NOTE: The type &quot;string_or_number&quot; is always treated as a number.</span>
+  <span class="s1">setNumber(field, value) {</span>
+    <span class="s1">const fieldType = </span><span class="s3">this</span><span class="s1">._fieldToType.get(field);</span>
+    <span class="s3">if </span><span class="s1">(</span>
+      <span class="s1">Array.isArray(fieldType) ||</span>
+      <span class="s1">fieldType === </span><span class="s2">&quot;string&quot; </span><span class="s1">||</span>
+      <span class="s1">fieldType === CHILDREN_FIELD_TYPE</span>
+    <span class="s1">) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Not a number field: &quot; </span><span class="s1">+ field);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._setRaw(field, value);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Moves the cursor to a given index in the buffer (expressed in # of</span>
+  <span class="s0">// records, NOT fields).</span>
+  <span class="s1">moveToRecord(recordIndex) {</span>
+    <span class="s3">this</span><span class="s1">._moveToPosition(recordIndex * </span><span class="s3">this</span><span class="s1">._recordSize);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Appends a new record at the end of the buffer.</span>
+  <span class="s0">//</span>
+  <span class="s0">// Returns the index of the appended record. All fields must be specified and</span>
+  <span class="s0">// have values of the correct types. The cursor may move while writing, but</span>
+  <span class="s0">// is guaranteed to return to its initial position when this function returns</span>
+  <span class="s0">// (or throws).</span>
+  <span class="s1">append(record) {</span>
+    <span class="s1">const savedPosition = </span><span class="s3">this</span><span class="s1">._position;</span>
+    <span class="s3">try </span><span class="s1">{</span>
+      <span class="s3">return this</span><span class="s1">.moveAndInsert(</span><span class="s3">this</span><span class="s1">._buffer.length / </span><span class="s3">this</span><span class="s1">._recordSize, record);</span>
+    <span class="s1">} </span><span class="s3">finally </span><span class="s1">{</span>
+      <span class="s3">this</span><span class="s1">._position = savedPosition;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Moves the cursor to a given index in the buffer (expressed in # of</span>
+  <span class="s0">// records, NOT fields) and inserts a record.</span>
+  <span class="s0">//</span>
+  <span class="s0">// Returns the index of the inserted record. All fields must be specified and</span>
+  <span class="s0">// have values of the correct types. The given index may be the end of the</span>
+  <span class="s0">// buffer; otherwise existing records starting at the given index will be</span>
+  <span class="s0">// shifted to the right to accommodate the new record.</span>
+  <span class="s0">//</span>
+  <span class="s0">// NOTE: Inserting is a risky, low-level operation. Care must be taken not to</span>
+  <span class="s0">// desync buffers that implicitly or explicitly depend on one another (e.g.</span>
+  <span class="s0">// edge.to_node -&gt; node position, cumulative node.edge_count -&gt; edge indices).</span>
+  <span class="s1">moveAndInsert(recordIndex, record) {</span>
+    <span class="s3">this</span><span class="s1">._moveToPosition(recordIndex * </span><span class="s3">this</span><span class="s1">._recordSize, </span><span class="s0">/* allowEnd */ </span><span class="s3">true</span><span class="s1">);</span>
+    <span class="s1">let didResizeBuffer = </span><span class="s3">false</span><span class="s1">;</span>
+    <span class="s3">try </span><span class="s1">{</span>
+      <span class="s3">for </span><span class="s1">(const field of </span><span class="s3">this</span><span class="s1">._fieldToOffset.keys()) {</span>
+        <span class="s0">// $FlowFixMe[method-unbinding] added when improving typing for this parameters</span>
+        <span class="s3">if </span><span class="s1">(!Object.prototype.hasOwnProperty.call(record, field)) {</span>
+          <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Missing value for field: &quot; </span><span class="s1">+ field);</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+      <span class="s3">this</span><span class="s1">._buffer.splice(</span><span class="s3">this</span><span class="s1">._position, </span><span class="s4">0</span><span class="s1">, ...</span><span class="s3">new </span><span class="s1">Array(</span><span class="s3">this</span><span class="s1">._recordSize));</span>
+      <span class="s1">didResizeBuffer = </span><span class="s3">true</span><span class="s1">;</span>
+      <span class="s3">for </span><span class="s1">(const field of Object.keys(record)) {</span>
+        <span class="s3">this</span><span class="s1">._set(field, record[field]);</span>
+      <span class="s1">}</span>
+      <span class="s3">return this</span><span class="s1">._position / </span><span class="s3">this</span><span class="s1">._recordSize;</span>
+    <span class="s1">} </span><span class="s3">catch </span><span class="s1">(e) {</span>
+      <span class="s3">if </span><span class="s1">(didResizeBuffer) {</span>
+        <span class="s0">// Roll back the write</span>
+        <span class="s3">this</span><span class="s1">._buffer.splice(</span><span class="s3">this</span><span class="s1">._position, </span><span class="s3">this</span><span class="s1">._recordSize);</span>
+      <span class="s1">}</span>
+      <span class="s3">throw </span><span class="s1">e;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** &quot;Protected&quot; methods (please don't use) */</span>
+
+  <span class="s0">// Return true if we can advance the position by one record (including from</span>
+  <span class="s0">// the last record to the &quot;end&quot; position).</span>
+  <span class="s1">protectedHasNext() {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._position &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s0">// We haven't started iterating yet, so this might _be_ the end position.</span>
+      <span class="s3">return this</span><span class="s1">._buffer.length &gt; </span><span class="s4">0</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s3">return this</span><span class="s1">._position &lt; </span><span class="s3">this</span><span class="s1">._buffer.length;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Move to the next record (or the end) if we're not already at the end.</span>
+  <span class="s1">protectedTryMoveNext() {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">.protectedHasNext()) {</span>
+      <span class="s3">this</span><span class="s1">._moveToPosition(</span>
+        <span class="s3">this</span><span class="s1">._position + </span><span class="s3">this</span><span class="s1">._recordSize,</span>
+        <span class="s0">/* allowEnd */ </span><span class="s3">true</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** Private methods */</span>
+
+  <span class="s0">// Reads the raw numeric value of a field.</span>
+  <span class="s1">_getRaw(field) {</span>
+    <span class="s3">this</span><span class="s1">._validatePosition();</span>
+    <span class="s1">const offset = </span><span class="s3">this</span><span class="s1">._fieldToOffset.get(field);</span>
+    <span class="s3">if </span><span class="s1">(offset == </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Unknown field: &quot; </span><span class="s1">+ field);</span>
+    <span class="s1">}</span>
+    <span class="s3">return this</span><span class="s1">._buffer[</span><span class="s3">this</span><span class="s1">._position + offset];</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Decodes a scalar (string or number) field.</span>
+  <span class="s1">_getScalar(field) {</span>
+    <span class="s1">const rawValue = </span><span class="s3">this</span><span class="s1">._getRaw(field);</span>
+    <span class="s3">if </span><span class="s1">(Array.isArray(rawValue)) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Not a scalar field: &quot; </span><span class="s1">+ field);</span>
+    <span class="s1">}</span>
+    <span class="s1">const fieldType = </span><span class="s3">this</span><span class="s1">._fieldToType.get(field);</span>
+    <span class="s3">if </span><span class="s1">(Array.isArray(fieldType)) {</span>
+      <span class="s1">invariant(</span>
+        <span class="s1">rawValue &gt;= </span><span class="s4">0 </span><span class="s1">&amp;&amp; rawValue &lt; fieldType.length,</span>
+        <span class="s2">&quot;raw value does not match field enum type&quot;</span>
+      <span class="s1">);</span>
+      <span class="s3">return </span><span class="s1">fieldType[rawValue];</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(fieldType === </span><span class="s2">&quot;string&quot;</span><span class="s1">) {</span>
+      <span class="s3">return this</span><span class="s1">._globalStringTable.get(rawValue);</span>
+    <span class="s1">}</span>
+    <span class="s3">return </span><span class="s1">rawValue;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Writes the raw value of a field.</span>
+  <span class="s1">_setRaw(field, rawValue) {</span>
+    <span class="s3">this</span><span class="s1">._validatePosition();</span>
+    <span class="s1">const offset = </span><span class="s3">this</span><span class="s1">._fieldToOffset.get(field);</span>
+    <span class="s3">if </span><span class="s1">(offset == </span><span class="s3">null</span><span class="s1">) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Unknown field: &quot; </span><span class="s1">+ field);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._buffer[</span><span class="s3">this</span><span class="s1">._position + offset] = rawValue;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Writes a scalar or children value to `field`, inferring the intended type</span>
+  <span class="s0">// based on the runtime type of `value`.</span>
+  <span class="s1">_set(field, value) {</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">value === </span><span class="s2">&quot;string&quot;</span><span class="s1">) {</span>
+      <span class="s3">this</span><span class="s1">.setString(field, value);</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(</span><span class="s3">typeof </span><span class="s1">value === </span><span class="s2">&quot;number&quot;</span><span class="s1">) {</span>
+      <span class="s3">this</span><span class="s1">.setNumber(field, value);</span>
+    <span class="s1">} </span><span class="s3">else if </span><span class="s1">(Array.isArray(value)) {</span>
+      <span class="s3">this</span><span class="s1">._setChildren(field, value);</span>
+    <span class="s1">} </span><span class="s3">else </span><span class="s1">{</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Unsupported value for field: &quot; </span><span class="s1">+ field);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Writes a children array to `field` by appending each element of `value` to</span>
+  <span class="s0">// a new buffer using `append()`s semantics.</span>
+  <span class="s1">_setChildren(field, value) {</span>
+    <span class="s1">const fieldType = </span><span class="s3">this</span><span class="s1">._fieldToType.get(field);</span>
+    <span class="s3">if </span><span class="s1">(fieldType !== CHILDREN_FIELD_TYPE) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Not a children field: &quot; </span><span class="s1">+ field);</span>
+    <span class="s1">}</span>
+    <span class="s3">this</span><span class="s1">._setRaw(field, []);</span>
+    <span class="s1">const childIt = </span><span class="s3">this</span><span class="s1">.getChildren(field);</span>
+    <span class="s3">for </span><span class="s1">(const child of value) {</span>
+      <span class="s1">childIt.append(child);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Encodes a string value according to its field schema.</span>
+  <span class="s0">// The global string table may be updated as a side effect.</span>
+  <span class="s1">_encodeString(field, value) {</span>
+    <span class="s1">const fieldType = </span><span class="s3">this</span><span class="s1">._fieldToType.get(field);</span>
+    <span class="s3">if </span><span class="s1">(Array.isArray(fieldType)) {</span>
+      <span class="s1">const index = fieldType.indexOf(value);</span>
+      <span class="s1">invariant(index &gt;= </span><span class="s4">0</span><span class="s1">, </span><span class="s2">&quot;Cannot define new values in enum field&quot;</span><span class="s1">);</span>
+      <span class="s3">return </span><span class="s1">index;</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(fieldType === </span><span class="s2">&quot;string&quot;</span><span class="s1">) {</span>
+      <span class="s3">return this</span><span class="s1">._globalStringTable.add(value);</span>
+    <span class="s1">}</span>
+    <span class="s3">throw new </span><span class="s1">Error(</span><span class="s2">&quot;Not a string or enum field: &quot; </span><span class="s1">+ field);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Asserts that the given position (default: the current position) is either</span>
+  <span class="s0">// a valid position for reading a record, or (if allowEnd is true) the end of</span>
+  <span class="s0">// the buffer.</span>
+  <span class="s1">_validatePosition(allowEnd = </span><span class="s3">false</span><span class="s1">, position = </span><span class="s3">this</span><span class="s1">._position) {</span>
+    <span class="s3">if </span><span class="s1">(!Number.isInteger(position)) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(`Position ${position} is not an integer`);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(position % </span><span class="s3">this</span><span class="s1">._recordSize !== </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(</span>
+        <span class="s1">`Position ${position} is not a multiple of record size ${</span><span class="s3">this</span><span class="s1">._recordSize}`</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(position &lt; </span><span class="s4">0</span><span class="s1">) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(`Position ${position} is out of range`);</span>
+    <span class="s1">}</span>
+    <span class="s1">const maxPosition = allowEnd</span>
+      <span class="s1">? </span><span class="s3">this</span><span class="s1">._buffer.length</span>
+      <span class="s1">: </span><span class="s3">this</span><span class="s1">._buffer.length - </span><span class="s4">1</span><span class="s1">;</span>
+    <span class="s3">if </span><span class="s1">(position &gt; maxPosition) {</span>
+      <span class="s3">throw new </span><span class="s1">Error(`Position ${position} is out of range`);</span>
+    <span class="s1">}</span>
+    <span class="s3">if </span><span class="s1">(</span><span class="s3">this</span><span class="s1">._buffer.length - position &lt; </span><span class="s3">this</span><span class="s1">._recordSize) {</span>
+      <span class="s3">if </span><span class="s1">(!(allowEnd &amp;&amp; </span><span class="s3">this</span><span class="s1">._buffer.length === position)) {</span>
+        <span class="s3">throw new </span><span class="s1">Error(</span>
+          <span class="s1">`Record at position ${position} is truncated: expected ${</span>
+            <span class="s3">this</span><span class="s1">._recordSize</span>
+          <span class="s1">} fields but found ${</span><span class="s3">this</span><span class="s1">._buffer.length - position}`</span>
+        <span class="s1">);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Move to the given position or throw an error if it is invalid.</span>
+  <span class="s1">_moveToPosition(nextPosition, allowEnd = </span><span class="s3">false</span><span class="s1">) {</span>
+    <span class="s3">this</span><span class="s1">._validatePosition(allowEnd, nextPosition);</span>
+    <span class="s3">this</span><span class="s1">._position = nextPosition;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s0">// $FlowIssue[prop-missing] Flow doesn't see that we implement the iteration protocol</span>
+<span class="s1">class ChromeHeapSnapshotRecordIterator extends ChromeHeapSnapshotRecordAccessor {</span>
+  <span class="s1">constructor(</span>
+    <span class="s1">buffer,</span>
+    <span class="s1">recordFields,</span>
+    <span class="s1">recordTypes,</span>
+    <span class="s1">globalStringTable,</span>
+    <span class="s0">// Initialise to &quot;before the first iteration&quot;.</span>
+    <span class="s0">// The Accessor constructor intentionally checks only alignment, not range,</span>
+    <span class="s0">// so this works as long as we don't try to read/write (at which point</span>
+    <span class="s0">// validation will kick in).</span>
+    <span class="s1">position = -recordFields.length,</span>
+    <span class="s1">parent</span>
+  <span class="s1">) {</span>
+    <span class="s1">super(</span>
+      <span class="s1">buffer,</span>
+      <span class="s1">recordFields,</span>
+      <span class="s1">recordTypes,</span>
+      <span class="s1">globalStringTable,</span>
+      <span class="s1">position,</span>
+      <span class="s1">parent</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// JS Iterator protocol</span>
+  <span class="s1">next() {</span>
+    <span class="s3">this</span><span class="s1">.protectedTryMoveNext();</span>
+    <span class="s3">return </span><span class="s1">{</span>
+      <span class="s1">done: !</span><span class="s3">this</span><span class="s1">.protectedHasNext(),</span>
+      <span class="s1">value: </span><span class="s3">this</span><span class="s1">,</span>
+    <span class="s1">};</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// JS Iterable protocol</span>
+  <span class="s0">// $FlowIssue[unsupported-syntax]</span>
+  <span class="s1">[Symbol.iterator]() {</span>
+    <span class="s3">return this</span><span class="s1">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+<span class="s1">module.exports = {</span>
+  <span class="s1">ChromeHeapSnapshotProcessor,</span>
+<span class="s1">};</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<html>
+<head>
+<title>EventQueueProcessor.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+EventQueueProcessor.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&lt;cxxreact/JSExecutor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&quot;EventEmitter.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;EventLogger.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;EventQueue.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;ShadowNodeFamily.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s1">EventQueueProcessor::EventQueueProcessor(</span>
+    <span class="s1">EventPipe eventPipe</span><span class="s4">,</span>
+    <span class="s1">StatePipe statePipe)</span>
+    <span class="s1">: eventPipe_(std::move(eventPipe))</span><span class="s4">, </span><span class="s1">statePipe_(std::move(statePipe)) {}</span>
+
+<span class="s4">void </span><span class="s1">EventQueueProcessor::flushEvents(</span>
+    <span class="s1">jsi::Runtime &amp;runtime</span><span class="s4">,</span>
+    <span class="s1">std::vector&lt;RawEvent&gt; &amp;&amp;events) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">{</span>
+    <span class="s1">std::lock_guard&lt;std::mutex&gt; lock(EventEmitter::DispatchMutex())</span><span class="s4">;</span>
+
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;event : events) {</span>
+      <span class="s4">if </span><span class="s1">(event.eventTarget) {</span>
+        <span class="s1">event.eventTarget-&gt;retain(runtime)</span><span class="s4">;</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;event : events) {</span>
+    <span class="s4">if </span><span class="s1">(event.category == RawEvent::Category::ContinuousEnd) {</span>
+      <span class="s1">hasContinuousEventStarted_ = </span><span class="s4">false;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">reactPriority = hasContinuousEventStarted_</span>
+        <span class="s1">? ReactEventPriority::Default</span>
+        <span class="s1">: ReactEventPriority::Discrete</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(event.category == RawEvent::Category::Continuous) {</span>
+      <span class="s1">reactPriority = ReactEventPriority::Default</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(event.category == RawEvent::Category::Discrete) {</span>
+      <span class="s1">reactPriority = ReactEventPriority::Discrete</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">eventLogger = getEventLogger()</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(eventLogger != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s1">eventLogger-&gt;onEventDispatch(event.loggingTag)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">eventPipe_(</span>
+        <span class="s1">runtime</span><span class="s4">,</span>
+        <span class="s1">event.eventTarget.get()</span><span class="s4">,</span>
+        <span class="s1">event.type</span><span class="s4">,</span>
+        <span class="s1">reactPriority</span><span class="s4">,</span>
+        <span class="s1">event.payloadFactory)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(eventLogger != </span><span class="s4">nullptr</span><span class="s1">) {</span>
+      <span class="s1">eventLogger-&gt;onEventEnd(event.loggingTag)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(event.category == RawEvent::Category::ContinuousStart) {</span>
+      <span class="s1">hasContinuousEventStarted_ = </span><span class="s4">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// No need to lock `EventEmitter::DispatchMutex()` here.</span>
+  <span class="s0">// The mutex protects from a situation when the `instanceHandle` can be</span>
+  <span class="s0">// deallocated during accessing, but that's impossible at this point because</span>
+  <span class="s0">// we have a strong pointer to it.</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;event : events) {</span>
+    <span class="s4">if </span><span class="s1">(event.eventTarget) {</span>
+      <span class="s1">event.eventTarget-&gt;release(runtime)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">EventQueueProcessor::flushStateUpdates(</span>
+    <span class="s1">std::vector&lt;StateUpdate&gt; &amp;&amp;states) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">const auto </span><span class="s1">&amp;stateUpdate : states) {</span>
+    <span class="s1">statePipe_(stateUpdate)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

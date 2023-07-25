@@ -1,0 +1,374 @@
+<html>
+<head>
+<title>Assets.js.flow</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+Assets.js.flow</font>
+</center></td></tr></table>
+<pre><span class="s0">/**</span>
+ <span class="s0">* Copyright (c) Meta Platforms, Inc. and affiliates.</span>
+ <span class="s0">*</span>
+ <span class="s0">* This source code is licensed under the MIT license found in the</span>
+ <span class="s0">* LICENSE file in the root directory of this source tree.</span>
+ <span class="s0">*</span>
+ <span class="s0">* @flow</span>
+ <span class="s0">* @format</span>
+ <span class="s0">* @oncall react_native</span>
+ <span class="s0">*/</span>
+
+<span class="s0">'use strict';</span>
+
+<span class="s0">import type {AssetPath} from './node-haste/lib/AssetPaths';</span>
+
+<span class="s0">const AssetPaths = require('./node-haste/lib/AssetPaths');</span>
+<span class="s0">const crypto = require('crypto');</span>
+<span class="s0">const denodeify = require('denodeify');</span>
+<span class="s0">const fs = require('fs');</span>
+<span class="s0">const getImageSize = require('image-size');</span>
+<span class="s0">const path = require('path');</span>
+
+<span class="s0">const readDir = denodeify(fs.readdir);</span>
+<span class="s0">const readFile = denodeify(fs.readFile);</span>
+
+<span class="s0">export type AssetInfo = {</span>
+  <span class="s0">+files: Array&lt;string&gt;,</span>
+  <span class="s0">+hash: string,</span>
+  <span class="s0">+name: string,</span>
+  <span class="s0">+scales: Array&lt;number&gt;,</span>
+  <span class="s0">+type: string,</span>
+<span class="s0">};</span>
+
+<span class="s0">export type AssetDataWithoutFiles = {</span>
+  <span class="s0">+__packager_asset: boolean,</span>
+  <span class="s0">+fileSystemLocation: string,</span>
+  <span class="s0">+hash: string,</span>
+  <span class="s0">+height: ?number,</span>
+  <span class="s0">+httpServerLocation: string,</span>
+  <span class="s0">+name: string,</span>
+  <span class="s0">+scales: Array&lt;number&gt;,</span>
+  <span class="s0">+type: string,</span>
+  <span class="s0">+width: ?number,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+<span class="s0">export type AssetDataFiltered = {</span>
+  <span class="s0">+__packager_asset: boolean,</span>
+  <span class="s0">+hash: string,</span>
+  <span class="s0">+height: ?number,</span>
+  <span class="s0">+httpServerLocation: string,</span>
+  <span class="s0">+name: string,</span>
+  <span class="s0">+scales: Array&lt;number&gt;,</span>
+  <span class="s0">+type: string,</span>
+  <span class="s0">+width: ?number,</span>
+  <span class="s0">...</span>
+<span class="s0">};</span>
+
+<span class="s0">// Test extension against all types supported by image-size module.</span>
+<span class="s0">// If it's not one of these, we won't treat it as an image.</span>
+<span class="s0">function isAssetTypeAnImage(type: string): boolean {</span>
+  <span class="s0">return (</span>
+    <span class="s0">[</span>
+      <span class="s0">'png',</span>
+      <span class="s0">'jpg',</span>
+      <span class="s0">'jpeg',</span>
+      <span class="s0">'bmp',</span>
+      <span class="s0">'gif',</span>
+      <span class="s0">'webp',</span>
+      <span class="s0">'psd',</span>
+      <span class="s0">'svg',</span>
+      <span class="s0">'tiff',</span>
+      <span class="s0">'ktx',</span>
+    <span class="s0">].indexOf(type) !== -1</span>
+  <span class="s0">);</span>
+<span class="s0">}</span>
+
+<span class="s0">function getAssetSize(</span>
+  <span class="s0">type: string,</span>
+  <span class="s0">content: Buffer,</span>
+  <span class="s0">filePath: string,</span>
+<span class="s0">): ?{+width: number, +height: number} {</span>
+  <span class="s0">if (!isAssetTypeAnImage(type)) {</span>
+    <span class="s0">return null;</span>
+  <span class="s0">}</span>
+  <span class="s0">if (content.length === 0) {</span>
+    <span class="s0">throw new Error(`Image asset \`${filePath}\` cannot be an empty file.`);</span>
+  <span class="s0">}</span>
+  <span class="s0">const {width, height} = getImageSize(content);</span>
+  <span class="s0">return {width, height};</span>
+<span class="s0">}</span>
+
+<span class="s0">export type AssetData = AssetDataWithoutFiles &amp; {+files: Array&lt;string&gt;, ...};</span>
+
+<span class="s0">export type AssetDataPlugin = (</span>
+  <span class="s0">assetData: AssetData,</span>
+<span class="s0">) =&gt; AssetData | Promise&lt;AssetData&gt;;</span>
+
+<span class="s0">const hashFiles = denodeify(function hashFilesCb(files, hash, callback): void {</span>
+  <span class="s0">if (!files.length) {</span>
+    <span class="s0">callback(null);</span>
+    <span class="s0">return;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const file = files.shift();</span>
+
+  <span class="s0">fs.readFile(file, (err, data: Buffer) =&gt; {</span>
+    <span class="s0">if (err) {</span>
+      <span class="s0">callback(err);</span>
+      <span class="s0">return;</span>
+    <span class="s0">} else {</span>
+      <span class="s0">hash.update(data);</span>
+      <span class="s0">hashFilesCb(files, hash, callback);</span>
+    <span class="s0">}</span>
+  <span class="s0">});</span>
+<span class="s0">});</span>
+
+<span class="s0">function buildAssetMap(</span>
+  <span class="s0">dir: string,</span>
+  <span class="s0">files: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">platform: ?string,</span>
+<span class="s0">): Map&lt;string, {files: Array&lt;string&gt;, scales: Array&lt;number&gt;}&gt; {</span>
+  <span class="s0">const platforms = new Set(platform != null ? [platform] : []);</span>
+  <span class="s0">const assets = files.map((file: string) =&gt;</span>
+    <span class="s0">AssetPaths.tryParse(file, platforms),</span>
+  <span class="s0">);</span>
+  <span class="s0">const map = new Map&lt;string, {files: Array&lt;string&gt;, scales: Array&lt;number&gt;}&gt;();</span>
+  <span class="s0">assets.forEach(function (asset: ?AssetPath, i: number) {</span>
+    <span class="s0">if (asset == null) {</span>
+      <span class="s0">return;</span>
+    <span class="s0">}</span>
+    <span class="s0">const file = files[i];</span>
+    <span class="s0">const assetKey = getAssetKey(asset.assetName, asset.platform);</span>
+    <span class="s0">let record = map.get(assetKey);</span>
+    <span class="s0">if (!record) {</span>
+      <span class="s0">record = {</span>
+        <span class="s0">scales: [],</span>
+        <span class="s0">files: [],</span>
+      <span class="s0">};</span>
+      <span class="s0">map.set(assetKey, record);</span>
+    <span class="s0">}</span>
+
+    <span class="s0">let insertIndex;</span>
+    <span class="s0">const length = record.scales.length;</span>
+
+    <span class="s0">for (insertIndex = 0; insertIndex &lt; length; insertIndex++) {</span>
+      <span class="s0">if (asset.resolution &lt; record.scales[insertIndex]) {</span>
+        <span class="s0">break;</span>
+      <span class="s0">}</span>
+    <span class="s0">}</span>
+    <span class="s0">record.scales.splice(insertIndex, 0, asset.resolution);</span>
+    <span class="s0">record.files.splice(insertIndex, 0, path.join(dir, file));</span>
+  <span class="s0">});</span>
+
+  <span class="s0">return map;</span>
+<span class="s0">}</span>
+
+<span class="s0">function getAssetKey(assetName: string, platform: ?string): string {</span>
+  <span class="s0">if (platform != null) {</span>
+    <span class="s0">return `${assetName} : ${platform}`;</span>
+  <span class="s0">} else {</span>
+    <span class="s0">return assetName;</span>
+  <span class="s0">}</span>
+<span class="s0">}</span>
+
+<span class="s0">async function getAbsoluteAssetRecord(</span>
+  <span class="s0">assetPath: string,</span>
+  <span class="s0">platform: ?string = null,</span>
+<span class="s0">): Promise&lt;{files: Array&lt;string&gt;, scales: Array&lt;number&gt;}&gt; {</span>
+  <span class="s0">const filename = path.basename(assetPath);</span>
+  <span class="s0">const dir = path.dirname(assetPath);</span>
+  <span class="s0">const files = await readDir(dir);</span>
+
+  <span class="s0">const assetData = AssetPaths.parse(</span>
+    <span class="s0">filename,</span>
+    <span class="s0">new Set(platform != null ? [platform] : []),</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const map = buildAssetMap(dir, files, platform);</span>
+
+  <span class="s0">let record;</span>
+  <span class="s0">if (platform != null) {</span>
+    <span class="s0">record =</span>
+      <span class="s0">map.get(getAssetKey(assetData.assetName, platform)) ||</span>
+      <span class="s0">map.get(assetData.assetName);</span>
+  <span class="s0">} else {</span>
+    <span class="s0">record = map.get(assetData.assetName);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (!record) {</span>
+    <span class="s0">throw new Error(</span>
+      <span class="s0">`Asset not found: ${assetPath} for platform: ${</span>
+        <span class="s0">platform ?? '(unspecified)'</span>
+      <span class="s0">}`,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return record;</span>
+<span class="s0">}</span>
+
+<span class="s0">async function getAbsoluteAssetInfo(</span>
+  <span class="s0">assetPath: string,</span>
+  <span class="s0">platform: ?string = null,</span>
+<span class="s0">): Promise&lt;AssetInfo&gt; {</span>
+  <span class="s0">const nameData = AssetPaths.parse(</span>
+    <span class="s0">assetPath,</span>
+    <span class="s0">new Set(platform != null ? [platform] : []),</span>
+  <span class="s0">);</span>
+  <span class="s0">const {name, type} = nameData;</span>
+
+  <span class="s0">const {scales, files} = await getAbsoluteAssetRecord(assetPath, platform);</span>
+  <span class="s0">const hasher = crypto.createHash('md5');</span>
+
+  <span class="s0">if (files.length &gt; 0) {</span>
+    <span class="s0">await hashFiles(Array.from(files), hasher);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return {files, hash: hasher.digest('hex'), name, scales, type};</span>
+<span class="s0">}</span>
+
+<span class="s0">async function getAssetData(</span>
+  <span class="s0">assetPath: string,</span>
+  <span class="s0">localPath: string,</span>
+  <span class="s0">assetDataPlugins: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">platform: ?string = null,</span>
+  <span class="s0">publicPath: string,</span>
+<span class="s0">): Promise&lt;AssetData&gt; {</span>
+  <span class="s0">// If the path of the asset is outside of the projectRoot, we don't want to</span>
+  <span class="s0">// use `path.join` since this will generate an incorrect URL path. In that</span>
+  <span class="s0">// case we just concatenate the publicPath with the relative path.</span>
+  <span class="s0">let assetUrlPath = localPath.startsWith('..')</span>
+    <span class="s0">? publicPath.replace(/\/$/, '') + '/' + path.dirname(localPath)</span>
+    <span class="s0">: path.join(publicPath, path.dirname(localPath));</span>
+
+  <span class="s0">// On Windows, change backslashes to slashes to get proper URL path from file path.</span>
+  <span class="s0">if (path.sep === '\\') {</span>
+    <span class="s0">assetUrlPath = assetUrlPath.replaceAll('\\', '/');</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const isImage = isAssetTypeAnImage(path.extname(assetPath).slice(1));</span>
+  <span class="s0">const assetInfo = await getAbsoluteAssetInfo(assetPath, platform);</span>
+
+  <span class="s0">const isImageInput = assetInfo.files[0].includes('.zip/')</span>
+    <span class="s0">? fs.readFileSync(assetInfo.files[0])</span>
+    <span class="s0">: assetInfo.files[0];</span>
+  <span class="s0">const dimensions = isImage ? getImageSize(isImageInput) : null;</span>
+  <span class="s0">const scale = assetInfo.scales[0];</span>
+
+  <span class="s0">const assetData = {</span>
+    <span class="s0">__packager_asset: true,</span>
+    <span class="s0">fileSystemLocation: path.dirname(assetPath),</span>
+    <span class="s0">httpServerLocation: assetUrlPath,</span>
+    <span class="s0">width: dimensions ? dimensions.width / scale : undefined,</span>
+    <span class="s0">height: dimensions ? dimensions.height / scale : undefined,</span>
+    <span class="s0">scales: assetInfo.scales,</span>
+    <span class="s0">files: assetInfo.files,</span>
+    <span class="s0">hash: assetInfo.hash,</span>
+    <span class="s0">name: assetInfo.name,</span>
+    <span class="s0">type: assetInfo.type,</span>
+  <span class="s0">};</span>
+  <span class="s0">return await applyAssetDataPlugins(assetDataPlugins, assetData);</span>
+<span class="s0">}</span>
+
+<span class="s0">async function applyAssetDataPlugins(</span>
+  <span class="s0">assetDataPlugins: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">assetData: AssetData,</span>
+<span class="s0">): Promise&lt;AssetData&gt; {</span>
+  <span class="s0">if (!assetDataPlugins.length) {</span>
+    <span class="s0">return assetData;</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const [currentAssetPlugin, ...remainingAssetPlugins] = assetDataPlugins;</span>
+  <span class="s0">// $FlowFixMe: impossible to type a dynamic require.</span>
+  <span class="s0">const assetPluginFunction: AssetDataPlugin = require(currentAssetPlugin);</span>
+  <span class="s0">const resultAssetData = await assetPluginFunction(assetData);</span>
+  <span class="s0">return await applyAssetDataPlugins(remainingAssetPlugins, resultAssetData);</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Returns all the associated files (for different resolutions) of an asset.</span>
+ <span class="s0">**/</span>
+<span class="s0">async function getAssetFiles(</span>
+  <span class="s0">assetPath: string,</span>
+  <span class="s0">platform: ?string = null,</span>
+<span class="s0">): Promise&lt;Array&lt;string&gt;&gt; {</span>
+  <span class="s0">const assetData = await getAbsoluteAssetRecord(assetPath, platform);</span>
+
+  <span class="s0">return assetData.files;</span>
+<span class="s0">}</span>
+
+<span class="s0">/**</span>
+ <span class="s0">* Return a buffer with the actual image given a request for an image by path.</span>
+ <span class="s0">* The relativePath can contain a resolution postfix, in this case we need to</span>
+ <span class="s0">* find that image (or the closest one to it's resolution) in one of the</span>
+ <span class="s0">* project roots:</span>
+ <span class="s0">*</span>
+ <span class="s0">* 1. We first parse the directory of the asset</span>
+ <span class="s0">* 2. We then build a map of all assets and their scales in this directory</span>
+ <span class="s0">* 3. Then try to pick platform-specific asset records</span>
+ <span class="s0">* 4. Then pick the closest resolution (rounding up) to the requested one</span>
+ <span class="s0">*/</span>
+<span class="s0">async function getAsset(</span>
+  <span class="s0">relativePath: string,</span>
+  <span class="s0">projectRoot: string,</span>
+  <span class="s0">watchFolders: $ReadOnlyArray&lt;string&gt;,</span>
+  <span class="s0">platform: ?string = null,</span>
+  <span class="s0">assetExts: $ReadOnlyArray&lt;string&gt;,</span>
+<span class="s0">): Promise&lt;Buffer&gt; {</span>
+  <span class="s0">const assetData = AssetPaths.parse(</span>
+    <span class="s0">relativePath,</span>
+    <span class="s0">new Set(platform != null ? [platform] : []),</span>
+  <span class="s0">);</span>
+
+  <span class="s0">const absolutePath = path.resolve(projectRoot, relativePath);</span>
+
+  <span class="s0">if (!assetExts.includes(assetData.type)) {</span>
+    <span class="s0">throw new Error(</span>
+      <span class="s0">`'${relativePath}' cannot be loaded as its extension is not registered in assetExts`,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">if (!pathBelongsToRoots(absolutePath, [projectRoot, ...watchFolders])) {</span>
+    <span class="s0">throw new Error(</span>
+      <span class="s0">`'${relativePath}' could not be found, because it cannot be found in the project root or any watch folder`,</span>
+    <span class="s0">);</span>
+  <span class="s0">}</span>
+
+  <span class="s0">const record = await getAbsoluteAssetRecord(absolutePath, platform);</span>
+
+  <span class="s0">for (let i = 0; i &lt; record.scales.length; i++) {</span>
+    <span class="s0">if (record.scales[i] &gt;= assetData.resolution) {</span>
+      <span class="s0">return readFile(record.files[i]);</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return readFile(record.files[record.files.length - 1]);</span>
+<span class="s0">}</span>
+
+<span class="s0">function pathBelongsToRoots(</span>
+  <span class="s0">pathToCheck: string,</span>
+  <span class="s0">roots: $ReadOnlyArray&lt;string&gt;,</span>
+<span class="s0">): boolean {</span>
+  <span class="s0">for (const rootFolder of roots) {</span>
+    <span class="s0">if (pathToCheck.startsWith(path.resolve(rootFolder))) {</span>
+      <span class="s0">return true;</span>
+    <span class="s0">}</span>
+  <span class="s0">}</span>
+
+  <span class="s0">return false;</span>
+<span class="s0">}</span>
+
+<span class="s0">module.exports = {</span>
+  <span class="s0">getAsset,</span>
+  <span class="s0">getAssetSize,</span>
+  <span class="s0">getAssetData,</span>
+  <span class="s0">getAssetFiles,</span>
+  <span class="s0">isAssetTypeAnImage,</span>
+<span class="s0">};</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,489 @@
+<html>
+<head>
+<title>ShadowTree.cpp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #bbb529;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+ShadowTree.cpp</font>
+</center></td></tr></table>
+<pre><span class="s0">/* 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ */</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ShadowTree.h&quot;</span>
+
+<span class="s2">#include </span><span class="s3">&lt;react/debug/react_native_assert.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/components/root/RootComponentDescriptor.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/components/view/ViewShadowNode.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/LayoutContext.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/core/LayoutPrimitives.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/debug/SystraceSection.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/ShadowTreeRevision.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/mounting/ShadowViewMutation.h&gt;</span>
+<span class="s2">#include </span><span class="s3">&lt;react/renderer/telemetry/TransactionTelemetry.h&gt;</span>
+
+<span class="s2">#include </span><span class="s3">&quot;ShadowTreeDelegate.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">facebook::react {</span>
+
+<span class="s4">using </span><span class="s1">CommitStatus = ShadowTree::CommitStatus</span><span class="s4">;</span>
+<span class="s4">using </span><span class="s1">CommitMode = ShadowTree::CommitMode</span><span class="s4">;</span>
+
+<span class="s0">/* 
+ * Generates (possibly) a new tree where all nodes with non-obsolete `State` 
+ * objects. If all `State` objects in the tree are not obsolete for the moment 
+ * of calling, the function returns `nullptr` (as an indication that no 
+ * additional work is required). 
+ */</span>
+<span class="s4">static </span><span class="s1">ShadowNode::Unshared progressState(ShadowNode </span><span class="s4">const </span><span class="s1">&amp;shadowNode) {</span>
+  <span class="s4">auto </span><span class="s1">isStateChanged = </span><span class="s4">false;</span>
+  <span class="s4">auto </span><span class="s1">areChildrenChanged = </span><span class="s4">false;</span>
+
+  <span class="s4">auto </span><span class="s1">newState = shadowNode.getState()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(newState) {</span>
+    <span class="s1">newState = newState-&gt;getMostRecentStateIfObsolete()</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(newState) {</span>
+      <span class="s1">isStateChanged = </span><span class="s4">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">newChildren = ShadowNode::ListOfShared{}</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(!shadowNode.getChildren().empty()) {</span>
+    <span class="s4">auto </span><span class="s1">index = size_t{</span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+    <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">&amp;childNode : shadowNode.getChildren()) {</span>
+      <span class="s4">auto </span><span class="s1">newChildNode = progressState(*childNode)</span><span class="s4">;</span>
+      <span class="s4">if </span><span class="s1">(newChildNode) {</span>
+        <span class="s4">if </span><span class="s1">(!areChildrenChanged) {</span>
+          <span class="s0">// Making a copy before the first mutation.</span>
+          <span class="s1">newChildren = shadowNode.getChildren()</span><span class="s4">;</span>
+        <span class="s1">}</span>
+        <span class="s1">newChildren[index] = newChildNode</span><span class="s4">;</span>
+        <span class="s1">areChildrenChanged = </span><span class="s4">true;</span>
+      <span class="s1">}</span>
+      <span class="s1">index++</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!areChildrenChanged &amp;&amp; !isStateChanged) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">shadowNode.clone({</span>
+      <span class="s1">ShadowNodeFragment::propsPlaceholder()</span><span class="s4">,</span>
+      <span class="s1">areChildrenChanged ? std::make_shared&lt;ShadowNode::ListOfShared </span><span class="s4">const</span><span class="s1">&gt;(</span>
+                               <span class="s1">std::move(newChildren))</span>
+                         <span class="s1">: ShadowNodeFragment::childrenPlaceholder()</span><span class="s4">,</span>
+      <span class="s1">isStateChanged ? newState : ShadowNodeFragment::statePlaceholder()</span><span class="s4">,</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s0">/* 
+ * An optimized version of the previous function (and relies on it). 
+ * The function uses a given base tree to exclude unchanged (equal) parts 
+ * of the three from the traversing. 
+ */</span>
+<span class="s4">static </span><span class="s1">ShadowNode::Unshared progressState(</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;shadowNode</span><span class="s4">,</span>
+    <span class="s1">ShadowNode </span><span class="s4">const </span><span class="s1">&amp;baseShadowNode) {</span>
+  <span class="s0">// The intuition behind the complexity:</span>
+  <span class="s0">// - A very few nodes have associated state, therefore it's mostly reading and</span>
+  <span class="s0">//   it only writes when state objects were found obsolete;</span>
+  <span class="s0">// - Most before-after trees are aligned, therefore most tree branches will be</span>
+  <span class="s0">//   skipped;</span>
+  <span class="s0">// - If trees are significantly different, any other algorithm will have</span>
+  <span class="s0">//   close to linear complexity.</span>
+
+  <span class="s4">auto </span><span class="s1">isStateChanged = </span><span class="s4">false;</span>
+  <span class="s4">auto </span><span class="s1">areChildrenChanged = </span><span class="s4">false;</span>
+
+  <span class="s4">auto </span><span class="s1">newState = shadowNode.getState()</span><span class="s4">;</span>
+  <span class="s4">if </span><span class="s1">(newState) {</span>
+    <span class="s1">newState = newState-&gt;getMostRecentStateIfObsolete()</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(newState) {</span>
+      <span class="s1">isStateChanged = </span><span class="s4">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto </span><span class="s1">&amp;children = shadowNode.getChildren()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">&amp;baseChildren = baseShadowNode.getChildren()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">newChildren = ShadowNode::ListOfShared{}</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">childrenSize = children.size()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">baseChildrenSize = baseChildren.size()</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">index = size_t{</span><span class="s5">0</span><span class="s1">}</span><span class="s4">;</span>
+
+  <span class="s0">// Stage 1: Aligned part.</span>
+  <span class="s4">for </span><span class="s1">(index = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">index &lt; childrenSize &amp;&amp; index &lt; baseChildrenSize</span><span class="s4">; </span><span class="s1">index++) {</span>
+    <span class="s4">auto const </span><span class="s1">&amp;childNode = *children[index]</span><span class="s4">;</span>
+    <span class="s4">auto const </span><span class="s1">&amp;baseChildNode = *baseChildren[index]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(&amp;childNode == &amp;baseChildNode) {</span>
+      <span class="s0">// Nodes are identical, skipping.</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(!ShadowNode::sameFamily(childNode</span><span class="s4">, </span><span class="s1">baseChildNode)) {</span>
+      <span class="s0">// Totally different nodes, updating is impossible.</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">newChildNode = progressState(childNode</span><span class="s4">, </span><span class="s1">baseChildNode)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(newChildNode) {</span>
+      <span class="s4">if </span><span class="s1">(!areChildrenChanged) {</span>
+        <span class="s0">// Making a copy before the first mutation.</span>
+        <span class="s1">newChildren = children</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">newChildren[index] = newChildNode</span><span class="s4">;</span>
+      <span class="s1">areChildrenChanged = </span><span class="s4">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Stage 2: Misaligned part.</span>
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">; </span><span class="s1">index &lt; childrenSize</span><span class="s4">; </span><span class="s1">index++) {</span>
+    <span class="s4">auto </span><span class="s1">newChildNode = progressState(*children[index])</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(newChildNode) {</span>
+      <span class="s4">if </span><span class="s1">(!areChildrenChanged) {</span>
+        <span class="s0">// Making a copy before the first mutation.</span>
+        <span class="s1">newChildren = children</span><span class="s4">;</span>
+      <span class="s1">}</span>
+      <span class="s1">newChildren[index] = newChildNode</span><span class="s4">;</span>
+      <span class="s1">areChildrenChanged = </span><span class="s4">true;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(!areChildrenChanged &amp;&amp; !isStateChanged) {</span>
+    <span class="s4">return nullptr;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">shadowNode.clone({</span>
+      <span class="s1">ShadowNodeFragment::propsPlaceholder()</span><span class="s4">,</span>
+      <span class="s1">areChildrenChanged ? std::make_shared&lt;ShadowNode::ListOfShared </span><span class="s4">const</span><span class="s1">&gt;(</span>
+                               <span class="s1">std::move(newChildren))</span>
+                         <span class="s1">: ShadowNodeFragment::childrenPlaceholder()</span><span class="s4">,</span>
+      <span class="s1">isStateChanged ? newState : ShadowNodeFragment::statePlaceholder()</span><span class="s4">,</span>
+  <span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">static void </span><span class="s1">updateMountedFlag(</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::ListOfShared &amp;oldChildren</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">ShadowNode::ListOfShared &amp;newChildren) {</span>
+  <span class="s0">// This is a simplified version of Diffing algorithm that only updates</span>
+  <span class="s0">// `mounted` flag on `ShadowNode`s. The algorithm sets &quot;mounted&quot; flag before</span>
+  <span class="s0">// &quot;unmounted&quot; to allow `ShadowNode` detect a situation where the node was</span>
+  <span class="s0">// remounted.</span>
+
+  <span class="s4">if </span><span class="s1">(&amp;oldChildren == &amp;newChildren) {</span>
+    <span class="s0">// Lists are identical, nothing to do.</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(oldChildren.empty() &amp;&amp; newChildren.empty()) {</span>
+    <span class="s0">// Both lists are empty, nothing to do.</span>
+    <span class="s4">return;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">size_t index</span><span class="s4">;</span>
+
+  <span class="s0">// Stage 1: Mount and unmount &quot;updated&quot; children.</span>
+  <span class="s4">for </span><span class="s1">(index = </span><span class="s5">0</span><span class="s4">; </span><span class="s1">index &lt; oldChildren.size() &amp;&amp; index &lt; newChildren.size()</span><span class="s4">;</span>
+       <span class="s1">index++) {</span>
+    <span class="s4">const auto </span><span class="s1">&amp;oldChild = oldChildren[index]</span><span class="s4">;</span>
+    <span class="s4">const auto </span><span class="s1">&amp;newChild = newChildren[index]</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(oldChild == newChild) {</span>
+      <span class="s0">// Nodes are identical, skipping the subtree.</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">if </span><span class="s1">(!ShadowNode::sameFamily(*oldChild</span><span class="s4">, </span><span class="s1">*newChild)) {</span>
+      <span class="s0">// Totally different nodes, updating is impossible.</span>
+      <span class="s4">break;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">newChild-&gt;setMounted(</span><span class="s4">true</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">oldChild-&gt;setMounted(</span><span class="s4">false</span><span class="s1">)</span><span class="s4">;</span>
+
+    <span class="s1">updateMountedFlag(oldChild-&gt;getChildren()</span><span class="s4">, </span><span class="s1">newChild-&gt;getChildren())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">size_t lastIndexAfterFirstStage = index</span><span class="s4">;</span>
+
+  <span class="s0">// State 2: Mount new children.</span>
+  <span class="s4">for </span><span class="s1">(index = lastIndexAfterFirstStage</span><span class="s4">; </span><span class="s1">index &lt; newChildren.size()</span><span class="s4">; </span><span class="s1">index++) {</span>
+    <span class="s4">const auto </span><span class="s1">&amp;newChild = newChildren[index]</span><span class="s4">;</span>
+    <span class="s1">newChild-&gt;setMounted(</span><span class="s4">true</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">updateMountedFlag({}</span><span class="s4">, </span><span class="s1">newChild-&gt;getChildren())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// State 3: Unmount old children.</span>
+  <span class="s4">for </span><span class="s1">(index = lastIndexAfterFirstStage</span><span class="s4">; </span><span class="s1">index &lt; oldChildren.size()</span><span class="s4">; </span><span class="s1">index++) {</span>
+    <span class="s4">const auto </span><span class="s1">&amp;oldChild = oldChildren[index]</span><span class="s4">;</span>
+    <span class="s1">oldChild-&gt;setMounted(</span><span class="s4">false</span><span class="s1">)</span><span class="s4">;</span>
+    <span class="s1">updateMountedFlag(oldChild-&gt;getChildren()</span><span class="s4">, </span><span class="s1">{})</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowTree::ShadowTree(</span>
+    <span class="s1">SurfaceId surfaceId</span><span class="s4">,</span>
+    <span class="s1">LayoutConstraints </span><span class="s4">const </span><span class="s1">&amp;layoutConstraints</span><span class="s4">,</span>
+    <span class="s1">LayoutContext </span><span class="s4">const </span><span class="s1">&amp;layoutContext</span><span class="s4">,</span>
+    <span class="s1">ShadowTreeDelegate </span><span class="s4">const </span><span class="s1">&amp;delegate</span><span class="s4">,</span>
+    <span class="s1">ContextContainer </span><span class="s4">const </span><span class="s1">&amp;contextContainer)</span>
+    <span class="s1">: surfaceId_(surfaceId)</span><span class="s4">, </span><span class="s1">delegate_(delegate) {</span>
+  <span class="s4">const auto </span><span class="s1">noopEventEmitter = std::make_shared&lt;</span><span class="s4">const </span><span class="s1">ViewEventEmitter&gt;(</span>
+      <span class="s4">nullptr, </span><span class="s1">-</span><span class="s5">1</span><span class="s4">, </span><span class="s1">std::shared_ptr&lt;</span><span class="s4">const </span><span class="s1">EventDispatcher&gt;())</span><span class="s4">;</span>
+
+  <span class="s4">static auto </span><span class="s1">globalRootComponentDescriptor =</span>
+      <span class="s1">std::make_unique&lt;RootComponentDescriptor </span><span class="s4">const</span><span class="s1">&gt;(</span>
+          <span class="s1">ComponentDescriptorParameters{</span>
+              <span class="s1">EventDispatcher::Shared{}</span><span class="s4">, nullptr, nullptr</span><span class="s1">})</span><span class="s4">;</span>
+
+  <span class="s4">const auto </span><span class="s1">props = std::make_shared&lt;</span><span class="s4">const </span><span class="s1">RootProps&gt;(</span>
+      <span class="s1">PropsParserContext{surfaceId</span><span class="s4">, </span><span class="s1">contextContainer}</span><span class="s4">,</span>
+      <span class="s1">*RootShadowNode::defaultSharedProps()</span><span class="s4">,</span>
+      <span class="s1">layoutConstraints</span><span class="s4">,</span>
+      <span class="s1">layoutContext)</span><span class="s4">;</span>
+
+  <span class="s4">auto const </span><span class="s1">fragment =</span>
+      <span class="s1">ShadowNodeFamilyFragment{surfaceId</span><span class="s4">, </span><span class="s1">surfaceId</span><span class="s4">, </span><span class="s1">noopEventEmitter}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">family = globalRootComponentDescriptor-&gt;createFamily(fragment</span><span class="s4">, nullptr</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">rootShadowNode = std::static_pointer_cast&lt;</span><span class="s4">const </span><span class="s1">RootShadowNode&gt;(</span>
+      <span class="s1">globalRootComponentDescriptor-&gt;createShadowNode(</span>
+          <span class="s1">ShadowNodeFragment{</span>
+              <span class="s0">/* .props = */ </span><span class="s1">props</span><span class="s4">,</span>
+          <span class="s1">}</span><span class="s4">,</span>
+          <span class="s1">family))</span><span class="s4">;</span>
+
+  <span class="s1">currentRevision_ = ShadowTreeRevision{</span>
+      <span class="s1">rootShadowNode</span><span class="s4">, </span><span class="s1">INITIAL_REVISION</span><span class="s4">, </span><span class="s1">TransactionTelemetry{}}</span><span class="s4">;</span>
+
+  <span class="s1">mountingCoordinator_ =</span>
+      <span class="s1">std::make_shared&lt;MountingCoordinator </span><span class="s4">const</span><span class="s1">&gt;(currentRevision_)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowTree::~ShadowTree() {</span>
+  <span class="s1">mountingCoordinator_-&gt;revoke()</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">Tag ShadowTree::getSurfaceId() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">surfaceId_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowTree::setCommitMode(CommitMode commitMode) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">auto </span><span class="s1">revision = ShadowTreeRevision{}</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s1">std::unique_lock lock(commitMutex_)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(commitMode_ == commitMode) {</span>
+      <span class="s4">return;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">commitMode_ = commitMode</span><span class="s4">;</span>
+    <span class="s1">revision = currentRevision_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// initial revision never contains any commits so mounting it here is</span>
+  <span class="s0">// incorrect</span>
+  <span class="s4">if </span><span class="s1">(commitMode == CommitMode::Normal &amp;&amp; revision.number != INITIAL_REVISION) {</span>
+    <span class="s1">mount(revision</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">CommitMode ShadowTree::getCommitMode() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(commitMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">commitMode_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">MountingCoordinator::Shared ShadowTree::getMountingCoordinator() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s4">return </span><span class="s1">mountingCoordinator_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">CommitStatus ShadowTree::commit(</span>
+    <span class="s4">const </span><span class="s1">ShadowTreeCommitTransaction &amp;transaction</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">CommitOptions &amp;commitOptions) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;ShadowTree::commit&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">int </span><span class="s1">attempts = </span><span class="s5">0</span><span class="s4">;</span>
+
+  <span class="s4">while </span><span class="s1">(</span><span class="s4">true</span><span class="s1">) {</span>
+    <span class="s1">attempts++</span><span class="s4">;</span>
+
+    <span class="s4">auto </span><span class="s1">status = tryCommit(transaction</span><span class="s4">, </span><span class="s1">commitOptions)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(status != CommitStatus::Failed) {</span>
+      <span class="s4">return </span><span class="s1">status</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s0">// After multiple attempts, we failed to commit the transaction.</span>
+    <span class="s0">// Something internally went terribly wrong.</span>
+    <span class="s1">react_native_assert(attempts &lt; </span><span class="s5">1024</span><span class="s1">)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s1">CommitStatus ShadowTree::tryCommit(</span>
+    <span class="s4">const </span><span class="s1">ShadowTreeCommitTransaction &amp;transaction</span><span class="s4">,</span>
+    <span class="s4">const </span><span class="s1">CommitOptions &amp;commitOptions) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span><span class="s3">&quot;ShadowTree::tryCommit&quot;</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s4">auto </span><span class="s1">telemetry = TransactionTelemetry{}</span><span class="s4">;</span>
+  <span class="s1">telemetry.willCommit()</span><span class="s4">;</span>
+
+  <span class="s1">CommitMode commitMode</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">oldRevision = ShadowTreeRevision{}</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">newRevision = ShadowTreeRevision{}</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s0">// Reading `currentRevision_` in shared manner.</span>
+    <span class="s1">std::shared_lock lock(commitMutex_)</span><span class="s4">;</span>
+    <span class="s1">commitMode = commitMode_</span><span class="s4">;</span>
+    <span class="s1">oldRevision = currentRevision_</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">auto const </span><span class="s1">&amp;oldRootShadowNode = oldRevision.rootShadowNode</span><span class="s4">;</span>
+  <span class="s4">auto </span><span class="s1">newRootShadowNode = transaction(*oldRevision.rootShadowNode)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(!newRootShadowNode ||</span>
+      <span class="s1">(commitOptions.shouldYield &amp;&amp; commitOptions.shouldYield())) {</span>
+    <span class="s4">return </span><span class="s1">CommitStatus::Cancelled</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">if </span><span class="s1">(commitOptions.enableStateReconciliation) {</span>
+    <span class="s4">auto </span><span class="s1">updatedNewRootShadowNode =</span>
+        <span class="s1">progressState(*newRootShadowNode</span><span class="s4">, </span><span class="s1">*oldRootShadowNode)</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(updatedNewRootShadowNode) {</span>
+      <span class="s1">newRootShadowNode =</span>
+          <span class="s1">std::static_pointer_cast&lt;RootShadowNode&gt;(updatedNewRootShadowNode)</span><span class="s4">;</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">// Run commit hooks.</span>
+  <span class="s1">newRootShadowNode = delegate_.shadowTreeWillCommit(</span>
+      <span class="s1">*</span><span class="s4">this, </span><span class="s1">oldRootShadowNode</span><span class="s4">, </span><span class="s1">newRootShadowNode)</span><span class="s4">;</span>
+
+  <span class="s0">// Layout nodes.</span>
+  <span class="s1">std::vector&lt;LayoutableShadowNode </span><span class="s4">const </span><span class="s1">*&gt; affectedLayoutableNodes{}</span><span class="s4">;</span>
+  <span class="s1">affectedLayoutableNodes.reserve(</span><span class="s5">1024</span><span class="s1">)</span><span class="s4">;</span>
+
+  <span class="s1">telemetry.willLayout()</span><span class="s4">;</span>
+  <span class="s1">telemetry.setAsThreadLocal()</span><span class="s4">;</span>
+  <span class="s1">newRootShadowNode-&gt;layoutIfNeeded(&amp;affectedLayoutableNodes)</span><span class="s4">;</span>
+  <span class="s1">telemetry.unsetAsThreadLocal()</span><span class="s4">;</span>
+  <span class="s1">telemetry.didLayout()</span><span class="s4">;</span>
+
+  <span class="s0">// Seal the shadow node so it can no longer be mutated</span>
+  <span class="s1">newRootShadowNode-&gt;sealRecursive()</span><span class="s4">;</span>
+
+  <span class="s1">{</span>
+    <span class="s0">// Updating `currentRevision_` in unique manner if it hasn't changed.</span>
+    <span class="s1">std::unique_lock lock(commitMutex_)</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(currentRevision_.number != oldRevision.number) {</span>
+      <span class="s4">return </span><span class="s1">CommitStatus::Failed</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s4">auto </span><span class="s1">newRevisionNumber = oldRevision.number + </span><span class="s5">1</span><span class="s4">;</span>
+
+    <span class="s4">if </span><span class="s1">(!newRootShadowNode ||</span>
+        <span class="s1">(commitOptions.shouldYield &amp;&amp; commitOptions.shouldYield())) {</span>
+      <span class="s4">return </span><span class="s1">CommitStatus::Cancelled</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">{</span>
+      <span class="s1">std::lock_guard&lt;std::mutex&gt; dispatchLock(EventEmitter::DispatchMutex())</span><span class="s4">;</span>
+
+      <span class="s1">updateMountedFlag(</span>
+          <span class="s1">currentRevision_.rootShadowNode-&gt;getChildren()</span><span class="s4">,</span>
+          <span class="s1">newRootShadowNode-&gt;getChildren())</span><span class="s4">;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">telemetry.didCommit()</span><span class="s4">;</span>
+    <span class="s1">telemetry.setRevisionNumber(</span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s4">int</span><span class="s1">&gt;(newRevisionNumber))</span><span class="s4">;</span>
+
+    <span class="s1">newRevision = ShadowTreeRevision{</span>
+        <span class="s1">std::move(newRootShadowNode)</span><span class="s4">, </span><span class="s1">newRevisionNumber</span><span class="s4">, </span><span class="s1">telemetry}</span><span class="s4">;</span>
+
+    <span class="s1">currentRevision_ = newRevision</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s1">emitLayoutEvents(affectedLayoutableNodes)</span><span class="s4">;</span>
+
+  <span class="s4">if </span><span class="s1">(commitMode == CommitMode::Normal) {</span>
+    <span class="s1">mount(std::move(newRevision)</span><span class="s4">, </span><span class="s1">commitOptions.mountSynchronously)</span><span class="s4">;</span>
+  <span class="s1">}</span>
+
+  <span class="s4">return </span><span class="s1">CommitStatus::Succeeded</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">ShadowTreeRevision ShadowTree::getCurrentRevision() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">std::shared_lock lock(commitMutex_)</span><span class="s4">;</span>
+  <span class="s4">return </span><span class="s1">currentRevision_</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowTree::mount(ShadowTreeRevision revision</span><span class="s4">, bool </span><span class="s1">mountSynchronously)</span>
+    <span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">mountingCoordinator_-&gt;push(std::move(revision))</span><span class="s4">;</span>
+  <span class="s1">delegate_.shadowTreeDidFinishTransaction(</span>
+      <span class="s1">mountingCoordinator_</span><span class="s4">, </span><span class="s1">mountSynchronously)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowTree::commitEmptyTree() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">commit(</span>
+      <span class="s1">[](RootShadowNode </span><span class="s4">const </span><span class="s1">&amp;oldRootShadowNode) -&gt; RootShadowNode::Unshared {</span>
+        <span class="s4">return </span><span class="s1">std::make_shared&lt;RootShadowNode&gt;(</span>
+            <span class="s1">oldRootShadowNode</span><span class="s4">,</span>
+            <span class="s1">ShadowNodeFragment{</span>
+                <span class="s0">/* .props = */ </span><span class="s1">ShadowNodeFragment::propsPlaceholder()</span><span class="s4">,</span>
+                <span class="s0">/* .children = */ </span><span class="s1">ShadowNode::emptySharedShadowNodeSharedList()</span><span class="s4">,</span>
+            <span class="s1">})</span><span class="s4">;</span>
+      <span class="s1">}</span><span class="s4">,</span>
+      <span class="s1">{</span><span class="s0">/* default commit options */</span><span class="s1">})</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowTree::emitLayoutEvents(</span>
+    <span class="s1">std::vector&lt;LayoutableShadowNode </span><span class="s4">const </span><span class="s1">*&gt; &amp;affectedLayoutableNodes) </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">SystraceSection s(</span>
+      <span class="s3">&quot;ShadowTree::emitLayoutEvents&quot;</span><span class="s4">,</span>
+      <span class="s3">&quot;affectedLayoutableNodes&quot;</span><span class="s4">,</span>
+      <span class="s1">affectedLayoutableNodes.size())</span><span class="s4">;</span>
+
+  <span class="s4">for </span><span class="s1">(</span><span class="s4">auto const </span><span class="s1">*layoutableNode : affectedLayoutableNodes) {</span>
+    <span class="s0">// Only instances of `ViewShadowNode` (and subclasses) are supported.</span>
+    <span class="s4">auto const </span><span class="s1">&amp;viewShadowNode =</span>
+        <span class="s4">static_cast</span><span class="s1">&lt;ViewShadowNode </span><span class="s4">const </span><span class="s1">&amp;&gt;(*layoutableNode)</span><span class="s4">;</span>
+    <span class="s4">auto const </span><span class="s1">&amp;viewEventEmitter = </span><span class="s4">static_cast</span><span class="s1">&lt;ViewEventEmitter </span><span class="s4">const </span><span class="s1">&amp;&gt;(</span>
+        <span class="s1">*viewShadowNode.getEventEmitter())</span><span class="s4">;</span>
+
+    <span class="s0">// Checking if the `onLayout` event was requested for the particular Shadow</span>
+    <span class="s0">// Node.</span>
+    <span class="s4">auto const </span><span class="s1">&amp;viewProps =</span>
+        <span class="s4">static_cast</span><span class="s1">&lt;ViewProps </span><span class="s4">const </span><span class="s1">&amp;&gt;(*viewShadowNode.getProps())</span><span class="s4">;</span>
+    <span class="s4">if </span><span class="s1">(!viewProps.onLayout) {</span>
+      <span class="s4">continue;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">viewEventEmitter.onLayout(layoutableNode-&gt;getLayoutMetrics())</span><span class="s4">;</span>
+  <span class="s1">}</span>
+<span class="s1">}</span>
+
+<span class="s4">void </span><span class="s1">ShadowTree::notifyDelegatesOfUpdates() </span><span class="s4">const </span><span class="s1">{</span>
+  <span class="s1">delegate_.shadowTreeDidFinishTransaction(mountingCoordinator_</span><span class="s4">, true</span><span class="s1">)</span><span class="s4">;</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace facebook::react</span>
+</pre>
+</body>
+</html>

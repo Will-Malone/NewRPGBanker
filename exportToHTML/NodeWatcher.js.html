@@ -1,0 +1,400 @@
+<html>
+<head>
+<title>NodeWatcher.js</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #cc7832;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+NodeWatcher.js</font>
+</center></td></tr></table>
+<pre><span class="s0">/** 
+ * Copyright (c) Meta Platforms, Inc. and affiliates. 
+ * 
+ * This source code is licensed under the MIT license found in the 
+ * LICENSE file in the root directory of this source tree. 
+ * 
+ * 
+ * @format 
+ * @oncall react_native 
+ */</span>
+
+<span class="s0">/** 
+ * Originally vendored from https://github.com/amasad/sane/blob/64ff3a870c42e84f744086884bf55a4f9c22d376/src/node_watcher.js 
+ */</span>
+
+<span class="s2">&quot;use strict&quot;</span><span class="s1">;</span>
+
+<span class="s1">const common = require(</span><span class="s2">&quot;./common&quot;</span><span class="s1">);</span>
+<span class="s1">const { EventEmitter } = require(</span><span class="s2">&quot;events&quot;</span><span class="s1">);</span>
+<span class="s1">const fs = require(</span><span class="s2">&quot;fs&quot;</span><span class="s1">);</span>
+<span class="s1">const platform = require(</span><span class="s2">&quot;os&quot;</span><span class="s1">).platform();</span>
+<span class="s1">const path = require(</span><span class="s2">&quot;path&quot;</span><span class="s1">);</span>
+<span class="s1">const fsPromises = fs.promises;</span>
+<span class="s1">const CHANGE_EVENT = common.CHANGE_EVENT;</span>
+<span class="s1">const DELETE_EVENT = common.DELETE_EVENT;</span>
+<span class="s1">const ADD_EVENT = common.ADD_EVENT;</span>
+<span class="s1">const ALL_EVENT = common.ALL_EVENT;</span>
+
+<span class="s0">/** 
+ * This setting delays all events. It suppresses 'change' events that 
+ * immediately follow an 'add', and debounces successive 'change' events to 
+ * only emit the latest. 
+ */</span>
+<span class="s1">const DEBOUNCE_MS = </span><span class="s3">100</span><span class="s1">;</span>
+<span class="s1">module.exports = class NodeWatcher extends EventEmitter {</span>
+  <span class="s1">_changeTimers = </span><span class="s4">new </span><span class="s1">Map();</span>
+  <span class="s1">constructor(dir, opts) {</span>
+    <span class="s1">super();</span>
+    <span class="s1">common.assignOptions(</span><span class="s4">this</span><span class="s1">, opts);</span>
+    <span class="s4">this</span><span class="s1">.watched = Object.create(</span><span class="s4">null</span><span class="s1">);</span>
+    <span class="s4">this</span><span class="s1">._dirRegistry = Object.create(</span><span class="s4">null</span><span class="s1">);</span>
+    <span class="s4">this</span><span class="s1">.root = path.resolve(dir);</span>
+    <span class="s4">this</span><span class="s1">._watchdir(</span><span class="s4">this</span><span class="s1">.root);</span>
+    <span class="s1">common.recReaddir(</span>
+      <span class="s4">this</span><span class="s1">.root,</span>
+      <span class="s1">(dir) =&gt; {</span>
+        <span class="s4">this</span><span class="s1">._watchdir(dir);</span>
+      <span class="s1">},</span>
+      <span class="s1">(filename) =&gt; {</span>
+        <span class="s4">this</span><span class="s1">._register(filename, </span><span class="s2">&quot;f&quot;</span><span class="s1">);</span>
+      <span class="s1">},</span>
+      <span class="s1">(symlink) =&gt; {</span>
+        <span class="s4">this</span><span class="s1">._register(symlink, </span><span class="s2">&quot;l&quot;</span><span class="s1">);</span>
+      <span class="s1">},</span>
+      <span class="s1">() =&gt; {</span>
+        <span class="s4">this</span><span class="s1">.emit(</span><span class="s2">&quot;ready&quot;</span><span class="s1">);</span>
+      <span class="s1">},</span>
+      <span class="s4">this</span><span class="s1">._checkedEmitError,</span>
+      <span class="s4">this</span><span class="s1">.ignored</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Register files that matches our globs to know what to type of event to 
+   * emit in the future. 
+   * 
+   * Registry looks like the following: 
+   * 
+   *  dirRegister =&gt; Map { 
+   *    dirpath =&gt; Map { 
+   *       filename =&gt; true 
+   *    } 
+   *  } 
+   * 
+   *  Return false if ignored or already registered. 
+   */</span>
+  <span class="s1">_register(filepath, type) {</span>
+    <span class="s1">const dir = path.dirname(filepath);</span>
+    <span class="s1">const filename = path.basename(filepath);</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._dirRegistry[dir] &amp;&amp; </span><span class="s4">this</span><span class="s1">._dirRegistry[dir][filename]) {</span>
+      <span class="s4">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const relativePath = path.relative(</span><span class="s4">this</span><span class="s1">.root, filepath);</span>
+    <span class="s4">if </span><span class="s1">(</span>
+      <span class="s1">type === </span><span class="s2">&quot;f&quot; </span><span class="s1">&amp;&amp;</span>
+      <span class="s1">!common.isIncluded(</span><span class="s2">&quot;f&quot;</span><span class="s1">, </span><span class="s4">this</span><span class="s1">.globs, </span><span class="s4">this</span><span class="s1">.dot, </span><span class="s4">this</span><span class="s1">.doIgnore, relativePath)</span>
+    <span class="s1">) {</span>
+      <span class="s4">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._dirRegistry[dir]) {</span>
+      <span class="s4">this</span><span class="s1">._dirRegistry[dir] = Object.create(</span><span class="s4">null</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._dirRegistry[dir][filename] = </span><span class="s4">true</span><span class="s1">;</span>
+    <span class="s4">return true</span><span class="s1">;</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Removes a file from the registry. 
+   */</span>
+  <span class="s1">_unregister(filepath) {</span>
+    <span class="s1">const dir = path.dirname(filepath);</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._dirRegistry[dir]) {</span>
+      <span class="s1">const filename = path.basename(filepath);</span>
+      <span class="s4">delete this</span><span class="s1">._dirRegistry[dir][filename];</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Removes a dir from the registry. 
+   */</span>
+  <span class="s1">_unregisterDir(dirpath) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._dirRegistry[dirpath]) {</span>
+      <span class="s4">delete this</span><span class="s1">._dirRegistry[dirpath];</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Checks if a file or directory exists in the registry. 
+   */</span>
+  <span class="s1">_registered(fullpath) {</span>
+    <span class="s1">const dir = path.dirname(fullpath);</span>
+    <span class="s4">return </span><span class="s1">!!(</span>
+      <span class="s4">this</span><span class="s1">._dirRegistry[fullpath] ||</span>
+      <span class="s1">(</span><span class="s4">this</span><span class="s1">._dirRegistry[dir] &amp;&amp;</span>
+        <span class="s4">this</span><span class="s1">._dirRegistry[dir][path.basename(fullpath)])</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Emit &quot;error&quot; event if it's not an ignorable event 
+   */</span>
+  <span class="s1">_checkedEmitError = (error) =&gt; {</span>
+    <span class="s4">if </span><span class="s1">(!isIgnorableFileError(error)) {</span>
+      <span class="s4">this</span><span class="s1">.emit(</span><span class="s2">&quot;error&quot;</span><span class="s1">, error);</span>
+    <span class="s1">}</span>
+  <span class="s1">};</span>
+
+  <span class="s0">/** 
+   * Watch a directory. 
+   */</span>
+  <span class="s1">_watchdir = (dir) =&gt; {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.watched[dir]) {</span>
+      <span class="s4">return false</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const watcher = fs.watch(</span>
+      <span class="s1">dir,</span>
+      <span class="s1">{</span>
+        <span class="s1">persistent: </span><span class="s4">true</span><span class="s1">,</span>
+      <span class="s1">},</span>
+      <span class="s1">(event, filename) =&gt; </span><span class="s4">this</span><span class="s1">._normalizeChange(dir, event, filename)</span>
+    <span class="s1">);</span>
+    <span class="s4">this</span><span class="s1">.watched[dir] = watcher;</span>
+    <span class="s1">watcher.on(</span><span class="s2">&quot;error&quot;</span><span class="s1">, </span><span class="s4">this</span><span class="s1">._checkedEmitError);</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.root !== dir) {</span>
+      <span class="s4">this</span><span class="s1">._register(dir, </span><span class="s2">&quot;d&quot;</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s4">return true</span><span class="s1">;</span>
+  <span class="s1">};</span>
+
+  <span class="s0">/** 
+   * Stop watching a directory. 
+   */</span>
+  <span class="s1">_stopWatching(dir) {</span>
+    <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">.watched[dir]) {</span>
+      <span class="s4">this</span><span class="s1">.watched[dir].close();</span>
+      <span class="s4">delete this</span><span class="s1">.watched[dir];</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * End watching. 
+   */</span>
+  <span class="s1">async close() {</span>
+    <span class="s1">Object.keys(</span><span class="s4">this</span><span class="s1">.watched).forEach((dir) =&gt; </span><span class="s4">this</span><span class="s1">._stopWatching(dir));</span>
+    <span class="s4">this</span><span class="s1">.removeAllListeners();</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * On some platforms, as pointed out on the fs docs (most likely just win32) 
+   * the file argument might be missing from the fs event. Try to detect what 
+   * change by detecting if something was deleted or the most recent file change. 
+   */</span>
+  <span class="s1">_detectChangedFile(dir, event, callback) {</span>
+    <span class="s4">if </span><span class="s1">(!</span><span class="s4">this</span><span class="s1">._dirRegistry[dir]) {</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">let found = </span><span class="s4">false</span><span class="s1">;</span>
+    <span class="s1">let closest = </span><span class="s4">null</span><span class="s1">;</span>
+    <span class="s1">let c = </span><span class="s3">0</span><span class="s1">;</span>
+    <span class="s1">Object.keys(</span><span class="s4">this</span><span class="s1">._dirRegistry[dir]).forEach((file, i, arr) =&gt; {</span>
+      <span class="s1">fs.lstat(path.join(dir, file), (error, stat) =&gt; {</span>
+        <span class="s4">if </span><span class="s1">(found) {</span>
+          <span class="s4">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(error) {</span>
+          <span class="s4">if </span><span class="s1">(isIgnorableFileError(error)) {</span>
+            <span class="s1">found = </span><span class="s4">true</span><span class="s1">;</span>
+            <span class="s1">callback(file);</span>
+          <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+            <span class="s4">this</span><span class="s1">.emit(</span><span class="s2">&quot;error&quot;</span><span class="s1">, error);</span>
+          <span class="s1">}</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s4">if </span><span class="s1">(closest == </span><span class="s4">null </span><span class="s1">|| stat.mtime &gt; closest.mtime) {</span>
+            <span class="s1">closest = {</span>
+              <span class="s1">file,</span>
+              <span class="s1">mtime: stat.mtime,</span>
+            <span class="s1">};</span>
+          <span class="s1">}</span>
+          <span class="s4">if </span><span class="s1">(arr.length === ++c) {</span>
+            <span class="s1">callback(closest.file);</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">});</span>
+    <span class="s1">});</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Normalize fs events and pass it on to be processed. 
+   */</span>
+  <span class="s1">_normalizeChange(dir, event, file) {</span>
+    <span class="s4">if </span><span class="s1">(!file) {</span>
+      <span class="s4">this</span><span class="s1">._detectChangedFile(dir, event, (actualFile) =&gt; {</span>
+        <span class="s4">if </span><span class="s1">(actualFile) {</span>
+          <span class="s4">this</span><span class="s1">._processChange(dir, event, actualFile).</span><span class="s4">catch</span><span class="s1">((error) =&gt;</span>
+            <span class="s4">this</span><span class="s1">.emit(</span><span class="s2">&quot;error&quot;</span><span class="s1">, error)</span>
+          <span class="s1">);</span>
+        <span class="s1">}</span>
+      <span class="s1">});</span>
+    <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+      <span class="s4">this</span><span class="s1">._processChange(dir, event, path.normalize(file)).</span><span class="s4">catch</span><span class="s1">((error) =&gt;</span>
+        <span class="s4">this</span><span class="s1">.emit(</span><span class="s2">&quot;error&quot;</span><span class="s1">, error)</span>
+      <span class="s1">);</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Process changes. 
+   */</span>
+  <span class="s1">async _processChange(dir, event, file) {</span>
+    <span class="s1">const fullPath = path.join(dir, file);</span>
+    <span class="s1">const relativePath = path.join(path.relative(</span><span class="s4">this</span><span class="s1">.root, dir), file);</span>
+    <span class="s1">const registered = </span><span class="s4">this</span><span class="s1">._registered(fullPath);</span>
+    <span class="s4">try </span><span class="s1">{</span>
+      <span class="s1">const stat = await fsPromises.lstat(fullPath);</span>
+      <span class="s4">if </span><span class="s1">(stat.isDirectory()) {</span>
+        <span class="s0">// win32 emits usless change events on dirs.</span>
+        <span class="s4">if </span><span class="s1">(event === </span><span class="s2">&quot;change&quot;</span><span class="s1">) {</span>
+          <span class="s4">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s4">if </span><span class="s1">(</span>
+          <span class="s1">!common.isIncluded(</span>
+            <span class="s2">&quot;d&quot;</span><span class="s1">,</span>
+            <span class="s4">this</span><span class="s1">.globs,</span>
+            <span class="s4">this</span><span class="s1">.dot,</span>
+            <span class="s4">this</span><span class="s1">.doIgnore,</span>
+            <span class="s1">relativePath</span>
+          <span class="s1">)</span>
+        <span class="s1">) {</span>
+          <span class="s4">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">common.recReaddir(</span>
+          <span class="s1">path.resolve(</span><span class="s4">this</span><span class="s1">.root, relativePath),</span>
+          <span class="s1">(dir, stats) =&gt; {</span>
+            <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._watchdir(dir)) {</span>
+              <span class="s4">this</span><span class="s1">._emitEvent(ADD_EVENT, path.relative(</span><span class="s4">this</span><span class="s1">.root, dir), {</span>
+                <span class="s1">modifiedTime: stats.mtime.getTime(),</span>
+                <span class="s1">size: stats.size,</span>
+                <span class="s1">type: </span><span class="s2">&quot;d&quot;</span><span class="s1">,</span>
+              <span class="s1">});</span>
+            <span class="s1">}</span>
+          <span class="s1">},</span>
+          <span class="s1">(file, stats) =&gt; {</span>
+            <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._register(file, </span><span class="s2">&quot;f&quot;</span><span class="s1">)) {</span>
+              <span class="s4">this</span><span class="s1">._emitEvent(ADD_EVENT, path.relative(</span><span class="s4">this</span><span class="s1">.root, file), {</span>
+                <span class="s1">modifiedTime: stats.mtime.getTime(),</span>
+                <span class="s1">size: stats.size,</span>
+                <span class="s1">type: </span><span class="s2">&quot;f&quot;</span><span class="s1">,</span>
+              <span class="s1">});</span>
+            <span class="s1">}</span>
+          <span class="s1">},</span>
+          <span class="s1">(symlink, stats) =&gt; {</span>
+            <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._register(symlink, </span><span class="s2">&quot;l&quot;</span><span class="s1">)) {</span>
+              <span class="s4">this</span><span class="s1">._rawEmitEvent(ADD_EVENT, path.relative(</span><span class="s4">this</span><span class="s1">.root, symlink), {</span>
+                <span class="s1">modifiedTime: stats.mtime.getTime(),</span>
+                <span class="s1">size: stats.size,</span>
+                <span class="s1">type: </span><span class="s2">&quot;l&quot;</span><span class="s1">,</span>
+              <span class="s1">});</span>
+            <span class="s1">}</span>
+          <span class="s1">},</span>
+          <span class="s4">function </span><span class="s1">endCallback() {},</span>
+          <span class="s4">this</span><span class="s1">._checkedEmitError,</span>
+          <span class="s4">this</span><span class="s1">.ignored</span>
+        <span class="s1">);</span>
+      <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+        <span class="s1">const type = common.typeFromStat(stat);</span>
+        <span class="s4">if </span><span class="s1">(type == </span><span class="s4">null</span><span class="s1">) {</span>
+          <span class="s4">return</span><span class="s1">;</span>
+        <span class="s1">}</span>
+        <span class="s1">const metadata = {</span>
+          <span class="s1">modifiedTime: stat.mtime.getTime(),</span>
+          <span class="s1">size: stat.size,</span>
+          <span class="s1">type,</span>
+        <span class="s1">};</span>
+        <span class="s4">if </span><span class="s1">(registered) {</span>
+          <span class="s4">this</span><span class="s1">._emitEvent(CHANGE_EVENT, relativePath, metadata);</span>
+        <span class="s1">} </span><span class="s4">else </span><span class="s1">{</span>
+          <span class="s4">if </span><span class="s1">(</span><span class="s4">this</span><span class="s1">._register(fullPath, type)) {</span>
+            <span class="s4">this</span><span class="s1">._emitEvent(ADD_EVENT, relativePath, metadata);</span>
+          <span class="s1">}</span>
+        <span class="s1">}</span>
+      <span class="s1">}</span>
+    <span class="s1">} </span><span class="s4">catch </span><span class="s1">(error) {</span>
+      <span class="s4">if </span><span class="s1">(!isIgnorableFileError(error)) {</span>
+        <span class="s4">this</span><span class="s1">.emit(</span><span class="s2">&quot;error&quot;</span><span class="s1">, error);</span>
+        <span class="s4">return</span><span class="s1">;</span>
+      <span class="s1">}</span>
+      <span class="s4">this</span><span class="s1">._unregister(fullPath);</span>
+      <span class="s4">this</span><span class="s1">._stopWatching(fullPath);</span>
+      <span class="s4">this</span><span class="s1">._unregisterDir(fullPath);</span>
+      <span class="s4">if </span><span class="s1">(registered) {</span>
+        <span class="s4">this</span><span class="s1">._emitEvent(DELETE_EVENT, relativePath);</span>
+      <span class="s1">}</span>
+    <span class="s1">}</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Emits the given event after debouncing, to 1) suppress 'change' events 
+   * immediately following an 'add', and 2) to only emit the latest 'change' 
+   * event when received in quick succession for a given file. 
+   * 
+   * See also note above for DEBOUNCE_MS. 
+   */</span>
+  <span class="s1">_emitEvent(type, file, metadata) {</span>
+    <span class="s1">const key = type + </span><span class="s2">&quot;-&quot; </span><span class="s1">+ file;</span>
+    <span class="s1">const addKey = ADD_EVENT + </span><span class="s2">&quot;-&quot; </span><span class="s1">+ file;</span>
+    <span class="s4">if </span><span class="s1">(type === CHANGE_EVENT &amp;&amp; </span><span class="s4">this</span><span class="s1">._changeTimers.has(addKey)) {</span>
+      <span class="s0">// Ignore the change event that is immediately fired after an add event.</span>
+      <span class="s0">// (This happens on Linux).</span>
+      <span class="s4">return</span><span class="s1">;</span>
+    <span class="s1">}</span>
+    <span class="s1">const existingTimer = </span><span class="s4">this</span><span class="s1">._changeTimers.get(key);</span>
+    <span class="s4">if </span><span class="s1">(existingTimer) {</span>
+      <span class="s1">clearTimeout(existingTimer);</span>
+    <span class="s1">}</span>
+    <span class="s4">this</span><span class="s1">._changeTimers.set(</span>
+      <span class="s1">key,</span>
+      <span class="s1">setTimeout(() =&gt; {</span>
+        <span class="s4">this</span><span class="s1">._changeTimers.</span><span class="s4">delete</span><span class="s1">(key);</span>
+        <span class="s4">this</span><span class="s1">._rawEmitEvent(type, file, metadata);</span>
+      <span class="s1">}, DEBOUNCE_MS)</span>
+    <span class="s1">);</span>
+  <span class="s1">}</span>
+
+  <span class="s0">/** 
+   * Actually emit the events 
+   */</span>
+  <span class="s1">_rawEmitEvent(eventType, file, metadata) {</span>
+    <span class="s4">this</span><span class="s1">.emit(eventType, file, </span><span class="s4">this</span><span class="s1">.root, metadata);</span>
+    <span class="s4">this</span><span class="s1">.emit(ALL_EVENT, eventType, file, </span><span class="s4">this</span><span class="s1">.root, metadata);</span>
+  <span class="s1">}</span>
+  <span class="s1">getPauseReason() {</span>
+    <span class="s4">return null</span><span class="s1">;</span>
+  <span class="s1">}</span>
+<span class="s1">};</span>
+<span class="s0">/** 
+ * Determine if a given FS error can be ignored 
+ */</span>
+<span class="s4">function </span><span class="s1">isIgnorableFileError(error) {</span>
+  <span class="s4">return </span><span class="s1">(</span>
+    <span class="s1">error.code === </span><span class="s2">&quot;ENOENT&quot; </span><span class="s1">||</span>
+    <span class="s0">// Workaround Windows EPERM on watched folder deletion, and when</span>
+    <span class="s0">// reading locked files (pending further writes or pending deletion).</span>
+    <span class="s0">// In such cases, we'll receive a subsequent event when the file is</span>
+    <span class="s0">// deleted or ready to read.</span>
+    <span class="s0">// https://github.com/facebook/metro/issues/1001</span>
+    <span class="s0">// https://github.com/nodejs/node-v0.x-archive/issues/4337</span>
+    <span class="s1">(error.code === </span><span class="s2">&quot;EPERM&quot; </span><span class="s1">&amp;&amp; platform === </span><span class="s2">&quot;win32&quot;</span><span class="s1">)</span>
+  <span class="s1">);</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>
